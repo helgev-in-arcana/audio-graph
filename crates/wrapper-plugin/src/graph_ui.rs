@@ -309,7 +309,7 @@ impl GraphEditor {
         for (i, name) in inputs.iter().enumerate() {
             let centre = Pos2::new(rect.min.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
             let connected = graph.source_of(id, i as u8).is_some();
-            if self.port(ui, &painter, centre, connected, name) {
+            if self.port(ui, &painter, (id, i as u8 + 1), centre, connected, name) {
                 outcome.clicked_input = Some(i as u8);
             }
             outcome.input_ports.push(centre);
@@ -317,7 +317,7 @@ impl GraphEditor {
         if has_output {
             let centre = Pos2::new(rect.max.x, rect.min.y + PORT_TOP);
             let connected = graph.links.iter().any(|l| l.from == id);
-            if self.port(ui, &painter, centre, connected, "out") {
+            if self.port(ui, &painter, (id, 0), centre, connected, "out") {
                 outcome.clicked_output = true;
             }
             outcome.output_port = centre;
@@ -331,16 +331,16 @@ impl GraphEditor {
         &self,
         ui: &mut egui::Ui,
         painter: &egui::Painter,
+        // The node and which of its ports this is — 0 for the output. Keyed on
+        // identity rather than on position, because a port's position changes
+        // every frame of a drag and two of them can land on the same pixel.
+        which: (NodeId, u8),
         centre: Pos2,
         connected: bool,
         name: &str,
     ) -> bool {
         let hit = Rect::from_center_size(centre, Vec2::splat(PORT_RADIUS * 3.0));
-        let response = ui.interact(
-            hit,
-            ui.id().with(("port", centre.x as i32, centre.y as i32)),
-            Sense::click(),
-        );
+        let response = ui.interact(hit, ui.id().with(("port", which)), Sense::click());
         let colour = if connected {
             ui.visuals().selection.stroke.color
         } else if response.hovered() {
