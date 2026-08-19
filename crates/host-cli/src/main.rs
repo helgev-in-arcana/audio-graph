@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         "sweep" => cmd_sweep(rest),
         "probe" => cmd_probe(rest),
         "nest" => cmd_nest(rest),
+        "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
         _ => {
             usage();
@@ -69,6 +70,8 @@ fn usage() {
   host-cli probe <PATH.vst3>        lifecycle-test one module in this process
   host-cli nest <WRAPPER.vst3> [CID]
                                     check the wrapper reloads its sub-plugin from state
+  host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
+                                    open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
   host-cli state <PATH.vst3> [CID]  save/restore a parameter across instances
   host-cli automate <PATH.vst3> <IN.wav> [CID [PARAM_ID]]
@@ -86,6 +89,8 @@ fn cmd_dirs() -> Result<(), String> {
 /// Resolve the paths to scan: explicit arguments, or the OS-conventional
 /// directories when none are given.
 fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
+    // Flags are not paths.
+    let args: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
     let dirs: Vec<PathBuf> = if args.is_empty() {
         default_plugin_directories()
     } else {
@@ -595,12 +600,35 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let classes = module.audio_modules().map_err(|e| e.to_string())?;
+
+    // Enumerate, then let the module go before doing anything else. Holding a
+    // second handle open across the editor probe is not something a host would
+    // do, and TH3 faults when we do it.
+    let classes = {
+        let module = Module::open(path).map_err(|e| e.to_string())?;
+        module.audio_modules().map_err(|e| e.to_string())?
+    };
     if classes.is_empty() {
         return Err("no audio module classes".into());
     }
 
+    // Editors are opened only on request: it takes seconds per plugin, and
+    // the windows steal focus. One teardown order per run, so a plugin that
+    // survives one and not the other says so precisely.
+    let gui_order = if args.iter().any(|a| a == "--gui-reverse") {
+        Some(true)
+    } else if args.iter().any(|a| a == "--gui") {
+        Some(false)
+    } else {
+        None
+    };
+    if let Some(reverse) = gui_order {
+        for class in &classes {
+            probe_editor(path, class.cid, &class.name, reverse)?;
+        }
+    }
+
+    let module = Module::open(path).map_err(|e| e.to_string())?;
     for class in classes {
         let host = Arc::new(host::CliHost::new());
         for round in 0..2 {
@@ -627,6 +655,52 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Open and tear down one plugin's editor, both ways round (§5.3).
+///
+/// The second order is the one that matters: some DAWs terminate a plugin
+/// without ever sending a close notification, so correctness cannot depend on
+/// a caller remembering to close the editor first.
+fn probe_editor(
+    path: &str,
+    cid: vst3_host::Cid,
+    name: &str,
+    reverse: bool,
+) -> Result<(), String> {
+    use std::sync::Arc;
+    use subhost_adapter::SubHost;
+
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    sub.load(Path::new(path), Some(cid))?;
+    match sub.open_editor() {
+        Ok(()) => {}
+        // A plugin with no editor is not a failure; plenty have none.
+        Err(e) if e.contains("no editor") => return Ok(()),
+        Err(e) => return Err(format!("{name}: open editor: {e}")),
+    }
+
+    // Long enough for the plugin to finish its first paint, which is when a
+    // badly attached editor tends to fault.
+    for _ in 0..20 {
+        vst3_host_view::pump_events();
+        sub.tick_editor();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    if reverse {
+        // The whole instance goes away with the editor still open, which is
+        // what a DAW does when it terminates a plugin without a close notice.
+        drop(sub);
+    } else {
+        sub.close_editor();
+        drop(sub);
+    }
+    vst3_host_view::pump_events();
+
+    let order = if reverse { "instance dropped with editor open" } else { "editor closed first" };
+    println!("{name} | editor ok ({order})");
+    Ok(())
+}
+
 /// The standing regression sweep: every installed plugin through the lifecycle
 /// a DAW would put it through.
 ///
@@ -649,27 +723,41 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
 
     for path in &modules {
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        let output = Command::new(&exe)
-            .arg("probe")
-            .arg(path)
-            .output()
-            .map_err(|e| format!("could not spawn probe: {e}"))?;
+        // Each requested mode is its own child process, so a plugin that
+        // crashes in one still reports its result for the others.
+        let mut modes: Vec<Vec<String>> = vec![Vec::new()];
+        if args.iter().any(|a| a == "--gui") {
+            modes = vec![vec!["--gui".into()], vec!["--gui-reverse".into()], Vec::new()];
+        }
 
-        if output.status.success() {
-            ok += 1;
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                println!("  ok   {name} | {line}");
+        let mut all_ok = true;
+        for mode in &modes {
+            let output = Command::new(&exe)
+                .arg("probe")
+                .arg(path)
+                .args(mode)
+                .output()
+                .map_err(|e| format!("could not spawn probe: {e}"))?;
+            if output.status.success() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    println!("  ok   {name} | {line}");
+                }
+            } else {
+                all_ok = false;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let detail = stderr
+                    .lines()
+                    .find(|l| l.starts_with("error:"))
+                    .map(str::to_string)
+                    // No error line means it did not get far enough to print
+                    // one: the process died, which is the interesting case.
+                    .unwrap_or_else(|| format!("crashed ({})", output.status));
+                let label = mode.first().map_or("lifecycle", |m| m.as_str());
+                problems.push(format!("{name} [{label}]: {detail}"));
             }
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr
-                .lines()
-                .find(|l| l.starts_with("error:"))
-                .map(str::to_string)
-                // No error line means it did not get far enough to print one:
-                // the process died, which is the interesting case.
-                .unwrap_or_else(|| format!("crashed ({})", output.status));
-            problems.push(format!("{name}: {detail}"));
+        }
+        if all_ok {
+            ok += 1;
         }
     }
 
@@ -724,5 +812,69 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
         return Err("the restored instance has no sub-plugin; state did not carry it".into());
     }
     println!("sub-plugin reference survived a state round-trip");
+    Ok(())
+}
+
+/// M4's acceptance check, run without a DAW.
+///
+/// Opens a sub-plugin's editor and tears it down in each of the two orders
+/// section 5.3 cares about:
+///
+///   normal   — the editor is closed, then the instance goes away
+///   reverse  — the whole instance is destroyed with the editor still open
+///
+/// The second is the one that actually breaks hosts. Some DAWs terminate a
+/// plugin without ever sending a close notification, so the ordering cannot
+/// live in a close path that a caller has to remember to call. It is enforced
+/// instead by field order inside `SubHost`, and this command is what proves it:
+/// `--reverse` drops the whole thing at once and the editor still tears down
+/// first.
+fn cmd_gui(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use subhost_adapter::SubHost;
+
+    let path = args.first().ok_or("expected a plugin path")?;
+    let cid = args
+        .get(1)
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .and_then(vst3_host::Cid::from_hex);
+    let seconds: f64 = args
+        .get(2)
+        .filter(|s| !s.starts_with("--"))
+        .map_or(Ok(1.5), |s| s.parse())
+        .map_err(|_| "bad duration")?;
+    let reverse = args.iter().any(|a| a == "--reverse");
+
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    sub.load(Path::new(path), cid)?;
+    let name = sub.class().map(|c| c.name.clone()).unwrap_or_default();
+    sub.open_editor()?;
+    println!("opened {name}");
+
+    // Stand in for the DAW's message pump. A plugin would never do this — the
+    // DAW is already pumping — but a harness has to.
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < deadline && sub.editor_is_open() {
+        vst3_host_view::pump_events();
+        sub.tick_editor();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    if reverse {
+        println!("destroying the whole instance with the editor still open");
+        drop(sub);
+    } else {
+        println!("closing the editor, then unloading");
+        sub.close_editor();
+        drop(sub);
+    }
+
+    // Dispatch anything the plugin posted while tearing down. A bad ordering
+    // usually surfaces here rather than at the moment of the mistake.
+    vst3_host_view::pump_events();
+
+    println!("teardown completed cleanly");
     Ok(())
 }

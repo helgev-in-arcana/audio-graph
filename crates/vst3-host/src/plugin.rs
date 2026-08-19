@@ -252,6 +252,30 @@ impl Vst3Plugin {
         &self.params
     }
 
+    /// Create the plugin's editor view, if it has one.
+    ///
+    /// Returns the raw `IPlugView`. That is deliberate: everything to do with
+    /// windows lives in `vst3-host-view` (§2), and handing it the interface is
+    /// the whole seam between the two crates. `plugin-host-api` never sees it,
+    /// so the rule in §4.1 about backend types staying out of the API surface
+    /// is untouched.
+    ///
+    /// The caller owns the returned view and must tear it down in the order
+    /// §5.3 lays out; `vst3_host_view::EditorWindow` does exactly that.
+    pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
+        let controller = self.controller.as_ref()?;
+        // "editor" is the only view name VST3 defines.
+        let name = c"editor";
+        let ptr = unsafe { controller.createView(name.as_ptr()) };
+        // createView returns an owned reference.
+        unsafe { ComPtr::from_raw(ptr) }
+    }
+
+    /// Whether the plugin offers an editor at all.
+    pub fn has_editor(&self) -> bool {
+        self.create_view().is_some()
+    }
+
     fn controller(&self) -> Result<&ComPtr<IEditController>> {
         self.controller
             .as_ref()

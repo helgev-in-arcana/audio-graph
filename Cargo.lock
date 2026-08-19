@@ -181,7 +181,9 @@ name = "host-cli"
 version = "0.1.0"
 dependencies = [
  "plugin-host-api",
+ "subhost-adapter",
  "vst3-host",
+ "vst3-host-view",
 ]
 
 [[package]]
@@ -497,6 +499,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vst3-host",
+ "vst3-host-view",
 ]
 
 [[package]]
@@ -703,6 +706,11 @@ dependencies = [
 [[package]]
 name = "vst3-host-view"
 version = "0.1.0"
+dependencies = [
+ "log",
+ "vst3",
+ "windows-sys",
+]
 
 [[package]]
 name = "widestring"

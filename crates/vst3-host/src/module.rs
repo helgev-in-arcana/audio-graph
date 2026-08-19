@@ -4,8 +4,9 @@
 //! instantiation, audio, or the nested-wrapper use case.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use plugin_host_api::{HostError, Result};
@@ -90,11 +91,39 @@ pub(crate) struct ModuleInner {
     path: PathBuf,
 }
 
+thread_local! {
+    /// Modules already loaded on this thread, keyed by canonical path.
+    ///
+    /// A VST3 module's entry point (`InitDll` / `bundleEntry` / `ModuleEntry`)
+    /// initialises process-wide state and must be balanced exactly once, no
+    /// matter how many times a host asks for the module. Loading it twice and
+    /// dropping one handle runs the exit point while the other handle is still
+    /// in use, which tears the plugin's globals down underneath it — the C++
+    /// SDK's own `Module` caches for the same reason.
+    ///
+    /// `Weak`, so a module is genuinely unloaded once nothing refers to it.
+    /// Thread-local rather than global because `ModuleInner` is deliberately
+    /// not `Send`: VST3 pins factory use to the loading thread.
+    static LOADED: RefCell<HashMap<PathBuf, Weak<ModuleInner>>> =
+        RefCell::new(HashMap::new());
+}
+
 impl Module {
     /// Load `path` (a bundle directory or a plain shared library) and obtain
     /// its plugin factory.
+    ///
+    /// Opening the same path twice returns handles onto one underlying module,
+    /// so the entry point runs once.
     pub fn open(path: impl AsRef<Path>) -> Result<Module> {
         let path = path.as_ref();
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+        if let Some(existing) = LOADED.with(|loaded| {
+            loaded.borrow().get(&key).and_then(Weak::upgrade)
+        }) {
+            return Ok(Module { inner: existing });
+        }
+
         let library = Library::open(path)?;
 
         let Some(sym) = library.lookup("GetPluginFactory") else {
@@ -115,14 +144,15 @@ impl Module {
             HostError::NoFactory(format!("GetPluginFactory returned null for {}", path.display()))
         })?;
 
-        Ok(Module {
-            inner: Rc::new(ModuleInner {
-                factory,
-                host_app: RefCell::new(None),
-                library,
-                path: path.to_path_buf(),
-            }),
-        })
+        let inner = Rc::new(ModuleInner {
+            factory,
+            host_app: RefCell::new(None),
+            library,
+            path: path.to_path_buf(),
+        });
+        LOADED.with(|loaded| loaded.borrow_mut().insert(key, Rc::downgrade(&inner)));
+
+        Ok(Module { inner })
     }
 
     pub fn path(&self) -> &Path {

@@ -13,6 +13,8 @@ use plugin_host_api::{
 };
 use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin};
 
+use vst3_host_view::EditorWindow;
+
 use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
@@ -32,9 +34,20 @@ pub struct SubHost {
     sub_latency: u32,
 }
 
+/// Field order here *is* the teardown order, and §5.3 is entirely about
+/// teardown order.
+///
+/// The editor holds an `IPlugView` created by the controller. VST3 requires
+/// that view to be removed from its parent and released before the controller
+/// terminates; doing it the other way round leaves the plugin operating on a
+/// window that no longer exists, and it faults. Declaring the editor first
+/// makes the correct order the one that happens automatically — including on
+/// the path §5.3 warns about, where the DAW destroys the whole instance without
+/// ever telling us to close the editor.
 struct Loaded {
-    /// Declared before `module`: the instance must be released before the
-    /// module it came from can be unloaded.
+    editor: Option<EditorWindow>,
+    /// Released before `module`: the instance must go before the library its
+    /// code lives in.
     plugin: Vst3Plugin,
     /// Held, not used: the instance's vtables point into this module's code, so
     /// it must outlive the instance. Dropping it first unloads the library out
@@ -112,11 +125,13 @@ impl SubHost {
         // the user with what they had rather than with nothing.
         self.unload();
         self.slots.resolve_against(&reference.plugin_id, SubPluginMain::params(&plugin));
-        self.loaded = Some(MainThread::new(Loaded { plugin, module, reference, class }));
+        self.loaded =
+            Some(MainThread::new(Loaded { editor: None, plugin, module, reference, class }));
         Ok(())
     }
 
     pub fn unload(&mut self) {
+        // Dropping `loaded` drops the editor first — see the note on `Loaded`.
         self.loaded = None;
         self.sub_latency = 0;
         // Bindings stay; only their resolution goes.
@@ -151,6 +166,53 @@ impl SubHost {
 
     pub fn class(&self) -> Option<&ClassInfo> {
         self.loaded.as_ref().map(|l| &l.get().class)
+    }
+
+    /// Open the sub-plugin's own editor in a top-level window (§5.1).
+    ///
+    /// Not composited into the wrapper's own editor: a native child window
+    /// cannot be composited over a GPU surface, so a separate window is the
+    /// only workable arrangement — and it is the arrangement that keeps ADR-6
+    /// open, since a child process can create its own window with no
+    /// cross-process embedding involved.
+    pub fn open_editor(&mut self) -> Result<(), String> {
+        let loaded = self.loaded.as_mut().ok_or("no sub-plugin loaded")?.get_mut();
+        if loaded.editor.is_some() {
+            return Ok(());
+        }
+        let view = loaded.plugin.create_view().ok_or("this plugin has no editor")?;
+        loaded.editor = Some(EditorWindow::open(view, &loaded.class.name)?);
+        Ok(())
+    }
+
+    /// Close the sub-plugin's editor, running the §5.3 sequence.
+    pub fn close_editor(&mut self) {
+        if let Some(loaded) = self.loaded.as_mut() {
+            // Dropping the EditorWindow runs the sequence; there is no way to
+            // close one without it.
+            loaded.get_mut().editor = None;
+        }
+    }
+
+    pub fn editor_is_open(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.get().editor.is_some())
+    }
+
+    /// Drive the editor for one UI tick: apply pending resizes, and close it if
+    /// the user asked.
+    ///
+    /// Call from the host's UI thread. A plugin must not pump messages itself —
+    /// the DAW is already doing that — so this only handles the parts that are
+    /// ours.
+    pub fn tick_editor(&mut self) {
+        let Some(loaded) = self.loaded.as_mut() else { return };
+        let loaded = loaded.get_mut();
+        let Some(editor) = loaded.editor.as_mut() else { return };
+
+        editor.sync_size();
+        if editor.close_requested() {
+            loaded.editor = None;
+        }
     }
 
     /// Bind a slot to one of the loaded plugin's parameters.

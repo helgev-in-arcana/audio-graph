@@ -16,7 +16,7 @@ use crate::wav::Audio;
 /// module the factory offers.
 pub fn choose_class(module: &Module, wanted: Option<&str>) -> Result<ClassInfo, String> {
     let classes = module.audio_modules().map_err(|e| e.to_string())?;
-    match wanted {
+    match wanted.filter(|t| !t.is_empty()) {
         Some(text) => {
             let cid = Cid::from_hex(text).ok_or("class id must be 32 hex digits")?;
             classes
