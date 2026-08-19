@@ -20,7 +20,6 @@ plugin-host-api = { path = "crates/plugin-host-api" }
 vst3-host = { path = "crates/vst3-host" }
 vst3-host-view = { path = "crates/vst3-host-view" }
 subhost-adapter = { path = "crates/subhost-adapter" }
-wrapper-engine = { path = "crates/wrapper-engine" }
 
 vst3 = "0.3.0"
 log = "0.4"

@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         "nest" => cmd_nest(rest),
         "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
+        "bundle" => cmd_bundle(rest),
         _ => {
             usage();
             return ExitCode::FAILURE;
@@ -75,8 +76,40 @@ fn usage() {
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
   host-cli state <PATH.vst3> [CID]  save/restore a parameter across instances
   host-cli automate <PATH.vst3> <IN.wav> [CID [PARAM_ID]]
-                                    check a mid-block parameter change lands"
+                                    check a mid-block parameter change lands
+  host-cli bundle <DLL> <OUT.vst3>  wrap a built cdylib as a VST3 bundle"
     );
+}
+
+/// Package a built cdylib as a VST3 bundle.
+///
+/// A bare `.dll` renamed to `.vst3` loads in some hosts and not others; the
+/// bundle layout is what the format actually specifies, so the wrapper is
+/// tested in the shape a DAW will meet it in. This exists here rather than in a
+/// build script because it is only ever wanted deliberately.
+fn cmd_bundle(args: &[String]) -> Result<(), String> {
+    let dll = args.first().ok_or("usage: bundle <DLL> <OUT.vst3>")?;
+    let out = args.get(1).ok_or("usage: bundle <DLL> <OUT.vst3>")?;
+    let out = Path::new(out);
+
+    let stem = out
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("the output needs a name ending in .vst3")?;
+    let arch = if cfg!(target_arch = "x86_64") { "x86_64-win" } else { "arm64-win" };
+    let contents = out.join("Contents").join(arch);
+
+    // Replaced wholesale: a stale binary next to a fresh one is the kind of
+    // thing that costs an hour to notice.
+    if out.exists() {
+        std::fs::remove_dir_all(out).map_err(|e| format!("clearing {}: {e}", out.display()))?;
+    }
+    std::fs::create_dir_all(&contents).map_err(|e| e.to_string())?;
+    let target = contents.join(format!("{stem}.vst3"));
+    std::fs::copy(dll, &target).map_err(|e| format!("copying {dll}: {e}"))?;
+
+    println!("{}", out.display());
+    Ok(())
 }
 
 fn cmd_dirs() -> Result<(), String> {
@@ -855,11 +888,19 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
 
     // Stand in for the DAW's message pump. A plugin would never do this — the
     // DAW is already pumping — but a harness has to.
-    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs_f64(seconds);
     while Instant::now() < deadline && sub.editor_is_open() {
         vst3_host_view::pump_events();
         sub.tick_editor();
         std::thread::sleep(Duration::from_millis(16));
+    }
+    // Which of the two ended it matters: a window that closes itself long
+    // before the deadline is the plugin giving up, not the user.
+    if sub.editor_is_open() {
+        println!("held open for {:.1}s", started.elapsed().as_secs_f64());
+    } else {
+        println!("the editor closed itself after {:.1}s", started.elapsed().as_secs_f64());
     }
 
     if reverse {

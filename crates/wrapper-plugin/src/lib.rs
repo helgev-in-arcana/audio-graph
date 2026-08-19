@@ -6,9 +6,11 @@
 //! input, and an instrument without one. The implementation is shared; only the
 //! bus layout and the descriptor differ.
 
+mod editor;
 mod host_context;
 mod params;
 mod plugin;
+mod shared;
 
 use std::sync::Arc;
 
@@ -17,6 +19,7 @@ use nice_plug::prelude::*;
 pub use host_context::WrapperHostContext;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
+pub use shared::{Shared, SubState};
 
 /// The effect form: audio in, audio out.
 #[derive(Default)]
@@ -58,14 +61,19 @@ macro_rules! wrapper_class {
             // the host split our buffer as well would fight that.
             const SAMPLE_ACCURATE_AUTOMATION: bool = false;
 
-            // No editor yet — M4 adds one so the sub-plugin can be picked
-            // and its own window opened.
-            type Editor = ();
+            // The editor is where a sub-plugin is chosen and its parameters
+            // bound to slots; without it the DAW sees 32 unlabelled slots and
+            // no way to point them at anything.
+            type Editor = nice_plug_egui::EguiEditor<$crate::editor::WrapperEditor>;
             type SysExMessage = ();
             type BackgroundTask = ();
 
             fn params(&self) -> Arc<dyn Params> {
                 self.0.params()
+            }
+
+            fn editor(&mut self, _executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
+                $crate::editor::create(self.0.shared().clone())
             }
 
             fn activate(

@@ -7,10 +7,11 @@ use plugin_host_api::{
     AudioBuffers, AudioConfig, BufferLayout, Event, EventSink, NoteEvent as ApiNote,
     ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SLOT_COUNT, SubHost, SubHostProcessor, WrapperState};
+use subhost_adapter::{SLOT_COUNT, SubHost, WrapperState};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
+use crate::shared::Shared;
 
 /// Which form the DAW loaded. Only the bus layout differs, but the sub-plugin
 /// has to be activated with a matching input channel count.
@@ -23,10 +24,11 @@ pub enum WrapperKind {
 pub struct Wrapper {
     params: Arc<WrapperParams>,
     context: Arc<WrapperHostContext>,
-    /// Main-thread side. `None` until the DAW activates us.
-    sub: SubHost,
-    /// Audio-thread side, handed over by `activate`.
-    processor: Option<SubHostProcessor>,
+    /// The sub-plugin and its processor, shared with the editor.
+    ///
+    /// Behind a lock rather than held by value, because the editor can load a
+    /// different sub-plugin at any moment; see [`crate::shared`].
+    shared: Arc<Shared>,
 
     /// Scratch reused every block; `process` must not allocate.
     slot_values: Vec<f64>,
@@ -42,11 +44,12 @@ pub struct Wrapper {
 impl Default for Wrapper {
     fn default() -> Self {
         let context = Arc::new(WrapperHostContext::new());
+        let params = WrapperParams::new();
+        let shared = Shared::new(SubHost::new(context.clone()), params.clone());
         Wrapper {
-            params: WrapperParams::new(),
-            sub: SubHost::new(context.clone()),
+            params,
             context,
-            processor: None,
+            shared,
             slot_values: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
@@ -67,12 +70,8 @@ impl Wrapper {
         &self.params
     }
 
-    pub fn sub_host(&self) -> &SubHost {
-        &self.sub
-    }
-
-    pub fn sub_host_mut(&mut self) -> &mut SubHost {
-        &mut self.sub
+    pub fn shared(&self) -> &Arc<Shared> {
+        &self.shared
     }
 
     /// Restore the wrapper's own state from the persisted blob.
@@ -87,7 +86,7 @@ impl Wrapper {
         }
         match serde_json::from_str::<WrapperState>(&json) {
             Ok(state) => {
-                for problem in self.sub.load_state(&state) {
+                for problem in self.shared.lock().host.load_state(&state) {
                     // Not fatal by design (§8.3): a sub-plugin that cannot be
                     // found must not stop the project from opening, and the
                     // bindings are kept so reinstalling it brings them back.
@@ -110,11 +109,11 @@ impl Wrapper {
     /// override a real project.
     fn load_development_override(&mut self) {
         // Never override a real project: state wins.
-        if self.sub.is_loaded() {
+        if self.shared.lock().host.is_loaded() {
             return;
         }
         let Ok(path) = std::env::var("AUDIO_GRAPH_SUB") else { return };
-        if let Err(e) = self.sub.load(std::path::Path::new(&path), None) {
+        if let Err(e) = self.shared.lock().host.load(std::path::Path::new(&path), None) {
             log::warn!("audio-graph: AUDIO_GRAPH_SUB failed to load: {e}");
             return;
         }
@@ -123,14 +122,16 @@ impl Wrapper {
         if let Ok(id) = std::env::var("AUDIO_GRAPH_SUB_BIND") {
             match id.parse::<u32>() {
                 Ok(id) => {
-                    if let Err(e) = self.sub.bind_slot(0, plugin_host_api::ParamId(id)) {
+                    if let Err(e) =
+                        self.shared.lock().host.bind_slot(0, plugin_host_api::ParamId(id))
+                    {
                         log::warn!("audio-graph: AUDIO_GRAPH_SUB_BIND: {e}");
                     }
                 }
                 Err(_) => log::warn!("audio-graph: AUDIO_GRAPH_SUB_BIND is not a number"),
             }
         }
-        self.store_state();
+        self.shared.store_state();
     }
 
     /// Write the wrapper's state back into the persisted field.
@@ -138,11 +139,7 @@ impl Wrapper {
     /// Called whenever the sub-plugin or the slot table changes, so the DAW has
     /// something current to save whenever it decides to.
     pub fn store_state(&self) {
-        let state = self.sub.save_state();
-        match serde_json::to_string(&state) {
-            Ok(json) => *self.params.state.0.write().unwrap() = json,
-            Err(e) => log::warn!("audio-graph: wrapper state unwritable: {e}"),
-        }
+        self.shared.store_state();
     }
 
     /// Returns the latency to report, or `None` if activation failed.
@@ -155,7 +152,7 @@ impl Wrapper {
         self.kind = kind;
         self.channels = layout.main_output_channels.map_or(2, |c| c.get());
 
-        if self.sub.is_loaded() {
+        if self.shared.lock().host.is_loaded() {
             // A second activate with a different configuration must not reuse
             // the old processor.
             self.deactivate();
@@ -176,13 +173,6 @@ impl Wrapper {
         self.events = Vec::with_capacity(1024);
         self.out_events = EventSink::with_capacity(256);
 
-        if !self.sub.is_loaded() {
-            // Nothing loaded is a normal state, not a failure: the user has to
-            // open the editor and pick something. The wrapper passes audio
-            // through until then.
-            return Some(0);
-        }
-
         let audio_config = AudioConfig {
             sample_rate: config.sample_rate as f64,
             max_block_size: max_block,
@@ -190,11 +180,23 @@ impl Wrapper {
             output_channels: self.channels,
             offline: false,
         };
+        // Remembered even when nothing is loaded: the editor uses it to
+        // activate whatever the user picks next, without waiting for the DAW to
+        // call `activate` again.
+        let mut state = self.shared.lock();
+        state.config = Some(audio_config);
 
-        match self.sub.activate(audio_config) {
+        if !state.host.is_loaded() {
+            // Nothing loaded is a normal state, not a failure: the user has to
+            // open the editor and pick something. The wrapper passes audio
+            // through until then.
+            return Some(0);
+        }
+
+        match state.host.activate(audio_config) {
             Ok(processor) => {
-                self.processor = Some(processor);
-                Some(self.sub.sub_latency())
+                state.processor = Some(processor);
+                Some(state.host.sub_latency())
             }
             Err(e) => {
                 log::warn!("audio-graph: sub-plugin failed to activate: {e}");
@@ -207,13 +209,14 @@ impl Wrapper {
     }
 
     pub fn deactivate(&mut self) {
-        if let Some(processor) = self.processor.take() {
-            self.sub.deactivate(processor);
+        let mut state = self.shared.lock();
+        if let Some(processor) = state.processor.take() {
+            state.host.deactivate(processor);
         }
     }
 
     pub fn reset(&mut self) {
-        if let Some(processor) = &mut self.processor {
+        if let Some(processor) = &mut self.shared.lock().processor {
             processor.reset();
         }
     }
@@ -237,17 +240,18 @@ impl Wrapper {
             }
         }
 
-        let Some(processor) = &mut self.processor else {
+        // `try_lock`, never `lock`: the editor holds this while it loads a
+        // sub-plugin, which takes far longer than a buffer. Missing it means a
+        // few blocks pass through unprocessed — the audible cost of swapping a
+        // plugin mid-playback — and never a blocked audio thread.
+        let mut state = match self.shared.try_lock() {
+            Some(state) => state,
+            None => return pass_through(buffer, self.kind),
+        };
+        let Some(processor) = &mut state.processor else {
             // Pass-through. `buffer` already holds the input, so an effect
             // needs no work; an instrument has nothing to play.
-            if self.kind == WrapperKind::Instrument {
-                for mut ch in buffer.iter_samples() {
-                    for sample in ch.iter_mut() {
-                        *sample = 0.0;
-                    }
-                }
-            }
-            return ProcessStatus::Normal;
+            return pass_through(buffer, self.kind);
         };
 
         self.params.slot_values(&mut self.slot_values);
@@ -328,6 +332,21 @@ impl Wrapper {
     pub fn take_latency_change(&self) -> Option<u32> {
         self.context.take_latency_change()
     }
+}
+
+/// Leave the input alone (an effect) or silence the output (an instrument).
+///
+/// The fallback whenever there is no sub-plugin to run, whether because none is
+/// loaded or because the editor currently holds the lock.
+fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
+    if kind == WrapperKind::Instrument {
+        for mut ch in buffer.iter_samples() {
+            for sample in ch.iter_mut() {
+                *sample = 0.0;
+            }
+        }
+    }
+    ProcessStatus::Normal
 }
 
 /// nice-plug's note events into the host API's.
