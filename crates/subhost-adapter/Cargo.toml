@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+plugin-host-api.workspace = true
+vst3-host.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true

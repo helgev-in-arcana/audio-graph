@@ -108,6 +108,13 @@ dependencies = [
 [[package]]
 name = "subhost-adapter"
 version = "0.1.0"
+dependencies = [
+ "log",
+ "plugin-host-api",
+ "serde",
+ "serde_json",
+ "vst3-host",
+]
 
 [[package]]
 name = "syn"
