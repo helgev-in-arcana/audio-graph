@@ -252,15 +252,6 @@ impl std::fmt::Debug for Module {
     }
 }
 
-impl ModuleInner {
-    pub(crate) fn factory(&self) -> &ComPtr<IPluginFactory> {
-        &self.factory
-    }
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
 /// Read `moduleinfo.json` for a bundle without loading any code.
 ///
 /// This is the point of the file: a scanner can enumerate a plugin's classes

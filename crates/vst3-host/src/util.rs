@@ -21,17 +21,6 @@ pub fn from_char16(buf: &[char16]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Read a `String128`-style buffer given only a pointer to its first element.
-///
-/// # Safety
-/// `ptr` must point to at least `len` valid `char16`s.
-pub unsafe fn from_char16_ptr(ptr: *const char16, len: usize) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    from_char16(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
 /// Write a Rust string into a fixed-size UTF-16 field, always NUL-terminating.
 pub fn to_char16(src: &str, dst: &mut [char16]) {
     if dst.is_empty() {

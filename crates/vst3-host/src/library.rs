@@ -43,10 +43,6 @@ impl Library {
         Ok(lib)
     }
 
-    pub fn binary_path(&self) -> &Path {
-        &self.binary_path
-    }
-
     /// Look up an exported symbol. Returns `None` if it is absent, which is a
     /// normal outcome — the entry points are all optional in practice.
     pub(crate) fn lookup(&self, name: &str) -> Option<*mut std::ffi::c_void> {

@@ -4,9 +4,14 @@
 //! prove — that a real plugin loads, enumerates, instantiates, and processes —
 //! is exercised from here without a DAW in the loop.
 
+mod host;
+mod render;
+mod wav;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use plugin_host_api::SubPluginMain;
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn main() -> ExitCode {
@@ -24,6 +29,9 @@ fn main() -> ExitCode {
         "info" => cmd_info(rest),
         "dirs" => cmd_dirs(),
         "churn" => cmd_churn(rest),
+        "params" => cmd_params(rest),
+        "render" => cmd_render(rest),
+        "synth" => cmd_synth(rest),
         _ => {
             usage();
             return ExitCode::FAILURE;
@@ -45,7 +53,12 @@ fn usage() {
   host-cli dirs                     list the conventional VST3 directories
   host-cli scan [DIR...]            load every module found and list its classes
   host-cli info <PATH.vst3>         detail one module
-  host-cli churn <PATH.vst3> [N]    load/unload N times (default 1000)"
+  host-cli churn <PATH.vst3> [N]    load/unload N times (default 1000)
+  host-cli params <PATH.vst3> [CID] instantiate and list parameters
+  host-cli render <PATH.vst3> <IN.wav> <OUT.wav> [CID]
+                                    run audio through the plugin
+  host-cli synth <PATH.vst3> <OUT.wav> [CID]
+                                    play a note into an instrument"
     );
 }
 
@@ -173,4 +186,99 @@ fn cmd_churn(args: &[String]) -> Result<(), String> {
 
     println!("{iterations} load/unload cycles completed");
     Ok(())
+}
+
+/// M2's parameter surface, seen from outside: the list, the ranges, and the
+/// plugin's own formatting of each current value.
+fn cmd_params(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let path = args.first().ok_or("expected a path")?;
+    let module = Module::open(path).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+
+    let host = Arc::new(host::CliHost::new());
+    let plugin = Vst3Plugin::create(&module, class.cid, host).map_err(|e| e.to_string())?;
+
+    let (ins, outs) = plugin.bus_channel_counts();
+    println!("{} [{}]", class.name, class.subcategories);
+    println!("buses: {ins} in / {outs} out");
+    println!("capabilities: {:?}", plugin.capabilities());
+
+    let snapshot = plugin.snapshot();
+    let params = SubPluginMain::params(&plugin);
+    println!("{} parameters", params.len());
+    for p in params.iter().take(40) {
+        let current = snapshot.get(p.id).unwrap_or(p.default);
+        let text = plugin.param_to_text(p.id, current).unwrap_or_default();
+        println!(
+            "  {:>8}  {:<28} {:>12.4} [{:.4} .. {:.4}]  {}",
+            p.id.0, p.name, current, p.min, p.max, text
+        );
+    }
+    if params.len() > 40 {
+        println!("  ... {} more", params.len() - 40);
+    }
+    Ok(())
+}
+
+fn cmd_render(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("expected a plugin path")?;
+    let input_path = args.get(1).ok_or("expected an input wav")?;
+    let output_path = args.get(2).ok_or("expected an output wav")?;
+
+    let input = wav::read(Path::new(input_path))?;
+    let outcome = render::render(
+        Path::new(path),
+        args.get(3).map(String::as_str),
+        &input,
+        512,
+        &[],
+    )?;
+
+    wav::write(Path::new(output_path), &outcome.audio)?;
+    report(&outcome, &input);
+    Ok(())
+}
+
+fn cmd_synth(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("expected a plugin path")?;
+    let output_path = args.get(1).ok_or("expected an output wav")?;
+
+    // Three seconds at 48 kHz: long enough that a slow attack or a preset that
+    // needs loading does not read as silence.
+    let sample_rate = 48_000.0;
+    let frames = (sample_rate * 3.0) as usize;
+    let input = wav::Audio::silence(sample_rate, 2, frames);
+    let events = render::note(60, (sample_rate * 0.1) as usize, (sample_rate * 2.0) as usize);
+
+    let outcome = render::render(
+        Path::new(path),
+        args.get(2).map(String::as_str),
+        &input,
+        512,
+        &events,
+    )?;
+
+    wav::write(Path::new(output_path), &outcome.audio)?;
+    report(&outcome, &input);
+    if outcome.audio.peak() == 0.0 {
+        return Err("instrument produced silence".into());
+    }
+    Ok(())
+}
+
+fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {
+    println!("blocks:  {}", outcome.blocks);
+    println!("latency: {} samples", outcome.latency);
+    println!("input:   peak {:.4}  rms {:.4}", input.peak(), input.rms());
+    println!(
+        "output:  peak {:.4}  rms {:.4}",
+        outcome.audio.peak(),
+        outcome.audio.rms()
+    );
+    for line in &outcome.host_log {
+        println!("host:    {line}");
+    }
 }
