@@ -7,6 +7,7 @@
 //! bus layout and the descriptor differ.
 
 mod editor;
+mod graph_ui;
 mod host_context;
 mod params;
 mod plugin;
@@ -19,7 +20,7 @@ use nice_plug::prelude::*;
 pub use host_context::WrapperHostContext;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
-pub use shared::{Shared, SubState};
+pub use shared::{MainState, Shared};
 
 /// The effect form: audio in, audio out.
 #[derive(Default)]

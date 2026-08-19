@@ -111,14 +111,17 @@ impl Vst3Plugin {
         let host_unknown = com_ref_ptr::<_, FUnknown>(&host_app);
 
         let component = create_instance::<IComponent>(module, cid.to_tuid())?;
-        check(unsafe { component.initialize(host_unknown) }, "IComponent::initialize")?;
+        check(
+            unsafe { component.initialize(host_unknown) },
+            "IComponent::initialize",
+        )?;
 
-        let processor = component.cast::<IAudioProcessor>().ok_or_else(|| {
-            HostError::Backend {
+        let processor = component
+            .cast::<IAudioProcessor>()
+            .ok_or_else(|| HostError::Backend {
                 context: "IComponent does not implement IAudioProcessor".into(),
                 code: 0,
-            }
-        })?;
+            })?;
 
         let handler = ComponentHandler::new(Arc::clone(&context));
         let (controller, controller_is_separate) =
@@ -178,7 +181,10 @@ impl Vst3Plugin {
         let (controller, is_separate) = if separate {
             match create_instance::<IEditController>(module, controller_cid) {
                 Ok(ctrl) => {
-                    check(unsafe { ctrl.initialize(host_unknown) }, "IEditController::initialize")?;
+                    check(
+                        unsafe { ctrl.initialize(host_unknown) },
+                        "IEditController::initialize",
+                    )?;
                     (Some(ctrl), true)
                 }
                 // A missing controller class is survivable: audio still works,
@@ -229,15 +235,14 @@ impl Vst3Plugin {
     pub fn bus_channel_counts(&self) -> (u32, u32) {
         use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_};
         let count = |dir: i32| -> u32 {
-            let n = unsafe {
-                self.component.getBusCount(MediaTypes_::kAudio as i32, dir)
-            };
+            let n = unsafe { self.component.getBusCount(MediaTypes_::kAudio as i32, dir) };
             if n <= 0 {
                 return 0;
             }
             let mut info: vst3::Steinberg::Vst::BusInfo = unsafe { std::mem::zeroed() };
             if unsafe {
-                self.component.getBusInfo(MediaTypes_::kAudio as i32, dir, 0, &mut info)
+                self.component
+                    .getBusInfo(MediaTypes_::kAudio as i32, dir, 0, &mut info)
             } == kResultOk
             {
                 info.channelCount.max(0) as u32
@@ -245,7 +250,10 @@ impl Vst3Plugin {
                 0
             }
         };
-        (count(BusDirections_::kInput as i32), count(BusDirections_::kOutput as i32))
+        (
+            count(BusDirections_::kInput as i32),
+            count(BusDirections_::kOutput as i32),
+        )
     }
 
     pub fn params(&self) -> &[ParamInfo] {
@@ -295,10 +303,10 @@ impl SubPluginMain for Vst3Plugin {
         Capabilities {
             modulation: false,
             poly_modulation: false,
-            note_expression: self
-                .controller
-                .as_ref()
-                .is_some_and(|c| c.cast::<vst3::Steinberg::Vst::INoteExpressionController>().is_some()),
+            note_expression: self.controller.as_ref().is_some_and(|c| {
+                c.cast::<vst3::Steinberg::Vst::INoteExpressionController>()
+                    .is_some()
+            }),
             dynamic_params: false,
         }
     }
@@ -335,7 +343,8 @@ impl SubPluginMain for Vst3Plugin {
         let mut buf: [TChar; 128] = [0; 128];
         to_char16(text, &mut buf);
         let mut normalized = 0.0;
-        (unsafe { ctrl.getParamValueByString(id.0, buf.as_mut_ptr(), &mut normalized) } == kResultOk)
+        (unsafe { ctrl.getParamValueByString(id.0, buf.as_mut_ptr(), &mut normalized) }
+            == kResultOk)
             .then(|| unsafe { ctrl.normalizedParamToPlain(id.0, normalized) })
     }
 
@@ -371,7 +380,10 @@ impl SubPluginMain for Vst3Plugin {
         let component_state = {
             let stream = MemoryStream::empty();
             let ptr = com_ref_ptr::<_, vst3::Steinberg::IBStream>(&stream);
-            check(unsafe { self.component.getState(ptr) }, "IComponent::getState")?;
+            check(
+                unsafe { self.component.getState(ptr) },
+                "IComponent::getState",
+            )?;
             stream.contents()
         };
 
@@ -410,7 +422,10 @@ impl SubPluginMain for Vst3Plugin {
 
         let stream = MemoryStream::from_bytes(component_state);
         let ptr = com_ref_ptr::<_, vst3::Steinberg::IBStream>(&stream);
-        check(unsafe { self.component.setState(ptr) }, "IComponent::setState")?;
+        check(
+            unsafe { self.component.setState(ptr) },
+            "IComponent::setState",
+        )?;
 
         if let Some(ctrl) = &self.controller {
             // The controller needs the *component* state as well as its own:
@@ -454,7 +469,10 @@ impl SubPluginMain for Vst3Plugin {
             "IAudioProcessor::setupProcessing",
         )?;
 
-        check(unsafe { self.component.setActive(1) }, "IComponent::setActive(true)")?;
+        check(
+            unsafe { self.component.setActive(1) },
+            "IComponent::setActive(true)",
+        )?;
         // Latency is only meaningful once the plugin is set up, which is why
         // it is read here rather than at construction.
         *self.latency.borrow_mut() = unsafe { self.processor.getLatencySamples() };
@@ -613,7 +631,12 @@ impl SubPluginProcessor for Vst3Processor {
             }
         }
 
-        vst_events::fill_inputs(events, &self.param_map, &self.input_changes, &self.input_events);
+        vst_events::fill_inputs(
+            events,
+            &self.param_map,
+            &self.input_changes,
+            &self.input_events,
+        );
 
         // Channel pointers into the caller's flat planar storage.
         let frame_len = frames as usize;
@@ -662,8 +685,8 @@ impl SubPluginProcessor for Vst3Processor {
         // The plugin sets silence flags on the output bus when it has nothing
         // to say; honouring that is what lets a chain skip downstream work.
         if output_bus.silenceFlags != 0 && self.output_ptrs.len() as u32 <= 64 {
-            let all_silent = (0..self.output_ptrs.len())
-                .all(|c| output_bus.silenceFlags & (1 << c) != 0);
+            let all_silent =
+                (0..self.output_ptrs.len()).all(|c| output_bus.silenceFlags & (1 << c) != 0);
             if all_silent {
                 return ProcessStatus::Silent;
             }
@@ -715,12 +738,7 @@ fn setup_buses(
     let num_out = if config.output_channels == 0 { 0 } else { 1 };
 
     let res = unsafe {
-        processor.setBusArrangements(
-            inputs.as_mut_ptr(),
-            num_in,
-            outputs.as_mut_ptr(),
-            num_out,
-        )
+        processor.setBusArrangements(inputs.as_mut_ptr(), num_in, outputs.as_mut_ptr(), num_out)
     };
     // kResultFalse means "I chose something else", not failure. Verify rather
     // than trust: a plugin that quietly picked mono would otherwise corrupt
@@ -802,7 +820,9 @@ fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
             module: from_char16(&raw.units),
             min,
             max,
-            default: unsafe { controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue) },
+            default: unsafe {
+                controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue)
+            },
             flags,
         });
     }
@@ -832,7 +852,9 @@ fn create_instance<I: Interface>(module: &Module, cid: TUID) -> Result<ComPtr<I>
 
 /// Borrowed interface pointer from a host-owned COM object.
 fn com_ref_ptr<C: vst3::Class, I: Interface>(wrapper: &ComWrapper<C>) -> *mut I {
-    wrapper.as_com_ref::<I>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    wrapper
+        .as_com_ref::<I>()
+        .map_or(std::ptr::null_mut(), |r| r.as_ptr())
 }
 
 fn check(result: i32, context: &str) -> Result<()> {

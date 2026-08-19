@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 
 use vst3::Steinberg::{
-    IBStream, IBStreamTrait, IBStream_::IStreamSeekMode_, ISizeableStream, ISizeableStreamTrait,
+    IBStream, IBStream_::IStreamSeekMode_, IBStreamTrait, ISizeableStream, ISizeableStreamTrait,
     int32, int64, kInvalidArgument, kResultOk, tresult,
 };
 use vst3::{Class, ComWrapper};
@@ -170,7 +170,11 @@ mod tests {
         let mut src = *b"hello world";
         let mut written = 0;
         unsafe {
-            stream.write(src.as_mut_ptr() as *mut c_void, src.len() as int32, &mut written);
+            stream.write(
+                src.as_mut_ptr() as *mut c_void,
+                src.len() as int32,
+                &mut written,
+            );
         }
         assert_eq!(written, 11);
         assert_eq!(stream.contents(), b"hello world");
@@ -204,7 +208,10 @@ mod tests {
             assert_eq!(out, 4);
             stream.seek(3, kIBSeekCur as int32, &mut out);
             assert_eq!(out, 7);
-            assert_eq!(stream.seek(-1, kIBSeekSet as int32, &mut out), kInvalidArgument);
+            assert_eq!(
+                stream.seek(-1, kIBSeekSet as int32, &mut out),
+                kInvalidArgument
+            );
         }
     }
 

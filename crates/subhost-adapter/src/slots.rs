@@ -87,7 +87,9 @@ impl SlotTable {
 
     /// Bind a slot to a sub-plugin parameter, replacing any previous binding.
     pub fn bind(&mut self, index: usize, plugin_id: &str, param: &ParamInfo) {
-        let Some(slot) = self.slots.get_mut(index) else { return };
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
         slot.binding = Some(Binding {
             plugin_id: plugin_id.to_string(),
             param_id: param.id.0,
@@ -143,7 +145,11 @@ impl SlotTable {
                 params
                     .iter()
                     .find(|p| p.id.0 == binding.param_id)
-                    .map(|p| ResolvedTarget { id: p.id, min: p.min, max: p.max })
+                    .map(|p| ResolvedTarget {
+                        id: p.id,
+                        min: p.min,
+                        max: p.max,
+                    })
             });
         }
     }
@@ -215,8 +221,14 @@ mod tests {
         table.bind(3, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
 
         table.resolve_against("BBBB", &[]);
-        assert!(table.resolved(3).is_none(), "should not resolve against another plugin");
-        assert!(table.slot(3).unwrap().binding.is_some(), "binding must be kept");
+        assert!(
+            table.resolved(3).is_none(),
+            "should not resolve against another plugin"
+        );
+        assert!(
+            table.slot(3).unwrap().binding.is_some(),
+            "binding must be kept"
+        );
         assert_eq!(table.unresolved().len(), 1);
 
         table.resolve_against("AAAA", &[param(7, "Cutoff", 0.0, 1.0)]);

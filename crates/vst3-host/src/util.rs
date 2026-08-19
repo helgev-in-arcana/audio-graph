@@ -1,6 +1,6 @@
 //! Conversions between VST3's fixed-size C string fields and Rust strings.
 
-use vst3::Steinberg::{char16, char8};
+use vst3::Steinberg::{char8, char16};
 
 /// Read a NUL-terminated (or field-filling) 8-bit string out of a fixed array.
 ///
@@ -17,7 +17,11 @@ pub fn from_char8(buf: &[char8]) -> String {
 
 /// Same for UTF-16 fields (`PClassInfoW`, and most `IEditController` strings).
 pub fn from_char16(buf: &[char16]) -> String {
-    let units: Vec<u16> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u16).collect();
+    let units: Vec<u16> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u16)
+        .collect();
     String::from_utf16_lossy(&units)
 }
 

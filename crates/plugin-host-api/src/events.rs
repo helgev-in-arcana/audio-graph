@@ -15,7 +15,10 @@ pub enum Target {
     #[default]
     Global,
     NoteId(i32),
-    Key { channel: i16, key: i16 },
+    Key {
+        channel: i16,
+        key: i16,
+    },
     Channel(i16),
     Port(i16),
 }
@@ -36,8 +39,12 @@ pub enum ParamEvent {
         amount: f64,
         sample_offset: u32,
     },
-    GestureBegin { id: ParamId },
-    GestureEnd { id: ParamId },
+    GestureBegin {
+        id: ParamId,
+    },
+    GestureEnd {
+        id: ParamId,
+    },
 }
 
 impl ParamEvent {
@@ -162,7 +169,9 @@ impl EventSink {
 
     /// Pre-allocate so the audio thread never grows the buffer (§9.1).
     pub fn with_capacity(cap: usize) -> Self {
-        Self { events: Vec::with_capacity(cap) }
+        Self {
+            events: Vec::with_capacity(cap),
+        }
     }
 
     pub fn push(&mut self, event: Event) {

@@ -20,7 +20,7 @@ use crate::cid::Cid;
 use crate::host_app::HostApplication;
 use crate::library::{self, Library};
 use crate::moduleinfo::ModuleInfo;
-use crate::util::{from_char16, from_char8};
+use crate::util::{from_char8, from_char16};
 
 /// Everything a scanner wants to know about the module as a whole.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -118,9 +118,9 @@ impl Module {
         let path = path.as_ref();
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-        if let Some(existing) = LOADED.with(|loaded| {
-            loaded.borrow().get(&key).and_then(Weak::upgrade)
-        }) {
+        if let Some(existing) =
+            LOADED.with(|loaded| loaded.borrow().get(&key).and_then(Weak::upgrade))
+        {
             return Ok(Module { inner: existing });
         }
 
@@ -141,7 +141,10 @@ impl Module {
         };
 
         let factory = factory.ok_or_else(|| {
-            HostError::NoFactory(format!("GetPluginFactory returned null for {}", path.display()))
+            HostError::NoFactory(format!(
+                "GetPluginFactory returned null for {}",
+                path.display()
+            ))
         })?;
 
         let inner = Rc::new(ModuleInner {
@@ -185,7 +188,11 @@ impl Module {
         }
 
         let app = HostApplication::new(context);
-        if let Some(factory3) = self.inner.factory.cast::<vst3::Steinberg::IPluginFactory3>() {
+        if let Some(factory3) = self
+            .inner
+            .factory
+            .cast::<vst3::Steinberg::IPluginFactory3>()
+        {
             use vst3::Steinberg::IPluginFactory3Trait;
             let ptr = app
                 .as_com_ref::<vst3::Steinberg::FUnknown>()
@@ -300,7 +307,11 @@ impl Module {
 
     /// Audio modules only — the classes worth showing a user picking a plugin.
     pub fn audio_modules(&self) -> Result<Vec<ClassInfo>> {
-        Ok(self.classes()?.into_iter().filter(ClassInfo::is_audio_module).collect())
+        Ok(self
+            .classes()?
+            .into_iter()
+            .filter(ClassInfo::is_audio_module)
+            .collect())
     }
 
     /// The bundle's `moduleinfo.json`, when it ships one.
@@ -316,7 +327,9 @@ impl Module {
 
 impl std::fmt::Debug for Module {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Module").field("path", &self.inner.path).finish_non_exhaustive()
+        f.debug_struct("Module")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
     }
 }
 

@@ -4,7 +4,9 @@
 //! otherwise do — choosing a sub-plugin, and deciding which of its parameters
 //! the DAW's automation lanes drive — possible at all, and to make them visible
 //! while checking the wrapper in a real DAW. It is not the eventual UI; §9's
-//! node graph replaces the slot table with something much richer.
+//! node graph (§9) sits alongside it on its own tab: the slot table says
+//! *which* sub-plugin parameter a lane drives, the graph says what drives
+//! the lane.
 //!
 //! # The draw callback records; it does not act
 //!
@@ -40,6 +42,7 @@ use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
 use plugin_host_api::{ParamId, ParamInfo};
 use subhost_adapter::{MainThread, SLOT_COUNT};
 
+use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;
 
 /// How often the sub-plugin's window gets its tick, in milliseconds.
@@ -52,10 +55,20 @@ const TICK_MS: u32 = 16;
 /// Something the user asked for, to be carried out once the frame is over.
 enum Command {
     Load(PathBuf),
+    /// The graph changed: recompile, publish, save.
+    ///
+    /// Editing the graph itself happens inline — it touches no window, so
+    /// none of the reentrancy above applies — but the work that *follows* an
+    /// edit is worth doing once per frame rather than once per mouse-move.
+    GraphEdited,
+    SetQuantum(u32),
     Unload,
     OpenSubEditor,
     CloseSubEditor,
-    Bind { slot: usize, param: ParamId },
+    Bind {
+        slot: usize,
+        param: ParamId,
+    },
     ClearSlot(usize),
 }
 
@@ -77,6 +90,16 @@ struct View {
     params: Vec<ParamInfo>,
     /// `(index, parameter name, currently resolved)`.
     slots: Vec<(usize, String, bool)>,
+    /// Whether the sub-plugin can take per-voice modulation (§3.3).
+    poly_modulation: bool,
+}
+
+/// Which half of the editor is on screen.
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum Tab {
+    #[default]
+    Patch,
+    Graph,
 }
 
 /// A `.vst3` found on disk, before anything has been loaded from it.
@@ -127,6 +150,8 @@ pub struct WrapperEditor {
     /// Filled while drawing, drained at the end of the same `ui` call.
     commands: Vec<Command>,
     view: View,
+    tab: Tab,
+    graph_ui: GraphEditor,
     /// The DAW's top-level window, so the sub-plugin's editor can be owned by
     /// it and stay in front. Null until `build`, and when standalone.
     daw_window: usize,
@@ -146,20 +171,31 @@ impl WrapperEditor {
             status: Status::default(),
             commands: Vec::new(),
             view: View::default(),
+            tab: Tab::default(),
+            graph_ui: GraphEditor::default(),
             daw_window: 0,
         }
     }
 
-    /// Refresh what gets drawn, if the lock is free.
+    /// Refresh what gets drawn.
     ///
     /// Cheap fields every time; the vectors only when something actually
-    /// changed shape.
+    /// changed shape. Rebuilding a two-thousand-entry parameter list sixty
+    /// times a second would be silly; noticing a counter is not.
+    ///
+    /// No lock is involved. Everything read here is main-thread state and the
+    /// audio thread has no way to reach it — which is the whole reason having
+    /// the editor open no longer costs the audio path anything.
     fn refresh(&mut self) {
-        let Some(state) = self.shared.try_lock() else { return };
+        let state = self.shared.main();
 
-        self.view.class = state.host.class().map(|c| (c.name.clone(), c.vendor.clone()));
+        self.view.class = state
+            .host
+            .class()
+            .map(|c| (c.name.clone(), c.vendor.clone()));
         self.view.loaded = state.host.is_loaded();
         self.view.sub_editor_open = state.host.editor_is_open();
+        self.view.poly_modulation = state.host.capabilities().poly_modulation;
 
         let generation = self.shared.generation();
         if generation == self.view.generation && !self.view.params.is_empty() {
@@ -190,7 +226,8 @@ impl WrapperEditor {
                 self.entries.push(Entry { name, path });
             }
         }
-        self.entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.entries
+            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         self.scanned = true;
     }
 
@@ -237,16 +274,19 @@ impl WrapperEditor {
 
         let needle = self.plugin_filter.to_lowercase();
         let mut to_load: Option<PathBuf> = None;
-        egui::ScrollArea::vertical().id_salt("plugins").max_height(200.0).show(ui, |ui| {
-            for entry in &self.entries {
-                if !needle.is_empty() && !entry.name.to_lowercase().contains(&needle) {
-                    continue;
+        egui::ScrollArea::vertical()
+            .id_salt("plugins")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for entry in &self.entries {
+                    if !needle.is_empty() && !entry.name.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    if ui.selectable_label(false, &entry.name).clicked() {
+                        to_load = Some(entry.path.clone());
+                    }
                 }
-                if ui.selectable_label(false, &entry.name).clicked() {
-                    to_load = Some(entry.path.clone());
-                }
-            }
-        });
+            });
         if let Some(path) = to_load {
             self.commands.push(Command::Load(path));
         }
@@ -280,20 +320,23 @@ impl WrapperEditor {
         let slot = self.next_slot;
         let mut to_bind: Option<ParamId> = None;
         let params = &self.view.params;
-        egui::ScrollArea::vertical().id_salt("params").max_height(280.0).show(ui, |ui| {
-            for param in params {
-                if !needle.is_empty() && !param.name.to_lowercase().contains(&needle) {
-                    continue;
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(format!("-> {}", slot + 1)).clicked() {
-                        to_bind = Some(param.id);
+        egui::ScrollArea::vertical()
+            .id_salt("params")
+            .max_height(280.0)
+            .show(ui, |ui| {
+                for param in params {
+                    if !needle.is_empty() && !param.name.to_lowercase().contains(&needle) {
+                        continue;
                     }
-                    ui.label(&param.name);
-                    ui.weak(format!("[{} .. {}]", param.min, param.max));
-                });
-            }
-        });
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("-> {}", slot + 1)).clicked() {
+                            to_bind = Some(param.id);
+                        }
+                        ui.label(&param.name);
+                        ui.weak(format!("[{} .. {}]", param.min, param.max));
+                    });
+                }
+            });
 
         if let Some(param) = to_bind {
             self.commands.push(Command::Bind { slot, param });
@@ -308,38 +351,78 @@ impl WrapperEditor {
         let params = self.shared.params();
         let rows = &self.view.slots;
         let mut clear: Option<usize> = None;
-        egui::ScrollArea::vertical().id_salt("slots").max_height(420.0).show(ui, |ui| {
-            for (i, name, resolved) in rows {
-                ui.horizontal(|ui| {
-                    // One-based, to agree with the DAW's automation lane names.
-                    ui.monospace(format!("Slot {}", i + 1));
-                    if *resolved {
-                        ui.label(name);
-                    } else {
-                        // §8.3: a binding outlives a sub-plugin that cannot be
-                        // found, so it has to be shown as such rather than
-                        // silently dropped.
-                        ui.colored_label(egui::Color32::from_rgb(200, 140, 60), name)
-                            .on_hover_text("not resolved against the loaded sub-plugin");
-                    }
-                    let value = params.slots[*i].value.value();
-                    ui.add(
-                        egui::ProgressBar::new(value)
-                            .desired_width(110.0)
-                            .text(format!("{value:.3}")),
-                    );
-                    if ui.small_button("x").clicked() {
-                        clear = Some(*i);
-                    }
-                });
-            }
-            if rows.is_empty() {
-                ui.weak("nothing bound yet");
-            }
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("slots")
+            .max_height(420.0)
+            .show(ui, |ui| {
+                for (i, name, resolved) in rows {
+                    ui.horizontal(|ui| {
+                        // One-based, to agree with the DAW's automation lane names.
+                        ui.monospace(format!("Slot {}", i + 1));
+                        if *resolved {
+                            ui.label(name);
+                        } else {
+                            // §8.3: a binding outlives a sub-plugin that cannot be
+                            // found, so it has to be shown as such rather than
+                            // silently dropped.
+                            ui.colored_label(egui::Color32::from_rgb(200, 140, 60), name)
+                                .on_hover_text("not resolved against the loaded sub-plugin");
+                        }
+                        let value = params.slots[*i].value.value();
+                        ui.add(
+                            egui::ProgressBar::new(value)
+                                .desired_width(110.0)
+                                .text(format!("{value:.3}")),
+                        );
+                        if ui.small_button("x").clicked() {
+                            clear = Some(*i);
+                        }
+                    });
+                }
+                if rows.is_empty() {
+                    ui.weak("nothing bound yet");
+                }
+            });
 
         if let Some(i) = clear {
             self.commands.push(Command::ClearSlot(i));
+        }
+    }
+
+    fn graph_panel(&mut self, ui: &mut egui::Ui) {
+        // The graph is main-thread state and this is the main thread, so it is
+        // edited in place. What must not happen inline is the *consequence* of
+        // an edit — see `Command::GraphEdited`.
+        let context = GraphContext {
+            bindings: &self.view.slots,
+            poly_modulation: self.view.poly_modulation,
+            error: self.shared.main().compile_error.clone(),
+            live: self.shared.live_slots(),
+        };
+
+        let mut state = self.shared.main();
+        let changed = self.graph_ui.ui(ui, &mut state.graph, &context);
+        drop(state);
+
+        if changed {
+            self.commands.push(Command::GraphEdited);
+        }
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Modulation rate").on_hover_text(
+            "how often the graph's outputs reach the sub-plugin, in samples. \
+             Smaller is smoother and costs more events.",
+        );
+        let current = self.shared.quantum();
+        for choice in subhost_adapter::QUANTUM_CHOICES {
+            if ui
+                .selectable_label(current == choice, choice.to_string())
+                .clicked()
+                && current != choice
+            {
+                self.commands.push(Command::SetQuantum(choice));
+            }
         }
     }
 
@@ -351,7 +434,8 @@ impl WrapperEditor {
         let Some(deferred) = self.deferred.as_ref() else {
             // No queue means no message loop to defer to, and running these
             // inline is the exact thing this module exists to avoid.
-            self.status.set("the editor has no message loop; command dropped");
+            self.status
+                .set("the editor has no message loop; command dropped");
             self.commands.clear();
             return;
         };
@@ -359,7 +443,9 @@ impl WrapperEditor {
         let shared = self.shared.clone();
         let status = self.status.clone();
         let owner = self.daw_window;
-        deferred.get().post(move || run(&shared, &status, owner, commands));
+        deferred
+            .get()
+            .post(move || run(&shared, &status, owner, commands));
     }
 }
 
@@ -373,8 +459,21 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
         // draws from a snapshot rather than from the lock.
         shared.changed();
         match command {
+            Command::GraphEdited => {
+                shared.publish_graph();
+                shared.store_state();
+                match shared.main().compile_error.clone() {
+                    Some(e) => status.set(format!("graph not applied: {e}")),
+                    None => status.set("graph applied"),
+                }
+            }
+            Command::SetQuantum(quantum) => {
+                shared.set_quantum(quantum);
+                shared.store_state();
+                status.set(format!("modulation rate {quantum} samples"));
+            }
             Command::Load(path) => {
-                let result = shared.lock().load(&path);
+                let result = shared.load(&path);
                 match result {
                     Ok(()) => {
                         shared.store_state();
@@ -384,29 +483,30 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 }
             }
             Command::Unload => {
-                shared.lock().unload();
+                shared.unload();
                 shared.store_state();
                 status.set("unloaded");
             }
             Command::OpenSubEditor => {
-                let result = shared.lock().host.open_editor(owner as *mut std::ffi::c_void);
+                let result = shared
+                    .main()
+                    .host
+                    .open_editor(owner as *mut std::ffi::c_void);
                 match result {
                     Ok(()) => status.set("plugin GUI open"),
                     Err(e) => status.set(format!("open GUI: {e}")),
                 }
             }
             Command::CloseSubEditor => {
-                shared.lock().host.close_editor();
+                shared.main().host.close_editor();
                 status.set("plugin GUI closed");
             }
             Command::Bind { slot, param } => {
-                let result = {
-                    let mut state = shared.lock();
-                    // The processor reads the resolved targets once, at
-                    // activate, so a new binding only reaches audio after a
-                    // restart.
-                    state.host.bind_slot(slot, param).and_then(|()| state.rebind())
-                };
+                // The processor reads the resolved targets once, at
+                // activate, so a new binding only reaches audio after a
+                // restart.
+                let bound = shared.main().host.bind_slot(slot, param);
+                let result = bound.and_then(|()| shared.rebind());
                 match result {
                     Ok(()) => {
                         shared.store_state();
@@ -416,11 +516,8 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 }
             }
             Command::ClearSlot(slot) => {
-                {
-                    let mut state = shared.lock();
-                    state.host.slots_mut().clear(slot);
-                    let _ = state.rebind();
-                }
+                shared.main().host.slots_mut().clear(slot);
+                let _ = shared.rebind();
                 shared.store_state();
                 status.set(format!("slot {slot} cleared"));
             }
@@ -450,9 +547,12 @@ impl NiceEguiApp for WrapperEditor {
                 // ride on the draw callback: answering a resize means resizing
                 // a window, which is precisely what must not happen there.
                 deferred.set_tick(TICK_MS, move || {
-                    if let Some(mut state) = shared.try_lock() {
-                        state.host.tick_editor();
-                    }
+                    shared.main().host.tick_editor();
+                    // The same turn of the loop is as good a moment as any to
+                    // free the programs the audio thread has handed back
+                    // (§9.1). Nothing else on the main thread is guaranteed to
+                    // run while a patch just sits there playing.
+                    shared.reclaim();
                 });
                 self.deferred = Some(MainThread::new(deferred));
             }
@@ -476,15 +576,32 @@ impl NiceEguiApp for WrapperEditor {
         // one frame, which looks like a flicker because it is one.
         self.refresh();
 
-        // `columns` rather than a `horizontal` of two `vertical`s: a vertical
-        // layout claims all the width that is going, so the second one ends up
-        // off the edge of the window entirely.
-        ui.columns(2, |cols| {
-            self.sub_plugin_panel(&mut cols[0]);
-            cols[0].add_space(8.0);
-            self.parameter_panel(&mut cols[0]);
-            self.slot_panel(&mut cols[1]);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Patch, "Patch");
+            ui.selectable_value(&mut self.tab, Tab::Graph, "Graph");
+            ui.separator();
+            self.settings_panel(ui);
         });
+        ui.separator();
+
+        match self.tab {
+            // `columns` rather than a `horizontal` of two `vertical`s: a
+            // vertical layout claims all the width that is going, so the second
+            // one ends up off the edge of the window entirely.
+            Tab::Patch => ui.columns(2, |cols| {
+                self.sub_plugin_panel(&mut cols[0]);
+                cols[0].add_space(8.0);
+                self.parameter_panel(&mut cols[0]);
+                self.slot_panel(&mut cols[1]);
+            }),
+            // Last, and given everything left: the canvas takes the rest of the
+            // window, so the status line below has to go.
+            Tab::Graph => {
+                self.graph_panel(ui);
+                self.dispatch();
+                return;
+            }
+        }
 
         let status = self.status.get();
         if !status.is_empty() {
@@ -499,9 +616,7 @@ impl NiceEguiApp for WrapperEditor {
         // The wrapper's window is going away, so the sub-plugin's window must
         // too: it is top level with no owner, and leaving it behind strands it
         // with nothing ticking it.
-        if let Some(mut state) = self.shared.try_lock() {
-            state.host.close_editor();
-        }
+        self.shared.main().host.close_editor();
         // Takes the timer, and anything still queued, with it.
         self.deferred = None;
     }

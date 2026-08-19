@@ -61,7 +61,11 @@ fn candidates() -> Vec<PathBuf> {
         .iter()
         .flat_map(|d| find_modules(d))
         .filter(|p| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
             !EXCLUDED.contains(&name.as_str())
         })
         .collect()
@@ -70,8 +74,12 @@ fn candidates() -> Vec<PathBuf> {
 /// Find an effect that takes stereo in and out.
 fn find_stereo_effect() -> Option<(PathBuf, Cid)> {
     for path in candidates().into_iter().take(SEARCH_LIMIT) {
-        let Ok(module) = Module::open(&path) else { continue };
-        let Ok(classes) = module.audio_modules() else { continue };
+        let Ok(module) = Module::open(&path) else {
+            continue;
+        };
+        let Ok(classes) = module.audio_modules() else {
+            continue;
+        };
         for class in classes {
             if class.is_instrument() {
                 continue;
@@ -120,7 +128,10 @@ fn repeated_activation(module: &Module, class: &ClassInfo) {
         let mut plugin = Vst3Plugin::create(module, class.cid, host.clone())
             .unwrap_or_else(|e| panic!("round {round}: {e}"));
         let processor = plugin
-            .activate(AudioConfig { offline: true, ..Default::default() })
+            .activate(AudioConfig {
+                offline: true,
+                ..Default::default()
+            })
             .unwrap_or_else(|e| panic!("round {round}: activate: {e}"));
         plugin.deactivate(processor);
     }
@@ -142,7 +153,10 @@ fn state_round_trips_into_a_fresh_instance(module: &Module, class: &ClassInfo) {
     drop(probe);
 
     if candidates.is_empty() {
-        eprintln!("{} exposes no writable parameter; skipping state check", class.name);
+        eprintln!(
+            "{} exposes no writable parameter; skipping state check",
+            class.name
+        );
         return;
     }
 
@@ -154,9 +168,15 @@ fn state_round_trips_into_a_fresh_instance(module: &Module, class: &ClassInfo) {
         }
     }
 
-    panic!("{}: no parameter round-tripped:
-  {}", class.name, rejected.join("
-  "));
+    panic!(
+        "{}: no parameter round-tripped:
+  {}",
+        class.name,
+        rejected.join(
+            "
+  "
+        )
+    );
 }
 
 fn try_round_trip(
@@ -176,7 +196,9 @@ fn try_round_trip(
     } else {
         target.max
     };
-    first.set_param(target.id, wanted).map_err(|e| e.to_string())?;
+    first
+        .set_param(target.id, wanted)
+        .map_err(|e| e.to_string())?;
 
     // Run a block before saving. Not ceremony: VST3 keeps the processor and the
     // controller apart, and an edit only reaches the processor through the
@@ -189,7 +211,9 @@ fn try_round_trip(
     let saved = first.snapshot().get(target.id).unwrap_or(f64::NAN);
     let span = (target.max - target.min).abs().max(1e-9);
     if (saved - wanted).abs() > span * 1e-3 {
-        return Err(format!("write did not stick (asked {wanted}, reads {saved})"));
+        return Err(format!(
+            "write did not stick (asked {wanted}, reads {saved})"
+        ));
     }
 
     let blob = first.save_state().map_err(|e| e.to_string())?;
@@ -221,7 +245,10 @@ fn truncated_state_is_rejected(module: &Module, class: &ClassInfo) {
 fn run_one_block(plugin: &mut Vst3Plugin) -> Result<(), String> {
     use plugin_host_api::{AudioBuffers, BufferLayout, EventSink, TimeContext};
 
-    let config = AudioConfig { offline: true, ..Default::default() };
+    let config = AudioConfig {
+        offline: true,
+        ..Default::default()
+    };
     let frames = 64u32;
     let mut processor = plugin.activate(config).map_err(|e| e.to_string())?;
 
@@ -245,11 +272,19 @@ fn run_one_block(plugin: &mut Vst3Plugin) -> Result<(), String> {
 fn parameters_report_usable_ranges(module: &Module, class: &ClassInfo) {
     let plugin = Vst3Plugin::create(module, class.cid, Arc::new(TestHost)).expect("create");
     for p in SubPluginMain::params(&plugin) {
-        assert!(p.min.is_finite() && p.max.is_finite(), "{}: non-finite range", p.name);
+        assert!(
+            p.min.is_finite() && p.max.is_finite(),
+            "{}: non-finite range",
+            p.name
+        );
         assert!(p.default.is_finite(), "{}: non-finite default", p.name);
         // A stepped parameter with an empty range cannot be addressed at all.
         if p.flags.contains(ParamFlags::STEPPED) {
-            assert!(p.max > p.min, "{}: stepped parameter with empty range", p.name);
+            assert!(
+                p.max > p.min,
+                "{}: stepped parameter with empty range",
+                p.name
+            );
         }
     }
 }

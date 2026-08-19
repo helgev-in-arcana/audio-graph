@@ -17,8 +17,8 @@ use plugin_host_api::{
 };
 use vst3::ComWrapper;
 use vst3::Steinberg::Vst::{
-    Event as VstEvent, Event_::EventTypes_, NoteExpressionTypeIDs_, NoteOffEvent, NoteOnEvent,
-    NoteExpressionValueEvent, ProcessContext, ProcessContext_::StatesAndFlags_,
+    Event as VstEvent, Event_::EventTypes_, NoteExpressionTypeIDs_, NoteExpressionValueEvent,
+    NoteOffEvent, NoteOnEvent, ProcessContext, ProcessContext_::StatesAndFlags_,
 };
 
 use crate::param_map::ParamMap;
@@ -49,7 +49,12 @@ pub fn fill_inputs(
 
 fn fill_param(event: &ParamEvent, map: &ParamMap, changes: &ComWrapper<ParameterChanges>) {
     match *event {
-        ParamEvent::SetValue { id, value, sample_offset, .. } => {
+        ParamEvent::SetValue {
+            id,
+            value,
+            sample_offset,
+            ..
+        } => {
             // An unknown id is dropped rather than sent with a guessed value.
             if let Some(normalized) = map.normalize(id, value) {
                 changes.add_point(id.0, sample_offset as i32, normalized);
@@ -69,7 +74,13 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
     vst.sampleOffset = event.sample_offset() as i32;
 
     match *event {
-        NoteEvent::NoteOn { note_id, channel, key, velocity, .. } => {
+        NoteEvent::NoteOn {
+            note_id,
+            channel,
+            key,
+            velocity,
+            ..
+        } => {
             vst.r#type = EventTypes_::kNoteOnEvent as u16;
             vst.__field0.noteOn = NoteOnEvent {
                 channel,
@@ -80,7 +91,13 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
                 noteId: note_id,
             };
         }
-        NoteEvent::NoteOff { note_id, channel, key, velocity, .. } => {
+        NoteEvent::NoteOff {
+            note_id,
+            channel,
+            key,
+            velocity,
+            ..
+        } => {
             vst.r#type = EventTypes_::kNoteOffEvent as u16;
             vst.__field0.noteOff = NoteOffEvent {
                 channel,
@@ -90,7 +107,12 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
                 tuning: 0.0,
             };
         }
-        NoteEvent::Expression { note_id, expression, value, .. } => {
+        NoteEvent::Expression {
+            note_id,
+            expression,
+            value,
+            ..
+        } => {
             let type_id = expression_type_id(expression)?;
             vst.r#type = EventTypes_::kNoteExpressionValueEvent as u16;
             vst.__field0.noteExpressionValue = NoteExpressionValueEvent {
@@ -299,7 +321,11 @@ mod tests {
 
     #[test]
     fn transport_flags_match_the_fields_we_filled() {
-        let ctx = TimeContext { playing: true, tempo_bpm: 140.0, ..Default::default() };
+        let ctx = TimeContext {
+            playing: true,
+            tempo_bpm: 140.0,
+            ..Default::default()
+        };
         let out = to_process_context(&ctx, 48_000.0);
         assert_eq!(out.tempo, 140.0);
         assert!(out.state & StatesAndFlags_::kPlaying as u32 != 0);

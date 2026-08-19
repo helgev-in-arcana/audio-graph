@@ -17,9 +17,7 @@
 use std::rc::Rc;
 
 use vst3::ComPtr;
-use vst3::Steinberg::{
-    IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk, kResultTrue,
-};
+use vst3::Steinberg::{IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk, kResultTrue};
 
 use crate::frame::PlugFrame;
 use crate::window::{ContainerWindow, PLATFORM_TYPE, Size};
@@ -72,9 +70,7 @@ impl EditorWindow {
         // divides by the factor while laying out — Chroma does — faults on its
         // first paint if the host never says anything. This has to happen
         // before `attached`, because that is when the first paint can occur.
-        if let Some(scale_support) =
-            view.cast::<vst3::Steinberg::IPlugViewContentScaleSupport>()
-        {
+        if let Some(scale_support) = view.cast::<vst3::Steinberg::IPlugViewContentScaleSupport>() {
             use vst3::Steinberg::IPlugViewContentScaleSupportTrait;
             unsafe { scale_support.setContentScaleFactor(window.scale_factor() as f32) };
         }
@@ -90,9 +86,7 @@ impl EditorWindow {
         // a parent that already has a valid device context and size.
         window.show();
 
-        let res = unsafe {
-            view.attached(window.platform_handle(), platform.as_ptr())
-        };
+        let res = unsafe { view.attached(window.platform_handle(), platform.as_ptr()) };
         if res != kResultOk {
             // Undo in reverse. Leaving a frame set on a view we are about to
             // drop leaves the plugin holding a pointer to freed memory.
@@ -111,7 +105,12 @@ impl EditorWindow {
         // zero, and which is wrong regardless of how a given plugin reacts.
         frame.set_last_reported_size(window.client_size());
 
-        Ok(EditorWindow { view, window, frame, closed: false })
+        Ok(EditorWindow {
+            view,
+            window,
+            frame,
+            closed: false,
+        })
     }
 
     pub fn window(&self) -> &ContainerWindow {
@@ -186,11 +185,21 @@ impl Drop for EditorWindow {
 }
 
 fn to_rect(size: Size) -> ViewRect {
-    ViewRect { left: 0, top: 0, right: size.width, bottom: size.height }
+    ViewRect {
+        left: 0,
+        top: 0,
+        right: size.width,
+        bottom: size.height,
+    }
 }
 
 fn view_size(view: &ComPtr<IPlugView>) -> Option<Size> {
-    let mut rect = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut rect = ViewRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     if unsafe { view.getSize(&mut rect) } != kResultOk {
         return None;
     }

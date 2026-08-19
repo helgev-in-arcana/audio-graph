@@ -100,7 +100,12 @@ mod tests {
         let frame = PlugFrame::new();
         assert!(frame.take_requested_size().is_none());
 
-        let mut rect = ViewRect { left: 0, top: 0, right: 640, bottom: 480 };
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: 640,
+            bottom: 480,
+        };
         let ptr = frame.com_ptr();
         assert!(!ptr.is_null());
         unsafe {
@@ -119,7 +124,10 @@ mod tests {
         let frame = PlugFrame::new();
         unsafe {
             let com = vst3::ComRef::<IPlugFrame>::from_raw(frame.com_ptr()).unwrap();
-            assert_eq!(com.resizeView(std::ptr::null_mut(), std::ptr::null_mut()), kResultOk);
+            assert_eq!(
+                com.resizeView(std::ptr::null_mut(), std::ptr::null_mut()),
+                kResultOk
+            );
         }
         assert!(frame.take_requested_size().is_none());
     }

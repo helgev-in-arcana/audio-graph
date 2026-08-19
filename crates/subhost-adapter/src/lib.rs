@@ -9,11 +9,13 @@
 
 mod host;
 mod main_thread;
+mod schedule;
 mod slots;
 mod state;
 
 pub use host::{SubHost, SubHostProcessor, SubPluginRef};
 pub use main_thread::MainThread;
+pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, SLOT_COUNT, Slot, SlotTable};
 pub use state::WrapperState;
 
@@ -40,7 +42,10 @@ mod tests {
 
     #[test]
     fn latency_is_the_sum_of_both_stages() {
-        let report = LatencyReport { sub_plugin: 512, wrapper: 64 };
+        let report = LatencyReport {
+            sub_plugin: 512,
+            wrapper: 64,
+        };
         assert_eq!(report.total(), 576);
     }
 
@@ -48,7 +53,10 @@ mod tests {
     fn latency_saturates_rather_than_wrapping() {
         // A plugin reporting a nonsense latency should not make the wrapper
         // report a tiny one, which is what a wrapping add would do.
-        let report = LatencyReport { sub_plugin: u32::MAX, wrapper: 64 };
+        let report = LatencyReport {
+            sub_plugin: u32::MAX,
+            wrapper: 64,
+        };
         assert_eq!(report.total(), u32::MAX);
     }
 }

@@ -110,7 +110,9 @@ impl ParameterChanges {
     /// per block. Both are hard limits from here on.
     pub fn new(max_params: usize, max_points: usize) -> ComWrapper<ParameterChanges> {
         ComWrapper::new(ParameterChanges {
-            pool: (0..max_params).map(|_| ValueQueue::new(max_points)).collect(),
+            pool: (0..max_params)
+                .map(|_| ValueQueue::new(max_points))
+                .collect(),
             used: Cell::new(0),
         })
     }
@@ -172,7 +174,11 @@ impl IParameterChangesTrait for ParameterChanges {
             .map_or(std::ptr::null_mut(), |r| r.as_ptr())
     }
 
-    unsafe fn addParameterData(&self, id: *const ParamID, index: *mut int32) -> *mut IParamValueQueue {
+    unsafe fn addParameterData(
+        &self,
+        id: *const ParamID,
+        index: *mut int32,
+    ) -> *mut IParamValueQueue {
         if id.is_null() {
             return std::ptr::null_mut();
         }
@@ -264,7 +270,11 @@ impl IEventListTrait for EventList {
         if e.is_null() {
             return kInvalidArgument;
         }
-        if self.push(unsafe { *e }) { kResultOk } else { kResultFalse }
+        if self.push(unsafe { *e }) {
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
 }
 

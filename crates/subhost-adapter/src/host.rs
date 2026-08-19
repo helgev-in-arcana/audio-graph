@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::schedule::SlotSchedule;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, Event, EventSink, HostContext, ParamEvent, ParamId, ParamInfo,
     ProcessStatus, SubPluginMain, SubPluginProcessor, Target, TimeContext,
@@ -60,7 +61,12 @@ struct Loaded {
 
 impl SubHost {
     pub fn new(context: Arc<dyn HostContext>) -> SubHost {
-        SubHost { loaded: None, slots: SlotTable::default(), context, sub_latency: 0 }
+        SubHost {
+            loaded: None,
+            slots: SlotTable::default(),
+            context,
+            sub_latency: 0,
+        }
     }
 
     pub fn slots(&self) -> &SlotTable {
@@ -82,6 +88,18 @@ impl SubHost {
     /// What is loaded, for display and for saving.
     pub fn reference(&self) -> Option<&SubPluginRef> {
         self.loaded.as_ref().map(|l| &l.get().reference)
+    }
+
+    /// What the loaded sub-plugin can accept (§3.3).
+    ///
+    /// The default — everything false — is also the honest answer when nothing
+    /// is loaded: a graph cannot send per-voice modulation to a plugin that is
+    /// not there.
+    pub fn capabilities(&self) -> plugin_host_api::Capabilities {
+        self.loaded
+            .as_ref()
+            .map(MainThread::get)
+            .map_or_else(Default::default, |l| l.plugin.capabilities())
     }
 
     pub fn params(&self) -> &[ParamInfo] {
@@ -124,9 +142,15 @@ impl SubHost {
         // Unload only after the new one is known good, so a failed load leaves
         // the user with what they had rather than with nothing.
         self.unload();
-        self.slots.resolve_against(&reference.plugin_id, SubPluginMain::params(&plugin));
-        self.loaded =
-            Some(MainThread::new(Loaded { editor: None, plugin, module, reference, class }));
+        self.slots
+            .resolve_against(&reference.plugin_id, SubPluginMain::params(&plugin));
+        self.loaded = Some(MainThread::new(Loaded {
+            editor: None,
+            plugin,
+            module,
+            reference,
+            class,
+        }));
         Ok(())
     }
 
@@ -154,8 +178,12 @@ impl SubHost {
 
         for dir in vst3_host::default_plugin_directories() {
             for candidate in vst3_host::find_modules(&dir) {
-                let Ok(module) = Module::open(&candidate) else { continue };
-                let Ok(classes) = module.audio_modules() else { continue };
+                let Ok(module) = Module::open(&candidate) else {
+                    continue;
+                };
+                let Ok(classes) = module.audio_modules() else {
+                    continue;
+                };
                 if classes.iter().any(|c| c.cid == wanted) {
                     return Some(candidate);
                 }
@@ -180,11 +208,18 @@ impl SubHost {
     /// ownerless window is a peer of the DAW's, so clicking in the DAW buries
     /// it — which is what this argument exists to prevent.
     pub fn open_editor(&mut self, owner: *mut std::ffi::c_void) -> Result<(), String> {
-        let loaded = self.loaded.as_mut().ok_or("no sub-plugin loaded")?.get_mut();
+        let loaded = self
+            .loaded
+            .as_mut()
+            .ok_or("no sub-plugin loaded")?
+            .get_mut();
         if loaded.editor.is_some() {
             return Ok(());
         }
-        let view = loaded.plugin.create_view().ok_or("this plugin has no editor")?;
+        let view = loaded
+            .plugin
+            .create_view()
+            .ok_or("this plugin has no editor")?;
         loaded.editor = Some(EditorWindow::open(view, &loaded.class.name, owner)?);
         Ok(())
     }
@@ -199,7 +234,9 @@ impl SubHost {
     }
 
     pub fn editor_is_open(&self) -> bool {
-        self.loaded.as_ref().is_some_and(|l| l.get().editor.is_some())
+        self.loaded
+            .as_ref()
+            .is_some_and(|l| l.get().editor.is_some())
     }
 
     /// Drive the editor for one UI tick: apply pending resizes, and close it if
@@ -209,9 +246,13 @@ impl SubHost {
     /// the DAW is already doing that — so this only handles the parts that are
     /// ours.
     pub fn tick_editor(&mut self) {
-        let Some(loaded) = self.loaded.as_mut() else { return };
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
         let loaded = loaded.get_mut();
-        let Some(editor) = loaded.editor.as_mut() else { return };
+        let Some(editor) = loaded.editor.as_mut() else {
+            return;
+        };
 
         editor.sync_size();
         if editor.close_requested() {
@@ -235,15 +276,28 @@ impl SubHost {
     /// Enter the processing phase.
     pub fn activate(&mut self, config: AudioConfig) -> Result<SubHostProcessor, String> {
         let targets = self.slots.active_targets();
-        let loaded = self.loaded.as_mut().ok_or("no sub-plugin loaded")?.get_mut();
+        let loaded = self
+            .loaded
+            .as_mut()
+            .ok_or("no sub-plugin loaded")?
+            .get_mut();
         let processor = loaded.plugin.activate(config).map_err(|e| e.to_string())?;
         self.sub_latency = loaded.plugin.latency_samples();
+
+        // One event per slot per sub-block is the worst a graph can ask for,
+        // plus whatever the DAW sends us. Reserved here because `process` is
+        // not allowed to grow it.
+        let sub_blocks = config
+            .max_block_size
+            .div_ceil(crate::schedule::MIN_QUANTUM)
+            .max(1) as usize;
+        let capacity = crate::slots::SLOT_COUNT * sub_blocks + INCOMING_EVENT_CAPACITY;
 
         Ok(SubHostProcessor {
             processor,
             targets,
             last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
-            scratch: Vec::with_capacity(crate::slots::SLOT_COUNT),
+            scratch: Vec::with_capacity(capacity),
         })
     }
 
@@ -315,6 +369,12 @@ impl SubHost {
     }
 }
 
+/// How many of the DAW's own events one block is expected to carry.
+///
+/// Only used to size the merge buffer. Overshooting costs a few kilobytes;
+/// undershooting would cost events, so it is generous.
+const INCOMING_EVENT_CAPACITY: usize = 1024;
+
 /// Audio-thread half of the adapter.
 pub struct SubHostProcessor {
     processor: Box<dyn SubPluginProcessor>,
@@ -333,37 +393,66 @@ pub struct SubHostProcessor {
 impl SubHostProcessor {
     /// Run one block through the sub-plugin.
     ///
-    /// `slot_values` are the wrapper's own parameter values in 0..1, straight
-    /// from the DAW's automation. In v1 they drive the sub-plugin's parameters
-    /// directly (Drive mode, ADR-5); the node graph of M5 goes between them.
+    /// `slots` carries the wrapper's slot values in 0..1 at each sub-block
+    /// boundary (§9.2) — the DAW's automation, with anything the node graph
+    /// drives written over it. Turning those into parameter events is this
+    /// function's whole job: which slot is bound to which parameter, what the
+    /// parameter's plain range is, and which values are worth sending at all.
+    ///
+    /// The two streams are merged in offset order. A sub-plugin is entitled to
+    /// assume its input events are sorted, and several real ones misbehave
+    /// quietly rather than loudly when they are not.
     pub fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,
-        slot_values: &[f64],
+        slots: &SlotSchedule,
         events: &[Event],
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
         self.scratch.clear();
+        let mut next_note = 0;
 
-        // Slot values first, at offset 0, so anything in `events` for this
-        // block still takes precedence.
-        for &(slot, target) in &self.targets {
-            let Some(&normalized) = slot_values.get(slot) else { continue };
-            if self.last_sent[slot] == normalized {
-                continue;
+        for index in 0..slots.blocks() {
+            let offset = slots.offset(index);
+
+            // Anything the DAW sent that lands before this boundary goes first,
+            // so the stream stays sorted.
+            while next_note < events.len() && events[next_note].sample_offset() < offset {
+                push(&mut self.scratch, events[next_note]);
+                next_note += 1;
             }
-            self.last_sent[slot] = normalized;
-            self.scratch.push(Event::Param(ParamEvent::SetValue {
-                id: target.id,
-                target: Target::Global,
-                value: target.to_plain(normalized),
-                sample_offset: 0,
-            }));
-        }
-        self.scratch.extend_from_slice(events);
 
-        self.processor.process(buffers, &self.scratch, context, out_events)
+            let values = slots.block(index);
+            for &(slot, target) in &self.targets {
+                let Some(&normalized) = values.get(slot) else {
+                    continue;
+                };
+                // Unchanged slots cost nothing. Resending would waste the
+                // sub-plugin's parameter queue and, worse, retrigger smoothing
+                // on plugins that ramp towards every incoming point.
+                if self.last_sent[slot] == normalized {
+                    continue;
+                }
+                self.last_sent[slot] = normalized;
+                push(
+                    &mut self.scratch,
+                    Event::Param(ParamEvent::SetValue {
+                        id: target.id,
+                        target: Target::Global,
+                        value: target.to_plain(normalized),
+                        sample_offset: offset,
+                    }),
+                );
+            }
+        }
+
+        for &event in &events[next_note..] {
+            push(&mut self.scratch, event);
+        }
+
+        self.processor
+            .process(buffers, &self.scratch, context, out_events)
     }
 
     pub fn reset(&mut self) {
@@ -371,6 +460,16 @@ impl SubHostProcessor {
         // Force a resend: after a reset the sub-plugin's idea of its parameters
         // is no longer something we can assume.
         self.last_sent.iter_mut().for_each(|v| *v = f64::NAN);
+    }
+}
+
+/// Append, unless the buffer is full.
+///
+/// Dropping an event is bad; growing a `Vec` inside an audio callback is worse,
+/// and the capacity reserved at activate is the worst case plus a wide margin.
+fn push(scratch: &mut Vec<Event>, event: Event) {
+    if scratch.len() < scratch.capacity() {
+        scratch.push(event);
     }
 }
 
@@ -398,28 +497,50 @@ mod tests {
         fn reset(&mut self) {}
     }
 
-    fn harness(targets: Vec<(usize, ResolvedTarget)>) -> (SubHostProcessor, std::sync::Arc<std::sync::Mutex<Vec<Event>>>) {
+    fn harness(
+        targets: Vec<(usize, ResolvedTarget)>,
+    ) -> (
+        SubHostProcessor,
+        std::sync::Arc<std::sync::Mutex<Vec<Event>>>,
+    ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
             processor: Box::new(Recorder { seen: seen.clone() }),
             targets,
             last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
-            scratch: Vec::with_capacity(crate::slots::SLOT_COUNT),
+            scratch: Vec::with_capacity(4096),
         };
         (processor, seen)
     }
 
     fn run(p: &mut SubHostProcessor, values: &[f64]) {
+        let mut schedule = SlotSchedule::new(4, 32);
+        schedule.begin(4);
+        schedule.fill(values);
+        run_scheduled(p, &schedule, &[]);
+    }
+
+    fn run_scheduled(p: &mut SubHostProcessor, schedule: &SlotSchedule, events: &[Event]) {
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
         let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
         let mut sink = EventSink::new();
-        p.process(&mut buffers, values, &[], &TimeContext::default(), &mut sink);
+        p.process(
+            &mut buffers,
+            schedule,
+            events,
+            &TimeContext::default(),
+            &mut sink,
+        );
     }
 
     #[test]
     fn slot_values_reach_the_sub_plugin_in_plain_units() {
-        let target = ResolvedTarget { id: ParamId(9), min: 20.0, max: 20_000.0 };
+        let target = ResolvedTarget {
+            id: ParamId(9),
+            min: 20.0,
+            max: 20_000.0,
+        };
         let (mut p, seen) = harness(vec![(0, target)]);
         let mut values = vec![0.0; crate::slots::SLOT_COUNT];
         values[0] = 0.5;
@@ -441,7 +562,11 @@ mod tests {
         // Sending 32 redundant events every block would waste the sub-plugin's
         // parameter queue and, worse, retrigger smoothing on plugins that ramp
         // on every incoming point.
-        let target = ResolvedTarget { id: ParamId(1), min: 0.0, max: 1.0 };
+        let target = ResolvedTarget {
+            id: ParamId(1),
+            min: 0.0,
+            max: 1.0,
+        };
         let (mut p, seen) = harness(vec![(0, target)]);
         let values = vec![0.25; crate::slots::SLOT_COUNT];
 
@@ -449,7 +574,11 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1, "first block must send");
 
         run(&mut p, &values);
-        assert_eq!(seen.lock().unwrap().len(), 1, "unchanged slot should send nothing");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "unchanged slot should send nothing"
+        );
 
         let mut moved = values.clone();
         moved[0] = 0.75;
@@ -459,14 +588,22 @@ mod tests {
 
     #[test]
     fn reset_forces_the_next_block_to_resend() {
-        let target = ResolvedTarget { id: ParamId(1), min: 0.0, max: 1.0 };
+        let target = ResolvedTarget {
+            id: ParamId(1),
+            min: 0.0,
+            max: 1.0,
+        };
         let (mut p, seen) = harness(vec![(0, target)]);
         let values = vec![0.25; crate::slots::SLOT_COUNT];
 
         run(&mut p, &values);
         p.reset();
         run(&mut p, &values);
-        assert_eq!(seen.lock().unwrap().len(), 2, "state after reset cannot be assumed");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "state after reset cannot be assumed"
+        );
     }
 
     #[test]
@@ -474,6 +611,91 @@ mod tests {
         let (mut p, seen) = harness(Vec::new());
         run(&mut p, &vec![0.5; crate::slots::SLOT_COUNT]);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_moving_slot_is_sent_once_per_sub_block_with_an_offset() {
+        // The point of §9.2: a value that changes within a block reaches the
+        // sub-plugin as several timed events, not as one at offset zero.
+        let target = ResolvedTarget {
+            id: ParamId(3),
+            min: 0.0,
+            max: 1.0,
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+
+        let mut schedule = SlotSchedule::new(128, 32);
+        let blocks = schedule.begin(128);
+        assert_eq!(blocks, 4);
+        for i in 0..blocks {
+            schedule.block_mut(i)[0] = i as f64 / 4.0;
+        }
+        run_scheduled(&mut p, &schedule, &[]);
+
+        let events = seen.lock().unwrap().clone();
+        let offsets: Vec<u32> = events.iter().map(|e| e.sample_offset()).collect();
+        assert_eq!(offsets, vec![0, 32, 64, 96]);
+    }
+
+    #[test]
+    fn a_slot_that_does_not_move_within_a_block_still_sends_once() {
+        let target = ResolvedTarget {
+            id: ParamId(3),
+            min: 0.0,
+            max: 1.0,
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+
+        let mut schedule = SlotSchedule::new(128, 32);
+        schedule.begin(128);
+        schedule.fill(&vec![0.5; crate::slots::SLOT_COUNT]);
+        run_scheduled(&mut p, &schedule, &[]);
+
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "four identical sub-blocks are one event"
+        );
+    }
+
+    #[test]
+    fn the_merged_stream_stays_sorted_by_offset() {
+        let target = ResolvedTarget {
+            id: ParamId(3),
+            min: 0.0,
+            max: 1.0,
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+
+        let mut schedule = SlotSchedule::new(128, 32);
+        let blocks = schedule.begin(128);
+        for i in 0..blocks {
+            schedule.block_mut(i)[0] = i as f64 / 4.0;
+        }
+        let notes = [
+            Event::Note(plugin_host_api::NoteEvent::NoteOn {
+                note_id: 1,
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity: 1.0,
+                sample_offset: 40,
+            }),
+            Event::Note(plugin_host_api::NoteEvent::NoteOff {
+                note_id: 1,
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity: 0.0,
+                sample_offset: 100,
+            }),
+        ];
+        run_scheduled(&mut p, &schedule, &notes);
+
+        let events = seen.lock().unwrap().clone();
+        let offsets: Vec<u32> = events.iter().map(|e| e.sample_offset()).collect();
+        assert_eq!(offsets, vec![0, 32, 40, 64, 96, 100]);
+        assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]
@@ -492,6 +714,16 @@ mod tests {
         };
         table.bind(5, "CID", &param);
         let targets = table.active_targets();
-        assert_eq!(targets, vec![(5, ResolvedTarget { id: ParamId(42), min: 0.0, max: 10.0 })]);
+        assert_eq!(
+            targets,
+            vec![(
+                5,
+                ResolvedTarget {
+                    id: ParamId(42),
+                    min: 0.0,
+                    max: 10.0
+                }
+            )]
+        );
     }
 }

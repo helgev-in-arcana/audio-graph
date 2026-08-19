@@ -59,7 +59,11 @@ pub fn render(
     let (plugin_in, plugin_out) = plugin.bus_channel_counts();
     // An instrument reports no input bus; feeding it one would fail bus setup.
     let input_channels = plugin_in.min(input.channels);
-    let output_channels = if plugin_out == 0 { 2 } else { plugin_out.min(2) };
+    let output_channels = if plugin_out == 0 {
+        2
+    } else {
+        plugin_out.min(2)
+    };
 
     let config = AudioConfig {
         sample_rate: input.sample_rate,
@@ -78,7 +82,10 @@ pub fn render(
     let mut sink = EventSink::with_capacity(256);
     let mut block_events: Vec<Event> = Vec::with_capacity(256);
 
-    let mut context = TimeContext { playing: true, ..Default::default() };
+    let mut context = TimeContext {
+        playing: true,
+        ..Default::default()
+    };
     let mut position = 0usize;
     let mut blocks = 0usize;
 
@@ -141,15 +148,44 @@ pub fn render(
 
 fn offset_event(event: Event, sample_offset: u32) -> Event {
     match event {
-        Event::Note(NoteEvent::NoteOn { note_id, port, channel, key, velocity, .. }) => {
-            Event::Note(NoteEvent::NoteOn { note_id, port, channel, key, velocity, sample_offset })
-        }
-        Event::Note(NoteEvent::NoteOff { note_id, port, channel, key, velocity, .. }) => {
-            Event::Note(NoteEvent::NoteOff { note_id, port, channel, key, velocity, sample_offset })
-        }
-        Event::Param(plugin_host_api::ParamEvent::SetValue { id, target, value, .. }) => {
-            Event::Param(plugin_host_api::ParamEvent::SetValue { id, target, value, sample_offset })
-        }
+        Event::Note(NoteEvent::NoteOn {
+            note_id,
+            port,
+            channel,
+            key,
+            velocity,
+            ..
+        }) => Event::Note(NoteEvent::NoteOn {
+            note_id,
+            port,
+            channel,
+            key,
+            velocity,
+            sample_offset,
+        }),
+        Event::Note(NoteEvent::NoteOff {
+            note_id,
+            port,
+            channel,
+            key,
+            velocity,
+            ..
+        }) => Event::Note(NoteEvent::NoteOff {
+            note_id,
+            port,
+            channel,
+            key,
+            velocity,
+            sample_offset,
+        }),
+        Event::Param(plugin_host_api::ParamEvent::SetValue {
+            id, target, value, ..
+        }) => Event::Param(plugin_host_api::ParamEvent::SetValue {
+            id,
+            target,
+            value,
+            sample_offset,
+        }),
         other => other,
     }
 }

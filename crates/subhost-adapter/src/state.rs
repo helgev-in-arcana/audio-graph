@@ -38,6 +38,23 @@ pub struct WrapperState {
     /// Base64 rather than raw bytes because this lives inside a JSON document
     /// that nice-plug persists as a string field.
     pub sub_state: Option<String>,
+    /// The node graph (§9), as its own JSON value.
+    ///
+    /// Held opaquely rather than as a `Graph` so that this crate — which is
+    /// about nesting one plugin inside another and knows nothing about node
+    /// graphs — does not grow a dependency on the engine to describe a field it
+    /// only ever passes through. It also means a project saved by a newer
+    /// version survives a round trip through an older one instead of losing the
+    /// patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<serde_json::Value>,
+    /// Sub-block size for modulation, in samples (§9.2).
+    #[serde(default = "default_sub_block")]
+    pub sub_block: u32,
+}
+
+fn default_sub_block() -> u32 {
+    crate::schedule::DEFAULT_QUANTUM
 }
 
 /// Current layout version.
@@ -45,7 +62,14 @@ pub const STATE_VERSION: u32 = 1;
 
 impl WrapperState {
     pub fn new(slots: Vec<Slot>) -> WrapperState {
-        WrapperState { version: STATE_VERSION, slots, sub_plugin: None, sub_state: None }
+        WrapperState {
+            version: STATE_VERSION,
+            slots,
+            sub_plugin: None,
+            sub_state: None,
+            graph: None,
+            sub_block: default_sub_block(),
+        }
     }
 
     pub fn set_sub_state(&mut self, bytes: &[u8]) {
@@ -60,17 +84,28 @@ impl WrapperState {
 /// Minimal standard base64. Written out rather than taken as a dependency:
 /// it is thirty lines, and this is the only place the project needs it.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
         out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
         out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -137,7 +172,10 @@ mod tests {
         let back: WrapperState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(back, state);
-        assert_eq!(back.sub_state_bytes().unwrap(), vec![0, 1, 2, 253, 254, 255]);
+        assert_eq!(
+            back.sub_state_bytes().unwrap(),
+            vec![0, 1, 2, 253, 254, 255]
+        );
     }
 
     #[test]
@@ -156,6 +194,29 @@ mod tests {
         // not as a chunk of wrong bytes handed to a third-party plugin.
         assert_eq!(base64_decode("!!!!"), None);
         assert_eq!(base64_decode("abc"), None);
+    }
+
+    #[test]
+    fn a_state_written_before_the_graph_existed_still_loads() {
+        // Projects saved by M3 and M4 have no `graph` and no `sub_block`. They
+        // must open with an empty graph and the default rate, not fail.
+        let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null}"#;
+        let state: WrapperState = serde_json::from_str(json).unwrap();
+        assert!(state.graph.is_none());
+        assert_eq!(state.sub_block, crate::schedule::DEFAULT_QUANTUM);
+    }
+
+    #[test]
+    fn a_graph_saved_by_a_newer_version_survives_a_round_trip() {
+        // The field is opaque here on purpose: this crate must not be the
+        // reason a patch is lost when versions disagree.
+        let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null,
+                       "graph":{"nodes":[{"kind":"SomethingFromTheFuture"}]},"sub_block":64}"#;
+        let state: WrapperState = serde_json::from_str(json).unwrap();
+        let back: WrapperState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.graph, state.graph);
+        assert_eq!(back.sub_block, 64);
     }
 
     #[test]

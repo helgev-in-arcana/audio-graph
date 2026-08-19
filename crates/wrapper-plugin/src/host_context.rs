@@ -64,7 +64,10 @@ impl HostContext for WrapperHostContext {
         // forwarding it would create automation the user never asked for.
         // Logged rather than dropped silently, because it is genuinely useful
         // when working out why a value did not stick.
-        log::trace!("sub-plugin edited param {} to {plain} (not forwarded)", id.0);
+        log::trace!(
+            "sub-plugin edited param {} to {plain} (not forwarded)",
+            id.0
+        );
     }
 }
 

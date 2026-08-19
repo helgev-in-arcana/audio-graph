@@ -96,7 +96,11 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("the output needs a name ending in .vst3")?;
-    let arch = if cfg!(target_arch = "x86_64") { "x86_64-win" } else { "arm64-win" };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64-win"
+    } else {
+        "arm64-win"
+    };
     let contents = out.join("Contents").join(arch);
 
     // Replaced wholesale: a stale binary next to a fresh one is the kind of
@@ -123,7 +127,11 @@ fn cmd_dirs() -> Result<(), String> {
 /// directories when none are given.
 fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
     // Flags are not paths.
-    let args: Vec<String> = args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
     let dirs: Vec<PathBuf> = if args.is_empty() {
         default_plugin_directories()
     } else {
@@ -166,7 +174,11 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
                     Ok(list) => {
                         for c in &list {
                             classes += 1;
-                            let kind = if c.is_instrument() { "instrument" } else { "fx" };
+                            let kind = if c.is_instrument() {
+                                "instrument"
+                            } else {
+                                "fx"
+                            };
                             println!("  [{kind}] {} ({})", c.name, c.subcategories);
                             println!("        cid {} v{}", c.cid, c.version);
                         }
@@ -224,12 +236,17 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 /// M0's leak check: repeated load/unload must not grow or crash.
 fn cmd_churn(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("expected a path")?;
-    let iterations: usize = args.get(1).map_or(Ok(1000), |s| s.parse()).map_err(|_| "bad count")?;
+    let iterations: usize = args
+        .get(1)
+        .map_or(Ok(1000), |s| s.parse())
+        .map_err(|_| "bad count")?;
     let path = Path::new(path);
 
     for i in 0..iterations {
         let module = Module::open(path).map_err(|e| format!("iteration {i}: {e}"))?;
-        let classes = module.classes().map_err(|e| format!("iteration {i}: {e}"))?;
+        let classes = module
+            .classes()
+            .map_err(|e| format!("iteration {i}: {e}"))?;
         if classes.is_empty() {
             return Err(format!("iteration {i}: no classes"));
         }
@@ -267,7 +284,11 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
         // The module is the VST3 unit the parameter sits in — the tree a DAW
         // shows when picking an automation lane. Printed because an accidental
         // extra level there is invisible from the parameter list alone (§8.1).
-        let module = if p.module.is_empty() { String::new() } else { format!("  <{}>", p.module) };
+        let module = if p.module.is_empty() {
+            String::new()
+        } else {
+            format!("  <{}>", p.module)
+        };
         println!(
             "  {:>8}  {:<28} {:>12.4} [{:.4} .. {:.4}]  {}{}",
             p.id.0, p.name, current, p.min, p.max, text, module
@@ -307,7 +328,11 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
     let sample_rate = 48_000.0;
     let frames = (sample_rate * 3.0) as usize;
     let input = wav::Audio::silence(sample_rate, 2, frames);
-    let events = render::note(60, (sample_rate * 0.1) as usize, (sample_rate * 2.0) as usize);
+    let events = render::note(
+        60,
+        (sample_rate * 0.1) as usize,
+        (sample_rate * 2.0) as usize,
+    );
 
     let outcome = render::render(
         Path::new(path),
@@ -379,8 +404,10 @@ fn cmd_state(args: &[String]) -> Result<(), String> {
     Err(format!(
         "no parameter round-tripped; tried:
   {}",
-        rejected.join("
-  ")
+        rejected.join(
+            "
+  "
+        )
     ))
 }
 
@@ -394,7 +421,8 @@ fn state_round_trip(
 ) -> Result<String, String> {
     use vst3_host::Vst3Plugin;
 
-    let mut first = Vst3Plugin::create(module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    let mut first =
+        Vst3Plugin::create(module, class.cid, host.clone()).map_err(|e| e.to_string())?;
     let before = first.snapshot().get(target.id).unwrap_or(target.default);
 
     // Move to whichever end is further away, so the check cannot pass because
@@ -404,7 +432,9 @@ fn state_round_trip(
     } else {
         target.max
     };
-    first.set_param(target.id, wanted).map_err(|e| e.to_string())?;
+    first
+        .set_param(target.id, wanted)
+        .map_err(|e| e.to_string())?;
 
     // VST3 keeps the processor and the controller apart, and an edit only
     // reaches the processor through the change list in `process`. Saving
@@ -415,7 +445,9 @@ fn state_round_trip(
     let saved = first.snapshot().get(target.id).unwrap_or(f64::NAN);
     let span = (target.max - target.min).abs().max(1e-9);
     if (saved - wanted).abs() > span * 1e-3 {
-        return Err(format!("write did not stick (asked {wanted}, reads {saved})"));
+        return Err(format!(
+            "write did not stick (asked {wanted}, reads {saved})"
+        ));
     }
 
     let blob = first.save_state().map_err(|e| e.to_string())?;
@@ -493,9 +525,7 @@ fn writable_params(plugin: &vst3_host::Vst3Plugin) -> Vec<plugin_host_api::Param
         .collect()
 }
 
-fn pick_writable_param(
-    plugin: &vst3_host::Vst3Plugin,
-) -> Option<plugin_host_api::ParamInfo> {
+fn pick_writable_param(plugin: &vst3_host::Vst3Plugin) -> Option<plugin_host_api::ParamInfo> {
     writable_params(plugin).into_iter().next()
 }
 
@@ -505,8 +535,8 @@ fn pick_writable_param(
 /// Rendering twice and diffing is the only way to see this from outside: the
 /// plugin is a black box, so the evidence is *where* the two renders diverge.
 fn cmd_automate(args: &[String]) -> Result<(), String> {
-    use std::sync::Arc;
     use plugin_host_api::{Event, ParamEvent, Target};
+    use std::sync::Arc;
     use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a plugin path")?;
@@ -537,12 +567,17 @@ fn cmd_automate(args: &[String]) -> Result<(), String> {
     const BLOCK: u32 = 512;
     const SWITCH_AT: usize = 1000;
 
-    let hold = |value: f64| vec![(0usize, Event::Param(ParamEvent::SetValue {
-        id: target.id,
-        target: Target::Global,
-        value,
-        sample_offset: 0,
-    }))];
+    let hold = |value: f64| {
+        vec![(
+            0usize,
+            Event::Param(ParamEvent::SetValue {
+                id: target.id,
+                target: Target::Global,
+                value,
+                sample_offset: 0,
+            }),
+        )]
+    };
 
     let baseline = render::render(Path::new(path), cid, &input, BLOCK, &hold(target.min))?;
 
@@ -611,7 +646,10 @@ fn cmd_twice(args: &[String]) -> Result<(), String> {
     use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a path")?;
-    let count: usize = args.get(1).map_or(Ok(3), |s| s.parse()).map_err(|_| "bad count")?;
+    let count: usize = args
+        .get(1)
+        .map_or(Ok(3), |s| s.parse())
+        .map_err(|_| "bad count")?;
     let module = Module::open(path).map_err(|e| e.to_string())?;
     let class = render::choose_class(&module, None)?;
     let host = Arc::new(host::CliHost::new());
@@ -620,7 +658,10 @@ fn cmd_twice(args: &[String]) -> Result<(), String> {
         eprintln!("[instance {i}] creating");
         let plugin = Vst3Plugin::create(&module, class.cid, host.clone())
             .map_err(|e| format!("instance {i}: {e}"))?;
-        eprintln!("[instance {i}] {} params", SubPluginMain::params(&plugin).len());
+        eprintln!(
+            "[instance {i}] {} params",
+            SubPluginMain::params(&plugin).len()
+        );
         drop(plugin);
         eprintln!("[instance {i}] dropped");
     }
@@ -697,12 +738,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 /// The second order is the one that matters: some DAWs terminate a plugin
 /// without ever sending a close notification, so correctness cannot depend on
 /// a caller remembering to close the editor first.
-fn probe_editor(
-    path: &str,
-    cid: vst3_host::Cid,
-    name: &str,
-    reverse: bool,
-) -> Result<(), String> {
+fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> Result<(), String> {
     use std::sync::Arc;
     use subhost_adapter::SubHost;
 
@@ -733,7 +769,11 @@ fn probe_editor(
     }
     vst3_host_view::pump_events();
 
-    let order = if reverse { "instance dropped with editor open" } else { "editor closed first" };
+    let order = if reverse {
+        "instance dropped with editor open"
+    } else {
+        "editor closed first"
+    };
     println!("{name} | editor ok ({order})");
     Ok(())
 }
@@ -759,12 +799,20 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
     let mut problems = Vec::new();
 
     for path in &modules {
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         // Each requested mode is its own child process, so a plugin that
         // crashes in one still reports its result for the others.
         let mut modes: Vec<Vec<String>> = vec![Vec::new()];
         if args.iter().any(|a| a == "--gui") {
-            modes = vec![vec!["--gui".into()], vec!["--gui-reverse".into()], Vec::new()];
+            modes = vec![
+                vec!["--gui".into()],
+                vec!["--gui-reverse".into()],
+                Vec::new(),
+            ];
         }
 
         let mut all_ok = true;
@@ -798,12 +846,19 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
         }
     }
 
-    println!("
-{ok} module(s) passed, {} problem(s)", problems.len());
+    println!(
+        "
+{ok} module(s) passed, {} problem(s)",
+        problems.len()
+    );
     for p in &problems {
         println!("  !! {p}");
     }
-    if problems.is_empty() { Ok(()) } else { Err("sweep found problems".into()) }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err("sweep found problems".into())
+    }
 }
 
 /// M3's project-reopen check: does the wrapper's state carry its sub-plugin?
@@ -823,7 +878,8 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
 
     // The first instance picks up its sub-plugin however it can — in
     // development that is AUDIO_GRAPH_SUB, since there is no editor yet.
-    let mut first = Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    let mut first =
+        Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
     run_one_block(&mut first)?;
     let blob = first.save_state().map_err(|e| e.to_string())?;
     drop(first);
@@ -904,7 +960,10 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     if sub.editor_is_open() {
         println!("held open for {:.1}s", started.elapsed().as_secs_f64());
     } else {
-        println!("the editor closed itself after {:.1}s", started.elapsed().as_secs_f64());
+        println!(
+            "the editor closed itself after {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     if reverse {

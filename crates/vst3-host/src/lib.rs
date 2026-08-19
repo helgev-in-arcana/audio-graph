@@ -43,7 +43,12 @@ pub fn default_plugin_directories() -> Vec<std::path::PathBuf> {
             dirs.push(std::path::PathBuf::from(pf).join("VST3"));
         }
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            dirs.push(std::path::PathBuf::from(local).join("Programs").join("Common").join("VST3"));
+            dirs.push(
+                std::path::PathBuf::from(local)
+                    .join("Programs")
+                    .join("Common")
+                    .join("VST3"),
+            );
         }
     }
 

@@ -61,7 +61,9 @@ impl Library {
         let names = ["ModuleEntry"];
 
         for name in names {
-            let Some(sym) = self.lookup(name) else { continue };
+            let Some(sym) = self.lookup(name) else {
+                continue;
+            };
 
             let ok = unsafe {
                 #[cfg(target_os = "windows")]
@@ -76,8 +78,7 @@ impl Library {
                     // macOS; plugins use it only to locate their own resources
                     // and tolerate null, which is what a dlopen-based loader
                     // can offer.
-                    let f: extern "C" fn(*mut std::ffi::c_void) -> bool =
-                        std::mem::transmute(sym);
+                    let f: extern "C" fn(*mut std::ffi::c_void) -> bool = std::mem::transmute(sym);
                     f(std::ptr::null_mut())
                 }
             };
@@ -179,18 +180,17 @@ fn resolve_binary(path: &Path) -> Result<PathBuf, HostError> {
     }
 
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(&contents)
-        .map_err(|e| {
-            HostError::ModuleLoad(format!("cannot read {}: {e}", contents.display()))
-        })?
+        .map_err(|e| HostError::ModuleLoad(format!("cannot read {}: {e}", contents.display())))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.is_file())
         .collect();
     candidates.sort();
 
-    candidates.into_iter().next().ok_or_else(|| {
-        HostError::ModuleLoad(format!("no binary found in {}", contents.display()))
-    })
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| HostError::ModuleLoad(format!("no binary found in {}", contents.display())))
 }
 
 /// Where a `moduleinfo.json` would live for this path, if the plugin ships one.
@@ -212,7 +212,7 @@ mod imp {
     use plugin_host_api::HostError;
     use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
     use windows_sys::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
+        GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
     };
 
     pub struct Handle(HMODULE);
@@ -230,7 +230,11 @@ mod imp {
             // it in the bundle, resolve without polluting the host's own search
             // order.
             let h = unsafe {
-                LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), LOAD_WITH_ALTERED_SEARCH_PATH)
+                LoadLibraryExW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_WITH_ALTERED_SEARCH_PATH,
+                )
             };
             if h.is_null() {
                 let err = std::io::Error::last_os_error();

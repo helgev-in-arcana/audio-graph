@@ -115,7 +115,8 @@ mod tests {
     #[test]
     fn access_from_another_thread_panics_rather_than_corrupting() {
         let v = MainThread::new(String::from("controller"));
-        let result = std::thread::scope(|s| s.spawn(|| std::panic::catch_unwind(|| v.get())).join());
+        let result =
+            std::thread::scope(|s| s.spawn(|| std::panic::catch_unwind(|| v.get())).join());
         let inner = result.expect("thread joined");
         assert!(inner.is_err(), "expected a panic on the wrong thread");
     }

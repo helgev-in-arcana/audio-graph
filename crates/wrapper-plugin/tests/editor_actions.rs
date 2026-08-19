@@ -67,7 +67,9 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
         if tried >= CANDIDATES {
             break;
         }
-        let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         if AVOID.iter().any(|a| name.contains(a)) {
             continue;
         }
@@ -76,10 +78,10 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
 
         let params = WrapperParams::new();
         let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
-        if shared.lock().load(&path).is_err() {
+        if shared.load(&path).is_err() {
             continue;
         }
-        if !shared.lock().host.params().is_empty() {
+        if !shared.main().host.params().is_empty() {
             return Some((path, shared));
         }
     }
@@ -106,7 +108,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 
     // The DAW has activated us, so the editor's later loads have a
     // configuration to activate against.
-    shared.lock().config = Some(AudioConfig {
+    shared.main().config = Some(AudioConfig {
         sample_rate: 48_000.0,
         max_block_size: 512,
         input_channels: 2,
@@ -122,33 +124,36 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     assert!(installed > 0, "the plugin list would be empty");
 
     // Clicking an entry in that list.
-    shared.lock().load(&path).expect("reload from the list");
-    assert!(shared.lock().host.is_loaded());
+    shared.load(&path).expect("reload from the list");
+    assert!(shared.main().host.is_loaded());
     assert!(
-        shared.lock().processor.is_some(),
+        shared.audio().processor.is_some(),
         "a load while the DAW is running has to leave the sub-plugin processing; \
          otherwise picking a plugin mid-session silently mutes the track"
     );
 
     // Clicking a parameter row: bind, then re-activate so the processor picks
     // the new target up.
-    let first = shared.lock().host.params()[0].clone();
-    {
-        let mut state = shared.lock();
-        state.host.bind_slot(0, first.id).expect("bind");
-        state.rebind().expect("rebind");
-    }
+    let first = shared.main().host.params()[0].clone();
+    shared.main().host.bind_slot(0, first.id).expect("bind");
+    shared.rebind().expect("rebind");
     assert!(
-        shared.lock().host.slots().resolved(0).is_some(),
+        shared.main().host.slots().resolved(0).is_some(),
         "the binding has to resolve against the plugin it was just made from"
     );
-    assert!(shared.lock().processor.is_some(), "still processing after a rebind");
+    assert!(
+        shared.audio().processor.is_some(),
+        "still processing after a rebind"
+    );
 
     // Every edit writes the state back, so the DAW always has something current
     // to save.
     shared.store_state();
     let saved = shared.params().state.0.read().unwrap().clone();
-    assert!(saved.contains(&first.name), "the binding is missing from the saved state");
+    assert!(
+        saved.contains(&first.name),
+        "the binding is missing from the saved state"
+    );
 
     // The "Open plugin GUI" button is deliberately *not* exercised here.
     // Opening a real editor needs somebody pumping the Win32 message loop, and
@@ -157,19 +162,167 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     // every installed plugin, in both teardown orders, one child process each.
 
     // "x" on a slot row.
-    {
-        let mut state = shared.lock();
-        state.host.slots_mut().clear(0);
-        state.rebind().expect("rebind after clearing");
-    }
-    assert!(shared.lock().host.slots().resolved(0).is_none());
+    shared.main().host.slots_mut().clear(0);
+    shared.rebind().expect("rebind after clearing");
+    assert!(shared.main().host.slots().resolved(0).is_none());
 
     // "Unload".
-    shared.lock().unload();
-    assert!(!shared.lock().host.is_loaded());
+    shared.unload();
+    assert!(!shared.main().host.is_loaded());
     assert!(
-        shared.lock().processor.is_none(),
+        shared.audio().processor.is_none(),
         "unloading has to take the processor with it, or the audio thread keeps \
          a processor whose plugin is gone"
+    );
+}
+
+/// The other half of what the editor does now: build a graph, publish it, and
+/// check the audio thread ends up driving the slot instead of the DAW.
+///
+/// Needs no plugin: everything from the canvas down to the compiled program is
+/// format-agnostic, which is the point of §9.
+#[test]
+fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
+    use wrapper_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
+
+    let params = WrapperParams::new();
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
+
+    // Dropping three nodes on the canvas and wiring them up.
+    {
+        let mut state = shared.main();
+        let lfo = state.graph.add(
+            NodeKind::Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(2.0),
+                phase: 0.0,
+                depth: 0.5,
+                offset: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let half = state.graph.add(
+            NodeKind::Math {
+                op: MathOp::Multiply,
+                b: 0.5,
+            },
+            [200.0, 0.0],
+        );
+        let out = state.graph.add(NodeKind::SlotOut { slot: 4 }, [400.0, 0.0]);
+        state.graph.connect(lfo, half, 0);
+        state.graph.connect(half, out, 0);
+    }
+    shared.publish_graph();
+    assert!(
+        shared.main().compile_error.is_none(),
+        "a valid graph must compile"
+    );
+
+    // The audio thread's side of the hand-off.
+    let mut engine = Engine::new();
+    assert!(
+        engine.adopt(shared.programs()),
+        "the program has to arrive without a lock"
+    );
+    assert!(engine.drives(4));
+    assert!(!engine.drives(5), "an untouched slot stays the DAW's");
+
+    let mut slots = vec![0.9; subhost_adapter::SLOT_COUNT];
+    let mut lowest = f64::INFINITY;
+    let mut highest = f64::NEG_INFINITY;
+    for _ in 0..2000 {
+        slots[4] = 0.9;
+        engine.run(
+            &BlockContext {
+                sample_rate: 48_000.0,
+                tempo_bpm: 120.0,
+                frames: 32,
+            },
+            &mut slots,
+        );
+        lowest = lowest.min(slots[4]);
+        highest = highest.max(slots[4]);
+    }
+    assert!(
+        highest > 0.45 && lowest < 0.05,
+        "the slot should sweep 0..0.5, got {lowest}..{highest}"
+    );
+    assert_eq!(
+        slots[5], 0.9,
+        "the graph must not touch a slot it does not drive"
+    );
+
+    // A graph the user has broken keeps the working program running.
+    {
+        let mut state = shared.main();
+        let a = state.graph.add(
+            NodeKind::Math {
+                op: MathOp::Add,
+                b: 0.0,
+            },
+            [0.0, 200.0],
+        );
+        let b = state.graph.add(
+            NodeKind::Math {
+                op: MathOp::Add,
+                b: 0.0,
+            },
+            [0.0, 300.0],
+        );
+        let out = state.graph.add(NodeKind::SlotOut { slot: 6 }, [0.0, 400.0]);
+        state.graph.connect(a, b, 0);
+        state.graph.connect(b, a, 0);
+        state.graph.connect(b, out, 0);
+    }
+    shared.publish_graph();
+    assert!(
+        shared.main().compile_error.is_some(),
+        "a cycle has to be reported"
+    );
+    assert!(
+        !engine.adopt(shared.programs()),
+        "nothing new should have been published"
+    );
+    assert!(
+        engine.drives(4),
+        "the last program that compiled keeps running"
+    );
+}
+
+/// The graph has to survive being saved and reopened, including when the
+/// sub-plugin it was built against is not there (§8.3).
+#[test]
+fn a_graph_survives_the_state_round_trip() {
+    use wrapper_engine::{Graph, NodeKind};
+
+    let params = WrapperParams::new();
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params.clone());
+    shared.set_quantum(64);
+    {
+        let mut state = shared.main();
+        let c = state
+            .graph
+            .add(NodeKind::Constant { value: 0.25 }, [10.0, 20.0]);
+        let out = state
+            .graph
+            .add(NodeKind::SlotOut { slot: 2 }, [210.0, 20.0]);
+        state.graph.connect(c, out, 0);
+    }
+    shared.store_state();
+
+    let json = params.state.0.read().unwrap().clone();
+    let saved: subhost_adapter::WrapperState = serde_json::from_str(&json).unwrap();
+    assert_eq!(saved.sub_block, 64);
+
+    let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
+    assert_eq!(restored, shared.main().graph);
+    assert_eq!(
+        restored.nodes[0].pos,
+        [10.0, 20.0],
+        "positions are part of the patch"
+    );
+    assert!(
+        saved.sub_plugin.is_none(),
+        "a graph does not need a sub-plugin to be saved"
     );
 }

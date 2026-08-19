@@ -7,7 +7,10 @@
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
-    default_plugin_directories().iter().flat_map(|d| find_modules(d)).collect()
+    default_plugin_directories()
+        .iter()
+        .flat_map(|d| find_modules(d))
+        .collect()
 }
 
 #[test]
@@ -44,8 +47,16 @@ fn every_installed_module_loads_and_enumerates() {
         }
     }
 
-    assert!(failures.is_empty(), "modules failed to load:\n{}", failures.join("\n"));
-    assert!(audio_classes > 0, "no audio module classes found across {} modules", modules.len());
+    assert!(
+        failures.is_empty(),
+        "modules failed to load:\n{}",
+        failures.join("\n")
+    );
+    assert!(
+        audio_classes > 0,
+        "no audio module classes found across {} modules",
+        modules.len()
+    );
 }
 
 #[test]
@@ -64,9 +75,14 @@ fn repeated_load_unload_is_stable() {
     };
 
     for i in 0..50 {
-        let Ok(m) = Module::open(&path) else { panic!("cycle {i}: load failed") };
+        let Ok(m) = Module::open(&path) else {
+            panic!("cycle {i}: load failed")
+        };
         let classes = m.classes().unwrap_or_else(|e| panic!("cycle {i}: {e}"));
-        assert_eq!(classes, first, "cycle {i}: class list changed across reloads");
+        assert_eq!(
+            classes, first,
+            "cycle {i}: class list changed across reloads"
+        );
     }
 }
 

@@ -113,7 +113,12 @@ pub fn read(path: &Path) -> Result<Audio, String> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        _ => return Err(format!("{}: unsupported format {format} / {bits}-bit", path.display())),
+        _ => {
+            return Err(format!(
+                "{}: unsupported format {format} / {bits}-bit",
+                path.display()
+            ));
+        }
     };
 
     let frames = interleaved.len() / channels as usize;
@@ -124,7 +129,12 @@ pub fn read(path: &Path) -> Result<Audio, String> {
         }
     }
 
-    Ok(Audio { sample_rate, channels, samples, frames })
+    Ok(Audio {
+        sample_rate,
+        channels,
+        samples,
+        frames,
+    })
 }
 
 /// Write 32-bit float WAVE, so a render round-trip loses nothing.
@@ -154,8 +164,8 @@ pub fn write(path: &Path, audio: &Audio) -> Result<(), String> {
         }
     }
 
-    let mut file =
-        std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    file.write_all(&out).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(&out)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(())
 }

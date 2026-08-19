@@ -10,10 +10,10 @@
 //!   document. `activate` hands out the processor by value; you cannot hold one
 //!   without having activated.
 
+use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
 use crate::events::{Event, EventSink, TimeContext};
 use crate::params::{Capabilities, ParamId, ParamInfo, ParamSnapshot};
-use crate::Result;
 
 /// What the sub-plugin reported about its output for this block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

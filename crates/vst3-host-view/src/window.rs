@@ -167,22 +167,37 @@ mod imp {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-        DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW, LoadCursorW,
-        MSG, PM_REMOVE, PeekMessageW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_CLOSE, WM_NCCREATE,
-        WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOMOVE,
-        SWP_NOZORDER, GetSystemMetrics, GetAncestor, GA_ROOT,
+        DestroyWindow, DispatchMessageW, GA_ROOT, GWLP_USERDATA, GetAncestor, GetSystemMetrics,
+        GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
+        SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW,
+        SetWindowPos, ShowWindow, TranslateMessage, WM_CLOSE, WM_NCCREATE, WM_SIZE, WNDCLASSEXW,
+        WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
     };
-    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 
     use super::{Size, WindowState};
 
     const CLASS_NAME: &[u16] = &[
-        b'A' as u16, b'u' as u16, b'd' as u16, b'i' as u16, b'o' as u16, b'G' as u16, b'r' as u16,
-        b'a' as u16, b'p' as u16, b'h' as u16, b'S' as u16, b'u' as u16, b'b' as u16, b'V' as u16,
-        b'i' as u16, b'e' as u16, b'w' as u16, 0,
+        b'A' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'G' as u16,
+        b'r' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b'h' as u16,
+        b'S' as u16,
+        b'u' as u16,
+        b'b' as u16,
+        b'V' as u16,
+        b'i' as u16,
+        b'e' as u16,
+        b'w' as u16,
+        0,
     ];
 
     /// Registering the same class twice fails, and a plugin may be instantiated
@@ -250,7 +265,10 @@ mod imp {
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
             let (x, y) = if screen_w > 0 && screen_h > 0 {
-                (((screen_w - width) / 2).max(0), ((screen_h - height) / 2).max(0))
+                (
+                    ((screen_w - width) / 2).max(0),
+                    ((screen_h - height) / 2).max(0),
+                )
             } else {
                 (CW_USEDEFAULT, CW_USEDEFAULT)
             };
@@ -288,7 +306,10 @@ mod imp {
                 ));
             }
 
-            Ok(Window { hwnd: Cell::new(hwnd), _state: state })
+            Ok(Window {
+                hwnd: Cell::new(hwnd),
+                _state: state,
+            })
         }
 
         pub fn handle(&self) -> *mut c_void {
@@ -471,8 +492,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_window_can_be_created_and_dropped() {
-        let window =
-            ContainerWindow::new("test", Size::new(320, 240), std::ptr::null_mut()).expect("create");
+        let window = ContainerWindow::new("test", Size::new(320, 240), std::ptr::null_mut())
+            .expect("create");
         assert!(!window.platform_handle().is_null());
         assert!(!window.close_requested());
         window.pump_events();

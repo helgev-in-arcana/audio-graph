@@ -17,9 +17,9 @@ use std::sync::Arc;
 
 use plugin_host_api::HostContext;
 use vst3::Steinberg::Vst::{
-    IAttributeList, IAttributeListTrait, IAttributeList_iid, IComponentHandler,
-    IComponentHandlerTrait, IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait,
-    IMessage_iid, ParamID, ParamValue, String128, TChar,
+    IAttributeList, IAttributeList_iid, IAttributeListTrait, IComponentHandler,
+    IComponentHandlerTrait, IHostApplication, IHostApplicationTrait, IMessage, IMessage_iid,
+    IMessageTrait, ParamID, ParamValue, String128, TChar,
 };
 use vst3::Steinberg::{
     TUID, char16, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue,
@@ -57,7 +57,12 @@ impl IHostApplicationTrait for HostApplication {
         kResultOk
     }
 
-    unsafe fn createInstance(&self, cid: *mut TUID, iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+    unsafe fn createInstance(
+        &self,
+        cid: *mut TUID,
+        iid: *mut TUID,
+        obj: *mut *mut c_void,
+    ) -> tresult {
         if cid.is_null() || iid.is_null() || obj.is_null() {
             return kInvalidArgument;
         }
@@ -120,7 +125,10 @@ impl HostAttributeList {
         if id.is_null() {
             return None;
         }
-        unsafe { CStr::from_ptr(id) }.to_str().ok().map(|s| s.to_owned())
+        unsafe { CStr::from_ptr(id) }
+            .to_str()
+            .ok()
+            .map(|s| s.to_owned())
     }
 }
 
@@ -184,7 +192,9 @@ impl IAttributeListTrait for HostAttributeList {
                 p = p.add(1);
             }
         }
-        self.attrs.borrow_mut().insert(k, Attr::String(from_char16(&units)));
+        self.attrs
+            .borrow_mut()
+            .insert(k, Attr::String(from_char16(&units)));
         kResultOk
     }
 
@@ -222,7 +232,9 @@ impl IAttributeListTrait for HostAttributeList {
         };
         let bytes =
             unsafe { std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize) };
-        self.attrs.borrow_mut().insert(k, Attr::Binary(bytes.to_vec()));
+        self.attrs
+            .borrow_mut()
+            .insert(k, Attr::Binary(bytes.to_vec()));
         kResultOk
     }
 
@@ -324,7 +336,8 @@ impl IComponentHandlerTrait for ComponentHandler {
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
         // Normalised here; the caller cannot denormalise without the parameter
         // list, so that translation happens in the plugin wrapper which owns it.
-        self.context.param_edited(plugin_host_api::ParamId(id), value_normalized);
+        self.context
+            .param_edited(plugin_host_api::ParamId(id), value_normalized);
         kResultOk
     }
 

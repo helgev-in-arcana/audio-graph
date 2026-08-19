@@ -51,7 +51,9 @@ impl Inner {
         }
         self.running.set(true);
         loop {
-            let Some(task) = self.queue.borrow_mut().pop_front() else { break };
+            let Some(task) = self.queue.borrow_mut().pop_front() else {
+                break;
+            };
             task();
         }
         self.running.set(false);
@@ -154,9 +156,23 @@ mod imp {
     const TIMER_ID: usize = 1;
 
     const CLASS_NAME: &[u16] = &[
-        b'a' as u16, b'u' as u16, b'd' as u16, b'i' as u16, b'o' as u16, b'g' as u16, b'r' as u16,
-        b'a' as u16, b'p' as u16, b'h' as u16, b'.' as u16, b'd' as u16, b'e' as u16, b'f' as u16,
-        b'e' as u16, b'r' as u16, 0,
+        b'a' as u16,
+        b'u' as u16,
+        b'd' as u16,
+        b'i' as u16,
+        b'o' as u16,
+        b'g' as u16,
+        b'r' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b'h' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'e' as u16,
+        b'f' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        0,
     ];
 
     static REGISTER: Once = Once::new();

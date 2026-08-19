@@ -123,7 +123,11 @@ fn invert_table(table: &[f64; TABLE_SIZE], plain: f64) -> f64 {
     let first = table[0];
     let last = table[TABLE_SIZE - 1];
 
-    let (lo_bound, hi_bound) = if ascending { (first, last) } else { (last, first) };
+    let (lo_bound, hi_bound) = if ascending {
+        (first, last)
+    } else {
+        (last, first)
+    };
     if plain <= lo_bound {
         return if ascending { 0.0 } else { 1.0 };
     }
@@ -136,7 +140,11 @@ fn invert_table(table: &[f64; TABLE_SIZE], plain: f64) -> f64 {
     let mut hi = TABLE_SIZE - 1;
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
-        let cmp = if ascending { table[mid] <= plain } else { table[mid] >= plain };
+        let cmp = if ascending {
+            table[mid] <= plain
+        } else {
+            table[mid] >= plain
+        };
         if cmp { lo = mid } else { hi = mid }
     }
 
