@@ -49,12 +49,34 @@ pub fn render(
     block_size: u32,
     events: &[(usize, Event)],
 ) -> Result<RenderOutcome, String> {
+    render_with_state(path, class_cid, None, input, block_size, events)
+}
+
+/// The same, starting from a saved state blob.
+///
+/// The wrapper keeps everything interesting — which sub-plugin, which
+/// bindings, the node graph — in its state rather than in its parameters, so
+/// rendering it under a *particular* patch means restoring one first. That is
+/// what makes a node graph checkable without a DAW.
+pub fn render_with_state(
+    path: &Path,
+    class_cid: Option<&str>,
+    state: Option<&[u8]>,
+    input: &Audio,
+    block_size: u32,
+    events: &[(usize, Event)],
+) -> Result<RenderOutcome, String> {
     let module = Module::open(path).map_err(|e| e.to_string())?;
     let class = choose_class(&module, class_cid)?;
 
     let host = Arc::new(CliHost::new());
     let mut plugin =
         Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    if let Some(state) = state {
+        // Before activate, as a DAW does: the wrapper loads its sub-plugin at
+        // activate, and it has to know which one by then.
+        plugin.load_state(state).map_err(|e| e.to_string())?;
+    }
 
     let (plugin_in, plugin_out) = plugin.bus_channel_counts();
     // An instrument reports no input bus; feeding it one would fail bus setup.

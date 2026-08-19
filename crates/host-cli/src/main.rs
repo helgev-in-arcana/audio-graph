@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         "sweep" => cmd_sweep(rest),
         "probe" => cmd_probe(rest),
         "nest" => cmd_nest(rest),
+        "graph" => cmd_graph(rest),
         "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
         "bundle" => cmd_bundle(rest),
@@ -71,6 +72,9 @@ fn usage() {
   host-cli probe <PATH.vst3>        lifecycle-test one module in this process
   host-cli nest <WRAPPER.vst3> [CID]
                                     check the wrapper reloads its sub-plugin from state
+  host-cli graph <WRAPPER.vst3> <IN.wav> [RATE_HZ]
+                                    check an LFO in the node graph reaches the sub-plugin
+                                    (set AUDIO_GRAPH_SUB and AUDIO_GRAPH_SUB_BIND first)
   host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
@@ -906,6 +910,275 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
     }
     println!("sub-plugin reference survived a state round-trip");
     Ok(())
+}
+
+/// M5's acceptance check, run without a DAW.
+///
+/// The claim to demonstrate is "an LFO can wobble a sub-plugin's parameter",
+/// and it is not one the unit tests can make: they stop at the compiled program
+/// and the events it produces. What they cannot show is that those events, sent
+/// through the wrapper, through the nesting layer, into a real commercial
+/// plugin, come out the other side as a change in the audio.
+///
+/// So: render the same input twice through the same wrapper and the same
+/// sub-plugin, once with a graph driving the bound slot and once without, and
+/// compare. The graph is injected into the wrapper's own saved state, which is
+/// exactly the route a project file takes.
+///
+///   AUDIO_GRAPH_SUB=...\RoughRider3.vst3 AUDIO_GRAPH_SUB_BIND=56 \
+///     cargo run -p host-cli -- graph target/AudioGraph.vst3 tone.wav
+fn cmd_graph(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let path = args.first().ok_or("expected the wrapper's path")?;
+    let input_path = args.get(1).ok_or("expected an input wav")?;
+    let rate: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4.0);
+
+    let input = wav::read(Path::new(input_path))?;
+    let module = Module::open(path).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+
+    // One instance, purely to get a state blob with a sub-plugin and a binding
+    // in it. In a DAW the user does this with the editor; here it is
+    // AUDIO_GRAPH_SUB and AUDIO_GRAPH_SUB_BIND.
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline_state = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+
+    let wrapper_state = read_wrapper_state(&baseline_state)?;
+    if !wrapper_state.contains("display_name") {
+        return Err("the wrapper saved no sub-plugin; set AUDIO_GRAPH_SUB".into());
+    }
+    if !wrapper_state.contains("param_id") {
+        return Err("no slot is bound; set AUDIO_GRAPH_SUB_BIND to a parameter id".into());
+    }
+
+    let with_graph = edit_wrapper_state(&baseline_state, &inject_graph(&wrapper_state, rate)?)?;
+    println!("graph: a {rate} Hz saw on slot 1, injected into the wrapper's saved state");
+
+    const BLOCK: u32 = 512;
+    let plain = render::render_with_state(
+        Path::new(path),
+        None,
+        Some(&baseline_state),
+        &input,
+        BLOCK,
+        &[],
+    )?;
+    let modulated =
+        render::render_with_state(Path::new(path), None, Some(&with_graph), &input, BLOCK, &[])?;
+
+    // Per-block RMS, so a slow modulation shows up as an envelope rather than
+    // being averaged away over the whole file.
+    let window = (input.sample_rate / 20.0) as usize;
+    let plain_envelope = envelope(&plain.audio, window);
+    let modulated_envelope = envelope(&modulated.audio, window);
+
+    let deviation = plain_envelope
+        .iter()
+        .zip(&modulated_envelope)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let wobble = spread(&modulated_envelope) - spread(&plain_envelope);
+
+    println!("{} windows of {window} samples", plain_envelope.len());
+    println!("largest difference from the unmodulated render: {deviation:.6}");
+    println!("extra envelope movement introduced by the graph: {wobble:.6}");
+
+    if deviation < 1e-6 {
+        return Err(
+            "the graph changed nothing. Either the bound parameter does not affect this \
+             plugin's output, or the modulation is not reaching it"
+                .into(),
+        );
+    }
+    if wobble <= 0.0 {
+        println!(
+            "note: the output differs but is not more varied. That is what a parameter \
+             that shifts the sound without shaping its level looks like."
+        );
+    }
+    println!("the graph reached the sub-plugin");
+    Ok(())
+}
+
+/// Read the wrapper's own JSON out of a saved state blob.
+///
+/// Three layers have to be peeled, and none of them belong to us: `vst3-host`
+/// frames the component and controller halves with their lengths, the plugin
+/// framework wraps each half in its own JSON document, and the wrapper's state
+/// is a persisted string field inside that. Searching rather than assuming, so
+/// this check does not break the next time one of them changes shape.
+fn read_wrapper_state(blob: &[u8]) -> Result<String, String> {
+    for half in halves(blob)? {
+        if let Some((_, inner)) = locate(half) {
+            return Ok(inner);
+        }
+    }
+    Err("no wrapper state found inside the saved blob".into())
+}
+
+/// Rewrite the wrapper's JSON wherever it appears, and re-frame the result.
+fn edit_wrapper_state(blob: &[u8], edited: &str) -> Result<Vec<u8>, String> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for half in halves(blob)? {
+        out.push(match locate(half) {
+            Some((mut document, _)) => {
+                document.replace(edited);
+                document.emit()
+            }
+            None => half.to_vec(),
+        });
+    }
+
+    // The framing `vst3-host` expects: two lengths, then the two halves.
+    let mut framed = Vec::with_capacity(8 + out.iter().map(Vec::len).sum::<usize>());
+    framed.extend_from_slice(&(out[0].len() as u32).to_le_bytes());
+    framed.extend_from_slice(&(out.get(1).map_or(0, Vec::len) as u32).to_le_bytes());
+    for half in &out {
+        framed.extend_from_slice(half);
+    }
+    Ok(framed)
+}
+
+fn halves(blob: &[u8]) -> Result<Vec<&[u8]>, String> {
+    if blob.len() < 8 {
+        return Err("the saved state is too short to be framed".into());
+    }
+    let component = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+    let controller = u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+    if blob.len() < 8 + component + controller {
+        return Err("the saved state is truncated".into());
+    }
+    Ok(vec![
+        &blob[8..8 + component],
+        &blob[8 + component..8 + component + controller],
+    ])
+}
+
+/// One half of the blob, with the wrapper's state found inside it.
+struct Document {
+    outer: serde_json::Value,
+    path: Vec<String>,
+    /// Whether the framework stored the string by serialising it again, so what
+    /// comes back is a JSON string *containing* a JSON string.
+    doubled: bool,
+}
+
+impl Document {
+    fn replace(&mut self, edited: &str) {
+        let stored = if self.doubled {
+            serde_json::to_string(edited).expect("a string always serialises")
+        } else {
+            edited.to_string()
+        };
+        let mut cursor = &mut self.outer;
+        for key in &self.path {
+            cursor = &mut cursor[key];
+        }
+        *cursor = serde_json::Value::String(stored);
+    }
+
+    fn emit(&self) -> Vec<u8> {
+        self.outer.to_string().into_bytes()
+    }
+}
+
+fn locate(half: &[u8]) -> Option<(Document, String)> {
+    let outer: serde_json::Value = serde_json::from_slice(half).ok()?;
+    let mut found = None;
+    walk(&outer, &mut Vec::new(), &mut found);
+    let (path, stored) = found?;
+
+    let doubled = stored.trim_start().starts_with('"');
+    let inner = if doubled {
+        serde_json::from_str::<String>(&stored).ok()?
+    } else {
+        stored
+    };
+    Some((
+        Document {
+            outer,
+            path,
+            doubled,
+        },
+        inner,
+    ))
+}
+
+/// Depth-first search for a string that is itself the wrapper's state.
+fn walk(
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    found: &mut Option<(Vec<String>, String)>,
+) {
+    if found.is_some() {
+        return;
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            // Matched on the field names rather than on exact JSON, because how
+            // many times the framework has escaped this on the way in is its
+            // business and not something worth depending on.
+            if text.contains("sub_block") && text.contains("slots") {
+                *found = Some((path.clone(), text.clone()));
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                path.push(key.clone());
+                walk(child, path, found);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Put an LFO on slot 1, the one `AUDIO_GRAPH_SUB_BIND` bound.
+fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0], "kind": { "Lfo": {
+                "waveform": "Saw", "rate": { "Hz": rate },
+                "phase": 0.0, "depth": 0.5, "offset": 0.5 } } },
+            { "id": 1, "pos": [260.0, 40.0], "kind": { "SlotOut": { "slot": 0 } } }
+        ],
+        "links": [{ "from": 0, "to": 1, "input": 0 }],
+        "next_id": 2
+    });
+    // The finest rate on offer, so a fast LFO is not the thing being measured.
+    value["sub_block"] = serde_json::json!(16);
+    Ok(value.to_string())
+}
+
+/// RMS over consecutive windows, summed across channels.
+fn envelope(audio: &wav::Audio, window: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(audio.frames / window.max(1) + 1);
+    let mut start = 0;
+    while start < audio.frames {
+        let end = (start + window).min(audio.frames);
+        let mut sum = 0.0f64;
+        for ch in 0..audio.channels {
+            for &sample in &audio.channel(ch)[start..end] {
+                sum += f64::from(sample) * f64::from(sample);
+            }
+        }
+        out.push((sum / ((end - start) * audio.channels as usize) as f64).sqrt() as f32);
+        start = end;
+    }
+    out
+}
+
+fn spread(envelope: &[f32]) -> f32 {
+    let highest = envelope.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lowest = envelope.iter().copied().fold(f32::INFINITY, f32::min);
+    highest - lowest
 }
 
 /// M4's acceptance check, run without a DAW.
