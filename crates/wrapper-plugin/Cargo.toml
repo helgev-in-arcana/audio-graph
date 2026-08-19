@@ -11,6 +11,7 @@ crate-type = ["lib", "cdylib"]
 plugin-host-api.workspace = true
 subhost-adapter.workspace = true
 vst3-host.workspace = true
+vst3-host-view.workspace = true
 nice-plug = "0.3"
 nice-log = "0.3"
 log.workspace = true

@@ -11,10 +11,12 @@
 //! plugin talks back through, and the ordering rules that keep teardown from
 //! crashing.
 
+mod deferred;
 mod editor;
 mod frame;
 mod window;
 
+pub use deferred::{Deferred, new as deferred};
 pub use editor::{EditorWindow, can_resize};
 pub use frame::PlugFrame;
 pub use window::{ContainerWindow, PLATFORM_TYPE, Size, WindowState, pump_events};

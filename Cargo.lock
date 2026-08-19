@@ -2569,6 +2569,7 @@ dependencies = [
  "serde_json",
  "subhost-adapter",
  "vst3-host",
+ "vst3-host-view",
 ]
 
 [[package]]
