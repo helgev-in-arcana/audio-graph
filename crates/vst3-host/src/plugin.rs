@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use plugin_host_api::{
     AudioBuffers, AudioConfig, Capabilities, Event, EventSink, HostContext, HostError, ParamFlags,
@@ -31,11 +31,15 @@ use vst3::Steinberg::Vst::{
     IParameterChanges, ParameterInfo, ProcessData, ProcessSetup, SpeakerArrangement, String128,
     TChar,
 };
-use vst3::Steinberg::{FUnknown, IPluginBaseTrait, IPluginFactoryTrait, TUID, kResultOk, kResultTrue};
+use vst3::Steinberg::{
+    FUnknown, IPluginBaseTrait, IPluginFactoryTrait, TUID, kNotImplemented, kResultFalse,
+    kResultOk, kResultTrue,
+};
 use vst3::{ComPtr, ComWrapper, Interface};
 
 use crate::cid::Cid;
 use crate::host_app::{ComponentHandler, HostApplication};
+
 use crate::module::{Module, ModuleInner};
 use crate::param_map::ParamMap;
 use crate::process_io::{EventList, ParameterChanges};
@@ -65,11 +69,31 @@ pub struct Vst3Plugin {
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: Option<ComPtr<IEditController>>,
+    /// Whether the controller is a distinct object from the component.
+    ///
+    /// A plugin may implement both interfaces on one object. When it does,
+    /// `initialize` and `terminate` must each be called exactly once for that
+    /// object — calling them a second time through the controller interface
+    /// leaves the plugin half torn down, and the next instantiation from the
+    /// same module faults.
+    controller_is_separate: bool,
     /// The processor/controller connection, kept so it can be torn down in the
     /// right order.
     connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
 
     params: Vec<ParamInfo>,
+    /// Main-thread parameter edits waiting to be delivered to the processor.
+    ///
+    /// VST3 splits a plugin in two, and `IEditController::setParamNormalized`
+    /// only reaches one half. The processor learns values solely through the
+    /// change list in `process`, so an edit made from the main thread has to be
+    /// queued for the next block — otherwise `IComponent::getState` saves a
+    /// value the processor never had, and the preset is silently wrong.
+    ///
+    /// `Mutex` is safe on the audio side because the processor only ever
+    /// *tries* to lock: an edit that loses the race is delivered one block
+    /// later rather than blocking the callback.
+    pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
     /// True once `activate` has handed out a processor.
     active: RefCell<bool>,
     latency: RefCell<u32>,
@@ -79,16 +103,12 @@ pub struct Vst3Plugin {
 impl Vst3Plugin {
     /// Create and fully initialise the class `cid` from `module`.
     pub fn create(module: &Module, cid: Cid, context: Arc<dyn HostContext>) -> Result<Vst3Plugin> {
-        let host_app = HostApplication::new(Arc::clone(&context));
+        // Module-scoped, not instance-scoped: the factory retains the pointer
+        // it is given via setHostContext for the module's whole lifetime. On
+        // Linux this is also where a plugin picks up the run loop, and §5.4
+        // wants that source to outlive any editor.
+        let host_app = module.host_application(Arc::clone(&context));
         let host_unknown = com_ref_ptr::<_, FUnknown>(&host_app);
-
-        // The factory gets the host context too: on Linux this is where a
-        // plugin picks up the run loop, and per §5.4 that source outlives the
-        // editor, unlike the IPlugFrame route.
-        if let Some(factory3) = module.factory().cast::<vst3::Steinberg::IPluginFactory3>() {
-            use vst3::Steinberg::IPluginFactory3Trait;
-            unsafe { factory3.setHostContext(host_unknown) };
-        }
 
         let component = create_instance::<IComponent>(module, cid.to_tuid())?;
         check(unsafe { component.initialize(host_unknown) }, "IComponent::initialize")?;
@@ -101,8 +121,16 @@ impl Vst3Plugin {
         })?;
 
         let handler = ComponentHandler::new(Arc::clone(&context));
-        let controller = Self::create_controller(module, &component, host_unknown, &handler)?;
-        let connection = Self::connect(&component, controller.as_ref());
+        let (controller, controller_is_separate) =
+            Self::create_controller(module, &component, host_unknown, &handler)?;
+        // Only meaningful between two distinct objects. A single object
+        // implementing both interfaces would be connected to itself, which
+        // plugins do not expect and OTT, for one, corrupts its heap over.
+        let connection = if controller_is_separate {
+            Self::connect(&component, controller.as_ref())
+        } else {
+            None
+        };
 
         // The controller starts out knowing nothing about the processor's
         // state, so the initial state has to be handed across explicitly.
@@ -124,8 +152,10 @@ impl Vst3Plugin {
             component,
             processor,
             controller,
+            controller_is_separate,
             connection,
             params,
+            pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES))),
             active: RefCell::new(false),
             latency: RefCell::new(0),
             context,
@@ -137,7 +167,7 @@ impl Vst3Plugin {
         component: &ComPtr<IComponent>,
         host_unknown: *mut FUnknown,
         handler: &ComWrapper<ComponentHandler>,
-    ) -> Result<Option<ComPtr<IEditController>>> {
+    ) -> Result<(Option<ComPtr<IEditController>>, bool)> {
         // Two legal shapes: a separate controller class, or one object
         // implementing both interfaces. A host that handles only the first
         // fails on a large fraction of real plugins.
@@ -145,22 +175,24 @@ impl Vst3Plugin {
         let separate = unsafe { component.getControllerClassId(&mut controller_cid) } == kResultOk
             && controller_cid != [0; 16];
 
-        let controller = if separate {
+        let (controller, is_separate) = if separate {
             match create_instance::<IEditController>(module, controller_cid) {
                 Ok(ctrl) => {
                     check(unsafe { ctrl.initialize(host_unknown) }, "IEditController::initialize")?;
-                    Some(ctrl)
+                    (Some(ctrl), true)
                 }
                 // A missing controller class is survivable: audio still works,
                 // only parameters and the editor are lost. Refusing to load
                 // would be worse for the user than a degraded load.
                 Err(e) => {
                     log::warn!("controller class could not be created: {e}");
-                    None
+                    (None, false)
                 }
             }
         } else {
-            component.cast::<IEditController>()
+            // Same object wearing both interfaces: already initialised as the
+            // component, so it must not be initialised again.
+            (component.cast::<IEditController>(), false)
         };
 
         if let Some(ctrl) = &controller {
@@ -168,11 +200,13 @@ impl Vst3Plugin {
             unsafe { ctrl.setComponentHandler(handler_ptr) };
         }
 
-        Ok(controller)
+        Ok((controller, is_separate))
     }
 
     /// Wire the processor and controller together if both expose a connection
     /// point. Plugins use this channel for anything parameters cannot carry.
+    ///
+    /// Only called when the two are separate objects — see the call site.
     fn connect(
         component: &ComPtr<IComponent>,
         controller: Option<&ComPtr<IEditController>>,
@@ -284,10 +318,26 @@ impl SubPluginMain for Vst3Plugin {
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
         let ctrl = self.controller()?;
         let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
-        check(
-            unsafe { ctrl.setParamNormalized(id.0, normalized) },
-            "IEditController::setParamNormalized",
-        )
+        // The return value is advisory. Every iZotope plugin here answers
+        // kResultFalse and applies the value anyway, and the SDK's own hosts
+        // ignore it too. The caller can see what actually happened through
+        // `snapshot`, which is a better source of truth than a status code.
+        let res = unsafe { ctrl.setParamNormalized(id.0, normalized) };
+        if res != kResultOk && res != kResultTrue && res != kResultFalse {
+            return Err(HostError::Backend {
+                context: "IEditController::setParamNormalized".into(),
+                code: res,
+            });
+        }
+
+        // The other half of the plugin still has to hear about it.
+        if let Ok(mut pending) = self.pending_edits.lock() {
+            pending.retain(|(existing, _)| *existing != id);
+            if pending.len() < pending.capacity() {
+                pending.push((id, plain));
+            }
+        }
+        Ok(())
     }
 
     fn save_state(&self) -> Result<Vec<u8>> {
@@ -384,10 +434,18 @@ impl SubPluginMain for Vst3Plugin {
         // Latency is only meaningful once the plugin is set up, which is why
         // it is read here rather than at construction.
         *self.latency.borrow_mut() = unsafe { self.processor.getLatencySamples() };
-        check(
-            unsafe { self.processor.setProcessing(1) },
-            "IAudioProcessor::setProcessing(true)",
-        )?;
+        // setProcessing is optional: a plugin with no realtime/offline
+        // distinction returns kNotImplemented, and six of the iZotope plugins
+        // here do. Treating that as a failure refuses to load them.
+        let res = unsafe { self.processor.setProcessing(1) };
+        if res != kResultOk && res != kResultTrue && res != kNotImplemented {
+            unsafe { self.component.setActive(0) };
+            *self.active.borrow_mut() = false;
+            return Err(HostError::Backend {
+                context: "IAudioProcessor::setProcessing(true)".into(),
+                code: res,
+            });
+        }
 
         *self.active.borrow_mut() = true;
         self.context.latency_changed(*self.latency.borrow());
@@ -401,7 +459,12 @@ impl SubPluginMain for Vst3Plugin {
             None => ParamMap::build(&[], |_, n| n),
         };
 
-        Ok(Box::new(Vst3Processor::new(self.processor.clone(), config, map)))
+        Ok(Box::new(Vst3Processor::new(
+            self.processor.clone(),
+            config,
+            map,
+            Arc::clone(&self.pending_edits),
+        )))
     }
 
     fn deactivate(&mut self, processor: Box<dyn SubPluginProcessor>) {
@@ -434,9 +497,9 @@ impl Drop for Vst3Plugin {
             }
         }
         if let Some(ctrl) = &self.controller {
-            unsafe {
-                ctrl.setComponentHandler(std::ptr::null_mut());
-                ctrl.terminate();
+            unsafe { ctrl.setComponentHandler(std::ptr::null_mut()) };
+            if self.controller_is_separate {
+                unsafe { ctrl.terminate() };
             }
         }
         unsafe { self.component.terminate() };
@@ -461,6 +524,8 @@ pub struct Vst3Processor {
 
     /// Plain→normalised conversion captured at activate.
     param_map: ParamMap,
+    /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
+    pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
 }
 
 // SAFETY: VST3 designates IAudioProcessor as the audio-thread interface; the
@@ -473,6 +538,7 @@ impl Vst3Processor {
         processor: ComPtr<IAudioProcessor>,
         config: AudioConfig,
         param_map: ParamMap,
+        pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
     ) -> Vst3Processor {
         Vst3Processor {
             processor,
@@ -484,6 +550,7 @@ impl Vst3Processor {
             input_ptrs: vec![std::ptr::null_mut(); config.input_channels as usize],
             output_ptrs: vec![std::ptr::null_mut(); config.output_channels as usize],
             param_map,
+            pending_edits,
         }
     }
 }
@@ -511,6 +578,16 @@ impl SubPluginProcessor for Vst3Processor {
         self.input_events.clear();
         self.output_events.clear();
         out_events.clear();
+
+        // Main-thread edits go in first, at offset 0, so an event stream for
+        // this block still overrides them.
+        if let Ok(mut pending) = self.pending_edits.try_lock() {
+            for (id, plain) in pending.drain(..) {
+                if let Some(normalized) = self.param_map.normalize(id, plain) {
+                    self.input_changes.add_point(id.0, 0, normalized);
+                }
+            }
+        }
 
         vst_events::fill_inputs(events, &self.param_map, &self.input_changes, &self.input_events);
 

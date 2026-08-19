@@ -224,6 +224,34 @@ mod tests {
     }
 
     #[test]
+    fn sub_block_updates_keep_their_offsets_and_share_one_queue() {
+        // What section 9.2's quantiser emits: many points for one parameter
+        // across a block. They must land in a single queue with their offsets
+        // intact — collapsing them to the block start is the failure that
+        // makes a fast LFO sound stepped.
+        let changes = ParameterChanges::new(4, 64);
+        let list = EventList::new(4);
+        let events: Vec<ApiEvent> = (0..8)
+            .map(|i| {
+                ApiEvent::Param(ParamEvent::SetValue {
+                    id: ParamId(3),
+                    target: Default::default(),
+                    value: i as f64 / 8.0,
+                    sample_offset: i * 32,
+                })
+            })
+            .collect();
+
+        fill_inputs(&events, &unit_map(3), &changes, &list);
+
+        let ids: std::collections::BTreeSet<_> =
+            changes.points().iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids.len(), 1, "all points belong to one parameter queue");
+        let offsets: Vec<i32> = changes.points().iter().map(|(_, o, _)| *o).collect();
+        assert_eq!(offsets, vec![0, 32, 64, 96, 128, 160, 192, 224]);
+    }
+
+    #[test]
     fn modulation_is_dropped_rather_than_flattened_into_a_value() {
         // Flattening would overwrite the parameter and destroy whatever value
         // the user had automated, which is worse than the modulation not

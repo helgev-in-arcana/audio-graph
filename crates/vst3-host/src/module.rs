@@ -3,17 +3,20 @@
 //! This is M0: on its own it is a working plugin scanner, with no notion of
 //! instantiation, audio, or the nested-wrapper use case.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use plugin_host_api::{HostError, Result};
 use vst3::Steinberg::{
     IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactory3, IPluginFactory3Trait,
     IPluginFactoryTrait, PClassInfo, PClassInfo2, PClassInfoW, PFactoryInfo, kResultOk,
 };
-use vst3::ComPtr;
+use vst3::{ComPtr, ComWrapper};
 
 use crate::cid::Cid;
+use crate::host_app::HostApplication;
 use crate::library::{self, Library};
 use crate::moduleinfo::ModuleInfo;
 use crate::util::{from_char16, from_char8};
@@ -75,6 +78,13 @@ pub struct Module {
 /// which happens when `Library` drops.
 pub(crate) struct ModuleInner {
     factory: ComPtr<IPluginFactory>,
+    /// The host application handed to `IPluginFactory3::setHostContext`.
+    ///
+    /// The factory keeps the raw pointer for as long as the module is loaded,
+    /// so this must live at module scope. Owning it per instance means the
+    /// factory dereferences freed memory the moment the first instance goes
+    /// away — which segfaults on the *second* instantiation, not the first.
+    host_app: RefCell<Option<ComWrapper<HostApplication>>>,
     #[allow(dead_code)]
     library: Library,
     path: PathBuf,
@@ -108,6 +118,7 @@ impl Module {
         Ok(Module {
             inner: Rc::new(ModuleInner {
                 factory,
+                host_app: RefCell::new(None),
                 library,
                 path: path.to_path_buf(),
             }),
@@ -126,6 +137,33 @@ impl Module {
     /// cannot be unloaded while a plugin object is still alive.
     pub(crate) fn handle(&self) -> Rc<ModuleInner> {
         Rc::clone(&self.inner)
+    }
+
+    /// The module-scoped host application, created on first use.
+    ///
+    /// One per module rather than one per instance, because
+    /// `setHostContext` is a module-level registration the factory retains.
+    /// The `context` argument is only honoured the first time; subsequent
+    /// instances share the object the factory was already given.
+    pub(crate) fn host_application(
+        &self,
+        context: Arc<dyn plugin_host_api::HostContext>,
+    ) -> ComWrapper<HostApplication> {
+        let mut slot = self.inner.host_app.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            return existing.clone();
+        }
+
+        let app = HostApplication::new(context);
+        if let Some(factory3) = self.inner.factory.cast::<vst3::Steinberg::IPluginFactory3>() {
+            use vst3::Steinberg::IPluginFactory3Trait;
+            let ptr = app
+                .as_com_ref::<vst3::Steinberg::FUnknown>()
+                .map_or(std::ptr::null_mut(), |r| r.as_ptr());
+            unsafe { factory3.setHostContext(ptr) };
+        }
+        *slot = Some(app.clone());
+        app
     }
 
     pub fn factory_info(&self) -> Result<FactoryInfo> {
