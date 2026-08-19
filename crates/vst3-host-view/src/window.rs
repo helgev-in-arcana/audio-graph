@@ -72,12 +72,29 @@ impl ContainerWindow {
     /// Must be called on the thread that owns the host's message pump. On
     /// Windows a window belongs to the thread that created it, and messages for
     /// it are only dispatched by that thread's pump.
-    pub fn new(title: &str, size: Size) -> Result<ContainerWindow, String> {
+    /// `owner` is the window this one should float above — the DAW's own
+    /// top-level window when there is one, null when running standalone.
+    ///
+    /// Without an owner the window is a peer of the DAW's, so clicking anywhere
+    /// in the DAW buries the plugin's editor behind it. With one it stays in
+    /// front of the DAW and minimises with it, which is what every other plugin
+    /// window does.
+    ///
+    /// It must be the DAW's *root* window, not the wrapper's editor view:
+    /// Windows destroys owned windows along with their owner, and the editor
+    /// view is destroyed every time the user closes the wrapper's UI — which
+    /// would take the sub-plugin's window with it, without the plugin ever
+    /// being told (§5.3). The root window only dies when the DAW does.
+    pub fn new(
+        title: &str,
+        size: Size,
+        owner: *mut std::ffi::c_void,
+    ) -> Result<ContainerWindow, String> {
         let state = Rc::new(WindowState {
             close_requested: Cell::new(false),
             size: Cell::new(size),
         });
-        let inner = imp::Window::new(title, size, Rc::clone(&state))?;
+        let inner = imp::Window::new(title, size, owner, Rc::clone(&state))?;
         Ok(ContainerWindow { inner, state })
     }
 
@@ -132,6 +149,15 @@ pub fn pump_events() {
     imp::pump_events();
 }
 
+/// The top-level window `handle` ultimately belongs to.
+///
+/// A plugin is handed a view somewhere deep inside the DAW's window tree, but
+/// the window a sub-plugin editor should be owned by is the root — see
+/// [`ContainerWindow::new`]. Returns null for a null handle.
+pub fn root_window(handle: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+    imp::root_window(handle)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::cell::Cell;
@@ -147,7 +173,7 @@ mod imp {
         MSG, PM_REMOVE, PeekMessageW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
         SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WM_CLOSE, WM_NCCREATE,
         WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW, SWP_NOMOVE,
-        SWP_NOZORDER, GetSystemMetrics,
+        SWP_NOZORDER, GetSystemMetrics, GetAncestor, GA_ROOT,
     };
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 
@@ -194,7 +220,12 @@ mod imp {
     }
 
     impl Window {
-        pub fn new(title: &str, size: Size, state: Rc<WindowState>) -> Result<Window, String> {
+        pub fn new(
+            title: &str,
+            size: Size,
+            owner: HWND,
+            state: Rc<WindowState>,
+        ) -> Result<Window, String> {
             ensure_class_registered();
 
             let mut wide: Vec<u16> = title.encode_utf16().collect();
@@ -227,17 +258,23 @@ mod imp {
             let state_ptr = Rc::as_ptr(&state);
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_APPWINDOW,
+                    // No WS_EX_APPWINDOW once there is an owner: an owned
+                    // window that also insists on its own taskbar button is a
+                    // dialog pretending to be an application.
+                    if owner.is_null() { WS_EX_APPWINDOW } else { 0 },
                     CLASS_NAME.as_ptr(),
                     wide.as_ptr(),
-                    // No owner window: §5.3 wants teardown driven by our own
-                    // code, not by an OS cascade that tells the plugin nothing.
                     WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     x,
                     y,
                     width,
                     height,
-                    std::ptr::null_mut(),
+                    // With WS_OVERLAPPEDWINDOW this argument is the *owner*,
+                    // not a parent: the window stays top-level and keeps its
+                    // title bar, but sits in front of the owner instead of
+                    // behind it. See `ContainerWindow::new` for which window
+                    // this has to be.
+                    owner,
                     std::ptr::null_mut(),
                     GetModuleHandleW(std::ptr::null()),
                     state_ptr as *mut c_void,
@@ -356,6 +393,15 @@ mod imp {
     }
 
     /// Drain this thread's message queue.
+    pub fn root_window(handle: *mut c_void) -> *mut c_void {
+        if handle.is_null() {
+            return handle;
+        }
+        // GA_ROOT walks up parents but stops at the first top-level window,
+        // which is the DAW's own frame rather than the desktop.
+        unsafe { GetAncestor(handle as HWND, GA_ROOT) as *mut c_void }
+    }
+
     pub fn pump_events() {
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
@@ -383,7 +429,12 @@ mod imp {
     pub struct Window;
 
     impl Window {
-        pub fn new(_title: &str, _size: Size, _state: Rc<WindowState>) -> Result<Window, String> {
+        pub fn new(
+            _title: &str,
+            _size: Size,
+            _owner: *mut c_void,
+            _state: Rc<WindowState>,
+        ) -> Result<Window, String> {
             Err("sub-plugin editor windows are only implemented on Windows so far".into())
         }
         pub fn handle(&self) -> *mut c_void {
@@ -397,6 +448,10 @@ mod imp {
     }
 
     pub fn pump_events() {}
+
+    pub fn root_window(handle: *mut c_void) -> *mut c_void {
+        handle
+    }
 }
 
 #[cfg(test)]
@@ -416,7 +471,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_window_can_be_created_and_dropped() {
-        let window = ContainerWindow::new("test", Size::new(320, 240)).expect("create");
+        let window =
+            ContainerWindow::new("test", Size::new(320, 240), std::ptr::null_mut()).expect("create");
         assert!(!window.platform_handle().is_null());
         assert!(!window.close_requested());
         window.pump_events();
@@ -429,7 +485,8 @@ mod tests {
         // The window class is registered once per process; a second
         // registration fails, so a naive implementation works exactly once.
         for _ in 0..3 {
-            let window = ContainerWindow::new("test", Size::new(200, 100)).expect("create");
+            let window = ContainerWindow::new("test", Size::new(200, 100), std::ptr::null_mut())
+                .expect("create");
             window.pump_events();
         }
     }

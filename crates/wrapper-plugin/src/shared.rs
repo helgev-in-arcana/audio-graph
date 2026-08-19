@@ -19,6 +19,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use plugin_host_api::AudioConfig;
@@ -88,6 +89,14 @@ impl SubState {
 pub struct Shared {
     state: Mutex<SubState>,
     params: Arc<WrapperParams>,
+    /// Bumped whenever something the editor displays has changed shape — a
+    /// different sub-plugin, a different set of bindings.
+    ///
+    /// The editor draws from a cached snapshot rather than reaching into the
+    /// lock every frame, and this is how it knows the snapshot is stale.
+    /// Rebuilding a two-thousand-entry parameter list sixty times a second
+    /// would be silly; noticing a counter is not.
+    generation: AtomicU64,
 }
 
 impl Shared {
@@ -95,11 +104,21 @@ impl Shared {
         Arc::new(Shared {
             state: Mutex::new(SubState { host, processor: None, config: None }),
             params,
+            generation: AtomicU64::new(0),
         })
     }
 
     pub fn params(&self) -> &Arc<WrapperParams> {
         &self.params
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Tell the editor its cached view of the sub-plugin is out of date.
+    pub fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Main-thread access. Blocks; never call this from `process`.

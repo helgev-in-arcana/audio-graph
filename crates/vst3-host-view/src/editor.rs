@@ -44,7 +44,16 @@ impl EditorWindow {
     /// Attach `view` to a new container window.
     ///
     /// `view` must not already be attached to anything.
-    pub fn open(view: ComPtr<IPlugView>, title: &str) -> Result<EditorWindow, String> {
+    ///
+    /// `owner` is the window the editor should float above — the DAW's root
+    /// window inside a plugin, null when standalone. See
+    /// [`ContainerWindow::new`] for why it must be the root and not the
+    /// wrapper's own editor view.
+    pub fn open(
+        view: ComPtr<IPlugView>,
+        title: &str,
+        owner: *mut std::ffi::c_void,
+    ) -> Result<EditorWindow, String> {
         // Ask before building anything: a plugin that cannot use our platform
         // type has no editor we can show, and finding that out after creating a
         // window means unwinding it again.
@@ -56,7 +65,7 @@ impl EditorWindow {
         }
 
         let size = view_size(&view).unwrap_or(Size::new(800, 600));
-        let window = ContainerWindow::new(title, size)?;
+        let window = ContainerWindow::new(title, size, owner)?;
 
         // Tell the plugin the display scale before it ever paints. Plugins
         // initialise this to zero and expect the host to supply it; one that

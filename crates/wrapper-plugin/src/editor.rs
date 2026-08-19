@@ -40,7 +40,7 @@ use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
 use plugin_host_api::{ParamId, ParamInfo};
 use subhost_adapter::{MainThread, SLOT_COUNT};
 
-use crate::shared::{Shared, SubState};
+use crate::shared::Shared;
 
 /// How often the sub-plugin's window gets its tick, in milliseconds.
 ///
@@ -57,6 +57,26 @@ enum Command {
     CloseSubEditor,
     Bind { slot: usize, param: ParamId },
     ClearSlot(usize),
+}
+
+/// What the editor draws, refreshed from [`Shared`] rather than read through
+/// the lock while drawing.
+///
+/// Two reasons. Drawing straight from the lock means a frame that cannot take
+/// it has nothing to draw, and replacing the whole UI with a "busy" line for one
+/// frame is exactly the flicker it looks like. And the parameter list can run to
+/// thousands of entries — copying it every frame to satisfy the borrow checker
+/// is work nobody asked for.
+#[derive(Default)]
+struct View {
+    /// The [`Shared::generation`] the vectors below were built from.
+    generation: u64,
+    class: Option<(String, String)>,
+    loaded: bool,
+    sub_editor_open: bool,
+    params: Vec<ParamInfo>,
+    /// `(index, parameter name, currently resolved)`.
+    slots: Vec<(usize, String, bool)>,
 }
 
 /// A `.vst3` found on disk, before anything has been loaded from it.
@@ -106,6 +126,10 @@ pub struct WrapperEditor {
 
     /// Filled while drawing, drained at the end of the same `ui` call.
     commands: Vec<Command>,
+    view: View,
+    /// The DAW's top-level window, so the sub-plugin's editor can be owned by
+    /// it and stay in front. Null until `build`, and when standalone.
+    daw_window: usize,
 }
 
 impl WrapperEditor {
@@ -121,7 +145,39 @@ impl WrapperEditor {
             next_slot: 0,
             status: Status::default(),
             commands: Vec::new(),
+            view: View::default(),
+            daw_window: 0,
         }
+    }
+
+    /// Refresh what gets drawn, if the lock is free.
+    ///
+    /// Cheap fields every time; the vectors only when something actually
+    /// changed shape.
+    fn refresh(&mut self) {
+        let Some(state) = self.shared.try_lock() else { return };
+
+        self.view.class = state.host.class().map(|c| (c.name.clone(), c.vendor.clone()));
+        self.view.loaded = state.host.is_loaded();
+        self.view.sub_editor_open = state.host.editor_is_open();
+
+        let generation = self.shared.generation();
+        if generation == self.view.generation && !self.view.params.is_empty() {
+            return;
+        }
+        self.view.generation = generation;
+        self.view.params = state.host.params().to_vec();
+
+        let table = state.host.slots();
+        self.view.slots = table
+            .slots()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let binding = slot.binding.as_ref()?;
+                Some((i, binding.param_name.clone(), table.resolved(i).is_some()))
+            })
+            .collect();
     }
 
     fn rescan(&mut self) {
@@ -138,21 +194,21 @@ impl WrapperEditor {
         self.scanned = true;
     }
 
-    fn sub_plugin_panel(&mut self, ui: &mut egui::Ui, state: &SubState) {
+    fn sub_plugin_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Sub-plugin");
-        ui.horizontal(|ui| match state.host.class() {
-            Some(class) => {
-                ui.label(egui::RichText::new(&class.name).strong());
-                ui.weak(&class.vendor);
+        ui.horizontal(|ui| match &self.view.class {
+            Some((name, vendor)) => {
+                ui.label(egui::RichText::new(name).strong());
+                ui.weak(vendor);
             }
             None => {
                 ui.weak("none loaded — the wrapper passes audio through");
             }
         });
 
-        if state.host.is_loaded() {
+        if self.view.loaded {
             ui.horizontal(|ui| {
-                if state.host.editor_is_open() {
+                if self.view.sub_editor_open {
                     if ui.button("Close plugin GUI").clicked() {
                         self.commands.push(Command::CloseSubEditor);
                     }
@@ -196,13 +252,12 @@ impl WrapperEditor {
         }
     }
 
-    fn parameter_panel(&mut self, ui: &mut egui::Ui, state: &SubState) {
-        let params: &[ParamInfo] = state.host.params();
+    fn parameter_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Parameters");
-            ui.weak(format!("{}", params.len()));
+            ui.weak(format!("{}", self.view.params.len()));
         });
-        if params.is_empty() {
+        if self.view.params.is_empty() {
             ui.weak("load a sub-plugin to see its parameters");
             return;
         }
@@ -211,19 +266,27 @@ impl WrapperEditor {
             ui.label("Filter");
             ui.text_edit_singleline(&mut self.param_filter);
             ui.label("bind to slot");
-            ui.add(egui::DragValue::new(&mut self.next_slot).range(0..=SLOT_COUNT - 1));
+            // Displayed one-based, stored zero-based. nice-plug numbers array
+            // elements from 1 in the parameter id, so the DAW's automation lane
+            // for `next_slot` is called "Slot {next_slot + 1}"; showing the
+            // other number here would leave the two disagreeing about which
+            // slot the user just bound.
+            let mut shown = self.next_slot + 1;
+            ui.add(egui::DragValue::new(&mut shown).range(1..=SLOT_COUNT));
+            self.next_slot = shown.clamp(1, SLOT_COUNT) - 1;
         });
 
         let needle = self.param_filter.to_lowercase();
         let slot = self.next_slot;
         let mut to_bind: Option<ParamId> = None;
+        let params = &self.view.params;
         egui::ScrollArea::vertical().id_salt("params").max_height(280.0).show(ui, |ui| {
             for param in params {
                 if !needle.is_empty() && !param.name.to_lowercase().contains(&needle) {
                     continue;
                 }
                 ui.horizontal(|ui| {
-                    if ui.button(format!("-> {slot}")).clicked() {
+                    if ui.button(format!("-> {}", slot + 1)).clicked() {
                         to_bind = Some(param.id);
                     }
                     ui.label(&param.name);
@@ -238,41 +301,39 @@ impl WrapperEditor {
         }
     }
 
-    fn slot_panel(&mut self, ui: &mut egui::Ui, state: &SubState) {
+    fn slot_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Slots");
         ui.weak("the DAW automates these; each drives one sub-plugin parameter");
 
-        let table = state.host.slots();
         let params = self.shared.params();
+        let rows = &self.view.slots;
         let mut clear: Option<usize> = None;
-        let mut any = false;
         egui::ScrollArea::vertical().id_salt("slots").max_height(420.0).show(ui, |ui| {
-            for (i, slot) in table.slots().iter().enumerate() {
-                let Some(binding) = &slot.binding else { continue };
-                any = true;
+            for (i, name, resolved) in rows {
                 ui.horizontal(|ui| {
-                    ui.monospace(format!("slot{i}"));
-                    if table.resolved(i).is_some() {
-                        ui.label(&binding.param_name);
+                    // One-based, to agree with the DAW's automation lane names.
+                    ui.monospace(format!("Slot {}", i + 1));
+                    if *resolved {
+                        ui.label(name);
                     } else {
                         // §8.3: a binding outlives a sub-plugin that cannot be
                         // found, so it has to be shown as such rather than
                         // silently dropped.
-                        ui.colored_label(egui::Color32::from_rgb(200, 140, 60), &binding.param_name)
+                        ui.colored_label(egui::Color32::from_rgb(200, 140, 60), name)
                             .on_hover_text("not resolved against the loaded sub-plugin");
                     }
-                    let value = params.slots[i].value.value();
+                    let value = params.slots[*i].value.value();
                     ui.add(
                         egui::ProgressBar::new(value)
                             .desired_width(110.0)
                             .text(format!("{value:.3}")),
                     );
                     if ui.small_button("x").clicked() {
-                        clear = Some(i);
+                        clear = Some(*i);
                     }
                 });
             }
-            if !any {
+            if rows.is_empty() {
                 ui.weak("nothing bound yet");
             }
         });
@@ -297,7 +358,8 @@ impl WrapperEditor {
         let commands = std::mem::take(&mut self.commands);
         let shared = self.shared.clone();
         let status = self.status.clone();
-        deferred.get().post(move || run(&shared, &status, commands));
+        let owner = self.daw_window;
+        deferred.get().post(move || run(&shared, &status, owner, commands));
     }
 }
 
@@ -305,8 +367,11 @@ impl WrapperEditor {
 ///
 /// Runs from the message loop, never from a draw callback — see the module
 /// comment for why that distinction is fatal rather than stylistic.
-fn run(shared: &Arc<Shared>, status: &Status, commands: Vec<Command>) {
+fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Command>) {
     for command in commands {
+        // Anything below can change what the editor should be showing, and it
+        // draws from a snapshot rather than from the lock.
+        shared.changed();
         match command {
             Command::Load(path) => {
                 let result = shared.lock().load(&path);
@@ -324,7 +389,7 @@ fn run(shared: &Arc<Shared>, status: &Status, commands: Vec<Command>) {
                 status.set("unloaded");
             }
             Command::OpenSubEditor => {
-                let result = shared.lock().host.open_editor();
+                let result = shared.lock().host.open_editor(owner as *mut std::ffi::c_void);
                 match result {
                     Ok(()) => status.set("plugin GUI open"),
                     Err(e) => status.set(format!("open GUI: {e}")),
@@ -368,8 +433,15 @@ impl NiceEguiApp for WrapperEditor {
         &mut self,
         _egui_ctx: egui::Context,
         _nice_gui_ctx: nice_plug::context::gui::GuiContext,
-        _frame: &mut nice_plug_egui::Frame,
+        frame: &mut nice_plug_egui::Frame,
     ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
+        // The window the sub-plugin's editor will be owned by, so it floats
+        // above the DAW instead of being buried the moment the user clicks
+        // anywhere else. Our own view sits deep inside the DAW's window tree,
+        // so walk up to the root — see `ContainerWindow::new` for why it has to
+        // be the root and not this view.
+        self.daw_window = vst3_host_view::root_window(raw_window(frame)) as usize;
+
         match vst3_host_view::deferred() {
             Ok(deferred) => {
                 let shared = self.shared.clone();
@@ -398,22 +470,20 @@ impl NiceEguiApp for WrapperEditor {
         // a plugin, and loading dispatches messages, which can ask for a
         // repaint. Waiting here would deadlock against work being done further
         // up this very thread's stack.
-        // Cloned so the guard borrows a local rather than `self`; the panels
-        // below need `&mut self` for their filter fields.
-        let shared = self.shared.clone();
-        let Some(state) = shared.try_lock() else {
-            ui.weak("busy…");
-            return;
-        };
+        // Take the lock only to copy out what has changed, never to draw. A
+        // frame that cannot get it draws the previous snapshot, which looks
+        // like nothing happened — as opposed to blanking the whole window for
+        // one frame, which looks like a flicker because it is one.
+        self.refresh();
 
         // `columns` rather than a `horizontal` of two `vertical`s: a vertical
         // layout claims all the width that is going, so the second one ends up
         // off the edge of the window entirely.
         ui.columns(2, |cols| {
-            self.sub_plugin_panel(&mut cols[0], &state);
+            self.sub_plugin_panel(&mut cols[0]);
             cols[0].add_space(8.0);
-            self.parameter_panel(&mut cols[0], &state);
-            self.slot_panel(&mut cols[1], &state);
+            self.parameter_panel(&mut cols[0]);
+            self.slot_panel(&mut cols[1]);
         });
 
         let status = self.status.get();
@@ -422,9 +492,6 @@ impl NiceEguiApp for WrapperEditor {
             ui.weak(status);
         }
 
-        // Released before dispatching: the commands take this lock themselves,
-        // from the message loop.
-        drop(state);
         self.dispatch();
     }
 
@@ -437,6 +504,21 @@ impl NiceEguiApp for WrapperEditor {
         }
         // Takes the timer, and anything still queued, with it.
         self.deferred = None;
+    }
+}
+
+/// This editor's own platform window handle, or null if it cannot be had.
+fn raw_window(frame: &nice_plug_egui::Frame) -> *mut std::ffi::c_void {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = frame.baseview_window().window_handle() else {
+        return std::ptr::null_mut();
+    };
+    match handle.as_raw() {
+        RawWindowHandle::Win32(h) => h.hwnd.get() as *mut std::ffi::c_void,
+        RawWindowHandle::AppKit(h) => h.ns_view.as_ptr(),
+        RawWindowHandle::Xlib(h) => h.window as *mut std::ffi::c_void,
+        _ => std::ptr::null_mut(),
     }
 }
 

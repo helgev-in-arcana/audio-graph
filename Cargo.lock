@@ -2565,6 +2565,7 @@ dependencies = [
  "nice-plug-egui",
  "parking_lot",
  "plugin-host-api",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "subhost-adapter",

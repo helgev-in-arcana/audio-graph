@@ -264,9 +264,13 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     for p in params.iter().take(40) {
         let current = snapshot.get(p.id).unwrap_or(p.default);
         let text = plugin.param_to_text(p.id, current).unwrap_or_default();
+        // The module is the VST3 unit the parameter sits in — the tree a DAW
+        // shows when picking an automation lane. Printed because an accidental
+        // extra level there is invisible from the parameter list alone (§8.1).
+        let module = if p.module.is_empty() { String::new() } else { format!("  <{}>", p.module) };
         println!(
-            "  {:>8}  {:<28} {:>12.4} [{:.4} .. {:.4}]  {}",
-            p.id.0, p.name, current, p.min, p.max, text
+            "  {:>8}  {:<28} {:>12.4} [{:.4} .. {:.4}]  {}{}",
+            p.id.0, p.name, current, p.min, p.max, text, module
         );
     }
     if params.len() > 40 {
@@ -704,7 +708,7 @@ fn probe_editor(
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
     sub.load(Path::new(path), Some(cid))?;
-    match sub.open_editor() {
+    match sub.open_editor(std::ptr::null_mut()) {
         Ok(()) => {}
         // A plugin with no editor is not a failure; plenty have none.
         Err(e) if e.contains("no editor") => return Ok(()),
@@ -883,7 +887,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
     sub.load(Path::new(path), cid)?;
     let name = sub.class().map(|c| c.name.clone()).unwrap_or_default();
-    sub.open_editor()?;
+    sub.open_editor(std::ptr::null_mut())?;
     println!("opened {name}");
 
     // Stand in for the DAW's message pump. A plugin would never do this — the

@@ -175,13 +175,17 @@ impl SubHost {
     /// only workable arrangement — and it is the arrangement that keeps ADR-6
     /// open, since a child process can create its own window with no
     /// cross-process embedding involved.
-    pub fn open_editor(&mut self) -> Result<(), String> {
+    /// `owner` is the window the sub-plugin's editor should float above: the
+    /// DAW's root window when running as a plugin, null when standalone. An
+    /// ownerless window is a peer of the DAW's, so clicking in the DAW buries
+    /// it — which is what this argument exists to prevent.
+    pub fn open_editor(&mut self, owner: *mut std::ffi::c_void) -> Result<(), String> {
         let loaded = self.loaded.as_mut().ok_or("no sub-plugin loaded")?.get_mut();
         if loaded.editor.is_some() {
             return Ok(());
         }
         let view = loaded.plugin.create_view().ok_or("this plugin has no editor")?;
-        loaded.editor = Some(EditorWindow::open(view, &loaded.class.name)?);
+        loaded.editor = Some(EditorWindow::open(view, &loaded.class.name, owner)?);
         Ok(())
     }
 
