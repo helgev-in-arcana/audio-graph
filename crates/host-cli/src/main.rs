@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         "twice" => cmd_twice(rest),
         "sweep" => cmd_sweep(rest),
         "probe" => cmd_probe(rest),
+        "nest" => cmd_nest(rest),
         "automate" => cmd_automate(rest),
         _ => {
             usage();
@@ -66,6 +67,8 @@ fn usage() {
                                     play a note into an instrument
   host-cli sweep [DIR...]           lifecycle-test every plugin, one child process each
   host-cli probe <PATH.vst3>        lifecycle-test one module in this process
+  host-cli nest <WRAPPER.vst3> [CID]
+                                    check the wrapper reloads its sub-plugin from state
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
   host-cli state <PATH.vst3> [CID]  save/restore a parameter across instances
   host-cli automate <PATH.vst3> <IN.wav> [CID [PARAM_ID]]
@@ -676,4 +679,50 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
         println!("  !! {p}");
     }
     if problems.is_empty() { Ok(()) } else { Err("sweep found problems".into()) }
+}
+
+/// M3's project-reopen check: does the wrapper's state carry its sub-plugin?
+///
+/// Saves state from an instance that has a sub-plugin loaded, then restores it
+/// into a fresh one and confirms the sub-plugin came back. This is what a DAW
+/// does when a project is closed and opened again, and it is the case section
+/// 8.3 exists for.
+fn cmd_nest(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let path = args.first().ok_or("expected the wrapper's path")?;
+    let module = Module::open(path).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+    let host = Arc::new(host::CliHost::new());
+
+    // The first instance picks up its sub-plugin however it can — in
+    // development that is AUDIO_GRAPH_SUB, since there is no editor yet.
+    let mut first = Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    run_one_block(&mut first)?;
+    let blob = first.save_state().map_err(|e| e.to_string())?;
+    drop(first);
+    println!("saved {} bytes of wrapper state", blob.len());
+
+    let text = String::from_utf8_lossy(&blob);
+    let names: Vec<&str> = text
+        .match_indices("display_name")
+        .filter_map(|(i, _)| text.get(i..i + 96))
+        .collect();
+    if names.is_empty() {
+        return Err("no sub-plugin reference in the saved state;                     set AUDIO_GRAPH_SUB so the first instance has one to save".into());
+    }
+    println!("state references: {}", names[0].escape_debug());
+
+    let mut second = Vst3Plugin::create(&module, class.cid, host).map_err(|e| e.to_string())?;
+    second.load_state(&blob).map_err(|e| e.to_string())?;
+    run_one_block(&mut second)?;
+    let restored = second.save_state().map_err(|e| e.to_string())?;
+
+    let restored_text = String::from_utf8_lossy(&restored);
+    if !restored_text.contains("display_name") {
+        return Err("the restored instance has no sub-plugin; state did not carry it".into());
+    }
+    println!("sub-plugin reference survived a state round-trip");
+    Ok(())
 }

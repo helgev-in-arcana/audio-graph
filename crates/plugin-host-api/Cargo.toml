@@ -5,3 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+# Intentionally empty, and worth keeping that way.
+#
+# ARCHITECTURE.md §4 requires that no backend type — no `ComPtr`, no raw
+# pointer — reaches this crate's public surface, because that is what keeps the
+# out-of-process backend of ADR-6 a substitution rather than a rewrite. With no
+# dependencies at all, that requirement is enforced by the build rather than by
+# review: a leak would not compile.
