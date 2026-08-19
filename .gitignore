@@ -1,1 +1,4 @@
 /target
+
+# Crash logs pasted in while debugging; kept on disk, not in history.
+panic-log.txt
