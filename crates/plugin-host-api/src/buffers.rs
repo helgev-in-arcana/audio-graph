@@ -1,0 +1,143 @@
+//! Audio buffer representation (ARCHITECTURE.md §4.3).
+//!
+//! Flat, not a nested slice-of-slices: a nested slice cannot live in shared
+//! memory, so the nested form would silently close the door on ADR-6.
+
+/// How channels are arranged inside the flat backing store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BufferLayout {
+    /// `c0f0 c1f0 c0f1 c1f1 ...`
+    Interleaved,
+    /// `c0f0 c0f1 ... c1f0 c1f1 ...`
+    #[default]
+    Planar,
+}
+
+/// Fixed configuration handed to `activate`. Changing any of it requires a
+/// deactivate/activate cycle, which the trait shape enforces (§4.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioConfig {
+    pub sample_rate: f64,
+    /// Largest block `process` will ever be called with.
+    pub max_block_size: u32,
+    pub input_channels: u32,
+    pub output_channels: u32,
+    /// True when the host is rendering faster than real time.
+    pub offline: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            max_block_size: 512,
+            input_channels: 2,
+            output_channels: 2,
+            offline: false,
+        }
+    }
+}
+
+/// Borrowed view over the flat audio storage for one process call.
+pub struct AudioBuffers<'a> {
+    input: &'a [f32],
+    output: &'a mut [f32],
+    input_channels: u32,
+    output_channels: u32,
+    frame_count: u32,
+    layout: BufferLayout,
+}
+
+impl<'a> AudioBuffers<'a> {
+    /// # Panics
+    /// If either slice is shorter than `channels * frame_count`.
+    pub fn new(
+        input: &'a [f32],
+        output: &'a mut [f32],
+        input_channels: u32,
+        output_channels: u32,
+        frame_count: u32,
+        layout: BufferLayout,
+    ) -> Self {
+        assert!(
+            input.len() >= (input_channels * frame_count) as usize,
+            "input buffer too small"
+        );
+        assert!(
+            output.len() >= (output_channels * frame_count) as usize,
+            "output buffer too small"
+        );
+        Self {
+            input,
+            output,
+            input_channels,
+            output_channels,
+            frame_count,
+            layout,
+        }
+    }
+
+    pub fn frame_count(&self) -> u32 {
+        self.frame_count
+    }
+    pub fn input_channels(&self) -> u32 {
+        self.input_channels
+    }
+    pub fn output_channels(&self) -> u32 {
+        self.output_channels
+    }
+    pub fn layout(&self) -> BufferLayout {
+        self.layout
+    }
+
+    /// Contiguous input channel, only available in planar layout.
+    pub fn input_channel(&self, channel: u32) -> Option<&[f32]> {
+        if self.layout != BufferLayout::Planar || channel >= self.input_channels {
+            return None;
+        }
+        let n = self.frame_count as usize;
+        let start = channel as usize * n;
+        Some(&self.input[start..start + n])
+    }
+
+    /// Contiguous output channel, only available in planar layout.
+    pub fn output_channel_mut(&mut self, channel: u32) -> Option<&mut [f32]> {
+        if self.layout != BufferLayout::Planar || channel >= self.output_channels {
+            return None;
+        }
+        let n = self.frame_count as usize;
+        let start = channel as usize * n;
+        Some(&mut self.output[start..start + n])
+    }
+
+    pub fn raw_input(&self) -> &[f32] {
+        self.input
+    }
+    pub fn raw_output_mut(&mut self) -> &mut [f32] {
+        self.output
+    }
+
+    /// Zero the whole output region. Used when a plugin reports silence or a
+    /// process call is skipped.
+    pub fn clear_output(&mut self) {
+        let n = (self.output_channels * self.frame_count) as usize;
+        self.output[..n].fill(0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planar_channels_are_contiguous() {
+        let input = vec![1.0, 1.0, 2.0, 2.0];
+        let mut output = vec![0.0; 4];
+        let mut b = AudioBuffers::new(&input, &mut output, 2, 2, 2, BufferLayout::Planar);
+        assert_eq!(b.input_channel(0), Some(&[1.0f32, 1.0][..]));
+        assert_eq!(b.input_channel(1), Some(&[2.0f32, 2.0][..]));
+        assert!(b.input_channel(2).is_none());
+        b.output_channel_mut(1).unwrap().fill(9.0);
+        assert_eq!(output, vec![0.0, 0.0, 9.0, 9.0]);
+    }
+}

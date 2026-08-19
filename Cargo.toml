@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/plugin-host-api",
+    "crates/vst3-host",
+    "crates/vst3-host-view",
+    "crates/subhost-adapter",
+    "crates/wrapper-engine",
+    "crates/wrapper-plugin",
+    "crates/host-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+plugin-host-api = { path = "crates/plugin-host-api" }
+vst3-host = { path = "crates/vst3-host" }
+vst3-host-view = { path = "crates/vst3-host-view" }
+subhost-adapter = { path = "crates/subhost-adapter" }
+wrapper-engine = { path = "crates/wrapper-engine" }
+
+vst3 = "0.3.0"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
