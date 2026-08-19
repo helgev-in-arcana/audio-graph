@@ -20,6 +20,11 @@ plugin-host-api = { path = "crates/plugin-host-api" }
 vst3-host = { path = "crates/vst3-host" }
 vst3-host-view = { path = "crates/vst3-host-view" }
 subhost-adapter = { path = "crates/subhost-adapter" }
+# Nothing depends on this yet; it is the M5 node graph's crate, declared here so
+# the workspace shows where it goes. `cargo add`/`cargo remove` prune workspace
+# dependencies nothing uses, so put it back rather than letting the scaffolding
+# quietly disappear.
+wrapper-engine = { path = "crates/wrapper-engine" }
 
 vst3 = "0.3.0"
 log = "0.4"
