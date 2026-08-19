@@ -29,6 +29,14 @@ pub struct MainThread<T> {
 // Drop is the one exception — see the `Drop` impl below.
 unsafe impl<T> Send for MainThread<T> {}
 
+// SAFETY: the same argument, one step further. `&MainThread<T>` hands out
+// nothing on a foreign thread — `get`/`get_mut` panic and `try_get` returns
+// `None` — so sharing the reference cannot produce a `&T` anywhere but the
+// owning thread. That is what makes it legitimate to put one inside an `Arc`
+// that the audio thread also holds: the audio thread can carry the pointer, it
+// simply cannot look through it.
+unsafe impl<T> Sync for MainThread<T> {}
+
 impl<T> MainThread<T> {
     pub fn new(value: T) -> MainThread<T> {
         MainThread {
