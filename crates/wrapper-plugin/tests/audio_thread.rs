@@ -62,6 +62,7 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
         max_block_size: 512,
         input_channels: 2,
         output_channels: 2,
+        aux_inputs: Default::default(),
         offline: true,
     });
 

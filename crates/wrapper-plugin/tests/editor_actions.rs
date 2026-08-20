@@ -115,6 +115,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         max_block_size: 512,
         input_channels: 2,
         output_channels: 2,
+        aux_inputs: Default::default(),
         offline: true,
     });
 

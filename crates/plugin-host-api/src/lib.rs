@@ -13,9 +13,11 @@ mod events;
 mod params;
 mod traits;
 
-pub use buffers::{AudioBuffers, AudioConfig, BufferLayout};
+pub use buffers::{AudioBuffers, AudioConfig, AuxBuses, BufferLayout, MAX_AUX_BUSES};
 pub use events::{Event, EventSink, NoteEvent, NoteExpression, ParamEvent, Target, TimeContext};
-pub use params::{Capabilities, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue};
+pub use params::{
+    BusInfo, Capabilities, IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
+};
 pub use traits::{HostContext, ProcessStatus, RestartReason, SubPluginMain, SubPluginProcessor};
 
 /// Errors surfaced across the host API boundary.

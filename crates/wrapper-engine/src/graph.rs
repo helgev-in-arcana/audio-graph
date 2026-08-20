@@ -110,6 +110,35 @@ pub struct PluginPorts {
     pub latency: u32,
 }
 
+impl PluginPorts {
+    /// Build a node's ports from what a loaded plugin reported (§14.2).
+    ///
+    /// `params` is deliberately left empty. The parameter sockets are the
+    /// user's choice, not the plugin's: a compressor with 90 parameters would
+    /// otherwise arrive as a node with 90 sockets. The editor adds them one at
+    /// a time.
+    ///
+    /// Widths are clamped to [`MAX_CHANNELS`][crate::MAX_CHANNELS]. M8 is
+    /// stereo throughout (§14.8), and a node drawn with a socket the compiler
+    /// will refuse is worse than one drawn narrow.
+    pub fn from_layout(layout: &plugin_host_api::IoLayout, latency: u32) -> PluginPorts {
+        let widths = |buses: &[plugin_host_api::BusInfo]| -> Vec<u16> {
+            buses
+                .iter()
+                .map(|b| b.channels.min(crate::MAX_CHANNELS as u16))
+                .filter(|&c| c > 0)
+                .collect()
+        };
+        PluginPorts {
+            audio_in: widths(&layout.inputs),
+            audio_out: widths(&layout.outputs),
+            accepts_notes: layout.accepts_notes,
+            params: Vec::new(),
+            latency,
+        }
+    }
+}
+
 /// One node's identity, position and settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {

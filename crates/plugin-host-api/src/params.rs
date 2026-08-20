@@ -193,3 +193,40 @@ mod tests {
         assert!(!f.contains(ParamFlags::BYPASS));
     }
 }
+
+/// One audio bus, as the plugin describes it (§14.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusInfo {
+    /// The plugin's own name for it: "Main", "Sidechain", "Key".
+    pub name: String,
+    pub channels: u16,
+    /// True for everything the format marks auxiliary. A sidechain is aux; the
+    /// bus a plugin actually processes is not.
+    pub is_aux: bool,
+}
+
+/// A plugin's whole I/O shape, read once after loading.
+///
+/// Discovered rather than declared (§14.2): what a plugin reports before
+/// negotiation is a wish, and the node's sockets have to match what it will
+/// actually accept. Returned in one call for the same reason as
+/// [`SubPluginMain::params`] — there is no per-bus getter anywhere (§4.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IoLayout {
+    pub inputs: Vec<BusInfo>,
+    pub outputs: Vec<BusInfo>,
+    pub accepts_notes: bool,
+    pub emits_notes: bool,
+}
+
+impl IoLayout {
+    /// Channel width of the main input bus, or zero for an instrument.
+    pub fn main_input_channels(&self) -> u16 {
+        self.inputs.first().map_or(0, |b| b.channels)
+    }
+
+    /// The aux input buses, in order. These are the sidechain sockets.
+    pub fn aux_inputs(&self) -> &[BusInfo] {
+        self.inputs.get(1..).unwrap_or(&[])
+    }
+}

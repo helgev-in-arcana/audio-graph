@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 plugin-host-api.workspace = true
+wrapper-engine.workspace = true
 vst3-host.workspace = true
 vst3-host-view.workspace = true
 subhost-adapter.workspace = true

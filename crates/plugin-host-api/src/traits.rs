@@ -13,7 +13,7 @@
 use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
 use crate::events::{Event, EventSink, TimeContext};
-use crate::params::{Capabilities, ParamId, ParamInfo, ParamSnapshot};
+use crate::params::{Capabilities, IoLayout, ParamId, ParamInfo, ParamSnapshot};
 
 /// What the sub-plugin reported about its output for this block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,13 @@ pub trait SubPluginMain {
     fn params(&self) -> &[ParamInfo];
 
     fn capabilities(&self) -> Capabilities;
+
+    /// The plugin's buses and whether it takes notes (§14.2).
+    ///
+    /// Read after loading and used to build the node's sockets. Batched for
+    /// the same reason as `params`: one round trip, so an out-of-process
+    /// backend is not a per-bus conversation (§4.1).
+    fn io_layout(&self) -> IoLayout;
 
     /// Current values of every parameter, in one round trip.
     fn snapshot(&self) -> ParamSnapshot;

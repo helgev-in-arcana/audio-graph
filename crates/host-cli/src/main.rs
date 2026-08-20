@@ -31,6 +31,7 @@ fn main() -> ExitCode {
     let result = match cmd {
         "scan" => cmd_scan(rest),
         "info" => cmd_info(rest),
+        "buses" => cmd_buses(rest),
         "dirs" => cmd_dirs(),
         "churn" => cmd_churn(rest),
         "params" => cmd_params(rest),
@@ -84,6 +85,8 @@ fn usage() {
   host-cli chain <WRAPPER.vst3> <IN.wav> <A.vst3> <B.vst3>
                                     check the graph routing A -> B matches A and B
                                     rendered one after the other
+  host-cli buses <PATH.vst3> [CID]   list the plugin's buses as the node graph
+                                    will see them (§14.2)
   host-cli instrument <WRAPPER.vst3> <SYNTH.vst3> <A.vst3> <B.vst3>
                                     check notes reach the instrument the graph
                                     points at, and only that one
@@ -216,6 +219,56 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
         "\n{} module(s): {loaded} loaded, {failed} failed, {classes} audio module class(es)",
         modules.len()
     );
+    Ok(())
+}
+
+/// What one plugin declares for buses and notes, which is what a plugin node's
+/// sockets are built from (§14.2).
+///
+/// Read before activation, so this is the plugin's default shape rather than a
+/// negotiated one. A sidechain socket has to exist before the graph can ask for
+/// anything to be connected to it, so the default is the right thing to build
+/// sockets from -- and §14.11 re-checks the negotiation at activate.
+fn cmd_buses(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let path = args.first().ok_or("expected a plugin path")?;
+    let module = Module::open(path).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+    let plugin = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+
+    let layout = plugin.io_layout();
+    println!("{}", class.name);
+    let show = |label: &str, buses: &[plugin_host_api::BusInfo]| {
+        if buses.is_empty() {
+            println!("  {label}: none");
+            return;
+        }
+        for (i, bus) in buses.iter().enumerate() {
+            let kind = if bus.is_aux { "aux" } else { "main" };
+            println!(
+                "  {label} {i}: {} ch, {kind}, \"{}\"",
+                bus.channels, bus.name
+            );
+        }
+    };
+    show("audio in ", &layout.inputs);
+    show("audio out", &layout.outputs);
+    println!("  notes in:  {}", layout.accepts_notes);
+    println!("  notes out: {}", layout.emits_notes);
+
+    // The same thing again, as the graph will show it.
+    println!("\nas a plugin node:");
+    let ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
+    let node = wrapper_engine::NodeKind::Plugin { instance: 0, ports };
+    for port in node.input_ports() {
+        println!("  in  {} ({})", port.name, port.ty.label());
+    }
+    for port in node.output_ports() {
+        println!("  out {} ({})", port.name, port.ty.label());
+    }
     Ok(())
 }
 
@@ -527,6 +580,7 @@ fn run_one_block(plugin: &mut vst3_host::Vst3Plugin) -> Result<(), String> {
         max_block_size: 512,
         input_channels: ins.min(2),
         output_channels: if outs == 0 { 2 } else { outs.min(2) },
+        aux_inputs: Default::default(),
         offline: true,
     };
     let frames = 64u32;
@@ -764,6 +818,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 max_block_size: 512,
                 input_channels: ins.min(2),
                 output_channels: if outs == 0 { 2 } else { outs.min(2) },
+                aux_inputs: Default::default(),
                 offline: true,
             };
             let processor = plugin
@@ -795,6 +850,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
         max_block_size: 512,
         input_channels: 2,
         output_channels: 2,
+        aux_inputs: Default::default(),
         offline: false,
     };
     let processor = sub.activate(config)?;

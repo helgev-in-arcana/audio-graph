@@ -801,6 +801,7 @@ dependencies = [
  "subhost-adapter",
  "vst3-host",
  "vst3-host-view",
+ "wrapper-engine",
 ]
 
 [[package]]

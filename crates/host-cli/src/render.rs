@@ -92,6 +92,7 @@ pub fn render_with_state(
         max_block_size: block_size,
         input_channels,
         output_channels,
+        aux_inputs: Default::default(),
         offline: true,
     };
 

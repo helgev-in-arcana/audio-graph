@@ -13,6 +13,60 @@ pub enum BufferLayout {
     Planar,
 }
 
+/// How many aux input buses one plugin may be given (§14.11).
+///
+/// Aux means everything after the main bus: a sidechain, a second sidechain, a
+/// key input. Fixed-size so [`AudioConfig`] stays `Copy` and carries no
+/// pointer, which is what lets it cross a process boundary unchanged (ADR-6).
+pub const MAX_AUX_BUSES: usize = 3;
+
+/// The aux input buses of one plugin, by channel width.
+///
+/// Empty is the common case and the default: most plugins have one input bus,
+/// and a graph that wires nothing to a sidechain should not make the host
+/// negotiate one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuxBuses {
+    widths: [u16; MAX_AUX_BUSES],
+    count: u8,
+}
+
+impl AuxBuses {
+    /// Take the first [`MAX_AUX_BUSES`] widths. Extra ones are dropped rather
+    /// than refused: the compiler has already checked the graph against the
+    /// same ceiling, so anything beyond it is a bug on this side, not the
+    /// user's.
+    pub fn new(widths: &[u16]) -> AuxBuses {
+        let mut out = AuxBuses::default();
+        for &width in widths.iter().take(MAX_AUX_BUSES) {
+            out.widths[out.count as usize] = width;
+            out.count += 1;
+        }
+        out
+    }
+
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<u16> {
+        (index < self.len()).then(|| self.widths[index])
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.widths[..self.len()].iter().copied()
+    }
+
+    /// Channels across every aux bus.
+    pub fn total_channels(&self) -> u32 {
+        self.iter().map(u32::from).sum()
+    }
+}
+
 /// Fixed configuration handed to `activate`. Changing any of it requires a
 /// deactivate/activate cycle, which the trait shape enforces (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,10 +74,25 @@ pub struct AudioConfig {
     pub sample_rate: f64,
     /// Largest block `process` will ever be called with.
     pub max_block_size: u32,
+    /// Channels on the *main* input bus. Zero for an instrument.
     pub input_channels: u32,
     pub output_channels: u32,
+    /// Extra input buses beyond the main one — sidechains (§14.11).
+    ///
+    /// Separate from `input_channels` rather than folded into a list of buses
+    /// because bus 0 is not like the others: it is the one a plugin processes,
+    /// and the rest are things it looks at.
+    pub aux_inputs: AuxBuses,
     /// True when the host is rendering faster than real time.
     pub offline: bool,
+}
+
+impl AudioConfig {
+    /// Every input channel the plugin will be handed, main bus and aux buses
+    /// together. This is the width of [`AudioBuffers`]'s input region.
+    pub fn total_input_channels(&self) -> u32 {
+        self.input_channels + self.aux_inputs.total_channels()
+    }
 }
 
 impl Default for AudioConfig {
@@ -33,17 +102,24 @@ impl Default for AudioConfig {
             max_block_size: 512,
             input_channels: 2,
             output_channels: 2,
+            aux_inputs: AuxBuses::default(),
             offline: false,
         }
     }
 }
 
 /// Borrowed view over the flat audio storage for one process call.
+///
+/// The input region holds the main bus first and then each aux bus, packed —
+/// so `input_channels` is the total and `aux_inputs` says where the joins are.
+/// One region rather than one per bus because a nested slice cannot live in
+/// shared memory (§4.3), and the buses are contiguous anyway.
 pub struct AudioBuffers<'a> {
     input: &'a [f32],
     output: &'a mut [f32],
     input_channels: u32,
     output_channels: u32,
+    aux_inputs: AuxBuses,
     frame_count: u32,
     layout: BufferLayout,
 }
@@ -72,9 +148,36 @@ impl<'a> AudioBuffers<'a> {
             output,
             input_channels,
             output_channels,
+            aux_inputs: AuxBuses::default(),
             frame_count,
             layout,
         }
+    }
+
+    /// Declare that the input region carries aux buses after the main one.
+    ///
+    /// `input_channels` must already count them; this only says where the
+    /// joins are. Builder-style because the great majority of calls have no
+    /// aux buses and should not have to say so.
+    ///
+    /// # Panics
+    /// If the buses do not add up to `input_channels`.
+    pub fn with_aux_inputs(mut self, aux: AuxBuses) -> Self {
+        assert!(
+            aux.total_channels() <= self.input_channels,
+            "aux buses claim more channels than the input region has"
+        );
+        self.aux_inputs = aux;
+        self
+    }
+
+    pub fn aux_inputs(&self) -> AuxBuses {
+        self.aux_inputs
+    }
+
+    /// Channels on the main input bus: everything the aux buses do not claim.
+    pub fn main_input_channels(&self) -> u32 {
+        self.input_channels - self.aux_inputs.total_channels()
     }
 
     pub fn frame_count(&self) -> u32 {

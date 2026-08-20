@@ -233,6 +233,7 @@ impl Wrapper {
             max_block_size: max_block,
             input_channels,
             output_channels: self.channels,
+            aux_inputs: Default::default(),
             offline: false,
         };
         // Remembered even when nothing is loaded: the editor uses it to
