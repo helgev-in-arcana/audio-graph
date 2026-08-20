@@ -14,7 +14,12 @@ use plugin_host_api::{NoteEvent, NoteExpression};
 
 use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
-use crate::program::{MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec};
+use crate::program::{
+    MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec,
+};
+
+/// No ring currently holds this line. Not a valid index into `rings`.
+const NOT_PRESENT: usize = usize::MAX;
 
 /// What the graph is being evaluated against for one sub-block.
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +85,18 @@ pub struct Engine {
     /// Which node each phase belongs to, mirrored from the program so the swap
     /// can match old state to new without touching the old program again.
     phase_nodes: Vec<u32>,
+    /// One ring per delay line, each `MAX_DELAY_TAPS` sub-blocks long (§14.5).
+    ///
+    /// A `Vec<Vec<f64>>` rather than one flat buffer specifically so that a
+    /// program swap can reorder the lines by swapping the outer entries, which
+    /// moves pointers instead of 32 kB of samples.
+    rings: Vec<Vec<f64>>,
+    /// Where the next write goes, per line.
+    ring_heads: Vec<usize>,
+    /// Which `DelayWrite` node each ring belongs to. Same role as `phase_nodes`.
+    ring_nodes: Vec<u32>,
+    /// Scratch for reordering `rings` on a swap, so the swap allocates nothing.
+    ring_order: Vec<usize>,
     expressions: Expressions,
     rng: u32,
 }
@@ -99,6 +116,12 @@ impl Engine {
             holds: vec![0.0; MAX_LFOS],
             carry: vec![(0, 0.0, 0.0); MAX_LFOS],
             phase_nodes: vec![u32::MAX; MAX_LFOS],
+            rings: (0..MAX_DELAY_LINES)
+                .map(|_| vec![0.0; MAX_DELAY_TAPS])
+                .collect(),
+            ring_heads: vec![0; MAX_DELAY_LINES],
+            ring_nodes: vec![u32::MAX; MAX_DELAY_LINES],
+            ring_order: vec![0; MAX_DELAY_LINES],
             expressions: Expressions::default(),
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
@@ -154,6 +177,51 @@ impl Engine {
         for i in next.lfo_nodes.len()..MAX_LFOS {
             self.phase_nodes[i] = u32::MAX;
         }
+
+        // Delay lines keep their contents across the swap (§14.5), which means
+        // moving each ring to whatever index the new program gave its node.
+        // Work out the permutation first, then apply it by swapping the outer
+        // `Vec` entries — no allocation, and no copying of ring contents.
+        let lines = next.delay_nodes.len().min(MAX_DELAY_LINES);
+        for i in 0..lines {
+            self.ring_order[i] = self
+                .ring_nodes
+                .iter()
+                .position(|&n| n == next.delay_nodes[i])
+                .unwrap_or(NOT_PRESENT);
+        }
+
+        // Move the surviving rings into place first. Clearing as we went would
+        // wipe a ring that is still sitting in a slot some later line wants.
+        for i in 0..lines {
+            let from = self.ring_order[i];
+            // `from` is never below `i`: slots below `i` already hold the rings
+            // of earlier lines, whose nodes are all different from this one's.
+            if from == NOT_PRESENT || from == i {
+                continue;
+            }
+            self.rings.swap(i, from);
+            self.ring_heads.swap(i, from);
+            // Whatever was at `i` now sits at `from`; a line still pointing at
+            // `i` has to follow it there.
+            for slot in self.ring_order[i + 1..lines].iter_mut() {
+                if *slot == i {
+                    *slot = from;
+                }
+            }
+            self.ring_order[i] = i;
+        }
+        // Whatever is left in a new line's slot belonged to a line that is gone.
+        for i in 0..lines {
+            if self.ring_order[i] == NOT_PRESENT {
+                self.rings[i].fill(0.0);
+                self.ring_heads[i] = 0;
+            }
+            self.ring_nodes[i] = next.delay_nodes[i];
+        }
+        for i in lines..MAX_DELAY_LINES {
+            self.ring_nodes[i] = u32::MAX;
+        }
         true
     }
 
@@ -189,6 +257,8 @@ impl Engine {
     pub fn reset(&mut self) {
         self.expressions = Expressions::default();
         self.phases.iter_mut().for_each(|p| *p = 0.0);
+        self.rings.iter_mut().for_each(|r| r.fill(0.0));
+        self.ring_heads.iter_mut().for_each(|h| *h = 0);
     }
 
     /// Evaluate the program for one sub-block.
@@ -215,8 +285,44 @@ impl Engine {
             0.0
         };
 
+        // How many sub-blocks back one second is. The floor of §14.4 in the
+        // param domain is one sub-block, and it is applied here rather than at
+        // compile time because only the audio thread knows both of these.
+        let taps_per_second = if ctx.frames > 0 && ctx.sample_rate > 0.0 {
+            ctx.sample_rate / f64::from(ctx.frames)
+        } else {
+            0.0
+        };
+
         for op in &program.ops {
             match *op {
+                Op::DelayRead { out, line, time } => {
+                    let index = line as usize;
+                    // A read whose line the program does not have is silence,
+                    // not a panic: `line` is compiler-generated, but the audio
+                    // thread is the wrong place to find that out the hard way.
+                    self.registers[out as usize] = if index < self.rings.len() {
+                        let taps = (time * taps_per_second)
+                            .round()
+                            .clamp(1.0, (MAX_DELAY_TAPS - 1) as f64)
+                            as usize;
+                        let head = self.ring_heads[index];
+                        // `head` is where the *next* write goes, so the value
+                        // written one sub-block ago is at `head - 1`.
+                        let at = (head + MAX_DELAY_TAPS - taps) % MAX_DELAY_TAPS;
+                        self.rings[index][at]
+                    } else {
+                        0.0
+                    };
+                }
+                Op::DelayWrite { line, a } => {
+                    let index = line as usize;
+                    if index < self.rings.len() {
+                        let head = self.ring_heads[index];
+                        self.rings[index][head] = self.registers[a as usize];
+                        self.ring_heads[index] = (head + 1) % MAX_DELAY_TAPS;
+                    }
+                }
                 Op::Const { out, value } => self.registers[out as usize] = value,
                 Op::Slot { out, slot } => {
                     self.registers[out as usize] = slots.get(slot as usize).copied().unwrap_or(0.0)
@@ -340,7 +446,7 @@ fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
 mod tests {
     use super::*;
     use crate::compile::compile;
-    use crate::graph::{Graph, NodeKind, Rate};
+    use crate::graph::{Graph, MathOp, NodeId, NodeKind, PortType, Rate};
 
     const SLOTS: usize = 32;
 
@@ -363,7 +469,7 @@ mod tests {
         let mut graph = Graph::new();
         let c = graph.add(NodeKind::Constant { value: 0.25 }, [0.0, 0.0]);
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(c, out, 0);
+        graph.connect(c, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -386,8 +492,8 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 4 }, [0.0, 0.0]);
-        graph.connect(input, half, 0);
-        graph.connect(half, out, 0);
+        graph.connect(input, 0, half, 0);
+        graph.connect(half, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -412,7 +518,7 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(lfo, out, 0);
+        graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -446,7 +552,7 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(lfo, out, 0);
+        graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -476,6 +582,141 @@ mod tests {
         );
     }
 
+    /// A feedback loop, built the only way §14.4 allows one to be built. The
+    /// value has to come back round, one sub-block later, scaled.
+    fn feedback_graph(time: f64) -> (Graph, NodeId) {
+        let mut graph = Graph::new();
+        let seed = graph.add(NodeKind::SlotIn { slot: 1 }, [0.0, 0.0]);
+        let read = graph.add(
+            NodeKind::DelayRead {
+                line: 0,
+                ty: PortType::Param,
+                max_time: 1.0,
+                time,
+            },
+            [0.0, 0.0],
+        );
+        // The loop: (input + what came back) * 0.5, written back to the line.
+        let mixed = graph.add(
+            NodeKind::Math {
+                op: MathOp::Add,
+                b: 0.0,
+            },
+            [0.0, 0.0],
+        );
+        let decayed = graph.add(
+            NodeKind::Math {
+                op: MathOp::Multiply,
+                b: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let write = graph.add(
+            NodeKind::DelayWrite {
+                line: 0,
+                ty: PortType::Param,
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+
+        graph.connect(seed, 0, mixed, 0);
+        graph.connect(read, 0, mixed, 1);
+        graph.connect(mixed, 0, decayed, 0);
+        graph.connect(decayed, 0, write, 0);
+        graph.connect(decayed, 0, out, 0);
+        (graph, write)
+    }
+
+    #[test]
+    fn a_delay_line_carries_a_value_round_the_loop() {
+        // One sub-block of delay, so each run reads exactly what the previous
+        // one wrote.
+        let (graph, _) = feedback_graph(32.0 / 48_000.0);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = vec![0.0; SLOTS];
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        // (1 + 0) * 0.5
+        assert!((slots[0] - 0.5).abs() < 1e-9, "first pass: {}", slots[0]);
+
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        // (1 + 0.5) * 0.5 — the 0.5 came back round.
+        assert!((slots[0] - 0.75).abs() < 1e-9, "second pass: {}", slots[0]);
+    }
+
+    /// §14.5. The line is state, like an LFO's phase, and an edit somewhere
+    /// else must not empty it.
+    #[test]
+    fn recompiling_does_not_empty_a_delay_line() {
+        let (mut graph, _) = feedback_graph(32.0 / 48_000.0);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = vec![0.0; SLOTS];
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        assert!((slots[0] - 0.5).abs() < 1e-9);
+
+        // An unrelated node appears, as it does on any edit.
+        graph.add(NodeKind::Constant { value: 0.0 }, [0.0, 0.0]);
+        load(&mut engine, &graph);
+
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        assert!(
+            (slots[0] - 0.75).abs() < 1e-9,
+            "the line was emptied by the swap: {}",
+            slots[0]
+        );
+    }
+
+    /// The floor of §14.4, in the param domain. A time under one sub-block
+    /// would be a read of the value being written in this same sub-block.
+    #[test]
+    fn a_delay_shorter_than_a_sub_block_is_held_at_one() {
+        let (graph, _) = feedback_graph(0.0);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = vec![0.0; SLOTS];
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        assert!(
+            (slots[0] - 0.75).abs() < 1e-9,
+            "a zero time should behave as one sub-block, not as zero: {}",
+            slots[0]
+        );
+    }
+
+    /// The DAW's buffer size is not the sub-block size, and the loop is defined
+    /// in sub-blocks. Two runs of 32 must land where one run of 64 does not.
+    #[test]
+    fn the_loop_is_measured_in_sub_blocks_not_daw_blocks() {
+        let (graph, _) = feedback_graph(2.0 * 32.0 / 48_000.0);
+        let run = |frames: u32, passes: usize| {
+            let mut engine = Engine::new();
+            load(&mut engine, &graph);
+            let mut slots = vec![0.0; SLOTS];
+            for _ in 0..passes {
+                slots[1] = 1.0;
+                engine.run(&ctx(frames), &mut slots);
+            }
+            slots[0]
+        };
+        // Same sub-block size, same answer, however the DAW hands us the block.
+        assert!((run(32, 4) - run(32, 4)).abs() < 1e-12);
+        // Two sub-blocks of delay: nothing has come back yet after two passes.
+        assert!((run(32, 2) - 0.5).abs() < 1e-9);
+        // By the third, it has.
+        assert!(run(32, 3) > 0.5);
+    }
+
     #[test]
     fn recompiling_does_not_restart_a_running_lfo() {
         let mut graph = Graph::new();
@@ -490,7 +731,7 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(lfo, out, 0);
+        graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -525,7 +766,7 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 7 }, [0.0, 0.0]);
-        graph.connect(expr, out, 0);
+        graph.connect(expr, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -554,7 +795,7 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(gate, out, 0);
+        graph.connect(gate, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
@@ -607,8 +848,8 @@ mod tests {
             [0.0, 0.0],
         );
         let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        graph.connect(a, div, 0);
-        graph.connect(div, out, 0);
+        graph.connect(a, 0, div, 0);
+        graph.connect(div, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);

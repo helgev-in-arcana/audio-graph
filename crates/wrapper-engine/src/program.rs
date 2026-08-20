@@ -19,6 +19,17 @@ use crate::graph::{ExprSource, MathOp, NodeId, Waveform};
 /// `process`.
 pub const MAX_REGISTERS: usize = 256;
 pub const MAX_LFOS: usize = 64;
+pub const MAX_DELAY_LINES: usize = 16;
+
+/// How far back a param delay line can read, in sub-blocks.
+///
+/// A param line stores one value per sub-block (§9.2), so this is a time only
+/// once the sample rate and the quantum are known: 4096 sub-blocks is 2.7 s at
+/// 48 kHz with the default quantum of 32, and 1.4 s at the finest quantum of
+/// 16. The ring is preallocated for it, because §9.1 forbids allocating in
+/// `process` and the alternative — sizing from the longest delay in the graph —
+/// would mean a reallocation every time the user drags the time control.
+pub const MAX_DELAY_TAPS: usize = 4096;
 
 /// An index into the register file.
 pub type Reg = u16;
@@ -80,6 +91,25 @@ pub enum Op {
         out_span: f64,
         clamp: bool,
     },
+    /// Read from a delay line, `time` seconds back (§14.4).
+    ///
+    /// Clamped at run time to at least one sub-block, which is the floor of
+    /// §14.4 expressed in the param domain. The compiler cannot do it: the
+    /// floor depends on the sample rate and the quantum, and it knows neither.
+    DelayRead {
+        out: Reg,
+        line: u16,
+        time: f64,
+    },
+    /// Write this sub-block's value into a delay line.
+    ///
+    /// Emitted after everything feeding it, like any other op — but nothing
+    /// reads its result, so no register is involved and no edge exists for the
+    /// topological sort to follow back.
+    DelayWrite {
+        line: u16,
+        a: Reg,
+    },
 }
 
 /// A graph, compiled.
@@ -91,6 +121,12 @@ pub struct Program {
     /// Which slot each output drives, and where its value ends up. Sorted by
     /// slot, and at most one entry per slot.
     pub outputs: Vec<(u16, Reg)>,
+    /// Line index → the `DelayWrite` node it belongs to.
+    ///
+    /// Carried across a swap for the same reason as `lfo_nodes`: §14.5. A
+    /// feedback loop that emptied itself every time the user nudged an
+    /// unrelated control would not be usable.
+    pub delay_nodes: Vec<NodeId>,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
@@ -106,6 +142,7 @@ impl Program {
             ops: Vec::new(),
             registers: 0,
             outputs: Vec::new(),
+            delay_nodes: Vec::new(),
             lfo_nodes: Vec::new(),
         }
     }

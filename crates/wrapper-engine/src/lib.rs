@@ -23,6 +23,11 @@ mod program;
 
 pub use compile::{CompileError, compile};
 pub use engine::{BlockContext, Engine};
-pub use graph::{ExprSource, Graph, Link, MathOp, Node, NodeId, NodeKind, Rate, Waveform};
+pub use graph::{
+    ExprSource, Graph, LineId, Link, MathOp, Node, NodeId, NodeKind, ParamPort, PluginPorts, Port,
+    PortType, Rate, Waveform,
+};
 pub use handoff::Handoff;
-pub use program::{MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec, Reg};
+pub use program::{
+    MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec, Reg,
+};

@@ -211,8 +211,8 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
             [200.0, 0.0],
         );
         let out = state.graph.add(NodeKind::SlotOut { slot: 4 }, [400.0, 0.0]);
-        state.graph.connect(lfo, half, 0);
-        state.graph.connect(half, out, 0);
+        state.graph.connect(lfo, 0, half, 0);
+        state.graph.connect(half, 0, out, 0);
     }
     shared.publish_graph();
     assert!(
@@ -272,9 +272,9 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
             [0.0, 300.0],
         );
         let out = state.graph.add(NodeKind::SlotOut { slot: 6 }, [0.0, 400.0]);
-        state.graph.connect(a, b, 0);
-        state.graph.connect(b, a, 0);
-        state.graph.connect(b, out, 0);
+        state.graph.connect(a, 0, b, 0);
+        state.graph.connect(b, 0, a, 0);
+        state.graph.connect(b, 0, out, 0);
     }
     shared.publish_graph();
     assert!(
@@ -308,7 +308,7 @@ fn a_graph_survives_the_state_round_trip() {
         let out = state
             .graph
             .add(NodeKind::SlotOut { slot: 2 }, [210.0, 20.0]);
-        state.graph.connect(c, out, 0);
+        state.graph.connect(c, 0, out, 0);
     }
     shared.store_state();
 

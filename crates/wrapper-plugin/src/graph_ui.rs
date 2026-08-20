@@ -116,7 +116,7 @@ impl GraphEditor {
             let from = ports.iter().find(|(id, _, _)| *id == link.from);
             let to = ports.iter().find(|(id, _, _)| *id == link.to);
             if let (Some((_, out, _)), Some((_, _, ins))) = (from, to)
-                && let Some(&target) = ins.get(link.input as usize)
+                && let Some(&target) = ins.get(link.to_port as usize)
             {
                 shapes.push(link_shape(*out, target, ui.visuals().weak_text_color()));
             }
@@ -138,7 +138,7 @@ impl GraphEditor {
             changed = true;
         }
         if let Some((from, to, input)) = to_connect {
-            graph.connect(from, to, input);
+            graph.connect(from, 0, to, input);
             changed = true;
         }
         if let Some((to, input)) = to_disconnect {
@@ -235,8 +235,8 @@ impl GraphEditor {
         let id = graph.nodes[index].id;
         let mut outcome = NodeOutcome::default();
 
-        let inputs = graph.nodes[index].kind.inputs();
-        let has_output = graph.nodes[index].kind.has_output();
+        let inputs = graph.nodes[index].kind.input_ports();
+        let outputs = graph.nodes[index].kind.output_ports();
         let title = graph.nodes[index].kind.title();
 
         let body = Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, 0.0));
@@ -314,18 +314,22 @@ impl GraphEditor {
 
         // Ports, drawn on the node's edges.
         let painter = ui.painter_at(canvas);
-        for (i, name) in inputs.iter().enumerate() {
+        for (i, port) in inputs.iter().enumerate() {
             let centre = Pos2::new(rect.min.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
             let connected = graph.source_of(id, i as u8).is_some();
-            if self.port(ui, &painter, (id, i as u8 + 1), centre, connected, name) {
+            let label = format!("{} ({})", port.name, port.ty.label());
+            if self.port(ui, &painter, (id, i as u8 + 1), centre, connected, &label) {
                 outcome.clicked_input = Some(i as u8);
             }
             outcome.input_ports.push(centre);
         }
-        if has_output {
+        // One output socket for now. A plugin node has one per bus, and the
+        // canvas grows a second column of sockets when M8.2 makes them run.
+        if let Some(port) = outputs.first() {
             let centre = Pos2::new(rect.max.x, rect.min.y + PORT_TOP);
             let connected = graph.links.iter().any(|l| l.from == id);
-            if self.port(ui, &painter, (id, 0), centre, connected, "out") {
+            let label = format!("{} ({})", port.name, port.ty.label());
+            if self.port(ui, &painter, (id, 0), centre, connected, &label) {
                 outcome.clicked_output = true;
             }
             outcome.output_port = centre;
@@ -441,6 +445,22 @@ impl GraphEditor {
                 });
                 changed |= ui.checkbox(clamp, "clamp").changed();
             }
+            NodeKind::DelayRead { time, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("time (s)");
+                    changed |= ui
+                        .add(egui::DragValue::new(time).speed(0.001).range(0.0..=10.0))
+                        .changed();
+                });
+                ui.weak("held at one sub-block minimum while in a loop");
+            }
+            // Sinks and sources with nothing to set. The M8 audio nodes have
+            // their controls in M8.2, where they start doing something.
+            NodeKind::DelayWrite { .. }
+            | NodeKind::AudioIn { .. }
+            | NodeKind::AudioOut { .. }
+            | NodeKind::NoteIn
+            | NodeKind::Plugin { .. } => {}
         }
         changed
     }

@@ -48,7 +48,7 @@ fn lfo_into(shared: &Arc<Shared>, slot: usize, rate: f64) {
         [0.0, 0.0],
     );
     let out = state.graph.add(NodeKind::SlotOut { slot }, [200.0, 0.0]);
-    state.graph.connect(lfo, out, 0);
+    state.graph.connect(lfo, 0, out, 0);
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
         let one = state
             .graph
             .add(NodeKind::SlotOut { slot: 1 }, [200.0, 100.0]);
-        state.graph.connect(a, one, 0);
+        state.graph.connect(a, 0, one, 0);
     }
     shared.publish_graph();
 
