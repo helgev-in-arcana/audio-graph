@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         "nest" => cmd_nest(rest),
         "graph" => cmd_graph(rest),
         "chain" => cmd_chain(rest),
+        "instrument" => cmd_instrument(rest),
         "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
         "bundle" => cmd_bundle(rest),
@@ -83,6 +84,9 @@ fn usage() {
   host-cli chain <WRAPPER.vst3> <IN.wav> <A.vst3> <B.vst3>
                                     check the graph routing A -> B matches A and B
                                     rendered one after the other
+  host-cli instrument <WRAPPER.vst3> <SYNTH.vst3> <A.vst3> <B.vst3>
+                                    check notes reach the instrument the graph
+                                    points at, and only that one
   host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
@@ -332,6 +336,12 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_synth(args: &[String]) -> Result<(), String> {
+    let twice = args.iter().any(|a| a == "--twice");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
     let path = args.first().ok_or("expected a plugin path")?;
     let output_path = args.get(1).ok_or("expected an output wav")?;
 
@@ -358,6 +368,29 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
     report(&outcome, &input);
     if outcome.audio.peak() == 0.0 {
         return Err("instrument produced silence".into());
+    }
+
+    // `--twice` asks whether a second instance in the *same* process plays the
+    // same notes the same way. Several synths randomise oscillator phase from a
+    // process-global generator, which makes them perfectly repeatable run to
+    // run and different instance to instance -- and therefore useless for any
+    // check that compares a graph against a hand-made chain.
+    if twice {
+        let again = render::render(
+            Path::new(path),
+            args.get(2).map(String::as_str),
+            &input,
+            512,
+            &events,
+        )?;
+        let mut worst = 0.0f32;
+        for (a, b) in outcome.audio.samples.iter().zip(again.audio.samples.iter()) {
+            worst = worst.max((a - b).abs());
+        }
+        println!("second instance in this process differs by {worst:.9}");
+        if worst > 1e-6 {
+            println!("=> not usable for a bit-exact graph comparison");
+        }
     }
     Ok(())
 }
@@ -1336,6 +1369,201 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
             { "from": 2, "from_port": 0, "to": 3, "to_port": 0 }
         ],
         "next_id": 4
+    });
+    Ok(value.to_string())
+}
+
+/// An instrument into two effects, through the node graph (ROADMAP M8.3).
+///
+/// Deliberately *not* a comparison against a hand-made chain. M8.2's `chain`
+/// already proves audio comes out sample-identical; what M8.3 adds is a rule
+/// about where notes go, and that rule is testable directly:
+///
+/// - notes wired to an instrument: it plays;
+/// - nothing wired to its notes port: it is silent. Before M8.3 every instance
+///   was handed every event the DAW sent, so this one played anyway;
+/// - notes wired to the *second* instrument node: that one plays. "Any
+///   instrument node", not "instance 0".
+///
+/// Comparing samples would have been the stronger check and it is not
+/// available: several synths randomise oscillator phase from a process-global
+/// generator, so two instances in one process play the same notes differently.
+/// `host-cli synth <PLUGIN> <OUT.wav> --twice` reports whether a given one
+/// does.
+fn cmd_instrument(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+    let first = args.get(2).ok_or("expected the first effect")?;
+    let second = args.get(3).ok_or("expected the second effect")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0;
+    let frames = (sample_rate * 3.0) as usize;
+    let note_at = (sample_rate * 0.1) as usize;
+    let silence = wav::Audio::silence(sample_rate, 2, frames);
+    let events = render::note(60, note_at, (sample_rate * 2.0) as usize);
+
+    // What the instrument is worth on its own, so "the chain is silent" can be
+    // told apart from "this synth needs a preset loaded first".
+    let alone = render::render(Path::new(synth), None, &silence, BLOCK, &events)?;
+    println!("{} alone: peak {:.6}", short(synth), alone.audio.peak());
+    if alone.audio.peak() < 1e-4 {
+        return Err(format!(
+            "{} produced silence on its own, so nothing here would mean anything",
+            short(synth)
+        ));
+    }
+
+    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |wired: Option<u32>| -> Result<render::RenderOutcome, String> {
+        let patched = inject_instrument(&baseline_json, synth, first, second, wired)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )
+    };
+
+    // The DoD's chain: notes -> instrument -> effect -> effect.
+    let played = run(Some(0))?;
+    println!(
+        "notes -> instrument 1 -> {} -> {}",
+        short(first),
+        short(second)
+    );
+    println!("  peak {:.6}", played.audio.peak());
+    if played.audio.peak() < 1e-4 {
+        return Err("the chain is silent; the notes are not reaching the instrument".into());
+    }
+    // Nothing before the note-on, or something other than the note is making
+    // the sound and the check above proves nothing.
+    let before = played
+        .audio
+        .samples
+        .chunks(played.audio.frames)
+        .flat_map(|ch| ch[..note_at.min(ch.len())].iter())
+        .fold(0.0f32, |a, s| a.max(s.abs()));
+    println!("  peak before the note: {before:.6}");
+
+    // The M8.3 rule: an unwired notes port means no notes at all.
+    let unwired = run(None)?;
+    println!("same graph, nothing wired to the notes port");
+    println!("  peak {:.6}", unwired.audio.peak());
+    if unwired.audio.peak() > 1e-4 {
+        return Err(format!(
+            "an instrument with nothing wired to its notes port still played \
+             (peak {:.6}); it is hearing the DAW's notes anyway",
+            unwired.audio.peak()
+        ));
+    }
+
+    // "Any instrument node", not "instance 0": the same graph with the notes
+    // going to the second one instead.
+    let other = run(Some(1))?;
+    println!("notes wired to instrument 2 instead");
+    println!("  peak {:.6}", other.audio.peak());
+    if other.audio.peak() < 1e-4 {
+        return Err("notes reach instrument 1 but not instrument 2".into());
+    }
+
+    println!("notes reach the instrument the graph points at, and only that one");
+    Ok(())
+}
+
+fn short(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Build the M8.3 patch: two instrument nodes mixed together, into two effects
+/// in series, with the DAW's notes wired to `wired` (or to neither).
+fn inject_instrument(
+    state: &str,
+    synth: &str,
+    first: &str,
+    second: &str,
+    wired: Option<u32>,
+) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let reference = |path: &str| -> Result<serde_json::Value, String> {
+        let module = Module::open(path).map_err(|e| e.to_string())?;
+        let class = render::choose_class(&module, None)?;
+        Ok(serde_json::json!({
+            "format": "vst3",
+            "plugin_id": class.cid.to_hex(),
+            "path_hint": path,
+            "display_name": class.name,
+        }))
+    };
+
+    value["sub_plugins"] = serde_json::json!([
+        { "instance": 0, "reference": reference(synth)? },
+        { "instance": 1, "reference": reference(synth)? },
+        { "instance": 2, "reference": reference(first)? },
+        { "instance": 3, "reference": reference(second)? },
+    ]);
+    // The pre-M8 fields would otherwise be read instead, and the test would be
+    // lying about which path it exercised.
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    // Ports as discovery will report them (§14.2). An instrument has no audio
+    // input and takes notes, so its port 0 *is* the notes port.
+    let instrument = serde_json::json!({
+        "audio_in": [], "audio_out": [2],
+        "accepts_notes": true, "params": [], "latency": 0
+    });
+    let effect = serde_json::json!({
+        "audio_in": [2], "audio_out": [2],
+        "accepts_notes": false, "params": [], "latency": 0
+    });
+
+    let mut links = vec![
+        serde_json::json!({ "from": 1, "from_port": 0, "to": 3, "to_port": 0 }),
+        serde_json::json!({ "from": 2, "from_port": 0, "to": 3, "to_port": 1 }),
+        serde_json::json!({ "from": 3, "from_port": 0, "to": 4, "to_port": 0 }),
+        serde_json::json!({ "from": 4, "from_port": 0, "to": 5, "to_port": 0 }),
+        serde_json::json!({ "from": 5, "from_port": 0, "to": 6, "to_port": 0 }),
+    ];
+    // Node 1 holds instance 0 and node 2 holds instance 1.
+    if let Some(instance) = wired {
+        links.push(serde_json::json!({
+            "from": 0, "from_port": 0, "to": instance + 1, "to_port": 0
+        }));
+    }
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],   "kind": "NoteIn" },
+            { "id": 1, "pos": [220.0, 40.0],  "kind": { "Plugin": { "instance": 0, "ports": instrument } } },
+            { "id": 2, "pos": [220.0, 200.0], "kind": { "Plugin": { "instance": 1, "ports": instrument } } },
+            { "id": 3, "pos": [400.0, 40.0],  "kind": { "Mix": { "channels": 2, "inputs": 2 } } },
+            { "id": 4, "pos": [580.0, 40.0],  "kind": { "Plugin": { "instance": 2, "ports": effect } } },
+            { "id": 5, "pos": [760.0, 40.0],  "kind": { "Plugin": { "instance": 3, "ports": effect } } },
+            { "id": 6, "pos": [940.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": links,
+        "next_id": 7
     });
     Ok(value.to_string())
 }

@@ -93,6 +93,11 @@ impl Wrapper {
     fn restore_state(&mut self) {
         let json = self.params.state.0.read().unwrap().clone();
         if json.is_empty() {
+            // A fresh instance, or a project saved before the wrapper ever
+            // wrote anything. Publish the defaults rather than leaving the
+            // field empty: what we are running under should be in the file.
+            self.shared.publish_graph();
+            self.shared.store_state();
             return;
         }
         match serde_json::from_str::<WrapperState>(&json) {
@@ -123,6 +128,11 @@ impl Wrapper {
             Err(e) => log::warn!("audio-graph: wrapper state unreadable: {e}"),
         }
         self.shared.publish_graph();
+        // Publish it back even when nothing was restored. A project saved
+        // without the editor ever being opened would otherwise store the empty
+        // string, and then the defaults it was running under -- the sub-block
+        // size among them -- would not be in the file at all.
+        self.shared.store_state();
     }
 
     /// Load a sub-plugin named by the environment, for development only.

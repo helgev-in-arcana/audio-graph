@@ -143,6 +143,24 @@ pub enum Chunking {
     SubBlock,
 }
 
+/// Where a plugin node's notes come from (§14.10).
+///
+/// An identity rather than a buffer: this crate does not know what a note is
+/// (§7), so it routes the *name* of a source and lets the adapter turn that
+/// into events. That is also what keeps a `Program` free of pointers (ADR-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoteSource {
+    /// Nothing wired to the notes port.
+    ///
+    /// The plugin gets no notes at all — not the DAW's, not anyone's. Before
+    /// M8.3 every instance was handed every event the DAW sent, which is why
+    /// two synths in one patch played in unison whatever the graph said.
+    #[default]
+    None,
+    /// One of the wrapper's own note inputs from the DAW.
+    Daw { bus: u16 },
+}
+
 /// One step of the audio half of a program.
 ///
 /// Kept apart from [`Op`] because the two halves run at different rates
@@ -163,6 +181,8 @@ pub enum AudioOp {
         instance: u32,
         input: Buf,
         output: Buf,
+        /// Which note stream this instance hears (§14.10).
+        notes: NoteSource,
     },
     /// Sum several buffers into one.
     Mix { out: Buf, inputs: Vec<Buf> },

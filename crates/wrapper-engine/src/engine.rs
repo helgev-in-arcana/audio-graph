@@ -17,7 +17,7 @@ use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
 use crate::program::{
     AudioOp, Buf, Chunking, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec,
+    MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, Operand, Program, RateSpec,
 };
 
 /// No ring currently holds this line. Not a valid index into `rings`.
@@ -108,14 +108,32 @@ pub trait AudioNodes {
     /// The two slices never alias. `output` is written in full for the frames
     /// the chunk covers; anything the implementation does not write is whatever
     /// the pool held, so a plugin that produces nothing should clear it.
-    fn process(&mut self, instance: u32, input: &[f32], output: &mut [f32], chunk: AudioChunk);
+    ///
+    /// `notes` says which note stream this instance hears (§14.10). It is a
+    /// name, not a buffer: the engine routes notes without knowing what one is,
+    /// and the implementation is what turns the name into events.
+    fn process(
+        &mut self,
+        instance: u32,
+        notes: NoteSource,
+        input: &[f32],
+        output: &mut [f32],
+        chunk: AudioChunk,
+    );
 }
 
 /// An implementation that produces silence, for a wrapper with nothing loaded.
 pub struct NoNodes;
 
 impl AudioNodes for NoNodes {
-    fn process(&mut self, _instance: u32, _input: &[f32], output: &mut [f32], chunk: AudioChunk) {
+    fn process(
+        &mut self,
+        _instance: u32,
+        _notes: NoteSource,
+        _input: &[f32],
+        output: &mut [f32],
+        chunk: AudioChunk,
+    ) {
         for ch in 0..chunk.channels {
             output[chunk.channel(ch)].fill(0.0);
         }
@@ -428,6 +446,7 @@ impl Engine {
                     instance,
                     input,
                     output,
+                    notes,
                 } => {
                     let width = program.buffers[*output as usize];
                     // The compiler guarantees these differ, so the two regions
@@ -449,6 +468,7 @@ impl Engine {
                     let packed = MAX_CHANNELS * frames;
                     nodes.process(
                         *instance,
+                        *notes,
                         &source[..packed],
                         &mut dest[..packed],
                         AudioChunk {
@@ -994,7 +1014,14 @@ mod tests {
     struct Adders;
 
     impl AudioNodes for Adders {
-        fn process(&mut self, instance: u32, input: &[f32], output: &mut [f32], chunk: AudioChunk) {
+        fn process(
+            &mut self,
+            instance: u32,
+            _notes: NoteSource,
+            input: &[f32],
+            output: &mut [f32],
+            chunk: AudioChunk,
+        ) {
             for ch in 0..chunk.channels {
                 let range = chunk.channel(ch);
                 for (o, i) in output[range.clone()].iter_mut().zip(input[range].iter()) {

@@ -644,6 +644,7 @@ impl wrapper_engine::AudioNodes for GraphNodes<'_> {
     fn process(
         &mut self,
         instance: u32,
+        notes: wrapper_engine::NoteSource,
         input: &[f32],
         output: &mut [f32],
         chunk: wrapper_engine::AudioChunk,
@@ -671,10 +672,18 @@ impl wrapper_engine::AudioNodes for GraphNodes<'_> {
             chunk.frames,
             plugin_host_api::BufferLayout::Planar,
         );
+        // §14.10. The engine routes a *name*; turning it into events is this
+        // side's job. A node with nothing wired to its notes port hears
+        // nothing — which is the whole point, since before M8.3 every instance
+        // was handed every event and two synths played in unison.
+        let events: &[Event] = match notes {
+            wrapper_engine::NoteSource::Daw { bus: 0 } => self.events,
+            _ => &[],
+        };
         processor.process(
             &mut buffers,
             self.slots,
-            self.events,
+            events,
             self.context,
             self.out_events,
         );
@@ -949,6 +958,54 @@ mod tests {
                     max: 10.0
                 }
             )]
+        );
+    }
+
+    /// §14.10, the other half: the engine names a source, and this is where the
+    /// name becomes events. Before M8.3 both instances were handed the same
+    /// list, so a second synth played along whatever the graph said.
+    #[test]
+    fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
+        use plugin_host_api::NoteEvent;
+        use wrapper_engine::{AudioChunk, AudioNodes, NoteSource};
+
+        let (wired, wired_saw) = harness(Vec::new());
+        let (idle, idle_saw) = harness(Vec::new());
+        let mut processors = SubHostProcessors {
+            entries: vec![Some(wired), Some(idle)],
+        };
+
+        let note = Event::Note(NoteEvent::NoteOn {
+            note_id: -1,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        let schedule = SlotSchedule::new(4, 32);
+        let mut sink = EventSink::new();
+        let context = TimeContext::default();
+        let incoming = [note];
+        let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);
+
+        let chunk = AudioChunk {
+            channels: 2,
+            frames: 4,
+        };
+        let input = [0.0f32; 8];
+        let mut output = [0.0f32; 8];
+        nodes.process(0, NoteSource::Daw { bus: 0 }, &input, &mut output, chunk);
+        nodes.process(1, NoteSource::None, &input, &mut output, chunk);
+
+        assert_eq!(
+            wired_saw.lock().unwrap().len(),
+            1,
+            "wired node gets the note"
+        );
+        assert!(
+            idle_saw.lock().unwrap().is_empty(),
+            "an unwired notes port must mean silence, not everything"
         );
     }
 }

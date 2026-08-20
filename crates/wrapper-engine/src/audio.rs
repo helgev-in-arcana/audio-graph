@@ -8,7 +8,7 @@
 //! runs.
 
 use crate::graph::{Graph, NodeId, NodeKind, PortType};
-use crate::program::{AudioOp, Buf, Chunking, MAX_COMPENSATION, MAX_COMPENSATORS};
+use crate::program::{AudioOp, Buf, Chunking, MAX_COMPENSATION, MAX_COMPENSATORS, NoteSource};
 
 use crate::compile::{CompileError, Line, NO_WRITER};
 
@@ -104,6 +104,27 @@ impl Pool {
     }
 }
 
+/// Which note stream a plugin node is wired to (§14.10).
+///
+/// `None` when nothing is connected, which is the answer that makes an
+/// unwired instrument silent rather than making it play whatever the DAW
+/// happened to send. Only `NoteIn` produces notes today; a plugin's own note
+/// output would need the engine to carry event buffers, and that is M9.
+fn note_source(graph: &Graph, id: NodeId, ports: &crate::graph::PluginPorts) -> NoteSource {
+    if !ports.accepts_notes {
+        return NoteSource::None;
+    }
+    // The notes port sits after the audio inputs and before the parameters —
+    // see `plugin_input_ports`, which is the one place that order is decided.
+    let port = ports.audio_in.len() as u8;
+    match graph.source_of(id, port) {
+        Some((from, _)) if matches!(graph.node(from).map(|n| &n.kind), Some(NodeKind::NoteIn)) => {
+            NoteSource::Daw { bus: 0 }
+        }
+        _ => NoteSource::None,
+    }
+}
+
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
@@ -187,6 +208,7 @@ pub(crate) fn compile_audio(
                     instance: *instance as u32,
                     input,
                     output,
+                    notes: note_source(graph, id, ports),
                 });
                 produced.push(Produced {
                     node: id,
@@ -519,6 +541,158 @@ mod tests {
         assert_eq!(
             compile(&graph, SLOTS).unwrap().chunking,
             Chunking::WholeBlock
+        );
+    }
+
+    /// A synth node with an instrument's ports.
+    fn synth(graph: &mut Graph, instance: usize) -> NodeId {
+        graph.add(
+            NodeKind::Plugin {
+                instance,
+                ports: PluginPorts {
+                    audio_in: vec![],
+                    audio_out: vec![2],
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            },
+            [0.0, 0.0],
+        )
+    }
+
+    fn note_sources(program: &crate::program::Program) -> Vec<(u32, NoteSource)> {
+        program
+            .audio_ops
+            .iter()
+            .filter_map(|op| match op {
+                AudioOp::Plugin {
+                    instance, notes, ..
+                } => Some((*instance, *notes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §14.10, the DoD: notes reach the instrument the graph points at.
+    #[test]
+    fn a_wired_instrument_hears_the_daw() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        // Port 0 is the notes port: this plugin has no audio inputs.
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(
+            note_sources(&program),
+            vec![(0, NoteSource::Daw { bus: 0 })]
+        );
+    }
+
+    /// The bug M8.3 exists to fix: before this, every instance was handed every
+    /// event the DAW sent, so a second synth played along whatever the graph
+    /// said. An unwired notes port has to mean silence.
+    #[test]
+    fn an_unwired_instrument_hears_nothing() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let wired = synth(&mut graph, 0);
+        let idle = synth(&mut graph, 1);
+        let mix = graph.add(
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 2,
+            },
+            [0.0, 0.0],
+        );
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, wired, 0);
+        graph.connect(wired, 0, mix, 0);
+        graph.connect(idle, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let mut sources = note_sources(&program);
+        sources.sort_by_key(|&(i, _)| i);
+        assert_eq!(
+            sources,
+            vec![(0, NoteSource::Daw { bus: 0 }), (1, NoteSource::None)]
+        );
+    }
+
+    /// The notes port sits after the audio inputs, so an effect that also takes
+    /// notes must not read its sidechain link as a note link.
+    #[test]
+    fn an_effect_that_takes_notes_finds_its_notes_port() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let node = graph.add(
+            NodeKind::Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2],
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            },
+            [0.0, 0.0],
+        );
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        // Port 1 is the notes port: port 0 is the audio input.
+        graph.connect(notes, 0, node, 1);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(
+            note_sources(&program),
+            vec![(0, NoteSource::Daw { bus: 0 })]
+        );
+    }
+
+    /// A plugin that does not take notes has no notes port, and nothing may be
+    /// wired to it — so it stays `None` whatever the user does.
+    #[test]
+    fn a_plugin_that_takes_no_notes_is_never_given_any() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = plugin(&mut graph, 0, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(note_sources(&program), vec![(0, NoteSource::None)]);
+    }
+
+    /// Instrument -> effect -> effect: the DoD's chain. Only the instrument
+    /// hears the notes, and the effects run after it in order.
+    #[test]
+    fn an_instrument_into_two_effects_routes_notes_only_to_the_instrument() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = synth(&mut graph, 0);
+        let first = plugin(&mut graph, 1, 0);
+        let second = plugin(&mut graph, 2, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, first, 0);
+        graph.connect(first, 0, second, 0);
+        graph.connect(second, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(
+            note_sources(&program),
+            vec![
+                (0, NoteSource::Daw { bus: 0 }),
+                (1, NoteSource::None),
+                (2, NoteSource::None)
+            ],
+            "the order is the order they run in, and only the synth hears notes"
         );
     }
 }

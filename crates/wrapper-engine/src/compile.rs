@@ -35,7 +35,9 @@ pub enum CompileError {
     /// A delay line whose two halves disagree about what they carry.
     DelayTypeMismatch { line: LineId },
     /// A node kind the compiler does not emit code for yet. M8.1 settles the
-    /// graph's shape; audio and note routing arrive in M8.2 and M8.3.
+    /// graph's shape. Audio and note routing landed in M8.2 and M8.3; what is
+    /// left behind this is note delay lines (§14.10) and a plugin's own note
+    /// output.
     NotYet { what: &'static str },
 }
 
@@ -287,13 +289,9 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             // same order again and emits their half (§14.9).
             NodeKind::AudioIn { .. }
             | NodeKind::AudioOut { .. }
+            | NodeKind::NoteIn
             | NodeKind::Plugin { .. }
             | NodeKind::Mix { .. } => {}
-            NodeKind::NoteIn => {
-                return Err(CompileError::NotYet {
-                    what: "note routing",
-                });
-            }
         }
     }
 
@@ -340,6 +338,14 @@ fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
             NodeKind::DelayRead { line, ty, .. } => (line, ty, None),
             _ => continue,
         };
+        // A note delay line would have to store events, not values, and the
+        // param ring stores one `f64` per sub-block. Refusing is the honest
+        // answer; compiling it would drop every note in silence.
+        if matches!(ty, PortType::Note) {
+            return Err(CompileError::NotYet {
+                what: "note delay lines",
+            });
+        }
         match lines.iter_mut().find(|(l, _)| l.id == id) {
             Some((existing, seen_ty)) => {
                 if *seen_ty != ty {
