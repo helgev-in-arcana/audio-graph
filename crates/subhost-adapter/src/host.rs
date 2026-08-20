@@ -27,13 +27,24 @@ pub use crate::state::SubPluginRef;
 /// The VST3 objects are main-thread only, which the outer plugin cannot express
 /// in its own type — see [`MainThread`].
 pub struct SubHost {
-    loaded: Option<MainThread<Loaded>>,
+    /// One entry per plugin node the graph may address (§14.1). Sparse: a slot
+    /// stays empty when its node has been deleted, because the graph names
+    /// instances by index and renumbering them would repoint every node.
+    instances: Vec<Option<MainThread<Loaded>>>,
     slots: SlotTable,
     context: Arc<dyn HostContext>,
-    /// Reported by the sub-plugin at its last activate, cached so the DAW can
-    /// be answered without touching the plugin (§7.4).
-    sub_latency: u32,
+    /// Each instance's latency at its last activate, cached so the DAW can be
+    /// answered without touching a plugin (§7.4). The compiler needs these too,
+    /// to line up parallel paths (§14.6).
+    latencies: Vec<u32>,
 }
+
+/// How many plugin nodes one wrapper may host.
+///
+/// A ceiling rather than guidance: the audio graph names instances by index and
+/// the buffer pool is sized at activate, so the number has to be known before
+/// the user starts drawing.
+pub const MAX_INSTANCES: usize = 16;
 
 /// Field order here *is* the teardown order, and §5.3 is entirely about
 /// teardown order.
@@ -62,11 +73,51 @@ struct Loaded {
 impl SubHost {
     pub fn new(context: Arc<dyn HostContext>) -> SubHost {
         SubHost {
-            loaded: None,
+            instances: Vec::new(),
             slots: SlotTable::default(),
             context,
-            sub_latency: 0,
+            latencies: Vec::new(),
         }
+    }
+
+    /// Highest instance index in use, plus one. Not a count: the middle may be
+    /// empty.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    fn at(&self, instance: usize) -> Option<&Loaded> {
+        self.instances
+            .get(instance)
+            .and_then(|slot| slot.as_ref())
+            .map(MainThread::get)
+    }
+
+    fn at_mut(&mut self, instance: usize) -> Option<&mut Loaded> {
+        self.instances
+            .get_mut(instance)
+            .and_then(|slot| slot.as_mut())
+            .map(MainThread::get_mut)
+    }
+
+    /// Grow the table so `instance` can be written to.
+    fn reserve(&mut self, instance: usize) -> Result<(), String> {
+        if instance >= MAX_INSTANCES {
+            return Err(format!("at most {MAX_INSTANCES} plugin nodes"));
+        }
+        if self.instances.len() <= instance {
+            self.instances.resize_with(instance + 1, || None);
+            self.latencies.resize(instance + 1, 0);
+        }
+        Ok(())
+    }
+
+    /// Every instance's latency, indexed the way the graph indexes them.
+    ///
+    /// Handed to the compiler, which needs it to line up parallel paths and to
+    /// know how short a feedback loop may be (§14.6, §14.4).
+    pub fn latencies(&self) -> &[u32] {
+        &self.latencies
     }
 
     pub fn slots(&self) -> &SlotTable {
@@ -77,17 +128,22 @@ impl SubHost {
         &mut self.slots
     }
 
-    pub fn is_loaded(&self) -> bool {
-        self.loaded.is_some()
+    pub fn is_loaded(&self, instance: usize) -> bool {
+        self.at(instance).is_some()
     }
 
-    pub fn sub_latency(&self) -> u32 {
-        self.sub_latency
+    /// Whether anything at all is loaded.
+    pub fn any_loaded(&self) -> bool {
+        self.instances.iter().any(Option::is_some)
+    }
+
+    pub fn sub_latency(&self, instance: usize) -> u32 {
+        self.latencies.get(instance).copied().unwrap_or(0)
     }
 
     /// What is loaded, for display and for saving.
-    pub fn reference(&self) -> Option<&SubPluginRef> {
-        self.loaded.as_ref().map(|l| &l.get().reference)
+    pub fn reference(&self, instance: usize) -> Option<&SubPluginRef> {
+        self.at(instance).map(|l| &l.reference)
     }
 
     /// What the loaded sub-plugin can accept (§3.3).
@@ -95,16 +151,14 @@ impl SubHost {
     /// The default — everything false — is also the honest answer when nothing
     /// is loaded: a graph cannot send per-voice modulation to a plugin that is
     /// not there.
-    pub fn capabilities(&self) -> plugin_host_api::Capabilities {
-        self.loaded
-            .as_ref()
-            .map(MainThread::get)
+    pub fn capabilities(&self, instance: usize) -> plugin_host_api::Capabilities {
+        self.at(instance)
             .map_or_else(Default::default, |l| l.plugin.capabilities())
     }
 
-    pub fn params(&self) -> &[ParamInfo] {
-        match &self.loaded {
-            Some(l) => SubPluginMain::params(&l.get().plugin),
+    pub fn params(&self, instance: usize) -> &[ParamInfo] {
+        match self.at(instance) {
+            Some(l) => SubPluginMain::params(&l.plugin),
             None => &[],
         }
     }
@@ -115,7 +169,13 @@ impl SubHost {
     /// Replaces whatever was loaded. Slot *bindings* are kept and re-resolved
     /// against the new plugin, so swapping a plugin for a newer version of
     /// itself keeps every mapping (§8.3).
-    pub fn load(&mut self, path: &Path, class_cid: Option<Cid>) -> Result<(), String> {
+    pub fn load(
+        &mut self,
+        instance: usize,
+        path: &Path,
+        class_cid: Option<Cid>,
+    ) -> Result<(), String> {
+        self.reserve(instance)?;
         let module = Module::open(path).map_err(|e| e.to_string())?;
         let classes = module.audio_modules().map_err(|e| e.to_string())?;
         let class = match class_cid {
@@ -141,10 +201,10 @@ impl SubHost {
 
         // Unload only after the new one is known good, so a failed load leaves
         // the user with what they had rather than with nothing.
-        self.unload();
+        self.unload(instance);
         self.slots
             .resolve_against(&reference.plugin_id, SubPluginMain::params(&plugin));
-        self.loaded = Some(MainThread::new(Loaded {
+        self.instances[instance] = Some(MainThread::new(Loaded {
             editor: None,
             plugin,
             module,
@@ -154,11 +214,23 @@ impl SubHost {
         Ok(())
     }
 
-    pub fn unload(&mut self) {
-        // Dropping `loaded` drops the editor first — see the note on `Loaded`.
-        self.loaded = None;
-        self.sub_latency = 0;
+    pub fn unload(&mut self, instance: usize) {
+        // Dropping the entry drops the editor first — see the note on `Loaded`.
+        if let Some(slot) = self.instances.get_mut(instance) {
+            *slot = None;
+        }
+        if let Some(latency) = self.latencies.get_mut(instance) {
+            *latency = 0;
+        }
         // Bindings stay; only their resolution goes.
+        if !self.any_loaded() {
+            self.slots.unresolve_all();
+        }
+    }
+
+    pub fn unload_all(&mut self) {
+        self.instances.clear();
+        self.latencies.clear();
         self.slots.unresolve_all();
     }
 
@@ -192,8 +264,8 @@ impl SubHost {
         None
     }
 
-    pub fn class(&self) -> Option<&ClassInfo> {
-        self.loaded.as_ref().map(|l| &l.get().class)
+    pub fn class(&self, instance: usize) -> Option<&ClassInfo> {
+        self.at(instance).map(|l| &l.class)
     }
 
     /// Open the sub-plugin's own editor in a top-level window (§5.1).
@@ -207,12 +279,12 @@ impl SubHost {
     /// DAW's root window when running as a plugin, null when standalone. An
     /// ownerless window is a peer of the DAW's, so clicking in the DAW buries
     /// it — which is what this argument exists to prevent.
-    pub fn open_editor(&mut self, owner: *mut std::ffi::c_void) -> Result<(), String> {
-        let loaded = self
-            .loaded
-            .as_mut()
-            .ok_or("no sub-plugin loaded")?
-            .get_mut();
+    pub fn open_editor(
+        &mut self,
+        instance: usize,
+        owner: *mut std::ffi::c_void,
+    ) -> Result<(), String> {
+        let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
         if loaded.editor.is_some() {
             return Ok(());
         }
@@ -225,18 +297,24 @@ impl SubHost {
     }
 
     /// Close the sub-plugin's editor, running the §5.3 sequence.
-    pub fn close_editor(&mut self) {
-        if let Some(loaded) = self.loaded.as_mut() {
+    pub fn close_editor(&mut self, instance: usize) {
+        if let Some(loaded) = self.at_mut(instance) {
             // Dropping the EditorWindow runs the sequence; there is no way to
             // close one without it.
-            loaded.get_mut().editor = None;
+            loaded.editor = None;
         }
     }
 
-    pub fn editor_is_open(&self) -> bool {
-        self.loaded
-            .as_ref()
-            .is_some_and(|l| l.get().editor.is_some())
+    /// Close every open sub-editor. Used on teardown, where §5.3's ordering
+    /// matters and no caller should have to remember which ones were open.
+    pub fn close_all_editors(&mut self) {
+        for instance in 0..self.instances.len() {
+            self.close_editor(instance);
+        }
+    }
+
+    pub fn editor_is_open(&self, instance: usize) -> bool {
+        self.at(instance).is_some_and(|l| l.editor.is_some())
     }
 
     /// Drive the editor for one UI tick: apply pending resizes, and close it if
@@ -245,11 +323,16 @@ impl SubHost {
     /// Call from the host's UI thread. A plugin must not pump messages itself —
     /// the DAW is already doing that — so this only handles the parts that are
     /// ours.
-    pub fn tick_editor(&mut self) {
-        let Some(loaded) = self.loaded.as_mut() else {
+    pub fn tick_editors(&mut self) {
+        for instance in 0..self.instances.len() {
+            self.tick_editor(instance);
+        }
+    }
+
+    fn tick_editor(&mut self, instance: usize) {
+        let Some(loaded) = self.at_mut(instance) else {
             return;
         };
-        let loaded = loaded.get_mut();
         let Some(editor) = loaded.editor.as_mut() else {
             return;
         };
@@ -260,9 +343,14 @@ impl SubHost {
         }
     }
 
-    /// Bind a slot to one of the loaded plugin's parameters.
-    pub fn bind_slot(&mut self, slot: usize, param_id: ParamId) -> Result<(), String> {
-        let loaded = self.loaded.as_ref().ok_or("no sub-plugin loaded")?.get();
+    /// Bind a slot to one of a loaded plugin's parameters.
+    pub fn bind_slot(
+        &mut self,
+        instance: usize,
+        slot: usize,
+        param_id: ParamId,
+    ) -> Result<(), String> {
+        let loaded = self.at(instance).ok_or("no sub-plugin loaded")?;
         let param = SubPluginMain::params(&loaded.plugin)
             .iter()
             .find(|p| p.id == param_id)
@@ -273,16 +361,13 @@ impl SubHost {
         Ok(())
     }
 
-    /// Enter the processing phase.
-    pub fn activate(&mut self, config: AudioConfig) -> Result<SubHostProcessor, String> {
+    /// Enter the processing phase, activating every loaded instance.
+    ///
+    /// All or nothing: if one instance refuses the configuration, the ones
+    /// already activated are wound back rather than left running, because a
+    /// half-activated set is a state no later call knows how to handle.
+    pub fn activate(&mut self, config: AudioConfig) -> Result<SubHostProcessors, String> {
         let targets = self.slots.active_targets();
-        let loaded = self
-            .loaded
-            .as_mut()
-            .ok_or("no sub-plugin loaded")?
-            .get_mut();
-        let processor = loaded.plugin.activate(config).map_err(|e| e.to_string())?;
-        self.sub_latency = loaded.plugin.latency_samples();
 
         // One event per slot per sub-block is the worst a graph can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
@@ -293,32 +378,65 @@ impl SubHost {
             .max(1) as usize;
         let capacity = crate::slots::SLOT_COUNT * sub_blocks + INCOMING_EVENT_CAPACITY;
 
-        Ok(SubHostProcessor {
-            processor,
-            targets,
-            last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
-            scratch: Vec::with_capacity(capacity),
+        let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
+        for instance in 0..self.instances.len() {
+            let Some(loaded) = self.at_mut(instance) else {
+                processors.push(None);
+                continue;
+            };
+            match loaded.plugin.activate(config) {
+                Ok(processor) => {
+                    let latency = loaded.plugin.latency_samples();
+                    self.latencies[instance] = latency;
+                    processors.push(Some(SubHostProcessor {
+                        processor,
+                        targets: targets.clone(),
+                        last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
+                        scratch: Vec::with_capacity(capacity),
+                    }));
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    self.deactivate(SubHostProcessors {
+                        entries: processors,
+                    });
+                    return Err(message);
+                }
+            }
+        }
+
+        Ok(SubHostProcessors {
+            entries: processors,
         })
     }
 
-    pub fn deactivate(&mut self, processor: SubHostProcessor) {
-        if let Some(loaded) = self.loaded.as_mut() {
-            loaded.get_mut().plugin.deactivate(processor.processor);
+    pub fn deactivate(&mut self, processors: SubHostProcessors) {
+        for (instance, entry) in processors.entries.into_iter().enumerate() {
+            let Some(processor) = entry else { continue };
+            if let Some(loaded) = self.at_mut(instance) {
+                loaded.plugin.deactivate(processor.processor);
+            }
         }
     }
 
     /// Collect everything that goes into the DAW's project file (§8.3).
     pub fn save_state(&self) -> WrapperState {
         let mut state = WrapperState::new(self.slots.to_state());
-        if let Some(loaded) = self.loaded.as_ref().map(MainThread::get) {
-            state.sub_plugin = Some(loaded.reference.clone());
-            match loaded.plugin.save_state() {
-                Ok(bytes) => state.set_sub_state(&bytes),
-                // The wrapper's own state is still worth saving: losing the
-                // graph and the bindings as well would turn one plugin's
-                // failure into a lost project.
-                Err(e) => log::error!("sub-plugin state could not be saved: {e}"),
-            }
+        for instance in 0..self.instances.len() {
+            let Some(loaded) = self.at(instance) else {
+                continue;
+            };
+            // The wrapper's own state is still worth saving even when a plugin
+            // will not give up its own: losing the graph and the bindings as
+            // well would turn one plugin's failure into a lost project.
+            let bytes = match loaded.plugin.save_state() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    log::error!("sub-plugin {instance} state could not be saved: {e}");
+                    None
+                }
+            };
+            state.set_instance(instance, loaded.reference.clone(), bytes.as_deref());
         }
         state
     }
@@ -331,38 +449,39 @@ impl SubHost {
     pub fn load_state(&mut self, state: &WrapperState) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
+        self.unload_all();
 
-        let Some(reference) = &state.sub_plugin else {
-            self.unload();
-            return problems;
-        };
-
-        match Self::resolve_reference(reference) {
-            Some(path) => {
-                let cid = Cid::from_hex(&reference.plugin_id);
-                if let Err(e) = self.load(&path, cid) {
-                    problems.push(format!("could not load {}: {e}", reference.display_name));
-                } else if let Some(bytes) = state.sub_state_bytes() {
-                    if let Some(loaded) = self.loaded.as_mut() {
-                        if let Err(e) = loaded.get_mut().plugin.load_state(&bytes) {
-                            problems.push(format!(
-                                "{} loaded but its settings did not restore: {e}",
-                                reference.display_name
-                            ));
-                        }
-                    }
-                } else {
-                    problems.push(format!(
-                        "{} loaded but no settings were saved",
-                        reference.display_name
-                    ));
-                }
+        for entry in state.instances() {
+            let reference = &entry.reference;
+            let Some(path) = Self::resolve_reference(reference) else {
+                problems.push(format!(
+                    "{} could not be found; its slot bindings are kept and will \
+                     resolve if it is reinstalled",
+                    reference.display_name
+                ));
+                continue;
+            };
+            let cid = Cid::from_hex(&reference.plugin_id);
+            if let Err(e) = self.load(entry.instance, &path, cid) {
+                problems.push(format!("could not load {}: {e}", reference.display_name));
+                continue;
             }
-            None => problems.push(format!(
-                "{} could not be found; its slot bindings are kept and will \
-                 resolve if it is reinstalled",
-                reference.display_name
-            )),
+            match entry.state_bytes() {
+                Some(bytes) => {
+                    if let Some(loaded) = self.at_mut(entry.instance)
+                        && let Err(e) = loaded.plugin.load_state(&bytes)
+                    {
+                        problems.push(format!(
+                            "{} loaded but its settings did not restore: {e}",
+                            reference.display_name
+                        ));
+                    }
+                }
+                None => problems.push(format!(
+                    "{} loaded but no settings were saved",
+                    reference.display_name
+                )),
+            }
         }
 
         problems
@@ -460,6 +579,102 @@ impl SubHostProcessor {
         // Force a resend: after a reset the sub-plugin's idea of its parameters
         // is no longer something we can assume.
         self.last_sent.iter_mut().for_each(|v| *v = f64::NAN);
+    }
+}
+
+/// Every instance's audio-thread half, indexed the way the graph indexes them.
+///
+/// Sparse for the same reason [`SubHost::instances`] is: the graph names a
+/// plugin node by index, so an empty slot has to stay empty.
+pub struct SubHostProcessors {
+    entries: Vec<Option<SubHostProcessor>>,
+}
+
+impl SubHostProcessors {
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+
+    pub fn get_mut(&mut self, instance: usize) -> Option<&mut SubHostProcessor> {
+        self.entries.get_mut(instance)?.as_mut()
+    }
+
+    pub fn reset(&mut self) {
+        for processor in self.entries.iter_mut().flatten() {
+            processor.reset();
+        }
+    }
+
+    /// Bind the per-block context that [`AudioNodes`] does not carry.
+    ///
+    /// The engine calls `process(instance, ...)` with nothing but buffers,
+    /// because it does not know that a plugin has events or a transport
+    /// position (§7). Everything else one needs is fixed for the whole block,
+    /// so it is attached here and the borrow lasts exactly that long.
+    pub fn nodes<'a>(
+        &'a mut self,
+        slots: &'a SlotSchedule,
+        events: &'a [Event],
+        context: &'a TimeContext,
+        out_events: &'a mut EventSink,
+    ) -> GraphNodes<'a> {
+        GraphNodes {
+            processors: self,
+            slots,
+            events,
+            context,
+            out_events,
+        }
+    }
+}
+
+/// [`SubHostProcessors`] with one block's worth of context attached.
+pub struct GraphNodes<'a> {
+    processors: &'a mut SubHostProcessors,
+    slots: &'a SlotSchedule,
+    events: &'a [Event],
+    context: &'a TimeContext,
+    out_events: &'a mut EventSink,
+}
+
+impl wrapper_engine::AudioNodes for GraphNodes<'_> {
+    fn process(
+        &mut self,
+        instance: u32,
+        input: &[f32],
+        output: &mut [f32],
+        chunk: wrapper_engine::AudioChunk,
+    ) {
+        let Some(processor) = self.processors.get_mut(instance as usize) else {
+            // A node whose plugin failed to load, or was deleted while the
+            // audio thread held this program. Silence is the only honest
+            // answer, and passing the input through would be worse: the user
+            // would hear the graph working when it is not.
+            for ch in 0..chunk.channels {
+                output[chunk.channel(ch)].fill(0.0);
+            }
+            return;
+        };
+
+        // The engine's pool is laid out for the longest block the host
+        // promised, so a short chunk still starts each channel at `stride`.
+        // `AudioBuffers` wants the channels packed at `frames`, which is the
+        // same thing whenever the chunk is a whole block and not otherwise.
+        let mut buffers = AudioBuffers::new(
+            input,
+            output,
+            chunk.channels as u32,
+            chunk.channels as u32,
+            chunk.frames,
+            plugin_host_api::BufferLayout::Planar,
+        );
+        processor.process(
+            &mut buffers,
+            self.slots,
+            self.events,
+            self.context,
+            self.out_events,
+        );
     }
 }
 

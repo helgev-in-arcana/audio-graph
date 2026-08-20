@@ -192,18 +192,18 @@ impl WrapperEditor {
 
         self.view.class = state
             .host
-            .class()
+            .class(0)
             .map(|c| (c.name.clone(), c.vendor.clone()));
-        self.view.loaded = state.host.is_loaded();
-        self.view.sub_editor_open = state.host.editor_is_open();
-        self.view.poly_modulation = state.host.capabilities().poly_modulation;
+        self.view.loaded = state.host.is_loaded(0);
+        self.view.sub_editor_open = state.host.editor_is_open(0);
+        self.view.poly_modulation = state.host.capabilities(0).poly_modulation;
 
         let generation = self.shared.generation();
         if generation == self.view.generation && !self.view.params.is_empty() {
             return;
         }
         self.view.generation = generation;
-        self.view.params = state.host.params().to_vec();
+        self.view.params = state.host.params(0).to_vec();
 
         let table = state.host.slots();
         self.view.slots = table
@@ -492,21 +492,21 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 let result = shared
                     .main()
                     .host
-                    .open_editor(owner as *mut std::ffi::c_void);
+                    .open_editor(0, owner as *mut std::ffi::c_void);
                 match result {
                     Ok(()) => status.set("plugin GUI open"),
                     Err(e) => status.set(format!("open GUI: {e}")),
                 }
             }
             Command::CloseSubEditor => {
-                shared.main().host.close_editor();
+                shared.main().host.close_editor(0);
                 status.set("plugin GUI closed");
             }
             Command::Bind { slot, param } => {
                 // The processor reads the resolved targets once, at
                 // activate, so a new binding only reaches audio after a
                 // restart.
-                let bound = shared.main().host.bind_slot(slot, param);
+                let bound = shared.main().host.bind_slot(0, slot, param);
                 let result = bound.and_then(|()| shared.rebind());
                 match result {
                     Ok(()) => {
@@ -583,7 +583,7 @@ impl NiceEguiApp for WrapperEditor {
                 // ride on the draw callback: answering a resize means resizing
                 // a window, which is precisely what must not happen there.
                 deferred.set_tick(TICK_MS, move || {
-                    shared.main().host.tick_editor();
+                    shared.main().host.tick_editors();
                     // The same turn of the loop is as good a moment as any to
                     // free the programs the audio thread has handed back
                     // (§9.1). Nothing else on the main thread is guaranteed to
@@ -654,7 +654,7 @@ impl NiceEguiApp for WrapperEditor {
         // The wrapper's window is going away, so the sub-plugin's window must
         // too: it is top level with no owner, and leaving it behind strands it
         // with nothing ticking it.
-        self.shared.main().host.close_editor();
+        self.shared.main().host.close_editor(0);
         // Takes the timer, and anything still queued, with it.
         self.deferred = None;
     }

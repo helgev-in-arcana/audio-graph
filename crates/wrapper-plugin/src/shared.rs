@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use plugin_host_api::AudioConfig;
 use subhost_adapter::{
-    DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessor, WrapperState,
+    DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
 };
 use wrapper_engine::{Graph, Handoff, Program, compile};
 
@@ -61,7 +61,7 @@ pub struct MainState {
 pub struct AudioState {
     /// `Some` between `activate` and `deactivate`, whether or not a sub-plugin
     /// is loaded — an empty wrapper still runs, it just passes audio through.
-    pub processor: Option<SubHostProcessor>,
+    pub processor: Option<SubHostProcessors>,
 }
 
 /// The handle both halves of the plugin hold.
@@ -192,13 +192,13 @@ impl Shared {
     /// Swap in a different sub-plugin while the DAW is running.
     pub fn load(&self, path: &Path) -> Result<(), String> {
         self.suspend();
-        self.main().host.load(path, None)?;
+        self.main().host.load(0, path, None)?;
         self.resume()
     }
 
     pub fn unload(&self) {
         self.suspend();
-        self.main().host.unload();
+        self.main().host.unload(0);
     }
 
     /// Re-activate after something the processor caches has changed — the slot
@@ -223,7 +223,7 @@ impl Shared {
     /// whole track is broken.
     fn resume(&self) -> Result<(), String> {
         let mut state = self.main();
-        if !state.host.is_loaded() {
+        if !state.host.is_loaded(0) {
             return Ok(());
         }
         let Some(config) = state.config else {

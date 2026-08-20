@@ -25,6 +25,20 @@ pub struct SubPluginRef {
     pub display_name: String,
 }
 
+/// One hosted sub-plugin, as saved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceState {
+    /// Which plugin node this belongs to. Stored rather than implied by
+    /// position, because the table is sparse: deleting a node must not
+    /// renumber the ones after it.
+    pub instance: usize,
+    pub reference: SubPluginRef,
+    /// The sub-plugin's own opaque chunk, base64 for the same reason as
+    /// [`WrapperState::sub_state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
 /// Everything the wrapper writes into the DAW's project file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WrapperState {
@@ -32,12 +46,23 @@ pub struct WrapperState {
     /// there is somewhere to branch when it does.
     pub version: u32,
     pub slots: Vec<Slot>,
+    /// Pre-M8 projects hold one sub-plugin here. Read on load and folded into
+    /// `instances`; never written any more (see [`WrapperState::instances`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_plugin: Option<SubPluginRef>,
-    /// The sub-plugin's own opaque chunk.
+    /// The pre-M8 sub-plugin's own opaque chunk.
     ///
     /// Base64 rather than raw bytes because this lives inside a JSON document
     /// that nice-plug persists as a string field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_state: Option<String>,
+    /// The hosted sub-plugins, from M8 on (§14.1).
+    ///
+    /// Empty in a pre-M8 project, where `sub_plugin` carries the single one
+    /// instead; [`instances`][WrapperState::instances] hides that difference
+    /// from every caller so there is one shape to handle rather than two.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_plugins: Vec<InstanceState>,
     /// The node graph (§9), as its own JSON value.
     ///
     /// Held opaquely rather than as a `Graph` so that this crate — which is
@@ -67,6 +92,7 @@ impl WrapperState {
             slots,
             sub_plugin: None,
             sub_state: None,
+            sub_plugins: Vec::new(),
             graph: None,
             sub_block: default_sub_block(),
         }
@@ -78,6 +104,44 @@ impl WrapperState {
 
     pub fn sub_state_bytes(&self) -> Option<Vec<u8>> {
         base64_decode(self.sub_state.as_deref()?)
+    }
+
+    /// Record one instance's plugin and settings.
+    pub fn set_instance(&mut self, instance: usize, reference: SubPluginRef, state: Option<&[u8]>) {
+        let entry = InstanceState {
+            instance,
+            reference,
+            state: state.map(base64_encode),
+        };
+        match self.sub_plugins.iter_mut().find(|e| e.instance == instance) {
+            Some(existing) => *existing = entry,
+            None => self.sub_plugins.push(entry),
+        }
+    }
+
+    /// The hosted sub-plugins, whichever way the project spelled them.
+    ///
+    /// A project saved before M8 has one in `sub_plugin`; one saved after has
+    /// any number in `sub_plugins`. Callers should not have to know which, so
+    /// the old shape is presented as instance 0 of the new one.
+    pub fn instances(&self) -> Vec<InstanceState> {
+        if !self.sub_plugins.is_empty() {
+            return self.sub_plugins.clone();
+        }
+        match &self.sub_plugin {
+            Some(reference) => vec![InstanceState {
+                instance: 0,
+                reference: reference.clone(),
+                state: self.sub_state.clone(),
+            }],
+            None => Vec::new(),
+        }
+    }
+}
+
+impl InstanceState {
+    pub fn state_bytes(&self) -> Option<Vec<u8>> {
+        base64_decode(self.state.as_deref()?)
     }
 }
 

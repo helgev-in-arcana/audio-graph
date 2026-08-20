@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         "probe" => cmd_probe(rest),
         "nest" => cmd_nest(rest),
         "graph" => cmd_graph(rest),
+        "chain" => cmd_chain(rest),
         "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
         "bundle" => cmd_bundle(rest),
@@ -79,6 +80,9 @@ fn usage() {
   host-cli graph <WRAPPER.vst3> <IN.wav> [RATE_HZ]
                                     check an LFO in the node graph reaches the sub-plugin
                                     (set AUDIO_GRAPH_SUB and AUDIO_GRAPH_SUB_BIND first)
+  host-cli chain <WRAPPER.vst3> <IN.wav> <A.vst3> <B.vst3>
+                                    check the graph routing A -> B matches A and B
+                                    rendered one after the other
   host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
@@ -751,7 +755,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     use subhost_adapter::SubHost;
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(Path::new(path), Some(cid))?;
+    sub.load(0, Path::new(path), Some(cid))?;
 
     let config = plugin_host_api::AudioConfig {
         sample_rate: 48_000.0,
@@ -762,7 +766,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     };
     let processor = sub.activate(config)?;
 
-    match sub.open_editor(std::ptr::null_mut()) {
+    match sub.open_editor(0, std::ptr::null_mut()) {
         Ok(()) => {}
         // A plugin with no editor is not a failure; plenty have none.
         Err(e) if e.contains("no editor") => {
@@ -779,7 +783,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     // badly attached editor tends to fault.
     for _ in 0..20 {
         vst3_host_view::pump_events();
-        sub.tick_editor();
+        sub.tick_editors();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
@@ -789,7 +793,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
         sub.deactivate(processor);
         drop(sub);
     } else {
-        sub.close_editor();
+        sub.close_editor(0);
         sub.deactivate(processor);
         drop(sub);
     }
@@ -1194,6 +1198,148 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Two sub-plugins in series through the node graph, against the same two
+/// rendered one after the other (ROADMAP M8.2).
+///
+/// The whole point of M8 is that a graph of plugins sounds like the plugins.
+/// Rendering the chain by hand and rendering it through the wrapper has to give
+/// the same samples, and "the same" here means bit-for-bit up to the tolerance
+/// two identical float paths deserve, not "close enough".
+fn cmd_chain(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let input_path = args.get(1).ok_or("expected an input wav")?;
+    let first = args.get(2).ok_or("expected the first sub-plugin")?;
+    let second = args.get(3).ok_or("expected the second sub-plugin")?;
+
+    let input = wav::read(Path::new(input_path))?;
+    const BLOCK: u32 = 512;
+
+    // The reference: each plugin rendered on its own, the second fed the
+    // first's output. This is what a DAW does with two plugins on a track.
+    let stage_one = render::render(Path::new(first), None, &input, BLOCK, &[])?;
+    let reference = render::render(Path::new(second), None, &stage_one.audio, BLOCK, &[])?;
+    println!(
+        "reference: {} -> {} rendered separately",
+        Path::new(first)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        Path::new(second)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
+
+    // The wrapper's own saved state, to graft a patch onto.
+    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+
+    let patched = inject_chain(&read_wrapper_state(&baseline)?, first, second)?;
+    let with_chain = edit_wrapper_state(&baseline, &patched)?;
+    println!("graph: audio in -> plugin 1 -> plugin 2 -> audio out");
+
+    let through = render::render_with_state(
+        Path::new(wrapper),
+        None,
+        Some(&with_chain),
+        &input,
+        BLOCK,
+        &[],
+    )?;
+
+    let frames = reference.audio.frames.min(through.audio.frames);
+    let channels = reference.audio.channels.min(through.audio.channels);
+    if frames == 0 || channels == 0 {
+        return Err("nothing was rendered".into());
+    }
+    let mut worst = 0.0f32;
+    let mut loudest = 0.0f32;
+    for ch in 0..channels {
+        for i in 0..frames {
+            let a = reference.audio.samples[(ch as usize * reference.audio.frames) + i];
+            let b = through.audio.samples[(ch as usize * through.audio.frames) + i];
+            worst = worst.max((a - b).abs());
+            loudest = loudest.max(a.abs());
+        }
+    }
+
+    println!("{frames} frames x {channels} ch compared");
+    println!("reference peak: {loudest:.6}");
+    // Two silences match perfectly, which would make everything below pass
+    // while proving nothing. This is the check that gives the comparison teeth.
+    if loudest < 1e-4 {
+        return Err("the reference render is silent; this would compare equal to anything".into());
+    }
+    println!("largest difference: {worst:.9}");
+    // Both paths run the same code on the same samples in the same order, so
+    // anything above float noise means the graph is not doing what the chain
+    // does.
+    if worst > 1e-6 {
+        return Err(format!(
+            "the graph and the hand-made chain disagree by {worst:.9}"
+        ));
+    }
+    println!("the graph routes audio through both plugins exactly as a chain does");
+    Ok(())
+}
+
+/// Build a two-plugin series patch inside the wrapper's saved state.
+fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let reference = |path: &str| -> Result<serde_json::Value, String> {
+        let module = Module::open(path).map_err(|e| e.to_string())?;
+        let class = render::choose_class(&module, None)?;
+        Ok(serde_json::json!({
+            "format": "vst3",
+            "plugin_id": class.cid.to_hex(),
+            "path_hint": path,
+            "display_name": class.name,
+        }))
+    };
+
+    value["sub_plugins"] = serde_json::json!([
+        { "instance": 0, "reference": reference(first)? },
+        { "instance": 1, "reference": reference(second)? },
+    ]);
+    // The pre-M8 fields would otherwise be read instead: `instances()` prefers
+    // `sub_plugins`, but leaving a stale single sub-plugin behind would make
+    // this test lie about which path it exercised.
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    // Ports as they would be after discovery (§14.2). Stereo throughout, which
+    // is what M8.2 covers.
+    let ports = serde_json::json!({
+        "audio_in": [2], "audio_out": [2],
+        "accepts_notes": false, "params": [], "latency": 0
+    });
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],  "kind": { "AudioIn": { "bus": 0, "channels": 2 } } },
+            { "id": 1, "pos": [220.0, 40.0], "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 2, "pos": [400.0, 40.0], "kind": { "Plugin": { "instance": 1, "ports": ports } } },
+            { "id": 3, "pos": [580.0, 40.0], "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": [
+            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
+            { "from": 1, "from_port": 0, "to": 2, "to_port": 0 },
+            { "from": 2, "from_port": 0, "to": 3, "to_port": 0 }
+        ],
+        "next_id": 4
+    });
+    Ok(value.to_string())
+}
+
 /// RMS over consecutive windows, summed across channels.
 fn envelope(audio: &wav::Audio, window: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(audio.frames / window.max(1) + 1);
@@ -1251,23 +1397,23 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let reverse = args.iter().any(|a| a == "--reverse");
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(Path::new(path), cid)?;
-    let name = sub.class().map(|c| c.name.clone()).unwrap_or_default();
-    sub.open_editor(std::ptr::null_mut())?;
+    sub.load(0, Path::new(path), cid)?;
+    let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
+    sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened {name}");
 
     // Stand in for the DAW's message pump. A plugin would never do this — the
     // DAW is already pumping — but a harness has to.
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(seconds);
-    while Instant::now() < deadline && sub.editor_is_open() {
+    while Instant::now() < deadline && sub.editor_is_open(0) {
         vst3_host_view::pump_events();
-        sub.tick_editor();
+        sub.tick_editors();
         std::thread::sleep(Duration::from_millis(16));
     }
     // Which of the two ended it matters: a window that closes itself long
     // before the deadline is the plugin giving up, not the user.
-    if sub.editor_is_open() {
+    if sub.editor_is_open(0) {
         println!("held open for {:.1}s", started.elapsed().as_secs_f64());
     } else {
         println!(
@@ -1281,7 +1427,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
         drop(sub);
     } else {
         println!("closing the editor, then unloading");
-        sub.close_editor();
+        sub.close_editor(0);
         drop(sub);
     }
 

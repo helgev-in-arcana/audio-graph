@@ -457,6 +457,7 @@ impl GraphEditor {
             // Sinks and sources with nothing to set. The M8 audio nodes have
             // their controls in M8.2, where they start doing something.
             NodeKind::DelayWrite { .. }
+            | NodeKind::Mix { .. }
             | NodeKind::AudioIn { .. }
             | NodeKind::AudioOut { .. }
             | NodeKind::NoteIn

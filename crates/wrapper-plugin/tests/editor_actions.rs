@@ -81,7 +81,7 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
         if shared.load(&path).is_err() {
             continue;
         }
-        if !shared.main().host.params().is_empty() {
+        if !shared.main().host.params(0).is_empty() {
             return Some((path, shared));
         }
     }
@@ -127,7 +127,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 
     // Clicking an entry in that list.
     shared.load(&path).expect("reload from the list");
-    assert!(shared.main().host.is_loaded());
+    assert!(shared.main().host.is_loaded(0));
     assert!(
         shared.audio().processor.is_some(),
         "a load while the DAW is running has to leave the sub-plugin processing; \
@@ -136,8 +136,8 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 
     // Clicking a parameter row: bind, then re-activate so the processor picks
     // the new target up.
-    let first = shared.main().host.params()[0].clone();
-    shared.main().host.bind_slot(0, first.id).expect("bind");
+    let first = shared.main().host.params(0)[0].clone();
+    shared.main().host.bind_slot(0, 0, first.id).expect("bind");
     shared.rebind().expect("rebind");
     assert!(
         shared.main().host.slots().resolved(0).is_some(),
@@ -170,7 +170,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 
     // "Unload".
     shared.unload();
-    assert!(!shared.main().host.is_loaded());
+    assert!(!shared.main().host.is_loaded(0));
     assert!(
         shared.audio().processor.is_none(),
         "unloading has to take the processor with it, or the audio thread keeps \

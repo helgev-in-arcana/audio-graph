@@ -76,21 +76,21 @@ fn expression_index(kind: NoteExpression) -> usize {
 
 /// The shape of one chunk handed to a sub-plugin.
 ///
-/// `stride` is not `frames`: the pool is laid out for the longest block the
-/// host promised, and a chunk shorter than that still starts each channel at
-/// the same offset. Passing both keeps the buffer flat, which is what §4.3
-/// asks for and what ADR-6 needs.
+/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses
+/// (§4.3). The pool has room for the longest block the host promised, but the
+/// channels inside a chunk sit at `frames` rather than at that maximum — so a
+/// short sub-block is a smaller buffer rather than a sparse one, and the slice
+/// can be handed straight to a sub-plugin without repacking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioChunk {
     pub channels: u16,
     pub frames: u32,
-    pub stride: u32,
 }
 
 impl AudioChunk {
     /// One channel of a chunk, as a range into the flat buffer.
     pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
-        let start = channel as usize * self.stride as usize;
+        let start = channel as usize * self.frames as usize;
         start..start + self.frames as usize
     }
 }
@@ -349,6 +349,16 @@ impl Engine {
         self.program.as_ref().map_or(0, |p| p.latency)
     }
 
+    /// Whether the program routes audio at all.
+    ///
+    /// False for a graph that only drives parameters, which is every patch
+    /// written before M8 — those keep the direct path through one sub-plugin.
+    pub fn has_audio(&self) -> bool {
+        self.program
+            .as_ref()
+            .is_some_and(|p| !p.audio_ops.is_empty())
+    }
+
     /// How often [`run_audio`][Engine::run_audio] wants to be called (§14.9).
     pub fn chunking(&self) -> Chunking {
         self.program
@@ -390,7 +400,7 @@ impl Engine {
                     // bus: that is the failure a user can hear and fix.
                     if *bus == 0 {
                         for ch in 0..width.min(MAX_CHANNELS) {
-                            let to = self.at(*out, ch);
+                            let to = self.at(*out, ch, frames);
                             let from = ch * frames;
                             for i in 0..frames {
                                 self.pool[to + i] = daw_in.get(from + i).copied().unwrap_or(0.0);
@@ -406,7 +416,7 @@ impl Engine {
                     }
                     let width = program.buffers[*a as usize] as usize;
                     for ch in 0..width.min(MAX_CHANNELS) {
-                        let from = self.at(*a, ch);
+                        let from = self.at(*a, ch, frames);
                         let to = ch * frames;
                         if to + frames <= daw_out.len() {
                             daw_out[to..to + frames]
@@ -436,14 +446,14 @@ impl Engine {
                     } else {
                         (&high[..], low)
                     };
+                    let packed = MAX_CHANNELS * frames;
                     nodes.process(
                         *instance,
-                        source,
-                        dest,
+                        &source[..packed],
+                        &mut dest[..packed],
                         AudioChunk {
                             channels: width,
                             frames: frames as u32,
-                            stride: self.stride as u32,
                         },
                     );
                 }
@@ -455,8 +465,8 @@ impl Engine {
                     let width = program.buffers[*out as usize] as usize;
                     for (n, &src) in inputs.iter().enumerate() {
                         for ch in 0..width.min(MAX_CHANNELS) {
-                            let from = self.at(src, ch);
-                            let to = self.at(*out, ch);
+                            let from = self.at(src, ch, frames);
+                            let to = self.at(*out, ch, frames);
                             if from == to {
                                 // Already in place: the first input may well
                                 // have been given the destination buffer.
@@ -484,13 +494,17 @@ impl Engine {
     }
 
     /// Where one channel of one buffer starts in the pool.
-    fn at(&self, buf: Buf, channel: usize) -> usize {
-        buf as usize * MAX_CHANNELS * self.stride + channel * self.stride
+    ///
+    /// Each buffer owns a region sized for the longest block; the channels
+    /// inside it are packed at `frames`, so the region is always big enough and
+    /// the packed part is exactly what a sub-plugin expects to be handed.
+    fn at(&self, buf: Buf, channel: usize, frames: usize) -> usize {
+        buf as usize * MAX_CHANNELS * self.stride + channel * frames
     }
 
     fn fill(&mut self, buf: Buf, frames: usize, value: f32) {
         for ch in 0..MAX_CHANNELS {
-            let start = self.at(buf, ch);
+            let start = self.at(buf, ch, frames);
             self.pool[start..start + frames].fill(value);
         }
     }
@@ -506,7 +520,7 @@ impl Engine {
             // same head and only the last one leaves it moved.
             head = self.compensator_heads[slot];
             let ring = slot * MAX_CHANNELS * MAX_COMPENSATION + ch * MAX_COMPENSATION;
-            let signal = self.at(buf, ch);
+            let signal = self.at(buf, ch, frames);
             for i in 0..frames {
                 let read = (head + MAX_COMPENSATION - samples) % MAX_COMPENSATION;
                 let delayed = self.compensators[ring + read];

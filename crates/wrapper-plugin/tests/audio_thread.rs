@@ -155,13 +155,13 @@ fn drawing_the_editor_never_reaches_the_audio_lock() {
     for _ in 0..200_000 {
         // What the editor does every frame.
         let state = shared.main();
-        let _ = state.host.is_loaded();
-        let _ = state.host.class();
+        let _ = state.host.is_loaded(0);
+        let _ = state.host.class(0);
         let _ = state.host.slots().slots().len();
-        let _ = state.host.capabilities();
+        let _ = state.host.capabilities(0);
         drop(state);
         // And what its timer does.
-        shared.main().host.tick_editor();
+        shared.main().host.tick_editors();
         let _ = shared.live_slots();
     }
     stop.store(true, Ordering::Relaxed);

@@ -137,7 +137,7 @@ impl Wrapper {
     /// override a real project.
     fn load_development_override(&mut self) {
         // Never override a real project: state wins.
-        if self.shared.main().host.is_loaded() {
+        if self.shared.main().host.is_loaded(0) {
             return;
         }
         let Ok(path) = std::env::var("AUDIO_GRAPH_SUB") else {
@@ -147,7 +147,7 @@ impl Wrapper {
             .shared
             .main()
             .host
-            .load(std::path::Path::new(&path), None)
+            .load(0, std::path::Path::new(&path), None)
         {
             log::warn!("audio-graph: AUDIO_GRAPH_SUB failed to load: {e}");
             return;
@@ -157,11 +157,11 @@ impl Wrapper {
         if let Ok(id) = std::env::var("AUDIO_GRAPH_SUB_BIND") {
             match id.parse::<u32>() {
                 Ok(id) => {
-                    if let Err(e) = self
-                        .shared
-                        .main()
-                        .host
-                        .bind_slot(0, plugin_host_api::ParamId(id))
+                    if let Err(e) =
+                        self.shared
+                            .main()
+                            .host
+                            .bind_slot(0, 0, plugin_host_api::ParamId(id))
                     {
                         log::warn!("audio-graph: AUDIO_GRAPH_SUB_BIND: {e}");
                     }
@@ -190,7 +190,7 @@ impl Wrapper {
         self.kind = kind;
         self.channels = layout.main_output_channels.map_or(2, |c| c.get());
 
-        if self.shared.main().host.is_loaded() {
+        if self.shared.main().host.is_loaded(0) {
             // A second activate with a different configuration must not reuse
             // the old processor.
             self.deactivate();
@@ -214,6 +214,9 @@ impl Wrapper {
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
         self.schedule = SlotSchedule::new(max_block, self.shared.quantum());
+        // The graph's audio buffers (§14.7). Sized for the ceilings rather than
+        // for the current patch, so a recompile never asks for memory.
+        self.engine.prepare(max_block);
 
         let audio_config = AudioConfig {
             sample_rate: config.sample_rate as f64,
@@ -228,7 +231,7 @@ impl Wrapper {
         let mut state = self.shared.main();
         state.config = Some(audio_config);
 
-        if !state.host.is_loaded() {
+        if !state.host.any_loaded() {
             // Nothing loaded is a normal state, not a failure: the user has to
             // open the editor and pick something. The wrapper passes audio
             // through until then.
@@ -237,7 +240,10 @@ impl Wrapper {
 
         match state.host.activate(audio_config) {
             Ok(processor) => {
-                let latency = state.host.sub_latency();
+                // What to report depends on how the audio is routed. A graph
+                // knows its own longest path (§14.6); the direct path is one
+                // plugin, so its latency is the plugin's.
+                let latency = self.engine.latency().max(state.host.sub_latency(0));
                 drop(state);
                 self.shared.audio().processor = Some(processor);
                 Some(latency)
@@ -359,7 +365,23 @@ impl Wrapper {
         };
 
         self.out_events.clear();
-        let status = {
+        let status = if self.engine.has_audio() {
+            // The graph decides where the audio goes and which plugins see it
+            // (§14). Sub-plugins are reached through `AudioNodes`, so the
+            // engine still knows nothing about what a plugin is.
+            let mut nodes =
+                processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
+            self.engine.run_audio(
+                frames,
+                &self.input_scratch[..(input_channels * frames).max(1) as usize],
+                &mut self.output_scratch[..(out_channels * frames) as usize],
+                &mut nodes,
+            );
+            ApiStatus::Continue
+        } else if let Some(single) = processor.get_mut(0) {
+            // No audio graph: one sub-plugin, straight through. This is the
+            // pre-M8 path and it stays exactly as it was, because most patches
+            // are still one plugin with its parameters driven.
             let mut buffers = AudioBuffers::new(
                 &self.input_scratch[..(input_channels * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
@@ -368,13 +390,15 @@ impl Wrapper {
                 frames,
                 BufferLayout::Planar,
             );
-            processor.process(
+            single.process(
                 &mut buffers,
                 &self.schedule,
                 &self.events,
                 &time,
                 &mut self.out_events,
             )
+        } else {
+            return ProcessStatus::Normal;
         };
 
         if status == ApiStatus::Error {
