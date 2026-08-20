@@ -526,6 +526,41 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
     }
 }
 
+impl WrapperEditor {
+    /// Give the DAW back the keys this editor has no use for.
+    ///
+    /// The editor window has focus while the user is looking at it, and a child
+    /// window is where keyboard messages stop — so without this, the space bar
+    /// goes nowhere and the DAW will not start or stop. See
+    /// `vst3_host_view::forward_key`.
+    ///
+    /// The rule is egui's own: if it wants keyboard input, a text field is
+    /// being edited and every key belongs to it. Otherwise the key is ours only
+    /// if the canvas has a use for it, which is a short list.
+    fn pass_keys_to_the_daw(&self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let forward: Vec<(u16, bool)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat,
+                        ..
+                    } if !repeat && !ours(*key) => virtual_key(*key).map(|vk| (vk, *pressed)),
+                    _ => None,
+                })
+                .collect()
+        });
+        for (vk, pressed) in forward {
+            vst3_host_view::forward_key(self.daw_window, vk, pressed);
+        }
+    }
+}
+
 impl NiceEguiApp for WrapperEditor {
     fn build(
         &mut self,
@@ -563,6 +598,8 @@ impl NiceEguiApp for WrapperEditor {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut nice_plug_egui::Frame) {
+        self.pass_keys_to_the_daw(ui.ctx());
+
         // Slot values move under automation with no input from the user, so the
         // meters need a repaint even when nothing was clicked.
         self.repaint.request_repaint();
@@ -638,6 +675,61 @@ fn raw_window(frame: &nice_plug_egui::Frame) -> *mut std::ffi::c_void {
     }
 }
 
+/// Keys the editor itself acts on, which are therefore not the DAW's.
+///
+/// Deliberately short. Tab and the arrows move focus between widgets and
+/// Escape abandons a half-drawn link; everything else — letters, digits,
+/// function keys, and the space bar above all — is a DAW shortcut as far as
+/// this editor is concerned.
+fn ours(key: egui::Key) -> bool {
+    use egui::Key::*;
+    matches!(
+        key,
+        Escape | Tab | ArrowUp | ArrowDown | ArrowLeft | ArrowRight
+    )
+}
+
+/// An egui key as Windows names it.
+///
+/// Letters, digits and function keys are contiguous in both, so they need a
+/// range each rather than a table. Punctuation is left out on purpose: the
+/// Win32 codes for it are OEM keys whose meaning depends on the keyboard
+/// layout, and guessing wrong sends the DAW a keystroke the user did not type.
+fn virtual_key(key: egui::Key) -> Option<u16> {
+    use egui::Key as K;
+    Some(match key {
+        K::Space => 0x20,
+        K::Enter => 0x0d,
+        K::Backspace => 0x08,
+        K::Delete => 0x2e,
+        K::Insert => 0x2d,
+        K::Home => 0x24,
+        K::End => 0x23,
+        K::PageUp => 0x21,
+        K::PageDown => 0x22,
+        _ => {
+            let name = key.name();
+            let byte = name.as_bytes();
+            match byte {
+                // "A".."Z" and "0".."9" share their ASCII value with their
+                // virtual key code.
+                [c @ b'A'..=b'Z'] => u16::from(*c),
+                [c @ b'0'..=b'9'] => u16::from(*c),
+                // "F1".."F24" — VK_F1 is 0x70 and they run consecutively.
+                [b'F', ..] => {
+                    let n: u16 = name[1..].parse().ok()?;
+                    if (1..=24).contains(&n) {
+                        0x6f + n
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+    })
+}
+
 /// The editor's initial size.
 pub const EDITOR_SIZE: (f64, f64) = (780.0, 640.0);
 
@@ -666,4 +758,45 @@ pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperE
             ),
         app,
     )
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{ours, virtual_key};
+    use egui::Key;
+
+    #[test]
+    fn the_space_bar_reaches_the_daw() {
+        // The whole point: this is the key that starts and stops the transport.
+        assert!(!ours(Key::Space));
+        assert_eq!(virtual_key(Key::Space), Some(0x20));
+    }
+
+    #[test]
+    fn letters_digits_and_function_keys_map_to_their_win32_codes() {
+        assert_eq!(virtual_key(Key::A), Some(0x41));
+        assert_eq!(virtual_key(Key::Z), Some(0x5a));
+        assert_eq!(virtual_key(Key::Num0), Some(0x30));
+        assert_eq!(virtual_key(Key::Num9), Some(0x39));
+        assert_eq!(virtual_key(Key::F1), Some(0x70));
+        assert_eq!(virtual_key(Key::F12), Some(0x7b));
+    }
+
+    #[test]
+    fn keys_with_no_layout_independent_code_are_not_guessed() {
+        // Punctuation is an OEM key on Windows and its meaning moves with the
+        // keyboard layout. Sending nothing is better than sending a keystroke
+        // the user did not type.
+        assert_eq!(virtual_key(Key::Semicolon), None);
+        assert_eq!(virtual_key(Key::Backslash), None);
+        // Beyond VK_F24 there is nothing to map onto.
+        assert_eq!(virtual_key(Key::F35), None);
+    }
+
+    #[test]
+    fn the_keys_the_canvas_uses_stay_here() {
+        for key in [Key::Escape, Key::Tab, Key::ArrowUp, Key::ArrowLeft] {
+            assert!(ours(key), "{key:?} should not be forwarded");
+        }
+    }
 }
