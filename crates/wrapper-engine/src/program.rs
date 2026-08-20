@@ -42,9 +42,19 @@ pub const MAX_DELAY_TAPS: usize = 4096;
 pub const MAX_COMPENSATORS: usize = 8;
 pub const MAX_COMPENSATION: usize = 32_768;
 
-/// Widest bus the engine moves around. M8.2 is stereo throughout (§14.8); the
-/// pool is sized for this so that M8.4 widening it is a constant change.
+/// Widest single bus the engine moves around. Stereo throughout (§14.8).
 pub const MAX_CHANNELS: usize = 2;
+
+/// Widest *buffer*, which is not the same thing (§14.11).
+///
+/// A plugin's input region holds its main bus and then each aux bus packed into
+/// one run, so it is as wide as all of them together. Every buffer in the pool
+/// is this wide because the pool is uniform; at 8 channels, 64 buffers and a
+/// 512-frame block that is a megabyte, which is worth it for not having two
+/// kinds of buffer to keep straight.
+pub const MAX_BUFFER_CHANNELS: usize = MAX_CHANNELS * (1 + MAX_AUX_BUSES);
+
+pub use plugin_host_api::MAX_AUX_BUSES;
 
 /// An index into the register file.
 pub type Reg = u16;
@@ -179,11 +189,26 @@ pub enum AudioOp {
     /// that the host has no business asking.
     Plugin {
         instance: u32,
+        /// The whole input region: main bus first, then each aux bus, packed
+        /// (§14.11). Assembled by a preceding [`AudioOp::Gather`] whenever it
+        /// is more than one bus wide.
         input: Buf,
+        /// Channel width of each input bus, main first. Empty for an
+        /// instrument. The engine needs it to tell the adapter where the joins
+        /// in `input` are.
+        input_buses: Vec<u16>,
         output: Buf,
         /// Which note stream this instance hears (§14.10).
         notes: NoteSource,
     },
+    /// Assemble a plugin's input region out of one buffer per bus (§14.11).
+    ///
+    /// Each entry names a source buffer and the width the plugin negotiated for
+    /// that bus. Where they differ the copy adapts: a stereo source into a mono
+    /// sidechain is summed, a mono source into a stereo bus is duplicated. That
+    /// conversion is an op rather than a rule inside `Plugin` so it is visible
+    /// in the compiled program and can be asserted on.
+    Gather { out: Buf, buses: Vec<(Buf, u16)> },
     /// Sum several buffers into one.
     Mix { out: Buf, inputs: Vec<Buf> },
     /// Delay a buffer by a fixed number of samples.
@@ -213,6 +238,12 @@ pub struct Program {
     pub delay_nodes: Vec<NodeId>,
     /// The audio half, in order (§14.9).
     pub audio_ops: Vec<AudioOp>,
+    /// How each plugin instance has to be activated (§14.11).
+    ///
+    /// Derived from the graph, not from the plugin: whether a sidechain bus is
+    /// switched on depends on whether anything is wired to it. Sorted by
+    /// instance.
+    pub instances: Vec<InstanceIo>,
     /// Channel width of each buffer in the pool, by index.
     pub buffers: Vec<u16>,
     /// How often `audio_ops` runs (§14.9).
@@ -236,6 +267,7 @@ impl Program {
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),
+            instances: Vec::new(),
             buffers: Vec::new(),
             chunking: Chunking::WholeBlock,
             latency: 0,
@@ -254,4 +286,20 @@ impl Program {
     pub fn drives(&self, slot: usize) -> bool {
         u16::try_from(slot).is_ok_and(|s| self.outputs.iter().any(|&(o, _)| o == s))
     }
+}
+
+/// The activation shape of one plugin instance (§14.11).
+///
+/// A sub-plugin has to be activated with the buses the graph will actually
+/// feed it, and that is a property of the patch rather than of the plugin. It
+/// lives in the `Program` because the compiler is what knows it, and because
+/// changing it means the sub-plugin has to be deactivated and activated again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceIo {
+    pub instance: u32,
+    /// Main input bus width. Zero for an instrument.
+    pub input_channels: u16,
+    /// Aux input buses, in order. Only the ones the graph wired.
+    pub aux_inputs: Vec<u16>,
+    pub output_channels: u16,
 }

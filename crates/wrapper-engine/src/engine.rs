@@ -16,8 +16,9 @@ use crate::audio::MAX_BUFFERS;
 use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
 use crate::program::{
-    AudioOp, Buf, Chunking, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, Operand, Program, RateSpec,
+    AudioOp, Buf, Chunking, MAX_BUFFER_CHANNELS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS,
+    MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, Operand, Program,
+    RateSpec,
 };
 
 /// No ring currently holds this line. Not a valid index into `rings`.
@@ -83,12 +84,17 @@ fn expression_index(kind: NoteExpression) -> usize {
 /// can be handed straight to a sub-plugin without repacking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioChunk {
-    pub channels: u16,
+    /// Channels in the input region: the main bus plus every aux bus (§14.11).
+    pub input_channels: u16,
+    pub output_channels: u16,
+    /// Where the joins in the input region are. Empty for the usual one-bus
+    /// plugin.
+    pub aux_inputs: plugin_host_api::AuxBuses,
     pub frames: u32,
 }
 
 impl AudioChunk {
-    /// One channel of a chunk, as a range into the flat buffer.
+    /// One output channel of a chunk, as a range into the flat buffer.
     pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
         let start = channel as usize * self.frames as usize;
         start..start + self.frames as usize
@@ -134,7 +140,7 @@ impl AudioNodes for NoNodes {
         output: &mut [f32],
         chunk: AudioChunk,
     ) {
-        for ch in 0..chunk.channels {
+        for ch in 0..chunk.output_channels {
             output[chunk.channel(ch)].fill(0.0);
         }
     }
@@ -171,6 +177,10 @@ pub struct Engine {
     pool: Vec<f32>,
     /// Frames one buffer's channel holds. Zero until `prepare`.
     stride: usize,
+    /// Channel width of each of the wrapper's own input buses, main first
+    /// (§14.11). Set by `prepare`, because it is fixed for as long as the DAW
+    /// keeps us activated.
+    daw_inputs: Vec<u16>,
     /// Rings for delay compensation (§14.6), one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
@@ -200,6 +210,7 @@ impl Engine {
             ring_nodes: vec![u32::MAX; MAX_DELAY_LINES],
             ring_order: vec![0; MAX_DELAY_LINES],
             pool: Vec::new(),
+            daw_inputs: Vec::new(),
             stride: 0,
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
@@ -351,11 +362,13 @@ impl Engine {
     /// ceilings rather than for the current program, so that a recompile —
     /// which happens on every drag of every control — never needs memory the
     /// audio thread does not already have (§9.1).
-    pub fn prepare(&mut self, max_frames: u32) {
+    pub fn prepare(&mut self, max_frames: u32, daw_inputs: &[u16]) {
         self.stride = max_frames as usize;
+        self.daw_inputs.clear();
+        self.daw_inputs.extend_from_slice(daw_inputs);
         self.pool.clear();
         self.pool
-            .resize(MAX_BUFFERS * MAX_CHANNELS * self.stride, 0.0);
+            .resize(MAX_BUFFERS * MAX_BUFFER_CHANNELS * self.stride, 0.0);
         self.compensators.clear();
         self.compensators
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
@@ -413,19 +426,30 @@ impl Engine {
                 AudioOp::Silence { out } => self.fill(*out, frames, 0.0),
                 AudioOp::Input { out, bus } => {
                     let width = program.buffers[*out as usize] as usize;
-                    // M8.2 is one bus each way (§14.8). A node naming a bus the
-                    // wrapper does not have reads silence rather than the wrong
-                    // bus: that is the failure a user can hear and fix.
-                    if *bus == 0 {
-                        for ch in 0..width.min(MAX_CHANNELS) {
-                            let to = self.at(*out, ch, frames);
-                            let from = ch * frames;
-                            for i in 0..frames {
-                                self.pool[to + i] = daw_in.get(from + i).copied().unwrap_or(0.0);
-                            }
-                        }
-                    } else {
+                    // `daw_in` holds every input bus packed, main first, the
+                    // same way a plugin's input region does (§14.11). A node
+                    // naming a bus the wrapper does not have reads silence
+                    // rather than the wrong bus: that is a failure a user can
+                    // hear and fix, and reading the wrong bus is not.
+                    let bus = *bus as usize;
+                    let Some(&have) = self.daw_inputs.get(bus) else {
                         self.fill(*out, frames, 0.0);
+                        continue;
+                    };
+                    let base: usize = self.daw_inputs[..bus]
+                        .iter()
+                        .map(|&c| c as usize * frames)
+                        .sum();
+                    for ch in 0..width.min(MAX_CHANNELS) {
+                        let to = self.at(*out, ch, frames);
+                        if ch >= have as usize {
+                            self.pool[to..to + frames].fill(0.0);
+                            continue;
+                        }
+                        let from = base + ch * frames;
+                        for i in 0..frames {
+                            self.pool[to + i] = daw_in.get(from + i).copied().unwrap_or(0.0);
+                        }
                     }
                 }
                 AudioOp::Output { a, bus } => {
@@ -442,16 +466,54 @@ impl Engine {
                         }
                     }
                 }
+                AudioOp::Gather { out, buses } => {
+                    // Assemble one plugin's input region, bus by bus (§14.11).
+                    // Widths are adapted here rather than inside the plugin op
+                    // so the conversion is visible in the compiled program.
+                    let mut at = 0usize;
+                    for &(from, want) in buses {
+                        let have = program.buffers[from as usize];
+                        for ch in 0..want {
+                            let to = self.at(*out, at + ch as usize, frames);
+                            if have == 1 && want > 1 {
+                                // Mono into a wider bus: the same signal on
+                                // every channel, which is what a host does.
+                                let src = self.at(from, 0, frames);
+                                self.pool.copy_within(src..src + frames, to);
+                            } else if want == 1 && have > 1 {
+                                // Wider into mono: summed. A sidechain detector
+                                // wants both channels to count, and taking the
+                                // left one would silently ignore half the
+                                // signal.
+                                let first = self.at(from, 0, frames);
+                                self.pool.copy_within(first..first + frames, to);
+                                for other in 1..have {
+                                    let src = self.at(from, other as usize, frames);
+                                    for i in 0..frames {
+                                        self.pool[to + i] += self.pool[src + i];
+                                    }
+                                }
+                            } else if ch < have {
+                                let src = self.at(from, ch as usize, frames);
+                                self.pool.copy_within(src..src + frames, to);
+                            } else {
+                                self.pool[to..to + frames].fill(0.0);
+                            }
+                        }
+                        at += want as usize;
+                    }
+                }
                 AudioOp::Plugin {
                     instance,
                     input,
+                    input_buses,
                     output,
                     notes,
                 } => {
                     let width = program.buffers[*output as usize];
                     // The compiler guarantees these differ, so the two regions
                     // cannot overlap and `split_at_mut` is enough to prove it.
-                    let span = MAX_CHANNELS * self.stride;
+                    let span = MAX_BUFFER_CHANNELS * self.stride;
                     let (lo, hi) = if input < output {
                         (*input as usize, *output as usize)
                     } else {
@@ -465,14 +527,23 @@ impl Engine {
                     } else {
                         (&high[..], low)
                     };
-                    let packed = MAX_CHANNELS * frames;
+                    let in_width: u16 = input_buses.iter().sum();
+                    // Only what the plugin will actually read is handed over.
+                    // The buffer behind it is as wide as any buffer in the
+                    // pool; the region it owns is its own buses (§14.11).
+                    let packed_in = in_width as usize * frames;
+                    let packed_out = width as usize * frames;
                     nodes.process(
                         *instance,
                         *notes,
-                        &source[..packed],
-                        &mut dest[..packed],
+                        &source[..packed_in],
+                        &mut dest[..packed_out],
                         AudioChunk {
-                            channels: width,
+                            input_channels: in_width,
+                            output_channels: width,
+                            aux_inputs: plugin_host_api::AuxBuses::new(
+                                input_buses.get(1..).unwrap_or(&[]),
+                            ),
                             frames: frames as u32,
                         },
                     );
@@ -519,7 +590,7 @@ impl Engine {
     /// inside it are packed at `frames`, so the region is always big enough and
     /// the packed part is exactly what a sub-plugin expects to be handed.
     fn at(&self, buf: Buf, channel: usize, frames: usize) -> usize {
-        buf as usize * MAX_CHANNELS * self.stride + channel * frames
+        buf as usize * MAX_BUFFER_CHANNELS * self.stride + channel * frames
     }
 
     fn fill(&mut self, buf: Buf, frames: usize, value: f32) {
@@ -1022,7 +1093,7 @@ mod tests {
             output: &mut [f32],
             chunk: AudioChunk,
         ) {
-            for ch in 0..chunk.channels {
+            for ch in 0..chunk.output_channels {
                 let range = chunk.channel(ch);
                 for (o, i) in output[range.clone()].iter_mut().zip(input[range].iter()) {
                     *o = *i + (instance + 1) as f32;
@@ -1070,7 +1141,7 @@ mod tests {
         graph.connect(second, 0, output, 0);
 
         let mut engine = Engine::new();
-        engine.prepare(64);
+        engine.prepare(64, &[2]);
         load(&mut engine, &graph);
 
         let daw_in = vec![10.0f32; 2 * 8];
@@ -1119,7 +1190,7 @@ mod tests {
         graph.connect(mix, 0, output, 0);
 
         let mut engine = Engine::new();
-        engine.prepare(64);
+        engine.prepare(64, &[2]);
         load(&mut engine, &graph);
 
         // An impulse on the first sample of each channel.
@@ -1156,7 +1227,7 @@ mod tests {
             [0.0, 0.0],
         );
         let mut engine = Engine::new();
-        engine.prepare(64);
+        engine.prepare(64, &[2]);
         load(&mut engine, &graph);
 
         let daw_in = vec![0.0f32; 2 * 8];
@@ -1194,7 +1265,7 @@ mod tests {
         engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
         assert!(daw_out.iter().all(|&s| s == 0.0));
 
-        engine.prepare(4);
+        engine.prepare(4, &[2]);
         engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
         assert!(
             daw_out.iter().all(|&s| s == 0.0),

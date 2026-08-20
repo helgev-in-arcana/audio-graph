@@ -44,6 +44,8 @@ pub struct Wrapper {
     events: Vec<Event>,
     out_events: EventSink,
     input_scratch: Vec<f32>,
+    /// Channel width of each of the wrapper's own input buses, main first.
+    daw_inputs: Vec<u16>,
     output_scratch: Vec<f32>,
 
     kind: WrapperKind,
@@ -65,6 +67,7 @@ impl Default for Wrapper {
             events: Vec::new(),
             out_events: EventSink::new(),
             input_scratch: Vec::new(),
+            daw_inputs: Vec::new(),
             output_scratch: Vec::new(),
             kind: WrapperKind::Effect,
             channels: 2,
@@ -214,8 +217,17 @@ impl Wrapper {
             WrapperKind::Effect => layout.main_input_channels.map_or(0, |c| c.get()),
             WrapperKind::Instrument => 0,
         };
+        // The wrapper's own input buses: the main one, then whatever the DAW
+        // gave us for aux (§14.11). An `AudioIn` node names a bus by index into
+        // this, so it is what the engine has to be told about.
+        self.daw_inputs = std::iter::once(input_channels)
+            .filter(|&c| c > 0)
+            .chain(layout.aux_input_ports.iter().map(|c| c.get()))
+            .map(|c| c.min(2) as u16)
+            .collect();
+        let total_in: u32 = self.daw_inputs.iter().map(|&c| u32::from(c)).sum();
 
-        self.input_scratch = vec![0.0; (input_channels.max(1) * max_block) as usize];
+        self.input_scratch = vec![0.0; (total_in.max(1) * max_block) as usize];
         self.output_scratch = vec![0.0; (self.channels * max_block) as usize];
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
@@ -226,7 +238,7 @@ impl Wrapper {
         self.schedule = SlotSchedule::new(max_block, self.shared.quantum());
         // The graph's audio buffers (§14.7). Sized for the ceilings rather than
         // for the current patch, so a recompile never asks for memory.
-        self.engine.prepare(max_block);
+        self.engine.prepare(max_block, &self.daw_inputs.clone());
 
         let audio_config = AudioConfig {
             sample_rate: config.sample_rate as f64,
@@ -249,7 +261,8 @@ impl Wrapper {
             return Some(0);
         }
 
-        match state.host.activate(audio_config) {
+        let io = state.instance_io.clone();
+        match state.host.activate(audio_config, &io) {
             Ok(processor) => {
                 // What to report depends on how the audio is routed. A graph
                 // knows its own longest path (§14.6); the direct path is one
@@ -293,6 +306,7 @@ impl Wrapper {
     pub fn process<P: Plugin>(
         &mut self,
         buffer: &mut Buffer,
+        aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<P>,
     ) -> ProcessStatus {
         let frames = buffer.samples() as u32;
@@ -353,13 +367,36 @@ impl Wrapper {
             WrapperKind::Effect => channels.min(2),
             WrapperKind::Instrument => 0,
         };
+        // The main bus first, then each aux bus, packed — the same layout a
+        // plugin's input region uses (§14.11).
+        let mut at = 0usize;
         {
             let slices = buffer.as_slice_immutable();
             for ch in 0..input_channels as usize {
-                let dst = &mut self.input_scratch[ch * frame_len..(ch + 1) * frame_len];
+                let dst = &mut self.input_scratch[at..at + frame_len];
                 dst.copy_from_slice(&slices[ch][..frame_len]);
+                at += frame_len;
             }
         }
+        for bus in 0..aux.inputs.len() {
+            let slices = aux.inputs[bus].as_slice_immutable();
+            let width = self
+                .daw_inputs
+                .get(usize::from(input_channels > 0) + bus)
+                .copied()
+                .unwrap_or(0) as usize;
+            for ch in 0..width {
+                let dst = &mut self.input_scratch[at..at + frame_len];
+                match slices.get(ch) {
+                    Some(src) => dst.copy_from_slice(&src[..frame_len]),
+                    // A DAW is allowed to hand us fewer channels than it
+                    // promised on a bus nobody connected.
+                    None => dst.fill(0.0),
+                }
+                at += frame_len;
+            }
+        }
+        let total_in = at / frame_len.max(1);
 
         let out_channels = self.channels.min(channels);
         let transport = context.transport();
@@ -384,7 +421,7 @@ impl Wrapper {
                 processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
             self.engine.run_audio(
                 frames,
-                &self.input_scratch[..(input_channels * frames).max(1) as usize],
+                &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
                 &mut nodes,
             );

@@ -579,6 +579,12 @@ impl Graph {
             self.output_type(from, from_port),
             self.input_type(to, to_port),
         ) {
+            // Audio joins audio whatever the widths are; the compiler adapts
+            // them explicitly (§14.11). The strict rule this replaces made a
+            // real plugin's sidechain unreachable -- RoughRider3's is mono and
+            // everything that would feed it is stereo -- and refusing the link
+            // taught the user nothing, because nothing in the graph converts.
+            (Some(PortType::Audio { .. }), Some(PortType::Audio { .. })) => true,
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
@@ -741,8 +747,15 @@ mod tests {
         assert_eq!(graph.links.len(), 1);
     }
 
+    /// Audio joins audio whatever the widths are, and the compiler adapts them
+    /// explicitly (§14.11).
+    ///
+    /// This reverses an earlier rule. Refusing the link read well until a real
+    /// plugin turned up whose sidechain is mono — RoughRider3's is — with
+    /// nothing in the graph able to convert. Refusing then taught the user
+    /// nothing and left the socket unusable.
     #[test]
-    fn a_wider_bus_does_not_quietly_fit_a_narrower_one() {
+    fn audio_of_different_widths_still_connects() {
         let mut graph = Graph::new();
         let mono = graph.add(
             NodeKind::AudioIn {
@@ -759,6 +772,22 @@ mod tests {
             [0.0, 0.0],
         );
         graph.connect(mono, 0, stereo, 0);
+        assert_eq!(graph.links.len(), 1);
+    }
+
+    /// What the widths rule does *not* do: audio and parameters stay apart.
+    #[test]
+    fn audio_still_does_not_connect_to_a_parameter() {
+        let mut graph = Graph::new();
+        let audio = graph.add(
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        let slot = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        graph.connect(audio, 0, slot, 0);
         assert!(graph.links.is_empty());
     }
 

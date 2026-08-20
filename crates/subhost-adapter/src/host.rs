@@ -19,6 +19,7 @@ use vst3_host_view::EditorWindow;
 use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
+use wrapper_engine::InstanceIo;
 
 pub use crate::state::SubPluginRef;
 
@@ -368,7 +369,17 @@ impl SubHost {
     /// All or nothing: if one instance refuses the configuration, the ones
     /// already activated are wound back rather than left running, because a
     /// half-activated set is a state no later call knows how to handle.
-    pub fn activate(&mut self, config: AudioConfig) -> Result<SubHostProcessors, String> {
+    ///
+    /// `io` says how each instance has to be activated — which buses, how wide
+    /// (§14.11). It comes from the compiled program rather than from the
+    /// plugin, because whether a sidechain is switched on depends on whether
+    /// the graph wired anything to it. An instance the program does not mention
+    /// is activated with `config` as it stands, which is the pre-M8 shape.
+    pub fn activate(
+        &mut self,
+        config: AudioConfig,
+        io: &[InstanceIo],
+    ) -> Result<SubHostProcessors, String> {
         // One event per slot per sub-block is the worst a graph can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
         // not allowed to grow it.
@@ -383,6 +394,16 @@ impl SubHost {
             let Some(loaded) = self.at_mut(instance) else {
                 processors.push(None);
                 continue;
+            };
+            // What this instance needs, if the graph routes audio to it.
+            let config = match io.iter().find(|e| e.instance as usize == instance) {
+                Some(entry) => AudioConfig {
+                    input_channels: u32::from(entry.input_channels),
+                    output_channels: u32::from(entry.output_channels),
+                    aux_inputs: plugin_host_api::AuxBuses::new(&entry.aux_inputs),
+                    ..config
+                },
+                None => config,
             };
             match loaded.plugin.activate(config) {
                 Ok(processor) => {
@@ -654,24 +675,25 @@ impl wrapper_engine::AudioNodes for GraphNodes<'_> {
             // audio thread held this program. Silence is the only honest
             // answer, and passing the input through would be worse: the user
             // would hear the graph working when it is not.
-            for ch in 0..chunk.channels {
+            for ch in 0..chunk.output_channels {
                 output[chunk.channel(ch)].fill(0.0);
             }
             return;
         };
 
-        // The engine's pool is laid out for the longest block the host
-        // promised, so a short chunk still starts each channel at `stride`.
-        // `AudioBuffers` wants the channels packed at `frames`, which is the
-        // same thing whenever the chunk is a whole block and not otherwise.
+        // The input region holds the main bus and then each aux bus, packed
+        // (§14.11); `aux_inputs` is what tells the backend where the joins
+        // are. Both regions are already packed at `frames`, which is the layout
+        // `AudioBuffers` wants, so nothing is repacked here.
         let mut buffers = AudioBuffers::new(
             input,
             output,
-            chunk.channels as u32,
-            chunk.channels as u32,
+            chunk.input_channels as u32,
+            chunk.output_channels as u32,
             chunk.frames,
             plugin_host_api::BufferLayout::Planar,
-        );
+        )
+        .with_aux_inputs(chunk.aux_inputs);
         // §14.10. The engine routes a *name*; turning it into events is this
         // side's job. A node with nothing wired to its notes port hears
         // nothing — which is the whole point, since before M8.3 every instance
@@ -990,7 +1012,9 @@ mod tests {
         let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);
 
         let chunk = AudioChunk {
-            channels: 2,
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
             frames: 4,
         };
         let input = [0.0f32; 8];

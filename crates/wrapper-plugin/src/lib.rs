@@ -102,10 +102,10 @@ macro_rules! wrapper_class {
             fn process(
                 &mut self,
                 buffer: &mut Buffer,
-                _aux: &mut AuxiliaryBuffers,
+                aux: &mut AuxiliaryBuffers,
                 context: &mut impl ProcessContext<Self>,
             ) -> ProcessStatus {
-                self.0.process(buffer, context)
+                self.0.process(buffer, aux, context)
             }
 
             fn deactivate(&mut self) {
@@ -129,20 +129,47 @@ macro_rules! wrapper_class {
     };
 }
 
-/// Stereo in, stereo out.
+/// Stereo in, stereo out, plus one stereo sidechain the DAW can feed.
+///
+/// The aux bus is fixed at compile time because VST3 cannot add one at runtime
+/// (§14.11) — the same reason the slot count is fixed (§8.1). One is enough for
+/// the shape this exists for: a compressor inside the graph keyed off another
+/// track. A patch that wires nothing to it costs the DAW an unused bus, which
+/// every host already deals with.
 const FX_LAYOUTS: &[AudioIOLayout] = &[AudioIOLayout {
     main_input_channels: NonZeroU32::new(2),
     main_output_channels: NonZeroU32::new(2),
+    aux_input_ports: &[TWO],
+    names: PortNames {
+        aux_inputs: &["Sidechain"],
+        ..PortNames::const_default()
+    },
     ..AudioIOLayout::const_default()
 }];
 
 /// No audio input. An instrument that declares one is refused outright by some
 /// hosts, and offered a silent buffer by others.
+///
+/// The sidechain bus is still offered: a graph whose instrument feeds a
+/// compressor keyed off another track is a normal thing to build, and an
+/// instrument with no input bus at all cannot express it.
 const INSTRUMENT_LAYOUTS: &[AudioIOLayout] = &[AudioIOLayout {
     main_input_channels: None,
     main_output_channels: NonZeroU32::new(2),
+    aux_input_ports: &[TWO],
+    names: PortNames {
+        aux_inputs: &["Sidechain"],
+        ..PortNames::const_default()
+    },
     ..AudioIOLayout::const_default()
 }];
+
+/// Written out because `NonZeroU32::new` is not usable in a const initialiser
+/// of an array element here.
+const TWO: NonZeroU32 = match NonZeroU32::new(2) {
+    Some(n) => n,
+    None => unreachable!(),
+};
 
 wrapper_class! {
     WrapperFx,

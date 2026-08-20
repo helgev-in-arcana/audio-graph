@@ -305,6 +305,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         registers: next_reg,
         outputs,
         audio_ops: audio.ops,
+        instances: audio.instances,
         buffers: audio.buffers,
         chunking: audio.chunking,
         latency: audio.latency,

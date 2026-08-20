@@ -45,6 +45,7 @@ fn main() -> ExitCode {
         "graph" => cmd_graph(rest),
         "chain" => cmd_chain(rest),
         "instrument" => cmd_instrument(rest),
+        "sidechain" => cmd_sidechain(rest),
         "gui" => cmd_gui(rest),
         "automate" => cmd_automate(rest),
         "bundle" => cmd_bundle(rest),
@@ -90,6 +91,9 @@ fn usage() {
   host-cli instrument <WRAPPER.vst3> <SYNTH.vst3> <A.vst3> <B.vst3>
                                     check notes reach the instrument the graph
                                     points at, and only that one
+  host-cli sidechain <WRAPPER.vst3> <COMP.vst3> <SYNTH.vst3> <SC_PARAM_ID>
+                                    check a compressor inside the graph ducks
+                                    against another node's audio
   host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
@@ -853,7 +857,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
         aux_inputs: Default::default(),
         offline: false,
     };
-    let processor = sub.activate(config)?;
+    let processor = sub.activate(config, &[])?;
 
     match sub.open_editor(0, std::ptr::null_mut()) {
         Ok(()) => {}
@@ -1617,6 +1621,242 @@ fn inject_instrument(
             { "id": 4, "pos": [580.0, 40.0],  "kind": { "Plugin": { "instance": 2, "ports": effect } } },
             { "id": 5, "pos": [760.0, 40.0],  "kind": { "Plugin": { "instance": 3, "ports": effect } } },
             { "id": 6, "pos": [940.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": links,
+        "next_id": 7
+    });
+    Ok(value.to_string())
+}
+
+/// A compressor inside the graph, keyed off another node (ROADMAP M8.4).
+///
+/// The signal being compressed is a steady tone, so anything that moves in the
+/// output moved because of the sidechain. The key is an instrument playing one
+/// note in the middle of it. Run twice — once with the key wired, once
+/// without — and the difference is the ducking.
+///
+/// The compressor's own "SC Active" switch is turned on the way a user would:
+/// a `Constant` node driving a slot that is bound to that parameter. So this
+/// exercises the parameter path and the audio path at once.
+fn cmd_sidechain(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let comp = args.get(1).ok_or("expected a compressor plugin")?;
+    let synth = args.get(2).ok_or("expected an instrument to key off")?;
+    let switch: u32 = args
+        .get(3)
+        .ok_or("expected the compressor's sidechain-enable parameter id")?
+        .parse()
+        .map_err(|_| "the parameter id must be a number")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 3.0) as usize;
+    let note_at = (sample_rate * 1.0) as usize;
+
+    // A steady tone: flat by construction, so any movement in the output is
+    // the compressor's doing and not the material's.
+    let mut tone = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    for ch in 0..2usize {
+        for i in 0..frames {
+            let phase = i as f32 / sample_rate * 220.0 * std::f32::consts::TAU;
+            tone.samples[ch * frames + i] = 0.3 * phase.sin();
+        }
+    }
+    let events = render::note(48, note_at, (sample_rate * 1.0) as usize);
+
+    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |keyed: bool| -> Result<render::RenderOutcome, String> {
+        let patched = inject_sidechain(&baseline_json, comp, synth, switch, keyed)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &tone,
+            BLOCK,
+            &events,
+        )
+    };
+
+    // How much the level moves between the quiet second and the keyed one.
+    let ducking = |out: &wav::Audio| -> (f32, f32) {
+        let window = |from: usize, to: usize| -> f32 {
+            let mut sum = 0.0f64;
+            let mut n = 0usize;
+            for ch in 0..out.channels as usize {
+                for i in from..to.min(out.frames) {
+                    let s = out.samples[ch * out.frames + i] as f64;
+                    sum += s * s;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                0.0
+            } else {
+                (sum / n as f64).sqrt() as f32
+            }
+        };
+        // Start half a second in: the compressor's release is a few hundred
+        // milliseconds, and its settling from the first sample is not ducking.
+        let quiet = window((sample_rate * 0.5) as usize, note_at);
+        let keyed = window(note_at + 4800, note_at + (sample_rate * 0.9) as usize);
+        (quiet, keyed)
+    };
+
+    let unkeyed = run(false)?;
+    let (a, b) = ducking(&unkeyed.audio);
+    println!("sidechain not wired: {a:.6} before the note, {b:.6} during");
+    if a < 1e-4 {
+        return Err("the compressor produced nothing; the tone is not reaching it".into());
+    }
+    let drift = (b / a - 1.0).abs();
+    println!("  level moved by {:.1}%", drift * 100.0);
+    if drift > 0.02 {
+        return Err(format!(
+            "the level moves by {:.1}% with nothing wired to the sidechain, \
+             so this measurement cannot tell ducking from the material",
+            drift * 100.0
+        ));
+    }
+
+    let keyed = run(true)?;
+    let (c, d) = ducking(&keyed.audio);
+    println!("sidechain wired:     {c:.6} before the note, {d:.6} during");
+    let reduction = 1.0 - d / c;
+    println!("  ducked by {:.1}%", reduction * 100.0);
+    if reduction < 0.2 {
+        return Err(format!(
+            "the sidechain is wired but the compressor did not duck \
+             ({:.1}%); either nothing is reaching the aux bus or the \
+             sidechain-enable parameter is not being driven",
+            reduction * 100.0
+        ));
+    }
+    println!("another node's audio reaches the sidechain, and the compressor acts on it");
+    Ok(())
+}
+
+/// Tone -> compressor -> out, with an instrument keying the compressor's aux
+/// bus, and a `Constant` driving a slot bound to the sidechain-enable switch.
+fn inject_sidechain(
+    state: &str,
+    comp: &str,
+    synth: &str,
+    switch: u32,
+    keyed: bool,
+) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let describe = |path: &str| -> Result<(serde_json::Value, String, Vec<u16>, bool), String> {
+        use std::sync::Arc;
+        use vst3_host::Vst3Plugin;
+        let module = Module::open(path).map_err(|e| e.to_string())?;
+        let class = render::choose_class(&module, None)?;
+        let plugin = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+        let layout = plugin.io_layout();
+        let ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
+        Ok((
+            serde_json::json!({
+                "format": "vst3",
+                "plugin_id": class.cid.to_hex(),
+                "path_hint": path,
+                "display_name": class.name,
+            }),
+            class.cid.to_hex(),
+            ports.audio_in.clone(),
+            ports.accepts_notes,
+        ))
+    };
+
+    // Ports are discovered rather than written down here (§14.2): the whole
+    // point is that the sidechain socket is the one the plugin really has.
+    let (comp_ref, comp_id, comp_in, _) = describe(comp)?;
+    let (synth_ref, _, synth_in, synth_notes) = describe(synth)?;
+    if comp_in.len() < 2 {
+        return Err(format!(
+            "{} declares no aux input bus, so it has no sidechain to wire",
+            short(comp)
+        ));
+    }
+    println!(
+        "{}: main {} ch, sidechain {} ch",
+        short(comp),
+        comp_in[0],
+        comp_in[1]
+    );
+
+    value["sub_plugins"] = serde_json::json!([
+        { "instance": 0, "reference": comp_ref },
+        { "instance": 1, "reference": synth_ref },
+    ]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    // Slot 0 drives the compressor's sidechain-enable switch. Bound to
+    // instance 0 explicitly -- keying on the plugin id alone is what §12-7 was
+    // about.
+    let mut slots: Vec<serde_json::Value> = (0..32)
+        .map(|_| serde_json::json!({ "name": null, "binding": null }))
+        .collect();
+    slots[0] = serde_json::json!({
+        "name": "SC Active",
+        "binding": {
+            "instance": 0,
+            "plugin_id": comp_id,
+            "param_id": switch,
+            "param_name": "SC Active",
+        }
+    });
+    value["slots"] = serde_json::Value::Array(slots);
+
+    let comp_ports = serde_json::json!({
+        "audio_in": comp_in, "audio_out": [2],
+        "accepts_notes": false, "params": [], "latency": 0
+    });
+    let synth_ports = serde_json::json!({
+        "audio_in": synth_in, "audio_out": [2],
+        "accepts_notes": synth_notes, "params": [], "latency": 0
+    });
+    // The synth's notes port sits after its audio inputs.
+    let synth_notes_port = synth_in.len() as u32;
+
+    let mut links = vec![
+        serde_json::json!({ "from": 0, "from_port": 0, "to": 1, "to_port": 0 }),
+        serde_json::json!({ "from": 1, "from_port": 0, "to": 4, "to_port": 0 }),
+        serde_json::json!({ "from": 5, "from_port": 0, "to": 6, "to_port": 0 }),
+    ];
+    if synth_notes {
+        links.push(serde_json::json!({
+            "from": 3, "from_port": 0, "to": 2, "to_port": synth_notes_port
+        }));
+    }
+    if keyed {
+        // Port 1 of the compressor is its sidechain -- see `plugin_input_ports`.
+        links.push(serde_json::json!({ "from": 2, "from_port": 0, "to": 1, "to_port": 1 }));
+    }
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],   "kind": { "AudioIn": { "bus": 0, "channels": 2 } } },
+            { "id": 1, "pos": [400.0, 40.0],  "kind": { "Plugin": { "instance": 0, "ports": comp_ports } } },
+            { "id": 2, "pos": [220.0, 220.0], "kind": { "Plugin": { "instance": 1, "ports": synth_ports } } },
+            { "id": 3, "pos": [40.0, 220.0],  "kind": "NoteIn" },
+            { "id": 4, "pos": [600.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
+            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": 1.0 } } },
+            { "id": 6, "pos": [220.0, 400.0], "kind": { "SlotOut": { "slot": 0 } } }
         ],
         "links": links,
         "next_id": 7

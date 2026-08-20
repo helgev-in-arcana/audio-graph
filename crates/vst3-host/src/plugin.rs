@@ -496,7 +496,7 @@ impl SubPluginMain for Vst3Plugin {
             return Err(HostError::InvalidState("plugin is already active"));
         }
 
-        setup_buses(&self.component, &self.processor, &config)?;
+        let declared = setup_buses(&self.component, &self.processor, &config)?;
 
         let mut setup = ProcessSetup {
             processMode: if config.offline {
@@ -548,6 +548,7 @@ impl SubPluginMain for Vst3Plugin {
         Ok(Box::new(Vst3Processor::new(
             self.processor.clone(),
             config,
+            &declared,
             map,
             Arc::clone(&self.pending_edits),
         )))
@@ -607,10 +608,14 @@ pub struct Vst3Processor {
     /// buffers. Sized once, never grown.
     input_ptrs: Vec<*mut f32>,
     output_ptrs: Vec<*mut f32>,
-    /// One descriptor per activated input bus: the main bus, then each aux bus
-    /// (§14.11). Built at activate with the widths already fixed, so a block
-    /// only refreshes the pointer inside each one.
+    /// One descriptor per bus the plugin *declares*, active or not (§14.11).
+    ///
+    /// Not one per bus we use: `numInputs` counts declared buses, and a plugin
+    /// that trusts it will read every entry. Ours declares a sidechain, and
+    /// handing it one entry is how this was found. Built at activate with the
+    /// widths fixed, so a block only refreshes the pointers.
     input_buses: Vec<vst3::Steinberg::Vst::AudioBusBuffers>,
+    output_buses: Vec<vst3::Steinberg::Vst::AudioBusBuffers>,
 
     /// Plain→normalised conversion captured at activate.
     param_map: ParamMap,
@@ -627,6 +632,7 @@ impl Vst3Processor {
     fn new(
         processor: ComPtr<IAudioProcessor>,
         config: AudioConfig,
+        declared: &DeclaredBuses,
         param_map: ParamMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
     ) -> Vst3Processor {
@@ -639,17 +645,8 @@ impl Vst3Processor {
             output_events: EventList::new(MAX_EVENTS_PER_BLOCK),
             input_ptrs: vec![std::ptr::null_mut(); config.total_input_channels() as usize],
             output_ptrs: vec![std::ptr::null_mut(); config.output_channels as usize],
-            input_buses: std::iter::once(config.input_channels)
-                .filter(|&c| c > 0)
-                .chain(config.aux_inputs.iter().map(u32::from))
-                .map(|channels| vst3::Steinberg::Vst::AudioBusBuffers {
-                    numChannels: channels as i32,
-                    silenceFlags: 0,
-                    __field0: vst3::Steinberg::Vst::AudioBusBuffers__type0 {
-                        channelBuffers32: std::ptr::null_mut(),
-                    },
-                })
-                .collect(),
+            input_buses: declared.inputs.iter().map(empty_bus).collect(),
+            output_buses: declared.outputs.iter().map(empty_bus).collect(),
             param_map,
             pending_edits,
         }
@@ -710,17 +707,33 @@ impl SubPluginProcessor for Vst3Processor {
             *slot = unsafe { output_raw.add(channel * frame_len) };
         }
 
-        // One `AudioBusBuffers` per activated input bus, pointing into the
-        // one flat run (§14.11). Only the pointer is refreshed here: the array
-        // and the widths were fixed at activate, because `process` may not
-        // allocate.
+        // One `AudioBusBuffers` per *declared* bus, pointing into the one flat
+        // run (§14.11). An inactive bus keeps zero channels and a null pointer,
+        // which is what an unconnected bus looks like — but it still gets an
+        // entry, because `numInputs` counts declared buses and a plugin that
+        // trusts the count will read every one. Only the pointers are refreshed
+        // here: the array and the widths were fixed at activate, because
+        // `process` may not allocate.
         let mut at = 0usize;
         for bus in self.input_buses.iter_mut() {
-            bus.__field0.channelBuffers32 = unsafe { self.input_ptrs.as_mut_ptr().add(at) };
+            let width = bus.numChannels.max(0) as usize;
             bus.silenceFlags = 0;
-            at += bus.numChannels.max(0) as usize;
+            if width == 0 {
+                continue;
+            }
+            bus.__field0.channelBuffers32 = unsafe { self.input_ptrs.as_mut_ptr().add(at) };
+            at += width;
         }
-        let mut output_bus = audio_bus(&mut self.output_ptrs);
+        let mut at = 0usize;
+        for bus in self.output_buses.iter_mut() {
+            let width = bus.numChannels.max(0) as usize;
+            bus.silenceFlags = 0;
+            if width == 0 {
+                continue;
+            }
+            bus.__field0.channelBuffers32 = unsafe { self.output_ptrs.as_mut_ptr().add(at) };
+            at += width;
+        }
         let mut process_context = vst_events::to_process_context(context, self.config.sample_rate);
 
         let mut data = ProcessData {
@@ -732,9 +745,9 @@ impl SubPluginProcessor for Vst3Processor {
             symbolicSampleSize: vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: self.input_buses.len() as i32,
-            numOutputs: if self.output_ptrs.is_empty() { 0 } else { 1 },
+            numOutputs: self.output_buses.len() as i32,
             inputs: self.input_buses.as_mut_ptr(),
-            outputs: &mut output_bus,
+            outputs: self.output_buses.as_mut_ptr(),
             inputParameterChanges: com_ref_ptr::<_, IParameterChanges>(&self.input_changes),
             outputParameterChanges: com_ref_ptr::<_, IParameterChanges>(&self.output_changes),
             inputEvents: com_ref_ptr::<_, IEventList>(&self.input_events),
@@ -752,9 +765,11 @@ impl SubPluginProcessor for Vst3Processor {
 
         // The plugin sets silence flags on the output bus when it has nothing
         // to say; honouring that is what lets a chain skip downstream work.
-        if output_bus.silenceFlags != 0 && self.output_ptrs.len() as u32 <= 64 {
-            let all_silent =
-                (0..self.output_ptrs.len()).all(|c| output_bus.silenceFlags & (1 << c) != 0);
+        if let Some(main) = self.output_buses.first()
+            && main.silenceFlags != 0
+            && self.output_ptrs.len() as u32 <= 64
+        {
+            let all_silent = (0..self.output_ptrs.len()).all(|c| main.silenceFlags & (1 << c) != 0);
             if all_silent {
                 return ProcessStatus::Silent;
             }
@@ -772,14 +787,32 @@ impl SubPluginProcessor for Vst3Processor {
     }
 }
 
-fn audio_bus(ptrs: &mut [*mut f32]) -> vst3::Steinberg::Vst::AudioBusBuffers {
+/// A descriptor for one declared bus, with no buffer attached yet.
+fn empty_bus(bus: &DeclaredBus) -> vst3::Steinberg::Vst::AudioBusBuffers {
     vst3::Steinberg::Vst::AudioBusBuffers {
-        numChannels: ptrs.len() as i32,
+        numChannels: bus.channels as i32,
         silenceFlags: 0,
         __field0: vst3::Steinberg::Vst::AudioBusBuffers__type0 {
-            channelBuffers32: ptrs.as_mut_ptr(),
+            channelBuffers32: std::ptr::null_mut(),
         },
     }
+}
+
+/// What one declared bus should be handed in `ProcessData` (§14.11).
+///
+/// Every bus a plugin *declares* needs an entry, active or not — that is what
+/// `numInputs` counts, and a plugin reading past the array is what it costs to
+/// be clever about it. Zero channels means the bus is declared but not switched
+/// on, which is what an unconnected bus looks like to a plugin.
+#[derive(Debug, Clone, Copy)]
+struct DeclaredBus {
+    channels: usize,
+}
+
+/// Every bus of a plugin, in declaration order, after negotiation.
+struct DeclaredBuses {
+    inputs: Vec<DeclaredBus>,
+    outputs: Vec<DeclaredBus>,
 }
 
 /// Negotiate bus arrangements and activate the buses we intend to use.
@@ -787,7 +820,7 @@ fn setup_buses(
     component: &ComPtr<IComponent>,
     processor: &ComPtr<IAudioProcessor>,
     config: &AudioConfig,
-) -> Result<()> {
+) -> Result<DeclaredBuses> {
     use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
 
     let arrangement = |channels: u32| -> SpeakerArrangement {
@@ -858,6 +891,10 @@ fn setup_buses(
     // nothing at all. Only as many input buses as were negotiated are switched
     // on: an active sidechain that never receives audio is worse than an
     // inactive one, because a compressor will duck to silence against it.
+    let mut declared = DeclaredBuses {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+    };
     for (media, dir, active) in [
         (MediaTypes_::kAudio, BusDirections_::kInput, num_in as usize),
         (
@@ -870,12 +907,37 @@ fn setup_buses(
     ] {
         let count = unsafe { component.getBusCount(media as i32, dir as i32) };
         for index in 0..count {
-            let state = u8::from((index as usize) < active);
-            unsafe { component.activateBus(media as i32, dir as i32, index, state) };
+            let on = (index as usize) < active;
+            unsafe { component.activateBus(media as i32, dir as i32, index, u8::from(on)) };
+            if media as i32 != MediaTypes_::kAudio as i32 {
+                continue;
+            }
+            let width = if dir as i32 == BusDirections_::kInput as i32 {
+                inputs.get(index as usize).copied()
+            } else {
+                outputs.get(index as usize).copied()
+            };
+            let bus = DeclaredBus {
+                channels: if on {
+                    width.map_or(0, channel_count)
+                } else {
+                    0
+                },
+            };
+            if dir as i32 == BusDirections_::kInput as i32 {
+                declared.inputs.push(bus);
+            } else {
+                declared.outputs.push(bus);
+            }
         }
     }
 
-    Ok(())
+    Ok(declared)
+}
+
+/// How many channels a speaker arrangement's bits stand for.
+fn channel_count(arrangement: SpeakerArrangement) -> usize {
+    arrangement.count_ones() as usize
 }
 
 /// Read the controller's parameter list into the core's plain-valued model.

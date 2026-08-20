@@ -8,7 +8,10 @@
 //! runs.
 
 use crate::graph::{Graph, NodeId, NodeKind, PortType};
-use crate::program::{AudioOp, Buf, Chunking, MAX_COMPENSATION, MAX_COMPENSATORS, NoteSource};
+use crate::program::{
+    AudioOp, Buf, Chunking, InstanceIo, MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS,
+    NoteSource,
+};
 
 use crate::compile::{CompileError, Line, NO_WRITER};
 
@@ -21,6 +24,7 @@ pub(crate) struct Audio {
     pub buffers: Vec<u16>,
     pub chunking: Chunking,
     pub latency: u32,
+    pub instances: Vec<InstanceIo>,
 }
 
 /// One node's audio output, once it has been emitted.
@@ -97,6 +101,10 @@ impl Pool {
         got
     }
 
+    fn width_of(&self, buf: Buf) -> u16 {
+        self.widths[buf as usize]
+    }
+
     /// One of `buf`'s readers has run.
     fn consume(&mut self, buf: Buf) {
         let slot = &mut self.pending[buf as usize];
@@ -135,6 +143,7 @@ pub(crate) fn compile_audio(
     let mut produced: Vec<Produced> = Vec::new();
     let mut latency = 0u32;
     let mut compensators = 0u16;
+    let mut instances: Vec<InstanceIo> = Vec::new();
 
     for &id in order {
         let node = graph.node(id).expect("ordering only contains real nodes");
@@ -192,23 +201,84 @@ pub(crate) fn compile_audio(
                     // is nothing downstream of it to compile.
                     continue;
                 }
-                let (input, in_latency) = match sources.first().copied().flatten() {
-                    Some(found) => found,
-                    None => {
-                        // A plugin expects an input buffer even when nothing
-                        // feeds it.
+
+                // Which input buses the graph actually feeds (§14.11). A
+                // sidechain nobody wired is left off entirely rather than
+                // activated and fed silence: a compressor with an active,
+                // silent sidechain ducks to nothing.
+                let mut wired = ports.audio_in.len();
+                while wired > 1 && sources.get(wired - 1).copied().flatten().is_none() {
+                    wired -= 1;
+                }
+                if wired > 1 + MAX_AUX_BUSES {
+                    return Err(CompileError::TooLarge {
+                        what: "aux input buses on one plugin",
+                        limit: 1 + MAX_AUX_BUSES,
+                    });
+                }
+                let buses: Vec<u16> = ports.audio_in[..wired].to_vec();
+
+                // One buffer per bus, at the width the plugin wants. An unwired
+                // bus before a wired one still needs something to read.
+                let mut in_latency = 0u32;
+                let mut parts: Vec<(Buf, u16)> = Vec::with_capacity(buses.len());
+                for (index, &width) in buses.iter().enumerate() {
+                    match sources.get(index).copied().flatten() {
+                        Some((buf, late)) => {
+                            in_latency = in_latency.max(late);
+                            parts.push((buf, width));
+                        }
+                        None => {
+                            let silent = pool.alloc(width, 1)?;
+                            ops.push(AudioOp::Silence { out: silent });
+                            parts.push((silent, width));
+                        }
+                    }
+                }
+
+                // One bus at the right width already is the plugin's input
+                // region; anything else has to be assembled. Skipping the copy
+                // in the common case matters — most plugins are one stereo bus.
+                let total: u16 = buses.iter().sum();
+                let input = match parts.as_slice() {
+                    [] => {
+                        // An instrument. It is still handed a buffer, because
+                        // the caller's slice has to point somewhere.
                         let silent = pool.alloc(out_width, 1)?;
                         ops.push(AudioOp::Silence { out: silent });
-                        (silent, 0)
+                        silent
+                    }
+                    [(buf, width)] if pool.width_of(*buf) == *width => *buf,
+                    _ => {
+                        let avoid: Vec<Buf> = parts.iter().map(|&(b, _)| b).collect();
+                        let out = pool.alloc_avoiding(total, 1, &avoid)?;
+                        ops.push(AudioOp::Gather {
+                            out,
+                            buses: parts.clone(),
+                        });
+                        out
                     }
                 };
-                pool.consume(input);
+                for (buf, _) in &parts {
+                    pool.consume(*buf);
+                }
+                if !parts.iter().any(|&(b, _)| b == input) {
+                    pool.consume(input);
+                }
+
                 let output = pool.alloc_avoiding(out_width, readers, &[input])?;
                 ops.push(AudioOp::Plugin {
                     instance: *instance as u32,
                     input,
+                    input_buses: buses.clone(),
                     output,
                     notes: note_source(graph, id, ports),
+                });
+                instances.push(InstanceIo {
+                    instance: *instance as u32,
+                    input_channels: buses.first().copied().unwrap_or(0),
+                    aux_inputs: buses.get(1..).unwrap_or(&[]).to_vec(),
+                    output_channels: out_width,
                 });
                 produced.push(Produced {
                     node: id,
@@ -274,7 +344,9 @@ pub(crate) fn compile_audio(
         .iter()
         .any(|line| matches!(line.ty, PortType::Audio { .. }) && line.writer != NO_WRITER);
 
+    instances.sort_unstable_by_key(|i| i.instance);
     Ok(Audio {
+        instances,
         ops,
         buffers: pool.widths,
         chunking: if looped {
@@ -290,6 +362,7 @@ pub(crate) fn compile_audio(
 mod tests {
     use super::*;
     use crate::compile::compile;
+    use crate::engine::{AudioChunk, AudioNodes};
     use crate::graph::PluginPorts;
     use crate::program::AudioOp;
 
@@ -303,6 +376,21 @@ mod tests {
                     audio_in: vec![2],
                     audio_out: vec![2],
                     latency,
+                    ..PluginPorts::default()
+                },
+            },
+            [0.0, 0.0],
+        )
+    }
+
+    /// A plugin with a main stereo bus and one aux bus of `aux` channels.
+    fn with_sidechain(graph: &mut Graph, instance: usize, aux: u16) -> NodeId {
+        graph.add(
+            NodeKind::Plugin {
+                instance,
+                ports: PluginPorts {
+                    audio_in: vec![2, aux],
+                    audio_out: vec![2],
                     ..PluginPorts::default()
                 },
             },
@@ -694,5 +782,128 @@ mod tests {
             ],
             "the order is the order they run in, and only the synth hears notes"
         );
+    }
+
+    /// A plugin with a sidechain socket nobody wired is activated with one bus.
+    ///
+    /// Not "activated with a silent sidechain": a compressor whose sidechain is
+    /// switched on and fed nothing ducks to silence (§14.11).
+    #[test]
+    fn an_unwired_sidechain_is_not_switched_on() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = with_sidechain(&mut graph, 0, 1);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.instances[0].aux_inputs, Vec::<u16>::new());
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Gather { .. })),
+            "one bus at the right width needs no assembling"
+        );
+    }
+
+    /// Wiring the sidechain switches the bus on and assembles the input region.
+    #[test]
+    fn a_wired_sidechain_is_gathered_behind_the_main_bus() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let key = stereo_in(&mut graph);
+        let node = with_sidechain(&mut graph, 0, 1);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(key, 0, node, 1);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.instances[0].input_channels, 2);
+        assert_eq!(program.instances[0].aux_inputs, vec![1]);
+
+        let gather = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Gather { buses, .. } => Some(buses.clone()),
+                _ => None,
+            })
+            .expect("the two buses have to be assembled into one region");
+        assert_eq!(gather.len(), 2);
+        assert_eq!(gather[0].1, 2, "main bus stays stereo");
+        assert_eq!(
+            gather[1].1, 1,
+            "the sidechain is the width the plugin wants"
+        );
+
+        let buses = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Plugin { input_buses, .. } => Some(input_buses.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(buses, vec![2, 1]);
+    }
+
+    /// A stereo source into a mono sidechain is summed, not halved and not
+    /// left-only: a detector that ignored one channel would miss half the
+    /// signal it is supposed to react to.
+    #[test]
+    fn a_stereo_source_reaches_a_mono_sidechain_as_a_sum() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let key = stereo_in(&mut graph);
+        let node = with_sidechain(&mut graph, 0, 1);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(key, 0, node, 1);
+        graph.connect(node, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        // Both stereo inputs read DAW bus 0, so the sidechain sees the same
+        // two channels: 1.0 and 2.0, which have to arrive as 3.0.
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        let mut seen = RecordInput::default();
+        engine.run_audio(4, &daw_in, &mut daw_out, &mut seen);
+
+        assert_eq!(seen.channels, 3, "stereo main plus mono sidechain");
+        assert_eq!(seen.first_of_each, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Records the shape and content of what a plugin node was handed.
+    #[derive(Default)]
+    struct RecordInput {
+        channels: u16,
+        first_of_each: Vec<f32>,
+    }
+
+    impl AudioNodes for RecordInput {
+        fn process(
+            &mut self,
+            _instance: u32,
+            _notes: NoteSource,
+            input: &[f32],
+            output: &mut [f32],
+            chunk: AudioChunk,
+        ) {
+            self.channels = chunk.input_channels;
+            self.first_of_each = (0..chunk.input_channels)
+                .map(|ch| input[ch as usize * chunk.frames as usize])
+                .collect();
+            for ch in 0..chunk.output_channels {
+                output[chunk.channel(ch)].fill(0.0);
+            }
+        }
     }
 }

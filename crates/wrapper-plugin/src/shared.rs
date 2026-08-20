@@ -38,6 +38,7 @@ use plugin_host_api::AudioConfig;
 use subhost_adapter::{
     DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
 };
+use wrapper_engine::InstanceIo;
 use wrapper_engine::{Graph, Handoff, Program, compile};
 
 use crate::params::WrapperParams;
@@ -55,6 +56,13 @@ pub struct MainState {
     /// through an edit; the last program that compiled keeps running and the
     /// editor says why.
     pub compile_error: Option<String>,
+    /// How each sub-plugin has to be activated under the current program
+    /// (§14.11).
+    ///
+    /// Kept here rather than read back off the engine because the engine lives
+    /// on the audio side of the wrapper, and this is needed on the main thread
+    /// every time something is re-activated.
+    pub instance_io: Vec<InstanceIo>,
 }
 
 /// The live processor, and the only thing the audio thread ever waits on.
@@ -100,6 +108,7 @@ impl Shared {
                 config: None,
                 graph: Graph::new(),
                 compile_error: None,
+                instance_io: Vec::new(),
             })),
             audio: Mutex::new(AudioState { processor: None }),
             programs: Handoff::new(),
@@ -177,7 +186,20 @@ impl Shared {
         match compile(&state.graph, SLOT_COUNT) {
             Ok(program) => {
                 state.compile_error = None;
+                // A graph edit can change which buses a sub-plugin needs —
+                // wiring a sidechain is exactly that — and a bus cannot be
+                // switched on while the plugin is active. Whether the change
+                // has to be acted on is `reactivate`'s decision; recording it
+                // is this one's.
+                let changed = state.instance_io != program.instances;
+                state.instance_io = program.instances.clone();
                 self.programs.send(Box::new(program));
+                drop(state);
+                if changed {
+                    if let Err(e) = self.rebind() {
+                        log::warn!("audio-graph: re-activating for new buses: {e}");
+                    }
+                }
             }
             Err(e) => state.compile_error = Some(e.to_string()),
         }
@@ -223,13 +245,14 @@ impl Shared {
     /// whole track is broken.
     fn resume(&self) -> Result<(), String> {
         let mut state = self.main();
-        if !state.host.is_loaded(0) {
+        if !state.host.any_loaded() {
             return Ok(());
         }
         let Some(config) = state.config else {
             return Ok(());
         };
-        let processor = state.host.activate(config)?;
+        let io = state.instance_io.clone();
+        let processor = state.host.activate(config, &io)?;
         drop(state);
         self.audio().processor = Some(processor);
         Ok(())
