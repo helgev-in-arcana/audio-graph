@@ -12,10 +12,12 @@
 
 use plugin_host_api::{NoteEvent, NoteExpression};
 
+use crate::audio::MAX_BUFFERS;
 use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
 use crate::program::{
-    MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec,
+    AudioOp, Buf, Chunking, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec,
 };
 
 /// No ring currently holds this line. Not a valid index into `rings`.
@@ -72,6 +74,54 @@ fn expression_index(kind: NoteExpression) -> usize {
     }
 }
 
+/// The shape of one chunk handed to a sub-plugin.
+///
+/// `stride` is not `frames`: the pool is laid out for the longest block the
+/// host promised, and a chunk shorter than that still starts each channel at
+/// the same offset. Passing both keeps the buffer flat, which is what §4.3
+/// asks for and what ADR-6 needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioChunk {
+    pub channels: u16,
+    pub frames: u32,
+    pub stride: u32,
+}
+
+impl AudioChunk {
+    /// One channel of a chunk, as a range into the flat buffer.
+    pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
+        let start = channel as usize * self.stride as usize;
+        start..start + self.frames as usize
+    }
+}
+
+/// How the engine runs a sub-plugin.
+///
+/// The engine schedules audio but has no idea what is at the other end of a
+/// plugin node — this crate does not know what a VST3 is, and after M6 it will
+/// not know what a CLAP is either (§7). Everything crossing this boundary is a
+/// flat slice or a `Copy` value, for the same reason as §4.1: it has to still
+/// work when the plugin is in another process (ADR-6).
+pub trait AudioNodes {
+    /// Run instance `instance` from `input` into `output`.
+    ///
+    /// The two slices never alias. `output` is written in full for the frames
+    /// the chunk covers; anything the implementation does not write is whatever
+    /// the pool held, so a plugin that produces nothing should clear it.
+    fn process(&mut self, instance: u32, input: &[f32], output: &mut [f32], chunk: AudioChunk);
+}
+
+/// An implementation that produces silence, for a wrapper with nothing loaded.
+pub struct NoNodes;
+
+impl AudioNodes for NoNodes {
+    fn process(&mut self, _instance: u32, _input: &[f32], output: &mut [f32], chunk: AudioChunk) {
+        for ch in 0..chunk.channels {
+            output[chunk.channel(ch)].fill(0.0);
+        }
+    }
+}
+
 pub struct Engine {
     program: Option<Box<Program>>,
     registers: Vec<f64>,
@@ -97,6 +147,15 @@ pub struct Engine {
     ring_nodes: Vec<u32>,
     /// Scratch for reordering `rings` on a swap, so the swap allocates nothing.
     ring_order: Vec<usize>,
+    /// The audio buffer pool (§14.7), one `MAX_CHANNELS * max_frames` region
+    /// per buffer index. Sized by [`prepare`][Engine::prepare], which is the
+    /// only place in this type that allocates.
+    pool: Vec<f32>,
+    /// Frames one buffer's channel holds. Zero until `prepare`.
+    stride: usize,
+    /// Rings for delay compensation (§14.6), one per compensated path.
+    compensators: Vec<f32>,
+    compensator_heads: Vec<usize>,
     expressions: Expressions,
     rng: u32,
 }
@@ -122,6 +181,10 @@ impl Engine {
             ring_heads: vec![0; MAX_DELAY_LINES],
             ring_nodes: vec![u32::MAX; MAX_DELAY_LINES],
             ring_order: vec![0; MAX_DELAY_LINES],
+            pool: Vec::new(),
+            stride: 0,
+            compensators: Vec::new(),
+            compensator_heads: vec![0; MAX_COMPENSATORS],
             expressions: Expressions::default(),
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
@@ -259,6 +322,200 @@ impl Engine {
         self.phases.iter_mut().for_each(|p| *p = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
+        self.pool.fill(0.0);
+        self.compensators.fill(0.0);
+        self.compensator_heads.iter_mut().for_each(|h| *h = 0);
+    }
+
+    /// Size the audio buffers. Called from `activate`, on the main thread.
+    ///
+    /// The only allocating method on this type. Everything is sized for the
+    /// ceilings rather than for the current program, so that a recompile —
+    /// which happens on every drag of every control — never needs memory the
+    /// audio thread does not already have (§9.1).
+    pub fn prepare(&mut self, max_frames: u32) {
+        self.stride = max_frames as usize;
+        self.pool.clear();
+        self.pool
+            .resize(MAX_BUFFERS * MAX_CHANNELS * self.stride, 0.0);
+        self.compensators.clear();
+        self.compensators
+            .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
+        self.compensator_heads.iter_mut().for_each(|h| *h = 0);
+    }
+
+    /// What the wrapper should report to the DAW as its own latency (§14.6).
+    pub fn latency(&self) -> u32 {
+        self.program.as_ref().map_or(0, |p| p.latency)
+    }
+
+    /// How often [`run_audio`][Engine::run_audio] wants to be called (§14.9).
+    pub fn chunking(&self) -> Chunking {
+        self.program
+            .as_ref()
+            .map_or(Chunking::WholeBlock, |p| p.chunking)
+    }
+
+    /// Run the audio half of the program for one chunk.
+    ///
+    /// `daw_in` and `daw_out` are planar — the wrapper's own connection to the
+    /// DAW. `nodes` is how a sub-plugin gets run, because this crate does not
+    /// know what a sub-plugin is (§7).
+    ///
+    /// Does nothing if `prepare` has not been called or the chunk is longer
+    /// than `prepare` was told to expect. Both mean the caller broke the
+    /// contract, and neither is worth reading past the end of a buffer for.
+    pub fn run_audio(
+        &mut self,
+        frames: u32,
+        daw_in: &[f32],
+        daw_out: &mut [f32],
+        nodes: &mut dyn AudioNodes,
+    ) {
+        let frames = frames as usize;
+        if self.stride == 0 || frames > self.stride {
+            return;
+        }
+        let Some(program) = self.program.take() else {
+            return;
+        };
+
+        for op in &program.audio_ops {
+            match op {
+                AudioOp::Silence { out } => self.fill(*out, frames, 0.0),
+                AudioOp::Input { out, bus } => {
+                    let width = program.buffers[*out as usize] as usize;
+                    // M8.2 is one bus each way (§14.8). A node naming a bus the
+                    // wrapper does not have reads silence rather than the wrong
+                    // bus: that is the failure a user can hear and fix.
+                    if *bus == 0 {
+                        for ch in 0..width.min(MAX_CHANNELS) {
+                            let to = self.at(*out, ch);
+                            let from = ch * frames;
+                            for i in 0..frames {
+                                self.pool[to + i] = daw_in.get(from + i).copied().unwrap_or(0.0);
+                            }
+                        }
+                    } else {
+                        self.fill(*out, frames, 0.0);
+                    }
+                }
+                AudioOp::Output { a, bus } => {
+                    if *bus != 0 {
+                        continue;
+                    }
+                    let width = program.buffers[*a as usize] as usize;
+                    for ch in 0..width.min(MAX_CHANNELS) {
+                        let from = self.at(*a, ch);
+                        let to = ch * frames;
+                        if to + frames <= daw_out.len() {
+                            daw_out[to..to + frames]
+                                .copy_from_slice(&self.pool[from..from + frames]);
+                        }
+                    }
+                }
+                AudioOp::Plugin {
+                    instance,
+                    input,
+                    output,
+                } => {
+                    let width = program.buffers[*output as usize];
+                    // The compiler guarantees these differ, so the two regions
+                    // cannot overlap and `split_at_mut` is enough to prove it.
+                    let span = MAX_CHANNELS * self.stride;
+                    let (lo, hi) = if input < output {
+                        (*input as usize, *output as usize)
+                    } else {
+                        (*output as usize, *input as usize)
+                    };
+                    let (front, back) = self.pool.split_at_mut(hi * span);
+                    let low = &mut front[lo * span..lo * span + span];
+                    let high = &mut back[..span];
+                    let (source, dest) = if input < output {
+                        (&low[..], high)
+                    } else {
+                        (&high[..], low)
+                    };
+                    nodes.process(
+                        *instance,
+                        source,
+                        dest,
+                        AudioChunk {
+                            channels: width,
+                            frames: frames as u32,
+                            stride: self.stride as u32,
+                        },
+                    );
+                }
+                AudioOp::Mix { out, inputs } => {
+                    if inputs.is_empty() {
+                        self.fill(*out, frames, 0.0);
+                        continue;
+                    }
+                    let width = program.buffers[*out as usize] as usize;
+                    for (n, &src) in inputs.iter().enumerate() {
+                        for ch in 0..width.min(MAX_CHANNELS) {
+                            let from = self.at(src, ch);
+                            let to = self.at(*out, ch);
+                            if from == to {
+                                // Already in place: the first input may well
+                                // have been given the destination buffer.
+                                continue;
+                            }
+                            for i in 0..frames {
+                                let value = self.pool[from + i];
+                                if n == 0 {
+                                    self.pool[to + i] = value;
+                                } else {
+                                    self.pool[to + i] += value;
+                                }
+                            }
+                        }
+                    }
+                }
+                AudioOp::Compensate { buf, slot, samples } => {
+                    let width = program.buffers[*buf as usize] as usize;
+                    self.compensate(*buf, *slot as usize, *samples as usize, width, frames);
+                }
+            }
+        }
+
+        self.program = Some(program);
+    }
+
+    /// Where one channel of one buffer starts in the pool.
+    fn at(&self, buf: Buf, channel: usize) -> usize {
+        buf as usize * MAX_CHANNELS * self.stride + channel * self.stride
+    }
+
+    fn fill(&mut self, buf: Buf, frames: usize, value: f32) {
+        for ch in 0..MAX_CHANNELS {
+            let start = self.at(buf, ch);
+            self.pool[start..start + frames].fill(value);
+        }
+    }
+
+    /// Push a buffer through a fixed delay, in place (§14.6).
+    fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, frames: usize) {
+        if slot >= MAX_COMPENSATORS || samples == 0 || samples >= MAX_COMPENSATION {
+            return;
+        }
+        let mut head = self.compensator_heads[slot];
+        for ch in 0..width.min(MAX_CHANNELS) {
+            // Every channel walks the same distance, so each starts from the
+            // same head and only the last one leaves it moved.
+            head = self.compensator_heads[slot];
+            let ring = slot * MAX_CHANNELS * MAX_COMPENSATION + ch * MAX_COMPENSATION;
+            let signal = self.at(buf, ch);
+            for i in 0..frames {
+                let read = (head + MAX_COMPENSATION - samples) % MAX_COMPENSATION;
+                let delayed = self.compensators[ring + read];
+                self.compensators[ring + head] = self.pool[signal + i];
+                self.pool[signal + i] = delayed;
+                head = (head + 1) % MAX_COMPENSATION;
+            }
+        }
+        self.compensator_heads[slot] = head;
     }
 
     /// Evaluate the program for one sub-block.
@@ -715,6 +972,193 @@ mod tests {
         assert!((run(32, 2) - 0.5).abs() < 1e-9);
         // By the third, it has.
         assert!(run(32, 3) > 0.5);
+    }
+
+    /// A stand-in for the sub-plugins, so the engine's routing can be tested
+    /// without one. Each instance adds its own number to every sample, which
+    /// makes the order it ran in readable off the output.
+    struct Adders;
+
+    impl AudioNodes for Adders {
+        fn process(&mut self, instance: u32, input: &[f32], output: &mut [f32], chunk: AudioChunk) {
+            for ch in 0..chunk.channels {
+                let range = chunk.channel(ch);
+                for (o, i) in output[range.clone()].iter_mut().zip(input[range].iter()) {
+                    *o = *i + (instance + 1) as f32;
+                }
+            }
+        }
+    }
+
+    fn audio_plugin(graph: &mut Graph, instance: usize, latency: u32) -> NodeId {
+        graph.add(
+            NodeKind::Plugin {
+                instance,
+                ports: crate::graph::PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2],
+                    latency,
+                    ..crate::graph::PluginPorts::default()
+                },
+            },
+            [0.0, 0.0],
+        )
+    }
+
+    #[test]
+    fn audio_runs_through_two_plugins_in_order() {
+        let mut graph = Graph::new();
+        let input = graph.add(
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        let first = audio_plugin(&mut graph, 0, 0);
+        let second = audio_plugin(&mut graph, 1, 0);
+        let output = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, first, 0);
+        graph.connect(first, 0, second, 0);
+        graph.connect(second, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64);
+        load(&mut engine, &graph);
+
+        let daw_in = vec![10.0f32; 2 * 8];
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+
+        // 10, then +1 from instance 0, then +2 from instance 1.
+        assert!(
+            daw_out.iter().all(|&s| (s - 13.0).abs() < 1e-6),
+            "{daw_out:?}"
+        );
+    }
+
+    /// §14.6, end to end: the dry branch really is held back, so an impulse
+    /// arrives once rather than twice.
+    #[test]
+    fn a_compensated_branch_arrives_with_the_late_one() {
+        let mut graph = Graph::new();
+        let input = graph.add(
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        // Latency 4, but the stand-in does not actually delay: what is being
+        // tested is that the *other* branch is delayed by the same 4.
+        let slow = audio_plugin(&mut graph, 0, 4);
+        let mix = graph.add(
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 2,
+            },
+            [0.0, 0.0],
+        );
+        let output = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, slow, 0);
+        graph.connect(slow, 0, mix, 0);
+        graph.connect(input, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64);
+        load(&mut engine, &graph);
+
+        // An impulse on the first sample of each channel.
+        let mut daw_in = vec![0.0f32; 2 * 8];
+        daw_in[0] = 1.0;
+        daw_in[8] = 1.0;
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+
+        // The wet branch is the stand-in: input + 1, so the impulse shows as
+        // 2.0 at sample 0 and 1.0 everywhere else. The dry branch is held back
+        // 4 samples, so its impulse lands at sample 4 and nowhere else.
+        assert!((daw_out[0] - 2.0).abs() < 1e-6, "wet at 0: {}", daw_out[0]);
+        assert!(
+            (daw_out[4] - 2.0).abs() < 1e-6,
+            "dry arrives at 4: {}",
+            daw_out[4]
+        );
+        assert!(
+            (daw_out[1] - 1.0).abs() < 1e-6,
+            "quiet between: {}",
+            daw_out[1]
+        );
+    }
+
+    #[test]
+    fn an_unconnected_output_leaves_the_daw_buffer_alone() {
+        let mut graph = Graph::new();
+        graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        let mut engine = Engine::new();
+        engine.prepare(64);
+        load(&mut engine, &graph);
+
+        let daw_in = vec![0.0f32; 2 * 8];
+        let mut daw_out = vec![7.0f32; 2 * 8];
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+        assert!(daw_out.iter().all(|&s| s == 7.0));
+    }
+
+    /// `prepare` is the only thing that allocates, so running without it — or
+    /// with a longer block than promised — has to be a no-op rather than a
+    /// panic or a read past the end.
+    #[test]
+    fn running_audio_unprepared_does_nothing() {
+        let mut graph = Graph::new();
+        let input = graph.add(
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        let output = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, output, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let daw_in = vec![1.0f32; 2 * 8];
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+        assert!(daw_out.iter().all(|&s| s == 0.0));
+
+        engine.prepare(4);
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+        assert!(
+            daw_out.iter().all(|&s| s == 0.0),
+            "8 frames were promised 4"
+        );
     }
 
     #[test]

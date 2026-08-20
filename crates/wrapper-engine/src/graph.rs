@@ -100,6 +100,14 @@ pub struct PluginPorts {
     pub accepts_notes: bool,
     #[serde(default)]
     pub params: Vec<ParamPort>,
+    /// The plugin's reported latency, in samples.
+    ///
+    /// Discovered after loading like everything else here, and re-read when the
+    /// plugin says `kLatencyChanged`. The compiler needs it to line up parallel
+    /// paths (§14.6) and to work out how short a feedback loop may be (§14.4),
+    /// so a change to it means a recompile.
+    #[serde(default)]
+    pub latency: u32,
 }
 
 /// One node's identity, position and settings.
@@ -191,6 +199,13 @@ pub enum NodeKind {
     /// cycle for the topological sort to find. That is the whole mechanism: the
     /// two halves are paired by `line`, never by an edge.
     DelayWrite { line: LineId, ty: PortType },
+    /// Sum several audio inputs of the same width into one.
+    ///
+    /// The only way two audio sources reach one destination. An input takes one
+    /// link everywhere in this graph, so mixing is a node rather than a rule —
+    /// and being a node is what lets the compiler see the merge and line the
+    /// paths up (§14.6).
+    Mix { channels: u16, inputs: u8 },
     /// The reading half of a delay line (§14.4).
     ///
     /// Has an output and no input. Several reads may share one line — that is a
@@ -371,6 +386,16 @@ impl NodeKind {
                 )]
             }
             NodeKind::DelayWrite { ty, .. } => vec![Port::new("in", *ty)],
+            NodeKind::Mix { channels, inputs } => (0..*inputs)
+                .map(|i| {
+                    Port::new(
+                        format!("in {}", i + 1),
+                        PortType::Audio {
+                            channels: *channels,
+                        },
+                    )
+                })
+                .collect(),
             NodeKind::Plugin { ports, .. } => plugin_input_ports(ports),
         }
     }
@@ -397,6 +422,14 @@ impl NodeKind {
             }
             NodeKind::NoteIn => vec![Port::new("out", PortType::Note)],
             NodeKind::DelayRead { ty, .. } => vec![Port::new("out", *ty)],
+            NodeKind::Mix { channels, .. } => {
+                vec![Port::new(
+                    "out",
+                    PortType::Audio {
+                        channels: *channels,
+                    },
+                )]
+            }
             NodeKind::Plugin { ports, .. } => ports
                 .audio_out
                 .iter()
@@ -428,6 +461,7 @@ impl NodeKind {
             NodeKind::Plugin { instance, .. } => format!("Plugin {}", instance + 1),
             NodeKind::DelayWrite { line, .. } => format!("Delay {} write", line + 1),
             NodeKind::DelayRead { line, .. } => format!("Delay {} read", line + 1),
+            NodeKind::Mix { .. } => "Mix".into(),
         }
     }
 }
@@ -727,6 +761,7 @@ mod tests {
                 id: 7,
                 name: "Cutoff".into(),
             }],
+            latency: 0,
         };
         let node = NodeKind::Plugin { instance: 0, ports };
         let inputs = node.input_ports();

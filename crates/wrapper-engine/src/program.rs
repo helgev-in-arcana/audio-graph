@@ -31,6 +31,21 @@ pub const MAX_DELAY_LINES: usize = 16;
 /// would mean a reallocation every time the user drags the time control.
 pub const MAX_DELAY_TAPS: usize = 4096;
 
+/// How many parallel paths one program may compensate, and by how much.
+///
+/// Both are preallocated (§9.1), so both are ceilings rather than guidance. A
+/// graph that wants more is refused with a message rather than served with an
+/// allocation inside `process`. The length is about 680 ms at 48 kHz, which
+/// covers the linear-phase and look-ahead plugins that make compensation
+/// necessary in the first place; the count is the number of *compensated*
+/// branches, not of buffers, and a merge of two paths needs one.
+pub const MAX_COMPENSATORS: usize = 8;
+pub const MAX_COMPENSATION: usize = 32_768;
+
+/// Widest bus the engine moves around. M8.2 is stereo throughout (§14.8); the
+/// pool is sized for this so that M8.4 widening it is a constant change.
+pub const MAX_CHANNELS: usize = 2;
+
 /// An index into the register file.
 pub type Reg = u16;
 
@@ -112,6 +127,55 @@ pub enum Op {
     },
 }
 
+/// An index into the audio buffer pool.
+pub type Buf = u16;
+
+/// How often the audio half of a program is evaluated (§14.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Chunking {
+    /// Once per block the DAW hands us. Parameter changes still arrive at
+    /// sub-block resolution, as events with an offset — there is no reason to
+    /// call a plugin more often than the DAW does.
+    #[default]
+    WholeBlock,
+    /// Once per sub-block. Required as soon as an audio feedback loop exists:
+    /// §14.4's `D >= chunk length` binds the plugins in the loop too.
+    SubBlock,
+}
+
+/// One step of the audio half of a program.
+///
+/// Kept apart from [`Op`] because the two halves run at different rates
+/// (§14.9). Buffers are indices into a pool the engine owns; nothing here is a
+/// pointer, so a `Program` still crosses a process boundary unchanged (ADR-6).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioOp {
+    /// Copy one of the wrapper's own inputs in from the DAW.
+    Input { out: Buf, bus: u16 },
+    /// Copy a buffer out to one of the wrapper's own outputs.
+    Output { a: Buf, bus: u16 },
+    /// Run a sub-plugin from one buffer into another.
+    ///
+    /// `input` and `output` are always different buffers: a plugin that reads
+    /// and writes the same memory is a question about the plugin's internals
+    /// that the host has no business asking.
+    Plugin {
+        instance: u32,
+        input: Buf,
+        output: Buf,
+    },
+    /// Sum several buffers into one.
+    Mix { out: Buf, inputs: Vec<Buf> },
+    /// Delay a buffer by a fixed number of samples.
+    ///
+    /// Inserted by the compiler to line up parallel paths (§14.6), never placed
+    /// by the user — the delay the user places is a `DelayWrite`/`DelayRead`
+    /// pair. `slot` indexes the engine's compensation rings.
+    Compensate { buf: Buf, slot: u16, samples: u32 },
+    /// Fill a buffer with silence. Emitted for an input nobody connected.
+    Silence { out: Buf },
+}
+
 /// A graph, compiled.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -127,6 +191,15 @@ pub struct Program {
     /// feedback loop that emptied itself every time the user nudged an
     /// unrelated control would not be usable.
     pub delay_nodes: Vec<NodeId>,
+    /// The audio half, in order (§14.9).
+    pub audio_ops: Vec<AudioOp>,
+    /// Channel width of each buffer in the pool, by index.
+    pub buffers: Vec<u16>,
+    /// How often `audio_ops` runs (§14.9).
+    pub chunking: Chunking,
+    /// What the wrapper should report to the DAW as its own latency: the
+    /// longest path from an input to an output, after compensation (§14.6).
+    pub latency: u32,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
@@ -142,13 +215,18 @@ impl Program {
             ops: Vec::new(),
             registers: 0,
             outputs: Vec::new(),
+            audio_ops: Vec::new(),
+            buffers: Vec::new(),
+            chunking: Chunking::WholeBlock,
+            latency: 0,
             delay_nodes: Vec::new(),
             lfo_nodes: Vec::new(),
         }
     }
 
+    /// Whether running this program would do nothing observable.
     pub fn is_empty(&self) -> bool {
-        self.outputs.is_empty()
+        self.outputs.is_empty() && self.audio_ops.is_empty()
     }
 
     /// Whether the graph drives this slot, and so overrides the DAW's

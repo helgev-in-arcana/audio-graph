@@ -283,19 +283,15 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     });
                 }
             }
-            NodeKind::AudioIn { .. } | NodeKind::AudioOut { .. } => {
-                return Err(CompileError::NotYet {
-                    what: "audio routing",
-                });
-            }
+            // Audio nodes carry no param register. The audio pass walks the
+            // same order again and emits their half (§14.9).
+            NodeKind::AudioIn { .. }
+            | NodeKind::AudioOut { .. }
+            | NodeKind::Plugin { .. }
+            | NodeKind::Mix { .. } => {}
             NodeKind::NoteIn => {
                 return Err(CompileError::NotYet {
                     what: "note routing",
-                });
-            }
-            NodeKind::Plugin { .. } => {
-                return Err(CompileError::NotYet {
-                    what: "plugin nodes",
                 });
             }
         }
@@ -303,22 +299,31 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
 
     ops.append(&mut writes);
 
+    let audio = crate::audio::compile_audio(graph, &order, &lines)?;
+
     outputs.sort_unstable();
     Ok(Program {
         ops,
         registers: next_reg,
         outputs,
+        audio_ops: audio.ops,
+        buffers: audio.buffers,
+        chunking: audio.chunking,
+        latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         lfo_nodes,
     })
 }
 
 /// One delay line, as the compiler sees it.
-struct Line {
-    id: LineId,
+pub(crate) struct Line {
+    pub id: LineId,
     /// The `DelayWrite` node, which is what the line's ring state is keyed to
     /// across a program swap (§14.5).
-    writer: NodeId,
+    pub writer: NodeId,
+    /// What the line carries. An audio line with a writer closes an audio loop,
+    /// which is what forces the fine evaluation grain (§14.9).
+    pub ty: PortType,
 }
 
 /// Number the delay lines and check that each one's halves agree.
@@ -358,6 +363,7 @@ fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
                     Line {
                         id,
                         writer: writer.unwrap_or(NO_WRITER),
+                        ty,
                     },
                     ty,
                 ));
@@ -371,7 +377,7 @@ fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
 /// Stands in for "this line has no writer yet". Node ids are never reused, and
 /// `Graph::next_id` cannot reach `u32::MAX` without exhausting the counter
 /// first, so no real node can collide with it.
-const NO_WRITER: NodeId = NodeId::MAX;
+pub(crate) const NO_WRITER: NodeId = NodeId::MAX;
 
 /// Every link's two ends must carry the same thing (§14.3).
 ///

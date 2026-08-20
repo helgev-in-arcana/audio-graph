@@ -15,19 +15,22 @@
 //!   back up, without a lock in either direction.
 //! - [`Engine`] runs it, allocating nothing and freeing nothing.
 
+mod audio;
 mod compile;
 mod engine;
 mod graph;
 mod handoff;
 mod program;
 
+pub use audio::MAX_BUFFERS;
 pub use compile::{CompileError, compile};
-pub use engine::{BlockContext, Engine};
+pub use engine::{AudioChunk, AudioNodes, BlockContext, Engine, NoNodes};
 pub use graph::{
     ExprSource, Graph, LineId, Link, MathOp, Node, NodeId, NodeKind, ParamPort, PluginPorts, Port,
     PortType, Rate, Waveform,
 };
 pub use handoff::Handoff;
 pub use program::{
-    MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec, Reg,
+    AudioOp, Buf, Chunking, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
+    Program, RateSpec, Reg,
 };
