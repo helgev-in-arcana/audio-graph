@@ -202,8 +202,11 @@ impl SubHost {
         // Unload only after the new one is known good, so a failed load leaves
         // the user with what they had rather than with nothing.
         self.unload(instance);
-        self.slots
-            .resolve_against(&reference.plugin_id, SubPluginMain::params(&plugin));
+        self.slots.resolve_against(
+            instance as u32,
+            &reference.plugin_id,
+            SubPluginMain::params(&plugin),
+        );
         self.instances[instance] = Some(MainThread::new(Loaded {
             editor: None,
             plugin,
@@ -222,10 +225,9 @@ impl SubHost {
         if let Some(latency) = self.latencies.get_mut(instance) {
             *latency = 0;
         }
-        // Bindings stay; only their resolution goes.
-        if !self.any_loaded() {
-            self.slots.unresolve_all();
-        }
+        // Bindings stay; only this instance's resolutions go. The other
+        // instances are still loaded and still being driven.
+        self.slots.unresolve(instance as u32);
     }
 
     pub fn unload_all(&mut self) {
@@ -357,7 +359,7 @@ impl SubHost {
             .ok_or_else(|| format!("no parameter {}", param_id.0))?;
         let plugin_id = loaded.reference.plugin_id.clone();
         let param = param.clone();
-        self.slots.bind(slot, &plugin_id, &param);
+        self.slots.bind(slot, instance as u32, &plugin_id, &param);
         Ok(())
     }
 
@@ -367,8 +369,6 @@ impl SubHost {
     /// already activated are wound back rather than left running, because a
     /// half-activated set is a state no later call knows how to handle.
     pub fn activate(&mut self, config: AudioConfig) -> Result<SubHostProcessors, String> {
-        let targets = self.slots.active_targets();
-
         // One event per slot per sub-block is the worst a graph can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
         // not allowed to grow it.
@@ -390,7 +390,10 @@ impl SubHost {
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
                         processor,
-                        targets: targets.clone(),
+                        // Only the slots bound against *this* instance. Handing
+                        // every instance the whole table would make one slot
+                        // drive the same parameter on every copy (§12-7).
+                        targets: self.slots.active_targets(instance as u32),
                         last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
                         scratch: Vec::with_capacity(capacity),
                     }));
@@ -752,6 +755,7 @@ mod tests {
     #[test]
     fn slot_values_reach_the_sub_plugin_in_plain_units() {
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(9),
             min: 20.0,
             max: 20_000.0,
@@ -778,6 +782,7 @@ mod tests {
         // parameter queue and, worse, retrigger smoothing on plugins that ramp
         // on every incoming point.
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(1),
             min: 0.0,
             max: 1.0,
@@ -804,6 +809,7 @@ mod tests {
     #[test]
     fn reset_forces_the_next_block_to_resend() {
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(1),
             min: 0.0,
             max: 1.0,
@@ -833,6 +839,7 @@ mod tests {
         // The point of §9.2: a value that changes within a block reaches the
         // sub-plugin as several timed events, not as one at offset zero.
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(3),
             min: 0.0,
             max: 1.0,
@@ -855,6 +862,7 @@ mod tests {
     #[test]
     fn a_slot_that_does_not_move_within_a_block_still_sends_once() {
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(3),
             min: 0.0,
             max: 1.0,
@@ -876,6 +884,7 @@ mod tests {
     #[test]
     fn the_merged_stream_stays_sorted_by_offset() {
         let target = ResolvedTarget {
+            instance: 0,
             id: ParamId(3),
             min: 0.0,
             max: 1.0,
@@ -927,13 +936,14 @@ mod tests {
             default: 0.0,
             flags: ParamFlags::AUTOMATABLE,
         };
-        table.bind(5, "CID", &param);
-        let targets = table.active_targets();
+        table.bind(5, 0, "CID", &param);
+        let targets = table.active_targets(0);
         assert_eq!(
             targets,
             vec![(
                 5,
                 ResolvedTarget {
+                    instance: 0,
                     id: ParamId(42),
                     min: 0.0,
                     max: 10.0

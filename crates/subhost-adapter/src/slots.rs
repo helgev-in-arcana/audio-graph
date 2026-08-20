@@ -17,12 +17,22 @@ pub const SLOT_COUNT: usize = 32;
 
 /// Which sub-plugin parameter a slot drives.
 ///
-/// Identified by `(plugin_id, param_id)` rather than by index: parameter
-/// *order* is not stable across plugin versions, and a binding that silently
-/// re-points at a different control after an update is worse than one that
-/// fails to resolve.
+/// Identified by `(instance, plugin_id, param_id)` rather than by index:
+/// parameter *order* is not stable across plugin versions, and a binding that
+/// silently re-points at a different control after an update is worse than one
+/// that fails to resolve.
+///
+/// `instance` is what makes two copies of the same plugin two different
+/// targets. Without it a binding made against the second copy would also
+/// resolve against the first, and both would move together (§12-7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
+    /// Which graph node's plugin this drives.
+    ///
+    /// Defaulted so a pre-M8 saved state, which had exactly one sub-plugin,
+    /// loads as a binding against instance 0 — which is what it was.
+    #[serde(default)]
+    pub instance: u32,
     /// The sub-plugin this binding was made against (VST3 CID as hex, §8.3).
     pub plugin_id: String,
     /// The parameter's stable id within that plugin.
@@ -55,6 +65,9 @@ pub struct SlotTable {
 /// A binding that currently points at a real parameter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResolvedTarget {
+    /// The instance the parameter belongs to. Carried through to the audio
+    /// thread so an event is delivered to the plugin it was bound against.
+    pub instance: u32,
     pub id: ParamId,
     pub min: f64,
     pub max: f64,
@@ -86,16 +99,18 @@ impl SlotTable {
     }
 
     /// Bind a slot to a sub-plugin parameter, replacing any previous binding.
-    pub fn bind(&mut self, index: usize, plugin_id: &str, param: &ParamInfo) {
+    pub fn bind(&mut self, index: usize, instance: u32, plugin_id: &str, param: &ParamInfo) {
         let Some(slot) = self.slots.get_mut(index) else {
             return;
         };
         slot.binding = Some(Binding {
+            instance,
             plugin_id: plugin_id.to_string(),
             param_id: param.id.0,
             param_name: param.name.clone(),
         });
         self.resolved[index] = Some(ResolvedTarget {
+            instance,
             id: param.id,
             min: param.min,
             max: param.max,
@@ -119,42 +134,61 @@ impl SlotTable {
         self.resolved.get(index).copied().flatten()
     }
 
-    /// Every slot that currently drives something, as `(slot index, target)`.
+    /// Every slot that currently drives something on `instance`, as
+    /// `(slot index, target)`.
     ///
     /// The audio thread takes this once per activate rather than walking the
-    /// table per block.
-    pub fn active_targets(&self) -> Vec<(usize, ResolvedTarget)> {
+    /// table per block. Filtered per instance so each sub-plugin is handed only
+    /// the slots that were bound against it.
+    pub fn active_targets(&self, instance: u32) -> Vec<(usize, ResolvedTarget)> {
         self.resolved
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| t.map(|t| (i, t)))
+            .filter_map(|(i, t)| t.filter(|t| t.instance == instance).map(|t| (i, t)))
             .collect()
     }
 
-    /// Re-resolve every binding against a newly loaded sub-plugin.
+    /// Re-resolve `instance`'s bindings against a newly loaded sub-plugin.
+    ///
+    /// Only bindings that name this instance are touched — the other instances'
+    /// resolutions are left exactly as they were, because loading a plugin into
+    /// one node must not disturb the parameters driving another.
     ///
     /// Bindings that do not match are *kept* and simply left unresolved, so
     /// reloading the original plugin brings them back (§8.3). Deleting them
     /// would turn a missing file into lost work.
-    pub fn resolve_against(&mut self, plugin_id: &str, params: &[ParamInfo]) {
+    pub fn resolve_against(&mut self, instance: u32, plugin_id: &str, params: &[ParamInfo]) {
         for (slot, resolved) in self.slots.iter().zip(self.resolved.iter_mut()) {
-            *resolved = slot.binding.as_ref().and_then(|binding| {
-                if binding.plugin_id != plugin_id {
-                    return None;
-                }
+            let Some(binding) = slot.binding.as_ref().filter(|b| b.instance == instance) else {
+                continue;
+            };
+            *resolved = if binding.plugin_id != plugin_id {
+                None
+            } else {
                 params
                     .iter()
                     .find(|p| p.id.0 == binding.param_id)
                     .map(|p| ResolvedTarget {
+                        instance,
                         id: p.id,
                         min: p.min,
                         max: p.max,
                     })
-            });
+            };
         }
     }
 
-    /// Drop every resolution without touching the bindings, for when the
+    /// Drop one instance's resolutions without touching the bindings, for when
+    /// that sub-plugin is unloaded.
+    pub fn unresolve(&mut self, instance: u32) {
+        for resolved in self.resolved.iter_mut() {
+            if resolved.is_some_and(|r| r.instance == instance) {
+                *resolved = None;
+            }
+        }
+    }
+
+    /// Drop every resolution without touching the bindings, for when every
     /// sub-plugin is unloaded.
     pub fn unresolve_all(&mut self) {
         self.resolved.iter_mut().for_each(|r| *r = None);
@@ -206,7 +240,7 @@ mod tests {
     #[test]
     fn a_bound_slot_maps_automation_onto_the_plain_range() {
         let mut table = SlotTable::default();
-        table.bind(0, "AAAA", &param(7, "Cutoff", 20.0, 20_000.0));
+        table.bind(0, 0, "AAAA", &param(7, "Cutoff", 20.0, 20_000.0));
         let target = table.resolved(0).expect("resolved");
         assert_eq!(target.to_plain(0.0), 20.0);
         assert_eq!(target.to_plain(1.0), 20_000.0);
@@ -218,9 +252,9 @@ mod tests {
         // The whole point of §8.3: a missing plugin must not delete the user's
         // work, because reloading it has to bring the mapping back.
         let mut table = SlotTable::default();
-        table.bind(3, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+        table.bind(3, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
 
-        table.resolve_against("BBBB", &[]);
+        table.resolve_against(0, "BBBB", &[]);
         assert!(
             table.resolved(3).is_none(),
             "should not resolve against another plugin"
@@ -231,7 +265,7 @@ mod tests {
         );
         assert_eq!(table.unresolved().len(), 1);
 
-        table.resolve_against("AAAA", &[param(7, "Cutoff", 0.0, 1.0)]);
+        table.resolve_against(0, "AAAA", &[param(7, "Cutoff", 0.0, 1.0)]);
         assert!(table.resolved(3).is_some(), "binding should come back");
         assert!(table.unresolved().is_empty());
     }
@@ -239,12 +273,12 @@ mod tests {
     #[test]
     fn bindings_follow_the_parameter_id_not_its_position() {
         let mut table = SlotTable::default();
-        table.bind(0, "AAAA", &param(42, "Drive", 0.0, 10.0));
+        table.bind(0, 0, "AAAA", &param(42, "Drive", 0.0, 10.0));
 
         // A plugin update reorders its parameter list. Resolving by index would
         // silently re-point the slot at whatever now sits in that position.
         let reordered = [param(1, "Mix", 0.0, 1.0), param(42, "Drive", 0.0, 10.0)];
-        table.resolve_against("AAAA", &reordered);
+        table.resolve_against(0, "AAAA", &reordered);
 
         let target = table.resolved(0).expect("resolved");
         assert_eq!(target.id, ParamId(42));
@@ -252,9 +286,62 @@ mod tests {
     }
 
     #[test]
+    fn two_copies_of_one_plugin_are_two_different_targets() {
+        // §12-7. Keying a binding on the plugin id alone made the two copies
+        // indistinguishable: a slot bound to the second one also resolved
+        // against the first, so both moved together.
+        let mut table = SlotTable::default();
+        table.bind(0, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+        table.bind(1, 1, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+
+        let params = [param(7, "Cutoff", 0.0, 1.0)];
+        table.resolve_against(0, "AAAA", &params);
+        table.resolve_against(1, "AAAA", &params);
+
+        assert_eq!(
+            table.active_targets(0).len(),
+            1,
+            "instance 0 should be driven by its own slot only"
+        );
+        assert_eq!(table.active_targets(0)[0].0, 0);
+        assert_eq!(table.active_targets(1)[0].0, 1);
+    }
+
+    #[test]
+    fn loading_one_instance_leaves_the_others_resolved() {
+        // Loading a plugin into one node re-resolves that node's bindings. If
+        // it rewrote the whole table, the other nodes' parameters would stop
+        // being driven the moment anything else was loaded.
+        let mut table = SlotTable::default();
+        table.bind(0, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+        table.bind(1, 1, "BBBB", &param(9, "Drive", 0.0, 1.0));
+
+        table.resolve_against(1, "BBBB", &[param(9, "Drive", 0.0, 1.0)]);
+
+        assert!(table.resolved(0).is_some(), "instance 0 must be untouched");
+        assert!(table.resolved(1).is_some());
+    }
+
+    #[test]
+    fn unloading_one_instance_leaves_the_others_alone() {
+        let mut table = SlotTable::default();
+        table.bind(0, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+        table.bind(1, 1, "BBBB", &param(9, "Drive", 0.0, 1.0));
+
+        table.unresolve(1);
+
+        assert!(table.resolved(0).is_some());
+        assert!(table.resolved(1).is_none());
+        assert!(
+            table.slot(1).unwrap().binding.is_some(),
+            "binding must be kept"
+        );
+    }
+
+    #[test]
     fn unloading_keeps_bindings_but_drops_resolutions() {
         let mut table = SlotTable::default();
-        table.bind(1, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
+        table.bind(1, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
         table.unresolve_all();
         assert!(table.resolved(1).is_none());
         assert!(table.slot(1).unwrap().binding.is_some());

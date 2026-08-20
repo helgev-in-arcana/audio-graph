@@ -223,6 +223,7 @@ mod tests {
             Slot {
                 name: Some("Cutoff".into()),
                 binding: Some(Binding {
+                    instance: 0,
                     plugin_id: "ABCD".repeat(8),
                     param_id: 7,
                     param_name: "Filter Cutoff".into(),
