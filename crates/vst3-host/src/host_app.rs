@@ -17,17 +17,25 @@ use std::sync::Arc;
 
 use plugin_host_api::HostContext;
 use vst3::Steinberg::Vst::{
-    IAttributeList, IAttributeList_iid, IAttributeListTrait, IComponentHandler,
-    IComponentHandlerTrait, IHostApplication, IHostApplicationTrait, IMessage, IMessage_iid,
-    IMessageTrait, ParamID, ParamValue, String128, TChar,
+    IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandler2,
+    IComponentHandler2Trait, IComponentHandlerTrait, IHostApplication, IHostApplicationTrait,
+    IMessage, IMessageTrait, IPlugInterfaceSupport, IPlugInterfaceSupportTrait, ParamID,
+    ParamValue, String128, TChar,
 };
 use vst3::Steinberg::{
-    TUID, char16, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk, kResultTrue,
-    tresult, uint32,
+    IPlugFrame, TUID, char16, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk,
+    kResultTrue, tresult, uint32,
 };
-use vst3::{Class, ComWrapper};
+use vst3::{Class, ComWrapper, Interface};
 
 use crate::util::{from_char16, to_char16};
+
+/// VST3 spells an interface id as `TUID` (`[c_char; 16]`); the Rust bindings
+/// spell the same sixteen bytes as `Guid` (`[u8; 16]`). Only the latter is
+/// reachable as a constant, so comparisons go through this.
+fn guid(tuid: &TUID) -> [u8; 16] {
+    std::array::from_fn(|i| tuid[i] as u8)
+}
 
 /// Host-side `IHostApplication`.
 ///
@@ -44,7 +52,24 @@ impl HostApplication {
 }
 
 impl Class for HostApplication {
-    type Interfaces = (IHostApplication,);
+    type Interfaces = (IHostApplication, IPlugInterfaceSupport);
+}
+
+impl IPlugInterfaceSupportTrait for HostApplication {
+    unsafe fn isPlugInterfaceSupported(&self, iid: *const TUID) -> tresult {
+        if iid.is_null() {
+            return kInvalidArgument;
+        }
+        let iid = guid(unsafe { &*iid });
+        let supported = iid == IHostApplication::IID
+            || iid == IPlugInterfaceSupport::IID
+            || iid == IComponentHandler::IID
+            || iid == IComponentHandler2::IID
+            || iid == IPlugFrame::IID
+            || iid == IMessage::IID
+            || iid == IAttributeList::IID;
+        if supported { kResultOk } else { kResultFalse }
+    }
 }
 
 impl IHostApplicationTrait for HostApplication {
@@ -69,11 +94,13 @@ impl IHostApplicationTrait for HostApplication {
         let cid = unsafe { *cid };
         let iid = unsafe { *iid };
 
+        let (cid, iid) = (guid(&cid), guid(&iid));
+
         // Only two classes are ever requested here, and both are pure host-side
         // containers, so implementing them locally is simpler than any form of
         // registry.
-        let wants_message = tuid_eq(&cid, &IMessage_iid) || tuid_eq(&iid, &IMessage_iid);
-        let wants_attrs = tuid_eq(&cid, &IAttributeList_iid) || tuid_eq(&iid, &IAttributeList_iid);
+        let wants_message = cid == IMessage::IID || iid == IMessage::IID;
+        let wants_attrs = cid == IAttributeList::IID || iid == IAttributeList::IID;
 
         if wants_message {
             let wrapper = ComWrapper::new(HostMessage::default());
@@ -92,10 +119,6 @@ impl IHostApplicationTrait for HostApplication {
         unsafe { *obj = std::ptr::null_mut() };
         kNotImplemented
     }
-}
-
-fn tuid_eq(a: &TUID, b: &TUID) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| x == y)
 }
 
 /// One attribute value. VST3 attributes are a tagged union in practice.
@@ -325,7 +348,7 @@ impl ComponentHandler {
 }
 
 impl Class for ComponentHandler {
-    type Interfaces = (IComponentHandler,);
+    type Interfaces = (IComponentHandler, IComponentHandler2);
 }
 
 impl IComponentHandlerTrait for ComponentHandler {
@@ -366,5 +389,23 @@ impl IComponentHandlerTrait for ComponentHandler {
         }
 
         if handled { kResultOk } else { kResultTrue }
+    }
+}
+
+impl IComponentHandler2Trait for ComponentHandler {
+    unsafe fn setDirty(&self, _state: vst3::Steinberg::TBool) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn requestOpenEditor(&self, _name: vst3::Steinberg::FIDString) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn startGroupEdit(&self) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn finishGroupEdit(&self) -> tresult {
+        kResultOk
     }
 }

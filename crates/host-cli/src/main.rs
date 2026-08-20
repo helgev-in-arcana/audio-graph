@@ -4,6 +4,7 @@
 //! prove — that a real plugin loads, enumerates, instantiates, and processes —
 //! is exercised from here without a DAW in the loop.
 
+mod fault;
 mod host;
 mod render;
 mod wav;
@@ -15,6 +16,9 @@ use plugin_host_api::SubPluginMain;
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn main() -> ExitCode {
+    fault::install_crash_handler();
+    vst3_host::init_apartment();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
         Some((c, r)) => (c.as_str(), r),
@@ -748,11 +752,27 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
     sub.load(Path::new(path), Some(cid))?;
+
+    let config = plugin_host_api::AudioConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 512,
+        input_channels: 2,
+        output_channels: 2,
+        offline: false,
+    };
+    let processor = sub.activate(config)?;
+
     match sub.open_editor(std::ptr::null_mut()) {
         Ok(()) => {}
         // A plugin with no editor is not a failure; plenty have none.
-        Err(e) if e.contains("no editor") => return Ok(()),
-        Err(e) => return Err(format!("{name}: open editor: {e}")),
+        Err(e) if e.contains("no editor") => {
+            sub.deactivate(processor);
+            return Ok(());
+        }
+        Err(e) => {
+            sub.deactivate(processor);
+            return Err(format!("{name}: open editor: {e}"));
+        }
     }
 
     // Long enough for the plugin to finish its first paint, which is when a
@@ -766,9 +786,11 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     if reverse {
         // The whole instance goes away with the editor still open, which is
         // what a DAW does when it terminates a plugin without a close notice.
+        sub.deactivate(processor);
         drop(sub);
     } else {
         sub.close_editor();
+        sub.deactivate(processor);
         drop(sub);
     }
     vst3_host_view::pump_events();
@@ -834,13 +856,28 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
             } else {
                 all_ok = false;
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let detail = stderr
-                    .lines()
-                    .find(|l| l.starts_with("error:"))
-                    .map(str::to_string)
-                    // No error line means it did not get far enough to print
-                    // one: the process died, which is the interesting case.
-                    .unwrap_or_else(|| format!("crashed ({})", output.status));
+                let fault_summary = if stderr.contains("NATIVE FAULT CAUGHT") {
+                    stderr
+                        .lines()
+                        .filter(|l| {
+                            l.starts_with("Exception:")
+                                || l.starts_with("Fault address:")
+                                || l.starts_with("Access violation")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                } else {
+                    String::new()
+                };
+                let detail = if !fault_summary.is_empty() {
+                    fault_summary
+                } else {
+                    stderr
+                        .lines()
+                        .find(|l| l.starts_with("error:"))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("crashed ({})", output.status))
+                };
                 let label = mode.first().map_or("lifecycle", |m| m.as_str());
                 problems.push(format!("{name} [{label}]: {detail}"));
             }

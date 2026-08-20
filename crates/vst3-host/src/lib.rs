@@ -11,6 +11,7 @@
 //! host services are injected through [`plugin_host_api::HostContext`].
 
 mod cid;
+mod com;
 mod host_app;
 mod library;
 mod module;
@@ -23,6 +24,7 @@ mod util;
 mod vst_events;
 
 pub use cid::Cid;
+pub use com::init_apartment;
 pub use module::{ClassInfo, FactoryInfo, Module, scan_without_loading};
 pub use moduleinfo::{ModuleClass, ModuleInfo, ModuleInfoError};
 pub use plugin::{Vst3Plugin, Vst3Processor};

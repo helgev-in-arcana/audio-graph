@@ -57,6 +57,8 @@ const MAX_PARAMS_FOR_PROBE: usize = 200;
 const CANDIDATES: usize = 8;
 
 fn candidates() -> Vec<PathBuf> {
+    // A test thread is not an initialised STA and plugins assume one (§13).
+    vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
         .flat_map(|d| find_modules(d))

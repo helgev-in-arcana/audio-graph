@@ -7,6 +7,8 @@
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
+    // A test thread is not an initialised STA and plugins assume one (§13).
+    vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
         .flat_map(|d| find_modules(d))

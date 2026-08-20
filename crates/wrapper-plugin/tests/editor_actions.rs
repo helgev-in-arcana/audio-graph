@@ -89,6 +89,8 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
 }
 
 fn candidate_paths() -> Vec<std::path::PathBuf> {
+    // A test thread is not an initialised STA and plugins assume one (§13).
+    vst3_host::init_apartment();
     if let Ok(explicit) = std::env::var("AUDIO_GRAPH_TEST_SUB") {
         return vec![std::path::PathBuf::from(explicit)];
     }
