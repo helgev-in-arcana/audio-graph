@@ -37,6 +37,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
 use plugin_host_api::{ParamId, ParamInfo};
@@ -640,6 +641,9 @@ fn raw_window(frame: &nice_plug_egui::Frame) -> *mut std::ffi::c_void {
 /// The editor's initial size.
 pub const EDITOR_SIZE: (f64, f64) = (780.0, 640.0);
 
+/// Below this the node canvas has no room left to be a canvas.
+const EDITOR_MIN_SIZE: (f32, f32) = (620.0, 460.0);
+
 /// Build the editor.
 pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperEditor>> {
     let repaint = RepaintNotifier::new();
@@ -648,7 +652,18 @@ pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperE
     nice_plug_egui::create_egui_editor(
         state,
         repaint,
-        nice_plug_egui::EguiNiceSettings::new().with_tile("Audio Graph"),
+        // A node canvas that cannot grow is a node canvas with about four
+        // nodes in it. Opting in also matters for what the *host* does: the
+        // default hint reports `canResize = false` to VST3, and a DAW that has
+        // been told the view is fixed will resize its frame without ever
+        // telling the view about it — which is what leaves grey margins down
+        // the right and bottom edges rather than more canvas.
+        nice_plug_egui::EguiNiceSettings::new()
+            .with_tile("Audio Graph")
+            .with_resize_hint(
+                ResizeHint::resizable()
+                    .with_min_logical_size(LogicalSize::new(EDITOR_MIN_SIZE.0, EDITOR_MIN_SIZE.1)),
+            ),
         app,
     )
 }

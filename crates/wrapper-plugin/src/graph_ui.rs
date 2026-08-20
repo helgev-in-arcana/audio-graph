@@ -240,8 +240,20 @@ impl GraphEditor {
         let title = graph.nodes[index].kind.title();
 
         let body = Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, 0.0));
+        // The drag handle is registered before the node's contents so that the
+        // widgets inside win the pointer. egui resolves a click to the last
+        // widget registered over it, and the title bar is both the handle and
+        // the home of the delete button.
+        let handle = Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, PORT_TOP));
+        let drag = ui.interact(handle, ui.id().with(("node", id)), Sense::drag());
+
         let mut child = ui.new_child(
             egui::UiBuilder::new()
+                // Without a salt of its own, every node's contents land in the
+                // same id namespace: two nodes of a kind then share one combo
+                // box's open/closed state and one button's click, and the
+                // second one drawn wins. Node id makes each node its own world.
+                .id_salt(("graph-node", id))
                 .max_rect(Rect::from_min_size(body.min, Vec2::new(NODE_WIDTH, 400.0)))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
@@ -272,10 +284,6 @@ impl GraphEditor {
 
         let rect = response.response.rect;
 
-        // The title bar is the drag handle. Dragging from the body would fight
-        // every slider and combo box inside it.
-        let handle = Rect::from_min_size(rect.min, Vec2::new(rect.width(), PORT_TOP));
-        let drag = ui.interact(handle, ui.id().with(("node", id)), Sense::drag());
         if drag.drag_started()
             && let Some(pointer) = ui.ctx().pointer_latest_pos()
         {
