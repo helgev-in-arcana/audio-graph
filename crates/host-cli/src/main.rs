@@ -96,6 +96,9 @@ fn usage() {
   host-cli sidechain <WRAPPER.vst3> <COMP.vst3> <SYNTH.vst3> <SC_PARAM_ID>
                                     check a compressor inside the graph ducks
                                     against another node's audio
+  host-cli delay <WRAPPER.vst3>      check a feedback delay in the graph sounds the
+                                    same at any block size, and that the mix's
+                                    gains fade the repeats
   host-cli editor <WRAPPER.vst3> <PLUGIN.vst3> [SECONDS]
                                     open the wrapper's editor with a plugin
                                     node already in the patch
