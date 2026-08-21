@@ -170,25 +170,29 @@ impl GraphEditor {
         // Ctrl+wheel zooms about the pointer: whatever is under the cursor
         // stays under it, which is what makes zooming feel like moving closer
         // rather than like the patch sliding away.
-        if response.hovered() {
-            let (scroll, zooming) = ui.input(|i| {
-                (
-                    i.smooth_scroll_delta.y,
-                    i.modifiers.ctrl || i.modifiers.command,
-                )
-            });
-            if zooming && scroll != 0.0 {
+        //
+        // `zoom_delta`, not the scroll delta: egui takes the wheel away from
+        // scrolling the moment ctrl is held and hands it over as a zoom factor
+        // instead, so the scroll delta this first read was always zero. It has
+        // applied the exponential already — a notch is the same proportion at
+        // every scale — and a trackpad pinch arrives the same way.
+        //
+        // Asked of the pointer rather than of the canvas `Response`: over a
+        // node it is the node's own widgets that are hovered, and that is
+        // where zooming has to work most of all.
+        if let Some(pointer) = ui
+            .ctx()
+            .pointer_latest_pos()
+            .filter(|p| canvas.contains(*p))
+        {
+            let step = ui.input(|i| i.zoom_delta());
+            if step != 1.0 {
                 let before = self.zoom;
-                // Exponential, so a notch is the same proportion at every
-                // scale — linear steps crawl when zoomed in and leap when out.
-                self.zoom =
-                    (before * (scroll * 0.004).exp()).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
-                if let Some(pointer) = ui.ctx().pointer_latest_pos() {
-                    // The graph point under the pointer must not move:
-                    //   pointer = canvas.min + pan + graph * zoom
-                    let anchor = pointer - canvas.min - self.pan;
-                    self.pan -= anchor * (self.zoom / before - 1.0);
-                }
+                self.zoom = (before * step).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                // The graph point under the pointer must not move:
+                //   pointer = canvas.min + pan + graph * zoom
+                let anchor = pointer - canvas.min - self.pan;
+                self.pan -= anchor * (self.zoom / before - 1.0);
             }
         }
         let zoom = self.zoom;
@@ -1282,4 +1286,143 @@ fn link_shape(from: Pos2, to: Pos2, colour: Color32) -> egui::Shape {
         Color32::TRANSPARENT,
         Stroke::new(2.0, colour),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One egui context, one canvas, and a clock — a canvas that can be driven
+    /// without a window.
+    ///
+    /// egui runs perfectly well headless: the output is a list of shapes nobody
+    /// has to paint. Worth doing here because the input plumbing is exactly
+    /// what was wrong the first time — the zoom read `smooth_scroll_delta`,
+    /// which egui zeroes the moment ctrl is held, so it did nothing and nothing
+    /// said so.
+    ///
+    /// The context is held across frames rather than made fresh each time. It
+    /// is where egui smooths wheel input, and a wheel event delivered to a
+    /// context that is thrown away before the next frame produces no motion at
+    /// all — which is its own way of testing nothing.
+    struct Canvas {
+        ctx: egui::Context,
+        editor: GraphEditor,
+        graph: Graph,
+        time: f64,
+    }
+
+    impl Canvas {
+        fn new() -> Canvas {
+            Canvas {
+                ctx: egui::Context::default(),
+                editor: GraphEditor::default(),
+                graph: Graph::default_patch(),
+                time: 0.0,
+            }
+        }
+
+        /// One frame, 1/60 s after the last, with `events` delivered to it.
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                time: Some(self.time),
+                predicted_dt: 1.0 / 60.0,
+                events,
+                ..Default::default()
+            };
+            let editor = &mut self.editor;
+            let graph = &mut self.graph;
+            let output = self.ctx.run_ui(input, |ui| {
+                let context = GraphContext {
+                    plugins: &[],
+                    instances: &[],
+                    free_instance: Some(0),
+                    bindings: &[],
+                    poly_modulation: false,
+                    error: None,
+                    live: [0.0; SLOT_COUNT],
+                    quantum: 32,
+                    sample_rate: 48_000.0,
+                };
+                editor.ui(ui, graph, &context);
+            });
+            output.drop_without_applying_deltas();
+        }
+
+        /// A wheel notch over the canvas, and the frames it takes egui to smooth
+        /// it out.
+        fn wheel(&mut self, lines: f32, modifiers: egui::Modifiers) {
+            // The pointer has to be over the canvas, and `pointer_latest_pos`
+            // is only set once a frame has seen it move there.
+            self.frame(vec![egui::Event::PointerMoved(Pos2::new(450.0, 450.0))]);
+            self.frame(vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: Vec2::new(0.0, lines),
+                phase: egui::TouchPhase::Move,
+                modifiers,
+            }]);
+            for _ in 0..30 {
+                self.frame(Vec::new());
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_wheel_zooms_the_canvas() {
+        let mut canvas = Canvas::new();
+        assert_eq!(canvas.editor.zoom, 1.0);
+
+        canvas.wheel(3.0, egui::Modifiers::COMMAND);
+        let inned = canvas.editor.zoom;
+        assert!(inned > 1.0, "zoomed in, factor {inned}");
+
+        canvas.wheel(-6.0, egui::Modifiers::COMMAND);
+        assert!(
+            canvas.editor.zoom < 1.0,
+            "and back out past where it started, factor {}",
+            canvas.editor.zoom
+        );
+    }
+
+    /// Without ctrl the same wheel is a scroll, and the canvas leaves it alone.
+    #[test]
+    fn a_plain_wheel_does_not_zoom() {
+        let mut canvas = Canvas::new();
+        canvas.wheel(3.0, egui::Modifiers::NONE);
+        assert_eq!(canvas.editor.zoom, 1.0);
+    }
+
+    /// §14.16. The point under the pointer is the one that must not move, which
+    /// means the pan has to take up the difference.
+    #[test]
+    fn zooming_holds_the_point_under_the_pointer() {
+        let mut canvas = Canvas::new();
+        assert_eq!(canvas.editor.pan, Vec2::ZERO);
+        canvas.wheel(3.0, egui::Modifiers::COMMAND);
+        assert!(canvas.editor.zoom > 1.0);
+        assert_ne!(
+            canvas.editor.pan,
+            Vec2::ZERO,
+            "the pan compensated for the growth"
+        );
+        // Zooming in about a point below and right of the origin pulls the
+        // patch up and left, so the pan goes negative in both.
+        assert!(canvas.editor.pan.x < 0.0 && canvas.editor.pan.y < 0.0);
+    }
+
+    /// The zoom is clamped, and the clamp is not a place the pan can get stuck:
+    /// spinning the wheel at the limit must not keep moving the view.
+    #[test]
+    fn the_zoom_stops_at_the_limit() {
+        let mut canvas = Canvas::new();
+        for _ in 0..12 {
+            canvas.wheel(6.0, egui::Modifiers::COMMAND);
+        }
+        assert_eq!(canvas.editor.zoom, *ZOOM_RANGE.end());
+        let settled = canvas.editor.pan;
+        canvas.wheel(6.0, egui::Modifiers::COMMAND);
+        assert_eq!(canvas.editor.pan, settled, "nothing moves at the limit");
+    }
 }
