@@ -1605,7 +1605,9 @@ fn inject_instrument(
 
     let mut links = vec![
         serde_json::json!({ "from": 1, "from_port": 0, "to": 3, "to_port": 0 }),
-        serde_json::json!({ "from": 2, "from_port": 0, "to": 3, "to_port": 1 }),
+        // A mix's sockets go signal, gain, signal, gain: the second audio
+        // input is port 2.
+        serde_json::json!({ "from": 2, "from_port": 0, "to": 3, "to_port": 2 }),
         serde_json::json!({ "from": 3, "from_port": 0, "to": 4, "to_port": 0 }),
         serde_json::json!({ "from": 4, "from_port": 0, "to": 5, "to_port": 0 }),
         serde_json::json!({ "from": 5, "from_port": 0, "to": 6, "to_port": 0 }),
@@ -1919,7 +1921,7 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
         *max_time = time * 2.0;
     }
     graph.connect(input, 0, mix, 0);
-    graph.connect(read, 0, mix, 1);
+    graph.connect(read, 0, mix, 2);
     graph.connect(mix, 0, output, 0);
     graph.connect(mix, 0, write, 0);
 
@@ -2141,19 +2143,61 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
     ]);
     value["sub_plugin"] = serde_json::Value::Null;
     value["sub_state"] = serde_json::Value::Null;
-    value["graph"] = serde_json::json!({
-        "nodes": [
-            { "id": 0, "pos": [40.0, 60.0],  "kind": { "AudioIn": { "bus": 0, "channels": 2 } } },
-            { "id": 1, "pos": [260.0, 60.0], "kind": { "Plugin": { "instance": 0, "ports": ports } } },
-            { "id": 2, "pos": [520.0, 60.0], "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
-            { "id": 3, "pos": [40.0, 260.0], "kind": { "SlotIn": { "slot": 0 } } }
-        ],
-        "links": [
-            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
-            { "from": 1, "from_port": 0, "to": 2, "to_port": 0 }
-        ],
-        "next_id": 4
-    });
+    // Every kind of socket at once: audio, an aux input, a param and (if the
+    // plugin takes them) notes. The canvas colours sockets by type, and a patch
+    // with only one type in it is a patch that cannot show whether it works.
+    let mut graph = wrapper_engine::Graph::new();
+    let input = graph.add(
+        wrapper_engine::NodeKind::AudioIn {
+            bus: 0,
+            channels: 2,
+        },
+        [40.0, 60.0],
+    );
+    let sidechain = graph.add(
+        wrapper_engine::NodeKind::AudioIn {
+            bus: 1,
+            channels: 2,
+        },
+        [40.0, 200.0],
+    );
+    let node = graph.add(
+        wrapper_engine::NodeKind::Plugin {
+            instance: 0,
+            ports: ports.clone(),
+        },
+        [300.0, 60.0],
+    );
+    let mix = graph.add(
+        wrapper_engine::NodeKind::Mix {
+            channels: 2,
+            inputs: 2,
+            gains: vec![1.0, 0.5],
+        },
+        [560.0, 60.0],
+    );
+    let output = graph.add(
+        wrapper_engine::NodeKind::AudioOut {
+            bus: 0,
+            channels: 2,
+        },
+        [800.0, 60.0],
+    );
+    let (write, read) = graph.add_delay(wrapper_engine::PortType::STEREO, [300.0, 340.0]);
+    let slot = graph.add(wrapper_engine::NodeKind::SlotIn { slot: 0 }, [40.0, 400.0]);
+
+    graph.connect(input, 0, node, 0);
+    if ports.audio_in.len() > 1 {
+        graph.connect(sidechain, 0, node, 1);
+    }
+    graph.connect(node, 0, mix, 0);
+    graph.connect(read, 0, mix, 2);
+    graph.connect(mix, 0, output, 0);
+    graph.connect(mix, 0, write, 0);
+    // A slot driving the delay time, so a param link is on screen too.
+    graph.connect(slot, 0, read, 0);
+
+    value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
     Ok(value.to_string())
 }
 

@@ -362,10 +362,13 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             // sockets sit after the audio inputs.
             NodeKind::Mix { inputs, .. } => {
                 for i in 0..inputs {
-                    let Some(reg) = input(inputs + i) else {
+                    // Signal, gain, signal, gain: the gain for input `i` is the
+                    // socket right after it.
+                    let port = 2 * i + 1;
+                    let Some(reg) = input(port) else {
                         continue;
                     };
-                    let lane = audio_lane(&mut audio_lanes, slot_count, (id, inputs + i))?;
+                    let lane = audio_lane(&mut audio_lanes, slot_count, (id, port))?;
                     outputs.push((lane, reg));
                 }
             }

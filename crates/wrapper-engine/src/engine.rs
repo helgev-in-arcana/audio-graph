@@ -1572,7 +1572,7 @@ mod tests {
         );
         graph.connect(input, 0, slow, 0);
         graph.connect(slow, 0, mix, 0);
-        graph.connect(input, 0, mix, 1);
+        graph.connect(input, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
 
         let mut engine = Engine::new();
@@ -1966,7 +1966,7 @@ mod tests {
             [0.0, 0.0],
         );
         graph.connect(input, 0, mix, 0);
-        graph.connect(read, 0, mix, 1);
+        graph.connect(read, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
         graph.connect(mix, 0, write, 0);
 
@@ -2206,7 +2206,7 @@ mod tests {
         );
         // The same source into both inputs: 0.5 + 0.25 of it should come out.
         graph.connect(a, 0, mix, 0);
-        graph.connect(a, 0, mix, 1);
+        graph.connect(a, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
 
         let mut engine = Engine::new();

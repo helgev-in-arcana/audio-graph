@@ -23,6 +23,31 @@ use wrapper_engine::{
     ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
 };
 
+/// What each kind of socket is painted.
+///
+/// A socket's type decides what may be plugged into it, and until it was
+/// coloured the only way to find that out was to hover — or to try, and have
+/// the link silently refused. Aux inputs get a colour of their own for the
+/// same reason: a sidechain that looks like the main input is one people wire
+/// into by mistake, and the mistake makes no sound.
+mod socket {
+    use egui::Color32;
+    pub const AUDIO: Color32 = Color32::from_rgb(96, 170, 240);
+    pub const AUX: Color32 = Color32::from_rgb(190, 130, 235);
+    pub const PARAM: Color32 = Color32::from_rgb(128, 200, 120);
+    pub const NOTE: Color32 = Color32::from_rgb(232, 176, 80);
+}
+
+/// The colour of one socket, and of the links leaving it.
+fn socket_colour(port: &wrapper_engine::Port) -> Color32 {
+    match port.ty {
+        PortType::Audio { .. } if port.aux => socket::AUX,
+        PortType::Audio { .. } => socket::AUDIO,
+        PortType::Param => socket::PARAM,
+        PortType::Note => socket::NOTE,
+    }
+}
+
 const NODE_WIDTH: f32 = 186.0;
 /// Vertical space between a node's top edge and its first port.
 const PORT_TOP: f32 = 26.0;
@@ -89,10 +114,20 @@ pub struct GraphContext<'a> {
     pub sample_rate: f64,
 }
 
+/// How far the canvas may be zoomed. Past the low end the text stops being
+/// text; past the high end one node fills the window.
+const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.4..=2.0;
+
 /// Canvas state that belongs to the view rather than to the patch.
-#[derive(Default)]
 pub struct GraphEditor {
     pan: Vec2,
+    /// Canvas scale. Applied to positions *and* to the style the nodes are
+    /// drawn with, so a zoomed-out node is a smaller node rather than the same
+    /// node with its text spilling out of it.
+    ///
+    /// Not part of the patch: two people opening the same project should each
+    /// get their own view, the same way the pan is each their own.
+    zoom: f32,
     /// The node being dragged and where inside it the pointer grabbed.
     dragging: Option<(NodeId, Vec2)>,
     /// An output port the user has picked up but not yet dropped, and which
@@ -106,6 +141,20 @@ pub struct GraphEditor {
     actions: Vec<GraphAction>,
 }
 
+impl Default for GraphEditor {
+    fn default() -> GraphEditor {
+        GraphEditor {
+            pan: Vec2::ZERO,
+            zoom: 1.0,
+            dragging: None,
+            linking: None,
+            add_at: None,
+            plugin_filter: String::new(),
+            actions: Vec::new(),
+        }
+    }
+}
+
 impl GraphEditor {
     /// Draw the canvas. Returns whether the graph was modified.
     pub fn ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, ctx: &GraphContext<'_>) -> bool {
@@ -117,6 +166,32 @@ impl GraphEditor {
         let (canvas, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
         let painter = ui.painter_at(canvas);
         painter.rect_filled(canvas, 4.0, ui.visuals().extreme_bg_color);
+
+        // Ctrl+wheel zooms about the pointer: whatever is under the cursor
+        // stays under it, which is what makes zooming feel like moving closer
+        // rather than like the patch sliding away.
+        if response.hovered() {
+            let (scroll, zooming) = ui.input(|i| {
+                (
+                    i.smooth_scroll_delta.y,
+                    i.modifiers.ctrl || i.modifiers.command,
+                )
+            });
+            if zooming && scroll != 0.0 {
+                let before = self.zoom;
+                // Exponential, so a notch is the same proportion at every
+                // scale — linear steps crawl when zoomed in and leap when out.
+                self.zoom =
+                    (before * (scroll * 0.004).exp()).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+                if let Some(pointer) = ui.ctx().pointer_latest_pos() {
+                    // The graph point under the pointer must not move:
+                    //   pointer = canvas.min + pan + graph * zoom
+                    let anchor = pointer - canvas.min - self.pan;
+                    self.pan -= anchor * (self.zoom / before - 1.0);
+                }
+            }
+        }
+        let zoom = self.zoom;
 
         // Panning the background moves the view, not the patch, so node
         // positions stay meaningful when the window is resized.
@@ -135,14 +210,15 @@ impl GraphEditor {
         let link_layer = painter.add(egui::Shape::Noop);
 
         let origin = canvas.min + self.pan;
-        let mut ports: Vec<(NodeId, Vec<Pos2>, Vec<Pos2>)> = Vec::with_capacity(graph.nodes.len());
+        let mut ports: Vec<Placed> = Vec::with_capacity(graph.nodes.len());
         let mut to_remove: Option<NodeId> = None;
         let mut to_connect: Option<(NodeId, u8, NodeId, u8)> = None;
         let mut to_disconnect: Option<(NodeId, u8)> = None;
 
         for index in 0..graph.nodes.len() {
             let id = graph.nodes[index].id;
-            let pos = origin + Vec2::new(graph.nodes[index].pos[0], graph.nodes[index].pos[1]);
+            let pos =
+                origin + Vec2::new(graph.nodes[index].pos[0], graph.nodes[index].pos[1]) * zoom;
             let outcome = self.node(ui, canvas, graph, index, pos, ctx);
 
             changed |= outcome.changed;
@@ -161,24 +237,34 @@ impl GraphEditor {
             if let Some(output) = outcome.clicked_output {
                 self.linking = Some((id, output));
             }
-            ports.push((id, outcome.output_ports, outcome.input_ports));
+            ports.push(Placed {
+                id,
+                outputs: outcome.output_ports,
+                output_colours: outcome.output_colours,
+                inputs: outcome.input_ports,
+            });
         }
 
         // Drawing the links, now that every node has been placed.
         let mut shapes: Vec<egui::Shape> = Vec::with_capacity(graph.links.len() + 1);
         for link in &graph.links {
-            let from = ports.iter().find(|(id, _, _)| *id == link.from);
-            let to = ports.iter().find(|(id, _, _)| *id == link.to);
-            if let (Some((_, outs, _)), Some((_, _, ins))) = (from, to)
-                && let Some(&source) = outs.get(link.from_port as usize)
-                && let Some(&target) = ins.get(link.to_port as usize)
+            let from = ports.iter().find(|p| p.id == link.from);
+            let to = ports.iter().find(|p| p.id == link.to);
+            if let (Some(from), Some(to)) = (from, to)
+                && let Some(&source) = from.outputs.get(link.from_port as usize)
+                && let Some(&target) = to.inputs.get(link.to_port as usize)
             {
-                shapes.push(link_shape(source, target, ui.visuals().weak_text_color()));
+                let colour = from
+                    .output_colours
+                    .get(link.from_port as usize)
+                    .copied()
+                    .unwrap_or_else(|| ui.visuals().weak_text_color());
+                shapes.push(link_shape(source, target, colour.gamma_multiply(0.85)));
             }
         }
         if let Some((from, from_port)) = self.linking
-            && let Some((_, outs, _)) = ports.iter().find(|(id, _, _)| *id == from)
-            && let Some(&source) = outs.get(from_port as usize)
+            && let Some(node) = ports.iter().find(|p| p.id == from)
+            && let Some(&source) = node.outputs.get(from_port as usize)
             && let Some(pointer) = ui.ctx().pointer_latest_pos()
         {
             shapes.push(link_shape(
@@ -221,7 +307,8 @@ impl GraphEditor {
         if response.secondary_clicked()
             && let Some(pointer) = ui.ctx().pointer_latest_pos()
         {
-            self.add_at = Some(pointer - self.pan - canvas.min.to_vec2());
+            self.add_at =
+                Some(Pos2::ZERO + (pointer - self.pan - canvas.min.to_vec2()).to_vec2() / zoom);
         }
         changed |= self.add_menu(ui, canvas, graph, ctx);
 
@@ -244,6 +331,16 @@ impl GraphEditor {
             }
             if ui.button("Centre").clicked() {
                 self.pan = Vec2::ZERO;
+                self.zoom = 1.0;
+            }
+            // Both an indicator and the way back: ctrl+wheel is not a gesture
+            // anyone finds unless they already expect it to be there.
+            if ui
+                .button(format!("{:.0}%", self.zoom * 100.0))
+                .on_hover_text("ctrl+wheel over the canvas to zoom — click to go back to 100%")
+                .clicked()
+            {
+                self.zoom = 1.0;
             }
             if ui
                 .button("Reset")
@@ -278,17 +375,18 @@ impl GraphEditor {
     }
 
     fn grid(&self, painter: &egui::Painter, canvas: Rect) {
+        let step = (GRID * self.zoom).max(6.0);
         let stroke = Stroke::new(1.0, Color32::from_gray(60).gamma_multiply(0.5));
-        let offset = Vec2::new(self.pan.x.rem_euclid(GRID), self.pan.y.rem_euclid(GRID));
-        let mut x = canvas.min.x + offset.x - GRID;
+        let offset = Vec2::new(self.pan.x.rem_euclid(step), self.pan.y.rem_euclid(step));
+        let mut x = canvas.min.x + offset.x - step;
         while x < canvas.max.x {
             painter.vline(x, canvas.y_range(), stroke);
-            x += GRID;
+            x += step;
         }
-        let mut y = canvas.min.y + offset.y - GRID;
+        let mut y = canvas.min.y + offset.y - step;
         while y < canvas.max.y {
             painter.hline(canvas.x_range(), y, stroke);
-            y += GRID;
+            y += step;
         }
     }
 
@@ -309,12 +407,14 @@ impl GraphEditor {
         let outputs = graph.nodes[index].kind.output_ports();
         let title = graph.nodes[index].kind.title();
 
-        let body = Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, 0.0));
+        let zoom = self.zoom;
+        let width = NODE_WIDTH * zoom;
+        let body = Rect::from_min_size(pos, Vec2::new(width, 0.0));
         // The drag handle is registered before the node's contents so that the
         // widgets inside win the pointer. egui resolves a click to the last
         // widget registered over it, and the title bar is both the handle and
         // the home of the delete button.
-        let handle = Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, PORT_TOP));
+        let handle = Rect::from_min_size(pos, Vec2::new(width, PORT_TOP * zoom));
         let drag = ui.interact(handle, ui.id().with(("node", id)), Sense::drag());
 
         let mut child = ui.new_child(
@@ -324,12 +424,18 @@ impl GraphEditor {
                 // box's open/closed state and one button's click, and the
                 // second one drawn wins. Node id makes each node its own world.
                 .id_salt(("graph-node", id))
-                .max_rect(Rect::from_min_size(body.min, Vec2::new(NODE_WIDTH, 400.0)))
+                .max_rect(Rect::from_min_size(body.min, Vec2::new(width, 4000.0)))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
         // Clipped to the canvas so a node dragged off the edge does not paint
         // over the panels around it.
         child.set_clip_rect(canvas);
+        // Zooming the *style* rather than only the geometry is what makes a
+        // zoomed node a smaller node instead of the same node with its text
+        // hanging out of it.
+        if zoom != 1.0 {
+            child.set_style(zoomed_style(ui.style(), zoom));
+        }
 
         let frame = egui::Frame::group(ui.style())
             .fill(ui.visuals().panel_fill)
@@ -338,8 +444,13 @@ impl GraphEditor {
                 ui.visuals().widgets.noninteractive.bg_stroke.color,
             ));
 
+        // Where each socket's row ended up, so the circles can be painted on
+        // the node's edge at exactly the height of the name beside them.
+        let mut input_rows: Vec<f32> = Vec::with_capacity(inputs.len());
+        let mut output_rows: Vec<f32> = Vec::with_capacity(outputs.len());
+
         let response = frame.show(&mut child, |ui| {
-            ui.set_width(NODE_WIDTH - 16.0);
+            ui.set_width(width - 16.0 * zoom);
             ui.horizontal(|ui| {
                 ui.strong(&title);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -363,6 +474,35 @@ impl GraphEditor {
                 });
             });
             ui.separator();
+
+            // Outputs above inputs, the way Blender's nodes read: what this
+            // node produces first, what it needs after. The names are here
+            // rather than only in a tooltip because a socket you have to hover
+            // to identify is one you get wrong before you ever hover it.
+            for port in &outputs {
+                let row = ui
+                    .horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.label(egui::RichText::new(port.name.as_ref()).small()),
+                        );
+                    })
+                    .response
+                    .rect;
+                output_rows.push(row.center().y);
+            }
+            for port in &inputs {
+                let row = ui
+                    .horizontal(|ui| {
+                        ui.label(egui::RichText::new(port.name.as_ref()).small());
+                    })
+                    .response
+                    .rect;
+                input_rows.push(row.center().y);
+            }
+            if !inputs.is_empty() || !outputs.is_empty() {
+                ui.separator();
+            }
             outcome.changed |= self.controls(ui, &mut graph.nodes[index].kind, ctx);
         });
 
@@ -379,7 +519,7 @@ impl GraphEditor {
             if drag.dragged()
                 && let Some(pointer) = ui.ctx().pointer_latest_pos()
             {
-                let target = pointer - grab - self.pan - canvas.min.to_vec2();
+                let target = (pointer - grab - self.pan - canvas.min.to_vec2()) / zoom;
                 graph.nodes[index].pos = [target.x, target.y];
                 // A moved node is a changed patch — it has to be saved — but it
                 // compiles to exactly the same program, so recompiling is
@@ -396,31 +536,50 @@ impl GraphEditor {
             }
         }
 
-        // Ports, drawn on the node's edges.
+        // Ports, painted on the node's edges at the height of their rows.
         let painter = ui.painter_at(canvas);
         for (i, port) in inputs.iter().enumerate() {
-            let centre = Pos2::new(rect.min.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
+            let y = input_rows
+                .get(i)
+                .copied()
+                .unwrap_or(rect.min.y + (PORT_TOP + i as f32 * PORT_SPACING) * zoom);
+            let centre = Pos2::new(rect.min.x, y);
             let connected = graph.source_of(id, i as u8).is_some();
-            let label = format!("{} ({})", port.name, port.ty.label());
-            if self.port(ui, &painter, (id, i as u8), centre, connected, &label) {
+            let socket = Socket {
+                colour: socket_colour(port),
+                connected,
+                name: &format!("{} ({})", port.name, port.ty.label()),
+            };
+            if self.port(ui, &painter, (id, i as u8), centre, socket) {
                 outcome.clicked_input = Some(i as u8);
             }
             outcome.input_ports.push(centre);
         }
-        // One socket per output bus, down the right-hand edge.
         for (i, port) in outputs.iter().enumerate() {
-            let centre = Pos2::new(rect.max.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
+            let y = output_rows
+                .get(i)
+                .copied()
+                .unwrap_or(rect.min.y + (PORT_TOP + i as f32 * PORT_SPACING) * zoom);
+            let centre = Pos2::new(rect.max.x, y);
             let connected = graph
                 .links
                 .iter()
                 .any(|l| l.from == id && l.from_port == i as u8);
-            let label = format!("{} ({})", port.name, port.ty.label());
+            let colour = socket_colour(port);
+            let socket = Socket {
+                colour,
+                connected,
+                name: &format!("{} ({})", port.name, port.ty.label()),
+            };
             // Output keys start past the inputs so the two never collide.
             let key = (id, 128 + i as u8);
-            if self.port(ui, &painter, key, centre, connected, &label) {
+            if self.port(ui, &painter, key, centre, socket) {
                 outcome.clicked_output = Some(i as u8);
             }
+            // The link takes the colour of the socket it leaves, so a cable can
+            // be followed across a crowded canvas without tracing it.
             outcome.output_ports.push(centre);
+            outcome.output_colours.push(colour);
         }
 
         outcome
@@ -436,20 +595,35 @@ impl GraphEditor {
         // every frame of a drag and two of them can land on the same pixel.
         which: (NodeId, u8),
         centre: Pos2,
-        connected: bool,
-        name: &str,
+        socket: Socket<'_>,
     ) -> bool {
-        let hit = Rect::from_center_size(centre, Vec2::splat(PORT_RADIUS * 3.0));
+        let Socket {
+            colour,
+            connected,
+            name,
+        } = socket;
+        let radius = PORT_RADIUS * self.zoom;
+        let hit = Rect::from_center_size(centre, Vec2::splat(radius * 3.0));
         let response = ui.interact(hit, ui.id().with(("port", which)), Sense::click());
-        let colour = if connected {
-            ui.visuals().selection.stroke.color
-        } else if response.hovered() {
-            ui.visuals().strong_text_color()
+        // The colour says what the socket takes; filled against hollow says
+        // whether anything is in it. Two facts, two channels — dimming the
+        // colour to mean "empty" would have made them one.
+        if connected {
+            painter.circle_filled(centre, radius, colour);
         } else {
-            ui.visuals().weak_text_color()
-        };
-        painter.circle_filled(centre, PORT_RADIUS, colour);
+            painter.circle(
+                centre,
+                radius,
+                ui.visuals().extreme_bg_color,
+                Stroke::new(1.6, colour),
+            );
+        }
         if response.hovered() {
+            painter.circle_stroke(
+                centre,
+                radius + 2.5,
+                Stroke::new(1.0, ui.visuals().strong_text_color()),
+            );
             response.clone().on_hover_text(name);
         }
         response.clicked()
@@ -728,7 +902,7 @@ impl GraphEditor {
 
         egui::Area::new(ui.id().with("add-node"))
             .order(egui::Order::Foreground)
-            .fixed_pos(canvas.min + at.to_vec2() + self.pan)
+            .fixed_pos(canvas.min + at.to_vec2() * self.zoom + self.pan)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_max_width(260.0);
@@ -832,6 +1006,24 @@ impl GraphEditor {
     }
 }
 
+/// One socket, as far as painting it is concerned.
+struct Socket<'a> {
+    colour: Color32,
+    connected: bool,
+    /// The long form, with the type in it — the tooltip. The short name is
+    /// drawn inside the node, beside the circle.
+    name: &'a str,
+}
+
+/// Where one node's sockets ended up on screen, for the links to find.
+struct Placed {
+    id: NodeId,
+    outputs: Vec<Pos2>,
+    /// One per output, so a link can take the colour of the socket it leaves.
+    output_colours: Vec<Color32>,
+    inputs: Vec<Pos2>,
+}
+
 /// What one node's frame reported back.
 #[derive(Default)]
 struct NodeOutcome {
@@ -840,6 +1032,7 @@ struct NodeOutcome {
     clicked_input: Option<u8>,
     clicked_output: Option<u8>,
     output_ports: Vec<Pos2>,
+    output_colours: Vec<Color32>,
     input_ports: Vec<Pos2>,
 }
 
@@ -921,6 +1114,32 @@ fn catalogue() -> Vec<(&'static str, NodeKind)> {
             },
         ),
     ]
+}
+
+/// `base` with every size in it multiplied by `zoom`.
+///
+/// egui has a zoom of its own, but it is global: it would scale the panels and
+/// the toolbar along with the canvas, which is not what a node editor's zoom
+/// means. Scaling a `Style` and handing it to the node's own `Ui` keeps it to
+/// the canvas.
+fn zoomed_style(base: &egui::Style, zoom: f32) -> egui::Style {
+    let mut style = base.clone();
+    for font in style.text_styles.values_mut() {
+        font.size *= zoom;
+    }
+    let s = &mut style.spacing;
+    s.item_spacing *= zoom;
+    s.button_padding *= zoom;
+    s.menu_margin *= zoom;
+    s.indent *= zoom;
+    s.interact_size *= zoom;
+    s.slider_width *= zoom;
+    s.combo_width *= zoom;
+    s.text_edit_width *= zoom;
+    s.icon_width *= zoom;
+    s.icon_width_inner *= zoom;
+    s.icon_spacing *= zoom;
+    style
 }
 
 /// Combo boxes are only so wide, and a parameter name can be long.

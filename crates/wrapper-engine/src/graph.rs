@@ -54,6 +54,14 @@ impl PortType {
 pub struct Port {
     pub name: Cow<'static, str>,
     pub ty: PortType,
+    /// Whether this is a *side* input rather than the signal path proper: a
+    /// sidechain or another aux bus (§14.11).
+    ///
+    /// The compiler does not care — an aux bus is the bus at that index and
+    /// nothing else. It is here because the editor does: a sidechain socket
+    /// that looks exactly like the main input is one a user wires into by
+    /// mistake, and the mistake is silent.
+    pub aux: bool,
 }
 
 impl Port {
@@ -61,11 +69,16 @@ impl Port {
         Port {
             name: name.into(),
             ty,
+            aux: false,
         }
     }
 
     fn param(name: impl Into<Cow<'static, str>>) -> Port {
         Port::new(name, PortType::Param)
+    }
+
+    fn aux(self) -> Port {
+        Port { aux: true, ..self }
     }
 }
 
@@ -435,32 +448,34 @@ impl NodeKind {
             NodeKind::DelayRead { .. } => vec![Port::param("time")],
             NodeKind::Math { .. } => vec![Port::param("a"), Port::param("b")],
             NodeKind::RangeMap { .. } | NodeKind::SlotOut { .. } => vec![Port::param("in")],
-            NodeKind::AudioOut { channels, .. } => {
-                vec![Port::new(
+            NodeKind::AudioOut { bus, channels } => {
+                let port = Port::new(
                     "in",
                     PortType::Audio {
                         channels: *channels,
                     },
-                )]
+                );
+                vec![if *bus == 0 { port } else { port.aux() }]
             }
             NodeKind::DelayWrite { ty, .. } => vec![Port::new("in", *ty)],
-            // Every audio input first, then every gain. Keeping the audio
-            // sockets where they were is what lets a patch saved before the
-            // gains existed keep its links: `prune` deletes a link into a
-            // socket whose type no longer matches, and renumbering would have
-            // made every one of them mismatch.
+            // Each input next to its own gain, rather than all the signals
+            // followed by all the gains: they are one row of one control on
+            // screen, and a socket list that does not read that way makes the
+            // user count.
             NodeKind::Mix {
                 channels, inputs, ..
             } => (0..*inputs)
-                .map(|i| {
-                    Port::new(
-                        format!("in {}", i + 1),
-                        PortType::Audio {
-                            channels: *channels,
-                        },
-                    )
+                .flat_map(|i| {
+                    [
+                        Port::new(
+                            format!("in {}", i + 1),
+                            PortType::Audio {
+                                channels: *channels,
+                            },
+                        ),
+                        Port::param(format!("gain {}", i + 1)),
+                    ]
                 })
-                .chain((0..*inputs).map(|i| Port::param(format!("gain {}", i + 1))))
                 .collect(),
             NodeKind::Plugin { ports, .. } => plugin_input_ports(ports),
         }
@@ -478,13 +493,14 @@ impl NodeKind {
             | NodeKind::Expression { .. }
             | NodeKind::Math { .. }
             | NodeKind::RangeMap { .. } => vec![Port::param("out")],
-            NodeKind::AudioIn { channels, .. } => {
-                vec![Port::new(
+            NodeKind::AudioIn { bus, channels } => {
+                let port = Port::new(
                     "out",
                     PortType::Audio {
                         channels: *channels,
                     },
-                )]
+                );
+                vec![if *bus == 0 { port } else { port.aux() }]
             }
             NodeKind::NoteIn => vec![Port::new("out", PortType::Note)],
             NodeKind::DelayRead { ty, .. } => vec![Port::new("out", *ty)],
@@ -546,7 +562,8 @@ fn plugin_input_ports(ports: &PluginPorts) -> Vec<Port> {
             1 => "sidechain".to_string(),
             _ => format!("aux {i}"),
         };
-        out.push(Port::new(name, PortType::Audio { channels }));
+        let port = Port::new(name, PortType::Audio { channels });
+        out.push(if i == 0 { port } else { port.aux() });
     }
     if ports.accepts_notes {
         out.push(Port::new("notes", PortType::Note));

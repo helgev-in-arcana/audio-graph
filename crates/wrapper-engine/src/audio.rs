@@ -346,9 +346,7 @@ pub(crate) fn compile_audio(
                 });
             }
             NodeKind::Mix {
-                channels,
-                inputs: count,
-                gains,
+                channels, gains, ..
             } => {
                 // §14.6, the merge point: every branch waits for the latest one
                 // or they phase-cancel.
@@ -385,9 +383,9 @@ pub(crate) fn compile_audio(
                     }
                     inputs.push(MixIn {
                         buf,
-                        // The gain socket for input `port` sits `count` sockets
-                        // further along.
-                        lane: lane_of(audio_lanes, id, (*count as usize + port) as u8),
+                        // Signal, gain, signal, gain: the gain for input
+                        // `port` is the socket right after it.
+                        lane: lane_of(audio_lanes, id, (2 * port + 1) as u8),
                         gain: gains.get(port).copied().unwrap_or(1.0),
                     });
                 }
@@ -650,7 +648,7 @@ mod tests {
         graph.connect(input, 0, slow, 0);
         graph.connect(slow, 0, mix, 0);
         // The dry branch, straight from the input.
-        graph.connect(input, 0, mix, 1);
+        graph.connect(input, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
@@ -685,7 +683,7 @@ mod tests {
         graph.connect(input, 0, a, 0);
         graph.connect(input, 0, b, 0);
         graph.connect(a, 0, mix, 0);
-        graph.connect(b, 0, mix, 1);
+        graph.connect(b, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
@@ -739,7 +737,7 @@ mod tests {
             [0.0, 0.0],
         );
         graph.connect(input, 0, mix, 0);
-        graph.connect(read, 0, mix, 1);
+        graph.connect(read, 0, mix, 2);
         graph.connect(mix, 0, node, 0);
         graph.connect(node, 0, write, 0);
 
@@ -881,7 +879,7 @@ mod tests {
         let output = stereo_out(&mut graph);
         graph.connect(notes, 0, wired, 0);
         graph.connect(wired, 0, mix, 0);
-        graph.connect(idle, 0, mix, 1);
+        graph.connect(idle, 0, mix, 2);
         graph.connect(mix, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
