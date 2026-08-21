@@ -1,8 +1,8 @@
 /target
 
-# Crash logs pasted in while debugging; kept on disk, not in history.
-panic-log.txt
-
 # Design/progress notes. Kept on disk for reference, deliberately out of git
 # history after an earlier purge removed them without a backup.
 /memo/
+
+# Temporary files.
+/temp/
