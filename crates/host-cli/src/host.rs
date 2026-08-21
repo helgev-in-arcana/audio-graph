@@ -7,7 +7,7 @@
 
 use std::sync::Mutex;
 
-use plugin_host_api::{HostContext, ParamId, RestartReason};
+use plugin_host::{HostContext, ParamId, RestartReason};
 
 #[derive(Default)]
 pub struct CliHost {

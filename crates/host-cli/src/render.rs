@@ -3,32 +3,58 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use plugin_host_api::{
-    AudioBuffers, AudioConfig, BufferLayout, Event, EventSink, NoteEvent, ProcessStatus,
-    SubPluginMain, TimeContext,
+use plugin_host::{
+    AudioBuffers, AudioConfig, BufferLayout, ClassInfo, Event, EventSink, NoteEvent, Plugin,
+    ProcessStatus, SubPluginMain, TimeContext,
 };
-use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin};
 
 use crate::host::CliHost;
 use crate::wav::Audio;
 
-/// Pick the class to instantiate: an explicit CID, otherwise the first audio
-/// module the factory offers.
-pub fn choose_class(module: &Module, wanted: Option<&str>) -> Result<ClassInfo, String> {
-    let classes = module.audio_modules().map_err(|e| e.to_string())?;
+/// Pick the class to instantiate: an explicit id, otherwise the module's first.
+///
+/// The id is whatever the format calls one — a VST3 class id in hex, a CLAP
+/// reverse-DNS name — so the same argument works for both and this never has to
+/// ask which format it is looking at.
+pub fn choose_class(path: &Path, wanted: Option<&str>) -> Result<ClassInfo, String> {
+    let classes = plugin_host::scan_module(path).map_err(|e| e.to_string())?;
     match wanted.filter(|t| !t.is_empty()) {
-        Some(text) => {
-            let cid = Cid::from_hex(text).ok_or("class id must be 32 hex digits")?;
-            classes
-                .into_iter()
-                .find(|c| c.cid == cid)
-                .ok_or_else(|| format!("no audio module class with cid {text}"))
-        }
+        Some(text) => classes
+            .into_iter()
+            .find(|c| c.id == text)
+            .ok_or_else(|| format!("no plugin with id {text} in {}", path.display())),
         None => classes
             .into_iter()
             .next()
-            .ok_or_else(|| "module exports no audio module class".to_string()),
+            .ok_or_else(|| format!("{} exports no plugin", path.display())),
     }
+}
+
+/// Load `path`, choosing `wanted` or its first plugin, and say which it was.
+///
+/// The pair is what nearly every command here needs, and putting it in one
+/// place is what keeps the CLI from knowing which format it just loaded.
+pub fn load(
+    path: &Path,
+    wanted: Option<&str>,
+    host: Arc<dyn plugin_host::HostContext>,
+) -> Result<(ClassInfo, Plugin), String> {
+    let class = choose_class(path, wanted)?;
+    let plugin = Plugin::load(path, Some(&class.id), host).map_err(|e| e.to_string())?;
+    Ok((class, plugin))
+}
+
+/// Main-bus widths, as a harness has to activate with them: `(in, out)`.
+///
+/// The plugin's declared shape before negotiation, which is the only thing a
+/// caller can ask for — and, for CLAP, the only thing there is (there is no
+/// negotiation at all).
+pub fn bus_widths(plugin: &Plugin) -> (u32, u32) {
+    let layout = SubPluginMain::io_layout(plugin);
+    (
+        u32::from(layout.main_input_channels()),
+        layout.outputs.first().map_or(0, |b| u32::from(b.channels)),
+    )
 }
 
 pub struct RenderOutcome {
@@ -66,21 +92,21 @@ pub fn render_with_state(
     block_size: u32,
     events: &[(usize, Event)],
 ) -> Result<RenderOutcome, String> {
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = choose_class(&module, class_cid)?;
+    let class = choose_class(path, class_cid)?;
 
     let host = Arc::new(CliHost::new());
     let mut plugin =
-        Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+        Plugin::load(path, Some(&class.id), host.clone()).map_err(|e| e.to_string())?;
     if let Some(state) = state {
         // Before activate, as a DAW does: the wrapper loads its sub-plugin at
         // activate, and it has to know which one by then.
         plugin.load_state(state).map_err(|e| e.to_string())?;
     }
 
-    let (plugin_in, plugin_out) = plugin.bus_channel_counts();
+    let layout = SubPluginMain::io_layout(&plugin);
     // An instrument reports no input bus; feeding it one would fail bus setup.
-    let input_channels = plugin_in.min(input.channels);
+    let input_channels = u32::from(layout.main_input_channels()).min(input.channels);
+    let plugin_out = layout.outputs.first().map_or(0, |b| u32::from(b.channels));
     let output_channels = if plugin_out == 0 {
         2
     } else {
@@ -201,9 +227,9 @@ fn offset_event(event: Event, sample_offset: u32) -> Event {
             velocity,
             sample_offset,
         }),
-        Event::Param(plugin_host_api::ParamEvent::SetValue {
+        Event::Param(plugin_host::ParamEvent::SetValue {
             id, target, value, ..
-        }) => Event::Param(plugin_host_api::ParamEvent::SetValue {
+        }) => Event::Param(plugin_host::ParamEvent::SetValue {
             id,
             target,
             value,
