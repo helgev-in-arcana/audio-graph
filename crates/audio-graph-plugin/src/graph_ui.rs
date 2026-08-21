@@ -17,11 +17,11 @@
 
 use std::path::PathBuf;
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
-use subhost_adapter::SLOT_COUNT;
 use audio_graph_engine::{
     ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
 };
+use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
+use subhost_adapter::SLOT_COUNT;
 
 /// What each kind of socket is painted.
 ///

@@ -1187,8 +1187,8 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use plugin_host_api::NoteEvent;
         use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
+        use plugin_host_api::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());

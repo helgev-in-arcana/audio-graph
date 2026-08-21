@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
+use audio_graph_engine::{BlockContext, Engine, Graph};
 use nice_plug::prelude::*;
 use plugin_host_api::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
 use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
-use audio_graph_engine::{BlockContext, Engine, Graph};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -717,8 +717,8 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subhost_adapter::LANES;
     use audio_graph_engine::{Graph, MathOp, NodeKind, Rate, Waveform, compile};
+    use subhost_adapter::LANES;
 
     /// A schedule carries more than the DAW's slots (§14.12), and `run_graph`
     /// fills the difference itself.

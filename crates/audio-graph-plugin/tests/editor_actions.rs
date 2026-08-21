@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
+use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host_api::{AudioConfig, HostContext, RestartReason};
 use subhost_adapter::SubHost;
-use audio_graph_plugin::{Shared, WrapperParams};
 
 struct SilentHost;
 

@@ -1,4 +1,4 @@
-//! The container window a sub-plugin's editor is attached to.
+//! A bare top-level container window for a hosted plugin's own editor.
 //!
 //! ARCHITECTURE.md §5.2: this window draws nothing. It is a titled, resizable
 //! frame and nothing else, so wgpu, Vello, layout and a windowing crate are all
@@ -8,6 +8,11 @@
 //! loop, and inside a plugin the DAW owns it. On Windows that is not even a
 //! difficulty — a window created on the DAW's UI thread has its messages
 //! delivered by the DAW's own pump, so there is no loop to run at all.
+//!
+//! Nothing here knows what a VST3 or a CLAP is. The two formats disagree only
+//! about the *name* they give a platform handle — `"HWND"` versus `"win32"` —
+//! and that name belongs to the backend that speaks it, not to the window.
+//! `vst3-host-view` and `clap-host` both attach their editors to this.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -24,26 +29,6 @@ impl Size {
         Size { width, height }
     }
 }
-
-/// What the platform handle means to the plugin.
-///
-/// VST3 identifies the parent it is given by a string constant, and passing the
-/// wrong one to a plugin that supports several is how an editor ends up
-/// attached to nothing.
-pub const PLATFORM_TYPE: &str = {
-    #[cfg(windows)]
-    {
-        "HWND"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "NSView"
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        "X11EmbedWindowID"
-    }
-};
 
 /// Shared state a window's message handler needs to reach.
 #[derive(Default)]
@@ -478,16 +463,6 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn platform_type_matches_what_we_pass_to_attached() {
-        // Handing a plugin the wrong platform string is how an editor attaches
-        // to nothing at all, silently.
-        #[cfg(windows)]
-        assert_eq!(PLATFORM_TYPE, "HWND");
-        #[cfg(target_os = "macos")]
-        assert_eq!(PLATFORM_TYPE, "NSView");
-    }
 
     #[cfg(windows)]
     #[test]

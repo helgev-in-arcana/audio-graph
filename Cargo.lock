@@ -834,6 +834,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "host-window"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2235,6 +2242,7 @@ dependencies = [
 name = "vst3-host-view"
 version = "0.1.0"
 dependencies = [
+ "host-window",
  "log",
  "vst3",
  "windows-sys 0.61.2",

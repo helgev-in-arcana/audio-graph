@@ -13,7 +13,7 @@ use std::cell::Cell;
 use vst3::Steinberg::{IPlugFrame, IPlugFrameTrait, IPlugView, ViewRect, kResultOk, tresult};
 use vst3::{Class, ComWrapper};
 
-use crate::window::Size;
+use host_window::Size;
 
 /// Host-side `IPlugFrame`.
 pub struct PlugFrame {

@@ -2187,7 +2187,10 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         [800.0, 60.0],
     );
     let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [300.0, 340.0]);
-    let slot = graph.add(audio_graph_engine::NodeKind::SlotIn { slot: 0 }, [40.0, 400.0]);
+    let slot = graph.add(
+        audio_graph_engine::NodeKind::SlotIn { slot: 0 },
+        [40.0, 400.0],
+    );
 
     graph.connect(input, 0, node, 0);
     if ports.audio_in.len() > 1 {

@@ -19,8 +19,9 @@ use std::rc::Rc;
 use vst3::ComPtr;
 use vst3::Steinberg::{IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk, kResultTrue};
 
+use crate::PLATFORM_TYPE;
 use crate::frame::PlugFrame;
-use crate::window::{ContainerWindow, PLATFORM_TYPE, Size};
+use host_window::{ContainerWindow, Size};
 
 /// A sub-plugin editor in its own top-level window.
 ///
