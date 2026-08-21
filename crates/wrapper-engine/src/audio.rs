@@ -661,6 +661,38 @@ mod tests {
             .collect()
     }
 
+    /// §14.14. An analyser is fed audio and its output goes nowhere, which is
+    /// exactly the shape the compiler otherwise deletes.
+    #[test]
+    fn an_always_on_plugin_still_gets_its_input() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let analyser = plugin(&mut graph, 0, 0);
+        graph.connect(input, 0, analyser, 0);
+
+        assert!(
+            compile(&graph, SLOTS).unwrap().audio_ops.is_empty(),
+            "nothing reads it, so nothing runs"
+        );
+
+        graph.node_mut(analyser).unwrap().always_on = true;
+        let program = compile(&graph, SLOTS).unwrap();
+        let feeds_it = program.audio_ops.iter().any(|op| {
+            matches!(op, AudioOp::Plugin { instance: 0, input, .. }
+                if program.audio_ops.iter().any(|w| matches!(w, AudioOp::Input { out, .. } if out == input)))
+        });
+        assert!(
+            feeds_it,
+            "the DAW's input reaches it: {:?}",
+            program.audio_ops
+        );
+        assert_eq!(
+            program.instances.len(),
+            1,
+            "and its buses are activated for it"
+        );
+    }
+
     /// §14.10, the DoD: notes reach the instrument the graph points at.
     #[test]
     fn a_wired_instrument_hears_the_daw() {

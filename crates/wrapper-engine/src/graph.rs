@@ -147,6 +147,14 @@ pub struct Node {
     /// reopens with its nodes rearranged is a graph the user has to re-read.
     #[serde(default)]
     pub pos: [f32; 2],
+    /// Compile this node even when nothing downstream reads it.
+    ///
+    /// The compiler keeps only what feeds an output, which is right for every
+    /// node whose whole purpose is the value it hands on — and wrong for an
+    /// analyser, whose purpose is the side effect of having run. There is no
+    /// way to tell the two apart from the graph, so the user says which it is.
+    #[serde(default)]
+    pub always_on: bool,
     pub kind: NodeKind,
 }
 
@@ -570,7 +578,12 @@ impl Graph {
     pub fn add(&mut self, kind: NodeKind, pos: [f32; 2]) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
-        self.nodes.push(Node { id, pos, kind });
+        self.nodes.push(Node {
+            id,
+            pos,
+            always_on: false,
+            kind,
+        });
         id
     }
 

@@ -99,10 +99,11 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
 
     // Every sink is a root. `DelayWrite` is one even though nothing reads it —
     // that is exactly what makes it a graph cut rather than an edge (§14.4).
+    // So is anything the user has marked always-on (§14.14).
     let sinks: Vec<NodeId> = graph
         .nodes
         .iter()
-        .filter(|n| n.kind.output_ports().is_empty())
+        .filter(|n| n.kind.output_ports().is_empty() || n.always_on)
         .map(|n| n.id)
         .collect();
 
@@ -552,6 +553,51 @@ mod tests {
             "the unwired nodes cost the audio thread nothing"
         );
         assert!(program.lfo_nodes.is_empty());
+    }
+
+    /// §14.14. An analyser produces nothing anyone reads, so the rule above
+    /// would delete it — the toggle is how the user says otherwise.
+    #[test]
+    fn an_always_on_node_is_compiled_with_nothing_downstream() {
+        let mut graph = Graph::new();
+        let lfo = graph.add(
+            NodeKind::Lfo {
+                waveform: Waveform::Sine,
+                rate: Rate::Hz(1.0),
+                phase: 0.0,
+                depth: 0.5,
+                offset: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        assert!(
+            compile(&graph, SLOTS).unwrap().is_empty(),
+            "unwired, it costs nothing"
+        );
+
+        graph.node_mut(lfo).unwrap().always_on = true;
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.ops.len(), 1);
+        assert_eq!(program.lfo_nodes.len(), 1, "and it keeps its phase");
+    }
+
+    /// Whatever it reads has to be compiled too, or it runs on nothing.
+    #[test]
+    fn an_always_on_node_pulls_its_inputs_in_with_it() {
+        let mut graph = Graph::new();
+        let source = graph.add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
+        let sink = graph.add(
+            NodeKind::Math {
+                op: MathOp::Multiply,
+                b: 2.0,
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(source, 0, sink, 0);
+        graph.node_mut(sink).unwrap().always_on = true;
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.ops.len(), 2, "the constant came with it");
     }
 
     #[test]

@@ -340,6 +340,20 @@ impl GraphEditor {
                     if ui.small_button("x").clicked() {
                         outcome.remove = true;
                     }
+                    // Only worth offering where it changes anything: a node
+                    // with no output is already compiled.
+                    if !outputs.is_empty() {
+                        let on = &mut graph.nodes[index].always_on;
+                        if ui
+                            .toggle_value(on, "on")
+                            .on_hover_text(
+                                "run this node even with nothing wired to its output                                  — for analysers",
+                            )
+                            .changed()
+                        {
+                            outcome.changed = true;
+                        }
+                    }
                 });
             });
             ui.separator();
