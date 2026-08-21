@@ -314,5 +314,42 @@ fn the_backend_drives_a_real_clap_module() {
         "a width the plugin does not declare has to be refused, not adapted"
     );
 
+    // --- the editor --------------------------------------------------------
+
+    assert!(plugin.has_editor());
+    #[cfg(windows)]
+    {
+        plugin.open_editor(std::ptr::null_mut()).expect("opens");
+        assert!(plugin.editor_is_open());
+        assert!(plugin.editor_can_resize());
+        let size = plugin.editor_window().expect("has a window").client_size();
+        assert_eq!(
+            (size.width, size.height),
+            (420, 260),
+            "the window was not made the size the plugin asked for"
+        );
+
+        // Opening twice is a no-op rather than a second window: the caller is a
+        // UI that may not know whether it already asked.
+        plugin
+            .open_editor(std::ptr::null_mut())
+            .expect("idempotent");
+
+        // A tick with nothing pending must leave it alone.
+        plugin.tick();
+        assert!(plugin.editor_is_open());
+
+        plugin.close_editor();
+        assert!(!plugin.editor_is_open());
+
+        // And again, to prove `gui.destroy` really released everything: a
+        // plugin that had not would refuse the second `create`.
+        plugin.open_editor(std::ptr::null_mut()).expect("reopens");
+        assert!(plugin.editor_is_open());
+    }
+
+    // Dropped with the editor still open — §5.3's dangerous path, where the
+    // DAW destroys the instance without ever saying "close". If the sequence
+    // were wrong this is where it would fault.
     drop(plugin);
 }

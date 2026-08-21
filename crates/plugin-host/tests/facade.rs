@@ -67,11 +67,22 @@ fn the_facade_loads_a_clap_by_path_alone() {
     assert_eq!(plugin.format(), Format::Clap);
     assert_eq!(SubPluginMain::params(&plugin).len(), 4);
     assert_eq!(SubPluginMain::io_layout(&plugin).inputs.len(), 2);
-    assert!(!plugin.has_editor(), "the fixture has no gui extension");
-
     // A tick with no editor open must still be safe, since the caller is told
-    // to call it every frame regardless.
+    // to call it every frame regardless — CLAP's timers and main-thread
+    // callbacks run whether or not anything is on screen.
     plugin.tick();
+
+    assert!(plugin.has_editor());
+    #[cfg(windows)]
+    {
+        // The whole point of the facade: the same three calls, whichever format
+        // answered.
+        plugin.open_editor(std::ptr::null_mut()).expect("opens");
+        assert!(plugin.editor_is_open());
+        plugin.tick();
+        plugin.close_editor();
+        assert!(!plugin.editor_is_open());
+    }
 
     // The saved form round-trips back to the same file.
     let reference = plugin.reference();

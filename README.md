@@ -8,9 +8,10 @@
 
 - 現時点のコミット先頭は全てバイブコードされた状態です。
   - 私(@helgev-in-arcana)が現在コード・設計監査を進めています。
-- 今はアルファ版で、Win、VST3のみの対応です。
+- 今はアルファ版で、Winのみの対応です。読み込めるプラグインは VST3 と CLAP です。
   - OSはLinuxまで対応可能です。MacOSはGithub Actionsでビルド可能ですが動作確認ができません。
-  - VST2、CLAP対応予定です。
+  - CLAP読み込みは自前のテスト用CLAPプラグインでの検証のみで、市販CLAPでの動作確認は未実施です。
+  - VST2対応予定です。DAWから見たときのAudioGraph自身は現在VST3のみです。
 - UIは現在仮組みです。改良予定です。ゲインが現在dBではなく実数値倍率になっています。
 - 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
 - コード署名が現在ありません。
@@ -22,6 +23,7 @@
 ## 現時点でできること
 
 - Fx と Instrument の 2 クラスを 1 バイナリから提供
+- **VST3 と CLAP の両方を読み込める**（同じグラフの中で混在できます）
 - プラグイン読み込みは16個まで
 - 音声、MIDI、パラメーター値のノードベース編集
 - DAWからのオートメーションスロットが32本
@@ -30,7 +32,8 @@
 ## 現時点でできないこと
 
 - Win以外の対応 (Win11(x86_64)のみ動作確認)
-- VST3以外の対応
+- VST3 / CLAP 以外のプラグインの読み込み
+- AudioGraph 自身を VST3 以外として書き出すこと
 - プラグインプロセス分離
 - 32bitプラグイン読み込み
 - 出力バスを 2 本以上持つプラグインのソケットは表示されますが、実機での検査は未実施です。
@@ -85,7 +88,7 @@ DAW を再スキャンすると、`Audio Graph FX` と `Audio Graph Instrument` 
 ### 最初の一手
 
 1. トラックに AudioGraph を挿してエディタを開く
-2. キャンバスに **Plugin ノード**を置き、手持ちの VST3 を読み込む
+2. キャンバスに **Plugin ノード**を置き、手持ちの VST3 か CLAP を読み込む（フィルタ欄に `clap` と打つと形式で絞れます）
 3. `AudioIn` → Plugin → `AudioOut` を繋ぐ（ここまでで普通のプラグインとして音が通ります）
 4. **LFO ノード**を置き、その出力を Plugin ノードのパラメータソケットへ繋ぐ
 5. LFO の rate を拍同期にすると、テンポに追従して揺れます
@@ -149,10 +152,11 @@ audio-graph-engine   グラフ、コンパイラ、オーディオ／パラメ�
 subhost-adapter      入れ子であること固有の処理
       │                トランスポート伝播、レイテンシ合算、state の入れ子、スロット束縛
       │
-plugin-host          マルチフォーマット・プラグインホスト（予定 / 下 3 つのファサード）
+plugin-host          マルチフォーマット・プラグインホスト（下 4 つのファサード）
       │                ├ plugin-host-api   依存ゼロの抽象。トレイトとデータモデル
       │                ├ vst3-host         VST3 バックエンド（純 Rust）
-      │                └ clap-host         CLAP バックエンド（予定）
+      │                ├ clap-host         CLAP バックエンド（純 Rust）
+      │                └ host-window       形式を知らないコンテナウィンドウ
       │
 host-cli             DAW の代役となる検査 CLI
 ```
@@ -165,13 +169,43 @@ host-cli             DAW の代役となる検査 CLI
 「オフラインレンダラやプラグインスキャナにも必要か」── 必要ならば下の層へ、
 不要ならばここへ、です。
 
-> 現時点では `plugin-host` と `clap-host` はまだ存在せず、上位クレートは
-> `plugin-host-api` と `vst3-host` に直接依存しています。
+**形式を知っている場所は `plugin-host` だけ**です。`subhost-adapter` から上は
+`plugin-host` にしか依存せず、`vst3-host` や `clap-host` という名前を一度も書きません。
+形式の分岐はトレイトオブジェクトではなく `enum Format` の `match` にしてあるので、
+3 つ目の形式を足したときに書き忘れた腕はコンパイラが落とします。
 
 ## プラグインホストライブラリ
 
-AudioGraph の副産物として、**Rust から VST3 プラグインをホストするためのライブラリ**が
+AudioGraph の副産物として、**Rust から VST3 / CLAP プラグインをホストするためのライブラリ**が
 手に入ります。AudioGraph 本体とは独立に使えるように保ってあります。
+
+### 使い方
+
+利用者が依存するのは `plugin-host` 1 つです。形式は拡張子から決まり、
+コードに形式名は現れません。
+
+```rust
+use plugin_host::{Plugin, SubPluginMain};
+
+// .vst3 でも .clap でも同じ行で読める
+let mut plugin = Plugin::load(path, None, host_context)?;
+
+for p in SubPluginMain::params(&plugin) {
+    println!("{}  {}..{}", p.name, p.min, p.max);   // plain 値。正規化しない
+}
+
+let mut processor = plugin.activate(config)?;        // オーディオスレッドへ渡せる半分
+processor.process(&mut buffers, &events, &time, &mut out_events);
+plugin.deactivate(processor);
+```
+
+走査は `plugin_host::installed_modules()`（両形式まとめて）と `scan_module(path)`。
+エディタは `plugin.open_editor(owner)` / `close_editor()` / 毎フレームの `tick()` で、
+VST3 の `IPlugView` と CLAP の GUI 拡張という構造の違いは外に出ません。
+
+保存した束縛を復元するときは `PluginRef`（形式 + id + パスヒント + 表示名）を
+`resolve_reference()` に渡します。id が権威でパスはヒントなので、
+プラグインフォルダの違う機械でもプロジェクトが開きます。
 
 ### API の形
 
@@ -209,20 +243,24 @@ pub trait SubPluginProcessor: Send {         // オーディオスレッド専�
 - **モデルは意図的に CLAP 寄り**に作り、VST3 側が degrade して合わせます。
   2 つの形式の共通部分に狭めることはしません。
 
+### 2 つの形式の違いをどう吸収しているか
+
+- **バスの交渉。** VST3 は `setBusArrangements` で交渉できますが、CLAP のポートは
+  宣言された幅そのものです。CLAP バックエンドは要求と宣言が食い違えば断ります
+  （黙って詰め替えると、サイドチェインの半分が未初期化のまま渡るような壊れ方をするため）。
+- **未結線のバス。** VST3 には「無効なバス」がありますが、CLAP にはありません。
+  CLAP バックエンドは未結線の入力ポートに無音バッファ、余った出力ポートに捨てバッファを
+  渡します（プラグインは宣言数ぶん全部読むので）。
+- **エディタの寿命。** VST3 は `IPlugView` という別オブジェクト、CLAP はインスタンスの拡張。
+  どちらも `Plugin` が内部に持ち、破棄順は `Drop` が保証します。
+- **メインスレッドのポンプ。** CLAP はホストが `on_main_thread` とタイマーを回す必要が
+  あります。`Plugin::tick()` がそれで、エディタが開いていなくても毎フレーム呼びます。
+
 ### 今後の予定
 
-`plugin-host` クレートを、**マルチフォーマットのプラグインホストライブラリ**として
-整備していく予定です。目指す形は次のとおりです。
-
-- 利用者は **`plugin-host` 1 つに依存するだけ**でよい
-- VST3 か CLAP かは**拡張子から内部でルーティング**され、利用者のコードに形式名は現れない
-- **feature フラグ**で対応形式を付け外しできる（既定は `vst3` + `clap` の両対応）
-
-トレイトはすでに `Box<dyn SubPluginProcessor>` として動的ディスパッチで扱われているので、
-バックエンドの差し替えは受け入れ側のコードに影響しません。
-残っているのは CLAP バックエンドの実装と、選択の入口の追加です。
-
-macOS / Linux 対応も同じ流れで進めます。OS 依存はエディタウィンドウ層にほぼ閉じています。
+- **feature フラグ**で対応形式を付け外しできるようにする（現状は両方が常に入ります）
+- macOS / Linux 対応。OS 依存は `host-window` にほぼ閉じています
+- 市販 CLAP プラグインでの実機検証
 
 現時点では API は AudioGraph の内部利用が主で、安定していません。
 
@@ -242,22 +280,25 @@ DAW を立ち上げずに、実物のプラグインを相手に検証できま�
 cargo run -p host-cli -- <コマンド>
 ```
 
+プラグインを指す引数は **`.vst3` でも `.clap` でもかまいません**。拡張子でバックエンドが
+決まります。
+
 **調べる**
 
 | コマンド | 内容 |
 |---|---|
-| `dirs` | VST3 の慣例的な設置場所を列挙 |
-| `scan [DIR...]` | 見つかったモジュールを全部ロードしてクラスを列挙 |
-| `info <PATH.vst3>` | 1 モジュールの詳細 |
-| `params <PATH.vst3>` | インスタンス化してパラメータを列挙 |
-| `buses <PATH.vst3>` | ノードグラフから見えるバス構成を表示 |
+| `dirs` | VST3 / CLAP の慣例的な設置場所を列挙 |
+| `scan [DIR...]` | 見つかったモジュールを全部ロードして中身を列挙 |
+| `info <PLUGIN>` | 1 モジュールの詳細 |
+| `params <PLUGIN>` | インスタンス化してパラメータを列挙 |
+| `buses <PLUGIN>` | ノードグラフから見えるバス構成を表示 |
 
 **音を出す**
 
 | コマンド | 内容 |
 |---|---|
-| `render <PATH.vst3> <IN.wav> <OUT.wav>` | プラグインにオーディオを通す |
-| `synth <PATH.vst3> <OUT.wav>` | インストゥルメントに 1 音入れる |
+| `render <PLUGIN> <IN.wav> <OUT.wav>` | プラグインにオーディオを通す |
+| `synth <PLUGIN> <OUT.wav>` | インストゥルメントに 1 音入れる |
 
 **グラフの振る舞いを検査する**
 
@@ -274,13 +315,13 @@ cargo run -p host-cli -- <コマンド>
 
 | コマンド | 内容 |
 |---|---|
-| `churn <PATH.vst3> [N]` | ロード／アンロードを N 回（既定 1000） |
-| `twice <PATH.vst3> [N]` | 連続 N 回インスタンス化 |
-| `state <PATH.vst3>` | インスタンスをまたいでパラメータを保存／復元 |
+| `churn <PLUGIN> [N]` | ロード／アンロードを N 回（既定 1000） |
+| `twice <PLUGIN> [N]` | 連続 N 回インスタンス化 |
+| `state <PLUGIN>` | インスタンスをまたいでパラメータを保存／復元 |
 | `sweep [DIR...]` | 全プラグインを 1 個ずつ子プロセスで寿命テスト |
-| `probe <PATH.vst3>` | 同じ寿命テストをこのプロセス内で |
-| `gui <PATH.vst3>` | エディタを開いて破棄（`--reverse` で破棄順を逆に） |
-| `editor <WRAPPER.vst3> <PLUGIN.vst3>` | プラグインノードを置いた状態でエディタを開く |
+| `probe <PLUGIN>` | 同じ寿命テストをこのプロセス内で |
+| `gui <PLUGIN>` | エディタを開いて破棄（`--reverse` で破棄順を逆に） |
+| `editor <WRAPPER.vst3> <PLUGIN>` | プラグインノードを置いた状態でエディタを開く |
 
 **オーディオスレッドでの確保を検出する**
 

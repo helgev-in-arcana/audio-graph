@@ -33,6 +33,7 @@ use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_STEREO, clap_audio_port_info,
     clap_plugin_audio_ports,
 };
+use clap_sys::ext::gui::CLAP_EXT_GUI;
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{
     CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI, clap_note_port_info,
@@ -119,7 +120,9 @@ impl Params {
     }
 }
 
-struct Instance {
+mod gui;
+
+pub(crate) struct Instance {
     /// The struct handed to the host. First field so the pointer the host holds
     /// is also the pointer to this allocation, which `from_host` relies on.
     raw: clap_plugin,
@@ -130,12 +133,17 @@ struct Instance {
     active: bool,
     processing: bool,
     initialised: bool,
+    /// Declared last so it drops last, which is the wrong order on purpose:
+    /// the host is required to call `gui.destroy` before the instance goes, and
+    /// a fixture that cleaned up after a host that forgot would hide the bug
+    /// §5.3 exists to catch.
+    gui: gui::Gui,
 }
 
 impl Instance {
     /// # Safety
     /// `plugin` must be a pointer this plugin handed out and still owns.
-    unsafe fn from_host<'a>(plugin: *const clap_plugin) -> Option<&'a mut Instance> {
+    pub(crate) unsafe fn from_host<'a>(plugin: *const clap_plugin) -> Option<&'a mut Instance> {
         if plugin.is_null() {
             return None;
         }
@@ -268,6 +276,7 @@ unsafe extern "C" fn factory_create(
         active: false,
         processing: false,
         initialised: false,
+        gui: gui::Gui::default(),
     });
     // Only once the box has its final address.
     instance.raw.plugin_data = (&raw mut *instance).cast::<c_void>();
@@ -477,6 +486,8 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const EXT_STATE).cast()
     } else if id == CLAP_EXT_LATENCY {
         (&raw const EXT_LATENCY).cast()
+    } else if id == CLAP_EXT_GUI {
+        (&raw const gui::EXT_GUI).cast()
     } else {
         std::ptr::null()
     }

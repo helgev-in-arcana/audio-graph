@@ -1,0 +1,411 @@
+//! A real, if very plain, editor for the fixture.
+//!
+//! It exists so `clap-host`'s GUI path can be checked without a third-party
+//! plugin installed. What matters is not what it draws but that it behaves like
+//! a plugin's editor does: it creates a child window inside the host's, paints
+//! into it, and must be told to go away before the host's window is destroyed —
+//! which is the ordering ARCHITECTURE.md §5.3 is entirely about.
+//!
+//! Windows only, like the host side. Elsewhere `is_api_supported` says no,
+//! which is the honest answer and the one a host must handle anyway.
+
+use std::ffi::{CStr, c_char, c_void};
+
+use clap_sys::ext::gui::{clap_gui_resize_hints, clap_plugin_gui, clap_window};
+use clap_sys::plugin::clap_plugin;
+
+use crate::Instance;
+
+/// Size the editor asks for, and the size a test asserts it got.
+pub const WIDTH: u32 = 420;
+pub const HEIGHT: u32 = 260;
+
+pub static EXT_GUI: clap_plugin_gui = clap_plugin_gui {
+    is_api_supported: Some(is_api_supported),
+    get_preferred_api: Some(get_preferred_api),
+    create: Some(create),
+    destroy: Some(destroy),
+    set_scale: Some(set_scale),
+    get_size: Some(get_size),
+    can_resize: Some(can_resize),
+    get_resize_hints: Some(get_resize_hints),
+    adjust_size: Some(adjust_size),
+    set_size: Some(set_size),
+    set_parent: Some(set_parent),
+    set_transient: Some(set_transient),
+    suggest_title: Some(suggest_title),
+    show: Some(show),
+    hide: Some(hide),
+};
+
+/// The editor's state, as far as this fixture has any.
+#[derive(Default)]
+pub struct Gui {
+    pub created: bool,
+    pub visible: bool,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    /// The child window, once there is a parent to put it in.
+    pub child: imp::Child,
+}
+
+unsafe extern "C" fn is_api_supported(
+    _plugin: *const clap_plugin,
+    api: *const c_char,
+    is_floating: bool,
+) -> bool {
+    if is_floating || api.is_null() {
+        // Embedded only: a floating window would be the plugin's own, and then
+        // the host could not own the teardown order.
+        return false;
+    }
+    (unsafe { CStr::from_ptr(api) }) == imp::WINDOW_API
+}
+
+unsafe extern "C" fn get_preferred_api(
+    _plugin: *const clap_plugin,
+    api: *mut *const c_char,
+    is_floating: *mut bool,
+) -> bool {
+    if api.is_null() || is_floating.is_null() {
+        return false;
+    }
+    unsafe {
+        *api = imp::WINDOW_API.as_ptr();
+        *is_floating = false;
+    }
+    true
+}
+
+unsafe extern "C" fn create(
+    plugin: *const clap_plugin,
+    api: *const c_char,
+    is_floating: bool,
+) -> bool {
+    if !unsafe { is_api_supported(plugin, api, is_floating) } {
+        return false;
+    }
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    if instance.gui.created {
+        return false;
+    }
+    instance.gui = Gui {
+        created: true,
+        width: WIDTH,
+        height: HEIGHT,
+        scale: 1.0,
+        ..Default::default()
+    };
+    true
+}
+
+unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
+    if let Some(instance) = unsafe { Instance::from_host(plugin) } {
+        // The child window goes with it. A plugin that leaked it here would
+        // leave the host's window with a dead child, which is the failure §5.3
+        // describes from the other side.
+        instance.gui = Gui::default();
+    }
+}
+
+unsafe extern "C" fn set_scale(plugin: *const clap_plugin, scale: f64) -> bool {
+    match unsafe { Instance::from_host(plugin) } {
+        Some(instance) if instance.gui.created => {
+            instance.gui.scale = scale;
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "C" fn get_size(
+    plugin: *const clap_plugin,
+    width: *mut u32,
+    height: *mut u32,
+) -> bool {
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    if width.is_null() || height.is_null() {
+        return false;
+    }
+    // Answered before `create` too: a host asks how big a window to make
+    // before there is anything to put in it.
+    let (w, h) = if instance.gui.created {
+        (instance.gui.width, instance.gui.height)
+    } else {
+        (WIDTH, HEIGHT)
+    };
+    unsafe {
+        *width = w;
+        *height = h;
+    }
+    true
+}
+
+unsafe extern "C" fn can_resize(_plugin: *const clap_plugin) -> bool {
+    true
+}
+
+unsafe extern "C" fn get_resize_hints(
+    _plugin: *const clap_plugin,
+    hints: *mut clap_gui_resize_hints,
+) -> bool {
+    if hints.is_null() {
+        return false;
+    }
+    unsafe {
+        *hints = clap_gui_resize_hints {
+            can_resize_horizontally: true,
+            can_resize_vertically: true,
+            preserve_aspect_ratio: false,
+            aspect_ratio_width: 0,
+            aspect_ratio_height: 0,
+        };
+    }
+    true
+}
+
+/// Round to a 10-pixel grid, so a test can see that the host honoured the
+/// plugin's adjustment rather than its own request.
+unsafe extern "C" fn adjust_size(
+    _plugin: *const clap_plugin,
+    width: *mut u32,
+    height: *mut u32,
+) -> bool {
+    if width.is_null() || height.is_null() {
+        return false;
+    }
+    unsafe {
+        *width = (*width).max(10) / 10 * 10;
+        *height = (*height).max(10) / 10 * 10;
+    }
+    true
+}
+
+unsafe extern "C" fn set_size(plugin: *const clap_plugin, width: u32, height: u32) -> bool {
+    match unsafe { Instance::from_host(plugin) } {
+        Some(instance) if instance.gui.created => {
+            instance.gui.width = width;
+            instance.gui.height = height;
+            instance.gui.child.resize(width, height);
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "C" fn set_parent(plugin: *const clap_plugin, window: *const clap_window) -> bool {
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    if !instance.gui.created || window.is_null() {
+        return false;
+    }
+    let w = unsafe { *window };
+    if w.api.is_null() || (unsafe { CStr::from_ptr(w.api) }) != imp::WINDOW_API {
+        return false;
+    }
+    let parent = unsafe { w.specific.ptr };
+    instance
+        .gui
+        .child
+        .create(parent, instance.gui.width, instance.gui.height)
+}
+
+unsafe extern "C" fn set_transient(
+    _plugin: *const clap_plugin,
+    _window: *const clap_window,
+) -> bool {
+    false
+}
+
+unsafe extern "C" fn suggest_title(_plugin: *const clap_plugin, _title: *const c_char) {}
+
+unsafe extern "C" fn show(plugin: *const clap_plugin) -> bool {
+    match unsafe { Instance::from_host(plugin) } {
+        Some(instance) if instance.gui.created => {
+            instance.gui.visible = true;
+            instance.gui.child.show(true);
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "C" fn hide(plugin: *const clap_plugin) -> bool {
+    match unsafe { Instance::from_host(plugin) } {
+        Some(instance) if instance.gui.created => {
+            instance.gui.visible = false;
+            instance.gui.child.show(false);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+pub mod imp {
+    use std::ffi::{CStr, c_void};
+
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SW_HIDE, SW_SHOW,
+        SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_PAINT, WNDCLASSEXW, WS_CHILD,
+        WS_VISIBLE,
+    };
+
+    pub const WINDOW_API: &CStr = clap_sys::ext::gui::CLAP_WINDOW_API_WIN32;
+
+    const CLASS_NAME: &[u16] = &[
+        b'C' as u16,
+        b'l' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b'T' as u16,
+        b'e' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'G' as u16,
+        b'u' as u16,
+        b'i' as u16,
+        0,
+    ];
+
+    fn ensure_class() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: 0,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: CLASS_NAME.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            RegisterClassExW(&class);
+        });
+    }
+
+    /// The plugin's own window, living inside the host's.
+    #[derive(Default)]
+    pub struct Child(HWND);
+
+    impl Child {
+        pub fn create(&mut self, parent: *mut c_void, width: u32, height: u32) -> bool {
+            if parent.is_null() || !self.0.is_null() {
+                return false;
+            }
+            ensure_class();
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    CLASS_NAME.as_ptr(),
+                    std::ptr::null(),
+                    WS_CHILD | WS_VISIBLE,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    parent as HWND,
+                    std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()),
+                    std::ptr::null(),
+                )
+            };
+            self.0 = hwnd;
+            !hwnd.is_null()
+        }
+
+        pub fn resize(&mut self, width: u32, height: u32) {
+            if self.0.is_null() {
+                return;
+            }
+            unsafe {
+                SetWindowPos(
+                    self.0,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    SWP_NOMOVE | SWP_NOZORDER,
+                );
+            }
+        }
+
+        pub fn show(&mut self, visible: bool) {
+            if !self.0.is_null() {
+                unsafe { ShowWindow(self.0, if visible { SW_SHOW } else { SW_HIDE }) };
+            }
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { DestroyWindow(self.0) };
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            if msg == WM_PAINT {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                // A colour nothing else would paint, so a screenshot of a
+                // failing teardown is unambiguous about who drew what.
+                let brush = CreateSolidBrush(0x00A0_5000);
+                FillRect(hdc, &ps.rcPaint, brush);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub mod imp {
+    use std::ffi::{CStr, c_void};
+
+    /// A window API no host will ask for, so `is_api_supported` says no and the
+    /// rest of this module is never reached.
+    pub const WINDOW_API: &CStr = c"unsupported";
+
+    #[derive(Default)]
+    pub struct Child;
+
+    impl Child {
+        pub fn create(&mut self, _parent: *mut c_void, _width: u32, _height: u32) -> bool {
+            false
+        }
+        pub fn resize(&mut self, _width: u32, _height: u32) {}
+        pub fn show(&mut self, _visible: bool) {}
+    }
+}
+
+/// Suppress the unused-import warning where `c_void` is only used by cfg'd code.
+#[allow(dead_code)]
+type _Unused = *mut c_void;

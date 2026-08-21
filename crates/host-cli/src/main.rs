@@ -1372,7 +1372,7 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
     let reference = |path: &str| -> Result<serde_json::Value, String> {
         let class = render::choose_class(Path::new(path), None)?;
         Ok(serde_json::json!({
-            "format": "vst3",
+            "format": class.format.tag(),
             "plugin_id": class.id,
             "path_hint": path,
             "display_name": class.name,
@@ -1545,7 +1545,7 @@ fn inject_instrument(
     let reference = |path: &str| -> Result<serde_json::Value, String> {
         let class = render::choose_class(Path::new(path), None)?;
         Ok(serde_json::json!({
-            "format": "vst3",
+            "format": class.format.tag(),
             "plugin_id": class.id,
             "path_hint": path,
             "display_name": class.name,
@@ -1914,7 +1914,7 @@ fn inject_sidechain(
         let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
         Ok((
             serde_json::json!({
-                "format": "vst3",
+                "format": class.format.tag(),
                 "plugin_id": class.id,
                 "path_hint": path,
                 "display_name": class.name,
@@ -2092,7 +2092,7 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         {
             "instance": 0,
             "reference": {
-                "format": "vst3",
+                "format": class.format.tag(),
                 "plugin_id": class.id,
                 "path_hint": plugin,
                 "display_name": class.name,
