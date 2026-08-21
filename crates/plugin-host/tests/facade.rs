@@ -21,10 +21,22 @@ impl HostContext for TestHost {
     fn request_restart(&self, _reason: RestartReason) {}
 }
 
-fn fixture_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let build_dir = exe.parent()?.parent()?;
-    [
+/// The CLAP fixture, under a `.clap` name.
+///
+/// The facade infers the format from the extension and cargo's artefact is
+/// named `.dll`, so it is copied rather than renamed — the original belongs to
+/// cargo and the next build would replace it anyway.
+///
+/// Panics when the fixture is missing, for the reason spelled out in
+/// `clap-host/tests/fixture_plugin.rs`: skipping would make a green run mean
+/// nothing.
+fn fixture_as_clap() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    let build_dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the test binary is two levels below the build directory");
+    let source = [
         "clap_test_plugin.dll",
         "libclap_test_plugin.so",
         "libclap_test_plugin.dylib",
@@ -32,26 +44,26 @@ fn fixture_path() -> Option<PathBuf> {
     .iter()
     .map(|n| build_dir.join(n))
     .find(|p| p.is_file())
-}
+    .unwrap_or_else(|| {
+        panic!(
+            "clap-test-plugin is not in {}.\n\
+             Run `cargo build --workspace` before `cargo test --workspace`: \
+             cargo does not build another package's cdylib on its own.",
+            build_dir.display()
+        )
+    });
 
-/// The fixture with a `.clap` extension, since the facade infers the format
-/// from the path and a build artefact is named `.dll`.
-fn fixture_as_clap() -> Option<PathBuf> {
-    let source = fixture_path()?;
-    let target = source.with_extension("clap");
-    // Copied rather than renamed: the original is cargo's artefact and the next
-    // build would replace it anyway.
-    std::fs::copy(&source, &target).ok()?;
-    Some(target)
+    // A distinct name per test binary, so two of them cannot copy over each
+    // other's file while the other has it loaded.
+    let target = build_dir.join("facade-fixture.clap");
+    std::fs::copy(&source, &target).expect("the fixture can be copied");
+    target
 }
 
 #[test]
 fn the_facade_loads_a_clap_by_path_alone() {
     plugin_host::init_thread();
-    let Some(path) = fixture_as_clap() else {
-        eprintln!("clap-test-plugin has not been built; skipping");
-        return;
-    };
+    let path = fixture_as_clap();
 
     // The extension is the only thing that says which backend answers.
     let classes = scan_module(&path).expect("scans");

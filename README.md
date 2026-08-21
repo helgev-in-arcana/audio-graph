@@ -267,9 +267,13 @@ pub trait SubPluginProcessor: Send {         // オーディオスレッド専�
 ## 開発
 
 ```sh
-cargo build --workspace
+cargo build --workspace   # 先に。cargo test は他パッケージの cdylib を作らないため
 cargo test --workspace
 ```
+
+CLAP バックエンドのテストは `clap-test-plugin`（ワークスペース内の本物の `.clap`）を
+実際にロードして検査します。ビルドされていなければテストは**スキップせず落ちます** ──
+「緑だが何も検査していない」を避けるためです。
 
 ### host-cli — DAW なしで確かめる
 

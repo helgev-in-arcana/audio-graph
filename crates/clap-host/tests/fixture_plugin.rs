@@ -42,10 +42,20 @@ impl HostContext for TestHost {
 ///
 /// A `.clap` on Windows and Linux *is* the shared library, so the artifact is
 /// loadable as it stands and nothing has to be copied or renamed.
-fn fixture_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+///
+/// **Panics rather than skipping when it is missing.** `cargo test` does not
+/// build another package's `cdylib` — a dependency only pulls in its `rlib` —
+/// so a skip here would be a green run that tested nothing, which is the exact
+/// failure ADR-13 exists to prevent. Build the workspace first; CHECKS.md says
+/// so, and unlike an installed third-party plugin this artifact can always be
+/// there.
+pub fn fixture_path() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test binary has a path");
     // .../target/<profile>/deps/<test>.exe
-    let build_dir = exe.parent()?.parent()?;
+    let build_dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the test binary is two levels below the build directory");
     let names = [
         "clap_test_plugin.dll",
         "libclap_test_plugin.so",
@@ -55,14 +65,19 @@ fn fixture_path() -> Option<PathBuf> {
         .iter()
         .map(|n| build_dir.join(n))
         .find(|p| p.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "clap-test-plugin is not in {}.\n\
+                 Run `cargo build --workspace` before `cargo test --workspace`: \
+                 cargo does not build another package's cdylib on its own.",
+                build_dir.display()
+            )
+        })
 }
 
 #[test]
 fn the_backend_drives_a_real_clap_module() {
-    let Some(path) = fixture_path() else {
-        eprintln!("clap-test-plugin has not been built; run `cargo build -p clap-test-plugin`");
-        return;
-    };
+    let path = fixture_path();
 
     // --- module and factory ------------------------------------------------
 
