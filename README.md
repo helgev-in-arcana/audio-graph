@@ -12,10 +12,11 @@
   - OSはLinuxまで対応可能です。MacOSはGithub Actionsでビルド可能ですが動作確認ができません。
   - VST2、CLAP対応予定です。
 - UIは現在仮組みです。改良予定です。ゲインが現在dBではなく実数値倍率になっています。
+- 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
+- コード署名が現在ありません。
 
 ―――――――――――――――――――――――――――――――――――――――🚧🚧🚧
 
-<!-- TODO: エディタのスクリーンショット -->
 ![](./docs/example-screenshot.png)
 
 ## 現時点でできること
@@ -28,7 +29,7 @@
 
 ## 現時点でできないこと
 
-- Win以外の対応
+- Win以外の対応 (Win11(x86_64)のみ動作確認)
 - VST3以外の対応
 - プラグインプロセス分離
 - 32bitプラグイン読み込み
@@ -40,9 +41,23 @@
 - ディレイノードでディレイ量が変化したときに波形の補間がうまくいっていない
 - ほか、存在するであろう未発見のバグ
 
+見つけた場合はIssueまで。
+一方で、現在アルファ版ですので開発によってバグが直ったり増えたり復活したりする可能性が0ではありません。
+
+## リリース
+
+https://github.com/helgev-in-arcana/audio-graph/releases
+
 ## License
 
 MIT OR Apache-2.0
+
+配布バイナリに組み込まれる依存ライブラリとフォントの著作権表示は
+[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) にまとめてあります。
+
+VST is a trademark of Steinberg Media Technologies GmbH, registered in Europe
+and other countries. 本プロジェクトは Steinberg Media Technologies GmbH と
+提携・関連するものではありません。
 
 ---
 

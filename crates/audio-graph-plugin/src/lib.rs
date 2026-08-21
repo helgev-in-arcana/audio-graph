@@ -45,8 +45,8 @@ macro_rules! wrapper_class {
     ) => {
         impl Plugin for $ty {
             const NAME: &'static str = $name;
-            const VENDOR: &'static str = "audio-graph";
-            const URL: &'static str = "https://example.invalid/audio-graph";
+            const VENDOR: &'static str = "https://github.com/helgev-in-arcana";
+            const URL: &'static str = "https://github.com/helgev-in-arcana/audio-graph";
             const EMAIL: &'static str = "";
             const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
@@ -114,7 +114,7 @@ macro_rules! wrapper_class {
         }
 
         impl Vst3Plugin for $ty {
-            const VST3_CLASS_ID: [u8; 16] = *$vst3_id;
+            const VST3_CLASS_ID: [u8; 16] = $vst3_id;
             const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = $vst3_categories;
         }
 
@@ -176,9 +176,16 @@ wrapper_class! {
     name: "Audio Graph FX",
     kind: WrapperKind::Effect,
     layouts: FX_LAYOUTS,
-    vst3_id: b"AudioGraphFx0001",
+    // 21f59683-14c0-466e-911b-cc12b7853aaa. Random, and fixed for good: a host
+    // finds this plugin by its class id alone, so changing it makes every
+    // saved project report the plugin as missing. It moves only alongside a
+    // deliberate break of that kind.
+    vst3_id: [
+        0x21, 0xf5, 0x96, 0x83, 0x14, 0xc0, 0x46, 0x6e, 0x91, 0x1b, 0xcc, 0x12, 0xb7, 0x85, 0x3a,
+        0xaa,
+    ],
     vst3_categories: &[Vst3SubCategory::Fx, Vst3SubCategory::Tools],
-    clap_id: "audio-graph.wrapper.fx",
+    clap_id: "io.github.helgev-in-arcana.audio-graph.fx",
     clap_features: &[ClapFeature::AudioEffect, ClapFeature::Stereo, ClapFeature::Utility],
 }
 
@@ -187,9 +194,13 @@ wrapper_class! {
     name: "Audio Graph Instrument",
     kind: WrapperKind::Instrument,
     layouts: INSTRUMENT_LAYOUTS,
-    vst3_id: b"AudioGraphInst01",
+    // c6d15c26-fa9c-43b4-bd58-e7f061c7d794. Fixed for good, as above.
+    vst3_id: [
+        0xc6, 0xd1, 0x5c, 0x26, 0xfa, 0x9c, 0x43, 0xb4, 0xbd, 0x58, 0xe7, 0xf0, 0x61, 0xc7, 0xd7,
+        0x94,
+    ],
     vst3_categories: &[Vst3SubCategory::Instrument, Vst3SubCategory::Synth],
-    clap_id: "audio-graph.wrapper.instrument",
+    clap_id: "io.github.helgev-in-arcana.audio-graph.instrument",
     clap_features: &[ClapFeature::Instrument, ClapFeature::Stereo],
 }
 
