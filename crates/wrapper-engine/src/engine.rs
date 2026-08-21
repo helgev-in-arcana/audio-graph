@@ -16,9 +16,9 @@ use crate::audio::MAX_BUFFERS;
 use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
 use crate::program::{
-    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
-    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS,
-    MAX_REGISTERS, NoteSource, Op, Operand, Program, RateSpec,
+    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_CHANNELS,
+    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS,
+    NoteSource, Op, Operand, Program, RateSpec,
 };
 
 /// How many `DelayRead` taps one program may have.
@@ -224,10 +224,16 @@ pub struct Engine {
     /// (§14.11). Set by `prepare`, because it is fixed for as long as the DAW
     /// keeps us activated.
     daw_inputs: Vec<u16>,
-    /// One ring per audio delay line, `MAX_CHANNELS * MAX_AUDIO_DELAY` samples
-    /// (§14.5). Split per line for the same reason the param rings are: a
-    /// program swap reorders them by moving pointers.
+    /// One ring per audio delay line, as long as the node asked for (§14.5).
+    ///
+    /// Allocated on the main thread and carried in on the program, because this
+    /// thread may not allocate (§9.1) and only that side knows both the graph's
+    /// `max_time` and the sample rate. Split per line for the same reason the
+    /// param rings are: a program swap reorders them by moving pointers.
     audio_rings: Vec<Vec<f32>>,
+    /// Samples per channel in each of those, mirrored so the ops do not have to
+    /// reach into the program for it.
+    audio_ring_len: Vec<usize>,
     audio_ring_heads: Vec<usize>,
     audio_ring_nodes: Vec<u32>,
     audio_ring_order: Vec<usize>,
@@ -247,6 +253,35 @@ impl Default for Engine {
     fn default() -> Self {
         Engine::new()
     }
+}
+
+/// Move a delay line's contents into a differently sized ring.
+///
+/// The samples that matter are the most recent ones, so the copy walks
+/// backwards from the old head and lands them at the end of the new ring.
+/// Anything that no longer fits is the oldest of it, which is the part a
+/// shorter line was never going to read again anyway.
+///
+/// `head` comes in pointing into the old ring and goes out pointing into the
+/// new one.
+fn copy_ring(from: &[f32], from_len: usize, to: &mut [f32], to_len: usize, head: &mut usize) {
+    if from_len == 0 || to_len == 0 {
+        *head = 0;
+        return;
+    }
+    let keep = from_len.min(to_len);
+    for ch in 0..MAX_CHANNELS {
+        let (src, dst) = (ch * from_len, ch * to_len);
+        for i in 0..keep {
+            // `keep` samples ending at the old head, laid down ending at the
+            // new one — which is `keep`, since the new ring starts empty.
+            let at = (*head + from_len - keep + i) % from_len;
+            if src + at < from.len() && dst + i < to.len() {
+                to[dst + i] = from[src + at];
+            }
+        }
+    }
+    *head = keep % to_len;
 }
 
 /// Four-point cubic Hermite, the interpolator §14.5 asks for.
@@ -330,9 +365,10 @@ impl Engine {
             ring_heads: vec![0; MAX_DELAY_LINES],
             ring_nodes: vec![u32::MAX; MAX_DELAY_LINES],
             ring_order: vec![0; MAX_DELAY_LINES],
-            // Empty until `prepare`: 3 MB of rings is not worth holding for a
-            // wrapper the DAW has not activated.
+            // Empty until a program with a delay line in it arrives, and then
+            // only as long as that line asked for.
             audio_rings: (0..MAX_AUDIO_DELAY_LINES).map(|_| Vec::new()).collect(),
+            audio_ring_len: vec![0; MAX_AUDIO_DELAY_LINES],
             audio_ring_heads: vec![0; MAX_AUDIO_DELAY_LINES],
             audio_ring_nodes: vec![u32::MAX; MAX_AUDIO_DELAY_LINES],
             audio_ring_order: vec![0; MAX_AUDIO_DELAY_LINES],
@@ -417,6 +453,35 @@ impl Engine {
             &next.audio_delay_nodes,
             0.0,
         );
+        // A line whose length changed comes with a new ring. Swapping rather
+        // than assigning is what sends the old one home: it rides back inside
+        // the program at the next swap, and is freed on the main thread (§9.1).
+        let next = self.program.as_mut().expect("take reported a swap");
+        for line in 0..next.audio_delay_nodes.len().min(MAX_AUDIO_DELAY_LINES) {
+            let len = next.audio_ring_len.get(line).copied().unwrap_or(0);
+            if next.audio_rings.get(line).is_some_and(|r| !r.is_empty()) {
+                std::mem::swap(&mut self.audio_rings[line], &mut next.audio_rings[line]);
+                // Carry over what will still fit, most recent samples last, so
+                // a feedback loop survives someone widening its range.
+                let from = &next.audio_rings[line];
+                copy_ring(
+                    from,
+                    self.audio_ring_len[line],
+                    &mut self.audio_rings[line],
+                    len,
+                    &mut self.audio_ring_heads[line],
+                );
+                self.audio_ring_len[line] = len;
+            } else if self.audio_ring_len[line] != len {
+                // The main thread thought this line already had the right ring
+                // and it does not. Reading a stale length would read off the
+                // end; an empty line is silence, which is recoverable.
+                self.audio_ring_len[line] = 0;
+            }
+        }
+        for line in next.audio_delay_nodes.len()..MAX_AUDIO_DELAY_LINES {
+            self.audio_ring_len[line] = 0;
+        }
         // Which tap is which may have changed, and sweeping a read pointer from
         // where a different tap left it would be a click. One chunk of jump is
         // the cheaper wrong answer.
@@ -461,13 +526,10 @@ impl Engine {
         self.pool.fill(0.0);
         self.compensators.fill(0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
-        // §14.5 wants these sized from the longest delay in the graph. There is
-        // no graph yet when the DAW activates us, so they are sized from a
-        // ceiling instead and the node's `max_time` bounds what it reads.
-        for ring in &mut self.audio_rings {
-            ring.clear();
-            ring.resize(MAX_CHANNELS * MAX_AUDIO_DELAY, 0.0);
-        }
+        // The delay rings are *not* sized here. §14.5 wants them sized from the
+        // graph's `max_time`, and there is no graph yet — the DAW activates us
+        // before the state is restored. They arrive with the program instead,
+        // allocated on the main thread by `Program::size_rings`.
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
     }
 
@@ -488,13 +550,10 @@ impl Engine {
         self.compensators
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
-        // §14.5 wants these sized from the longest delay in the graph. There is
-        // no graph yet when the DAW activates us, so they are sized from a
-        // ceiling instead and the node's `max_time` bounds what it reads.
-        for ring in &mut self.audio_rings {
-            ring.clear();
-            ring.resize(MAX_CHANNELS * MAX_AUDIO_DELAY, 0.0);
-        }
+        // The delay rings are *not* sized here. §14.5 wants them sized from the
+        // graph's `max_time`, and there is no graph yet — the DAW activates us
+        // before the state is restored. They arrive with the program instead,
+        // allocated on the main thread by `Program::size_rings`.
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
     }
 
@@ -727,17 +786,23 @@ impl Engine {
                         continue;
                     }
                     let width = program.buffers[*out as usize] as usize;
-                    for (n, &src) in inputs.iter().enumerate() {
+                    for (n, input) in inputs.iter().enumerate() {
+                        let gain = input
+                            .lane
+                            .and_then(|lane| ctx.lane(row, lane))
+                            .unwrap_or(input.gain) as f32;
                         for ch in 0..width.min(MAX_CHANNELS) {
-                            let from = self.at(src, ch, frames);
+                            let from = self.at(input.buf, ch, frames);
                             let to = self.at(*out, ch, frames);
-                            if from == to {
-                                // Already in place: the first input may well
-                                // have been given the destination buffer.
+                            if from == to && gain == 1.0 {
+                                // Already in place and unchanged: the first
+                                // input may well have been given the
+                                // destination buffer, and a mix of one at unity
+                                // is then nothing at all.
                                 continue;
                             }
                             for i in 0..frames {
-                                let value = self.pool[from + i];
+                                let value = self.pool[from + i] * gain;
                                 if n == 0 {
                                     self.pool[to + i] = value;
                                 } else {
@@ -772,7 +837,7 @@ impl Engine {
                         // this chunk's own writes.
                         let floor = frames as f64 + 2.0;
                         let ceiling = (max_time * ctx.sample_rate)
-                            .min((MAX_AUDIO_DELAY - 4) as f64)
+                            .min(self.audio_ring_len[*line as usize].saturating_sub(4) as f64)
                             .max(floor);
                         (seconds * ctx.sample_rate).clamp(floor, ceiling)
                     });
@@ -819,7 +884,8 @@ impl Engine {
         frames: usize,
         distance: f64,
     ) {
-        if line >= self.audio_rings.len() || self.audio_rings[line].is_empty() {
+        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
+        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
             self.fill(buf, frames, 0.0);
             return;
         }
@@ -830,7 +896,7 @@ impl Engine {
         };
         let head = self.audio_ring_heads[line];
         for ch in 0..width.min(MAX_CHANNELS) {
-            let ring = ch * MAX_AUDIO_DELAY;
+            let ring = ch * ring_len;
             let to = self.at(buf, ch, frames);
             for i in 0..frames {
                 // The sweep lands exactly on `distance` at the last sample, so
@@ -842,7 +908,7 @@ impl Engine {
                 let fraction = position - whole;
                 let at = whole as i64;
                 let y = |offset: i64| -> f32 {
-                    let index = (at + offset).rem_euclid(MAX_AUDIO_DELAY as i64) as usize;
+                    let index = (at + offset).rem_euclid(ring_len as i64) as usize;
                     self.audio_rings[line][ring + index]
                 };
                 self.pool[to + i] = hermite(y(-1), y(0), y(1), y(2), fraction as f32);
@@ -860,17 +926,18 @@ impl Engine {
     /// reads saw, and a delay of one chunk reads the chunk before it rather
     /// than itself.
     fn delay_write(&mut self, line: usize, buf: Buf, width: usize, frames: usize) {
-        if line >= self.audio_rings.len() || self.audio_rings[line].is_empty() {
+        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
+        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
             return;
         }
         let head = self.audio_ring_heads[line];
         for ch in 0..MAX_CHANNELS {
-            let ring = ch * MAX_AUDIO_DELAY;
+            let ring = ch * ring_len;
             // A channel the source does not have still has to be written, or
             // the line would keep replaying whatever a wider patch left there.
             let from = self.at(buf, ch, frames);
             for i in 0..frames {
-                let at = (head + i) % MAX_AUDIO_DELAY;
+                let at = (head + i) % ring_len;
                 self.audio_rings[line][ring + at] = if ch < width.min(MAX_CHANNELS) {
                     self.pool[from + i]
                 } else {
@@ -878,7 +945,7 @@ impl Engine {
                 };
             }
         }
-        self.audio_ring_heads[line] = (head + frames) % MAX_AUDIO_DELAY;
+        self.audio_ring_heads[line] = (head + frames) % ring_len;
     }
 
     /// Push a buffer through a fixed delay, in place (§14.6).
@@ -1112,14 +1179,22 @@ mod tests {
         }
     }
 
-    /// A context for a test with no automation in it. The sample rate is one
-    /// sample per second, so a delay time in seconds *is* a delay in samples
-    /// and the assertions can be about individual samples.
+    /// The rate the audio tests run at. Real rather than convenient, because
+    /// the delay rings are sized in seconds and a fake rate would make a
+    /// sensible `max_time` come out as four samples.
+    const RATE: f64 = 48_000.0;
+
+    /// Samples, as the seconds a delay node wants.
+    fn seconds(samples: f64) -> f64 {
+        samples / RATE
+    }
+
+    /// A context for a test with no automation in it.
     fn audio_ctx(frames: u32) -> AudioContext<'static> {
         AudioContext {
             frames,
             quantum: 32,
-            sample_rate: 1.0,
+            sample_rate: RATE,
             lanes: &[],
             lanes_per_row: 0,
         }
@@ -1127,7 +1202,11 @@ mod tests {
 
     fn load(engine: &mut Engine, graph: &Graph) {
         let handoff = Handoff::new();
-        handoff.send(Box::new(compile(graph, SLOTS).unwrap()));
+        let mut program = compile(graph, SLOTS).unwrap();
+        // What the wrapper's `publish_graph` does, and for the same reason: the
+        // rings are allocated on this side and ride over with the program.
+        program.size_rings(RATE, &[]);
+        handoff.send(Box::new(program));
         assert!(engine.adopt(&handoff));
     }
 
@@ -1479,6 +1558,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
@@ -1763,8 +1844,8 @@ mod tests {
         )
     }
 
-    /// The two halves of an audio delay line, on line 0, at `time` seconds.
-    fn audio_delay(graph: &mut Graph, time: f64) -> (NodeId, NodeId) {
+    /// The two halves of an audio delay line, on line 0, `samples` back.
+    fn audio_delay(graph: &mut Graph, samples: f64) -> (NodeId, NodeId) {
         let write = graph.add(
             NodeKind::DelayWrite {
                 line: 0,
@@ -1776,8 +1857,9 @@ mod tests {
             NodeKind::DelayRead {
                 line: 0,
                 ty: PortType::STEREO,
-                max_time: 1000.0,
-                time,
+                // Room for the sweeps, without asking for a megabyte of ring.
+                max_time: 0.05,
+                time: seconds(samples),
             },
             [0.0, 0.0],
         );
@@ -1799,7 +1881,6 @@ mod tests {
         let mut graph = Graph::new();
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
-        // 64 samples, at the one-sample-per-second rate of `audio_ctx`.
         let (write, read) = audio_delay(&mut graph, 64.0);
         graph.connect(input, 0, write, 0);
         graph.connect(read, 0, output, 0);
@@ -1879,6 +1960,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
@@ -1976,7 +2059,7 @@ mod tests {
                 &AudioContext {
                     frames: 128,
                     quantum: 32,
-                    sample_rate: 1.0,
+                    sample_rate: RATE,
                     lanes: &lanes,
                     lanes_per_row,
                 },
@@ -1986,8 +2069,12 @@ mod tests {
             );
             counting.0
         };
-        assert_eq!(run(64.0), run(400.0));
-        assert_eq!(run(64.0), 4, "one call per sub-block, because of the loop");
+        assert_eq!(run(seconds(64.0)), run(seconds(400.0)));
+        assert_eq!(
+            run(seconds(64.0)),
+            4,
+            "one call per sub-block, because of the loop"
+        );
     }
 
     /// The headline of M8.5: moving the delay time moves the pitch, and does
@@ -2040,14 +2127,14 @@ mod tests {
             let mut lanes = vec![0.0f64; lanes_per_row * 4];
             for row in 0..4 {
                 let swept = (block - 4).max(0) as f64 * 4.0 + row as f64;
-                lanes[row * lanes_per_row + lane] = 300.0 - swept * 8.0;
+                lanes[row * lanes_per_row + lane] = seconds(300.0 - swept * 8.0);
             }
             let mut daw_out = vec![0.0f32; 2 * 128];
             engine.run_audio(
                 &AudioContext {
                     frames: 128,
                     quantum: 32,
-                    sample_rate: 1.0,
+                    sample_rate: RATE,
                     lanes: &lanes,
                     lanes_per_row,
                 },
@@ -2071,6 +2158,138 @@ mod tests {
             .map(|s| (s - 1.25).abs())
             .fold(0.0f32, f32::max);
         assert!(worst < 0.02, "largest departure from 1.25 was {worst}");
+    }
+
+    /// A mix of one input is a gain, which is the whole reason the gains live
+    /// on `Mix` rather than on a node of their own.
+    #[test]
+    fn a_mix_of_one_is_a_gain() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let gain = graph.add(
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 1,
+                gains: vec![0.25],
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, gain, 0);
+        graph.connect(gain, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+
+        let daw_in: Vec<f32> = (0..2 * 8).map(|i| i as f32).collect();
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(&audio_ctx(8), &daw_in, &mut daw_out, &mut Adders);
+        let want: Vec<f32> = daw_in.iter().map(|v| v * 0.25).collect();
+        assert_eq!(daw_out, want);
+    }
+
+    /// Each input has its own gain, and the sum is of the scaled ones. This is
+    /// what turns a feedback loop's gain down below unity so it decays.
+    #[test]
+    fn each_mix_input_is_scaled_before_the_sum() {
+        let mut graph = Graph::new();
+        let a = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let mix = graph.add(
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 2,
+                gains: vec![0.5, 0.25],
+            },
+            [0.0, 0.0],
+        );
+        // The same source into both inputs: 0.5 + 0.25 of it should come out.
+        graph.connect(a, 0, mix, 0);
+        graph.connect(a, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+
+        let daw_in = vec![4.0f32; 2 * 8];
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(&audio_ctx(8), &daw_in, &mut daw_out, &mut Adders);
+        assert!(
+            daw_out.iter().all(|&v| (v - 3.0).abs() < 1e-6),
+            "{daw_out:?}"
+        );
+    }
+
+    /// §14.5. The ring is as long as the node asked for, not as long as some
+    /// ceiling — and widening `max_time` gets a longer one without emptying it.
+    #[test]
+    fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let (write, read) = audio_delay(&mut graph, 200.0);
+        graph.connect(input, 0, write, 0);
+        graph.connect(read, 0, output, 0);
+
+        let mut program = compile(&graph, SLOTS).unwrap();
+        let sized = program.size_rings(RATE, &[]);
+        // 0.05 s at 48 kHz, plus the interpolator's headroom.
+        assert_eq!(program.audio_ring_len, vec![2404]);
+        assert_eq!(program.audio_rings[0].len(), MAX_CHANNELS * 2404);
+
+        // Publishing again with nothing changed hands over no ring at all.
+        let mut again = compile(&graph, SLOTS).unwrap();
+        let sized_again = again.size_rings(RATE, &sized);
+        assert!(
+            again.audio_rings[0].is_empty(),
+            "an unchanged line is left alone"
+        );
+        assert_eq!(sized_again, sized);
+
+        let mut engine = Engine::new();
+        engine.prepare(128, &[2]);
+        let handoff = Handoff::new();
+        handoff.send(Box::new(program));
+        assert!(engine.adopt(&handoff));
+
+        let daw_in = impulse(128, 8);
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+
+        // Now ask for four times the range. The ring has to be reallocated on
+        // the main thread, and the impulse still in it has to survive.
+        if let Some(NodeKind::DelayRead { max_time, .. }) =
+            graph.node_mut(read).map(|n| &mut n.kind)
+        {
+            *max_time = 0.2;
+        }
+        let mut wider = compile(&graph, SLOTS).unwrap();
+        wider.size_rings(RATE, &sized);
+        assert_eq!(wider.audio_ring_len, vec![9604]);
+        assert!(
+            !wider.audio_rings[0].is_empty(),
+            "a changed line gets a new ring"
+        );
+        let handoff = Handoff::new();
+        handoff.send(Box::new(wider));
+        assert!(engine.adopt(&handoff));
+
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        engine.run_audio(
+            &audio_ctx(128),
+            &vec![0.0; 2 * 128],
+            &mut daw_out,
+            &mut Adders,
+        );
+        assert_eq!(
+            daw_out[..128]
+                .iter()
+                .position(|v| v.abs() > 0.9)
+                .expect("the impulse came through the reallocation"),
+            8 + 200 - 128
+        );
     }
 
     /// §14.5. Recompiling happens on every drag of every control; a feedback

@@ -1761,6 +1761,9 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
 /// done here instead (ROADMAP). No sub-plugin is involved: the patch is an
 /// input, a mix, a delay line and an output, which is the smallest thing that
 /// puts §14.4's cut in the middle of a cycle.
+/// How much of the loop goes back round, on the `Mix` node's second input.
+const FEEDBACK: f64 = 0.7;
+
 fn cmd_delay(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
     use vst3_host::Vst3Plugin;
@@ -1803,7 +1806,7 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
     let mut repeats: Vec<usize> = Vec::new();
     let mut i = 1;
     while i < big.frames {
-        if big.samples[i].abs() > 0.2 {
+        if big.samples[i].abs() > 0.1 {
             repeats.push(i);
             i += expected / 2;
         }
@@ -1827,7 +1830,25 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
         if at.abs_diff(want) > 1 {
             return Err(format!("repeat {} landed at {at}, expected {want}", n + 1));
         }
+        // And each one is the last one times the mix's gain, which is the only
+        // thing in the patch that could be making them fade.
+        let height = big.samples[at].abs();
+        let want = FEEDBACK.powi(n as i32 + 1) as f32;
+        if (height - want).abs() > 0.02 {
+            return Err(format!(
+                "repeat {} came back at {height:.4}, expected {want:.4}",
+                n + 1
+            ));
+        }
     }
+    println!(
+        "  repeats fade by the mix's gain: {:?}",
+        repeats
+            .iter()
+            .take(4)
+            .map(|&at| format!("{:.3}", big.samples[at].abs()))
+            .collect::<Vec<_>>()
+    );
 
     let worst = big
         .samples
@@ -1882,6 +1903,10 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
         wrapper_engine::NodeKind::Mix {
             channels: 2,
             inputs: 2,
+            // The dry signal at unity, the loop below it, so the repeats fade
+            // rather than running for ever. Checking that they fade *by this
+            // much* is what puts the mix's gains under test too.
+            gains: vec![1.0, FEEDBACK],
         },
         [320.0, 40.0],
     );
@@ -1893,10 +1918,6 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
         *t = time;
         *max_time = time * 2.0;
     }
-    // The loop has no gain node in it: the graph has no audio multiply yet, so
-    // the repeats come back at full height rather than fading. That makes the
-    // block-size comparison sharper, and two seconds is not long enough for it
-    // to be a problem.
     graph.connect(input, 0, mix, 0);
     graph.connect(read, 0, mix, 1);
     graph.connect(mix, 0, output, 0);

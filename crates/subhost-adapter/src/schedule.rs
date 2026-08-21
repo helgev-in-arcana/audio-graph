@@ -21,16 +21,17 @@ use crate::slots::SLOT_COUNT;
 /// How many values one sub-block carries.
 ///
 /// The 32 slots the DAW automates, then one lane per parameter the graph drives
-/// directly (§14.12), then one per automated delay time (§14.5). One buffer
+/// directly (§14.12), then one per audio-side control the graph automates — a
+/// delay time (§14.5) or a gain. One buffer
 /// rather than three because they are produced by the same evaluator pass and
 /// consumed by the same merge: the evaluator writes a lane exactly the way it
 /// writes a slot, and nothing below the compiler has to know which is which.
 ///
 /// The ranges are disjoint and fixed, which is what lets each consumer read
-/// only its own: the sub-plugin adapter never sees a delay time, and the audio
-/// half never sees a parameter.
+/// only its own: the sub-plugin adapter never sees a delay time or a gain, and
+/// the audio half never sees a parameter.
 pub const LANES: usize =
-    SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS + wrapper_engine::MAX_DELAY_LANES;
+    SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS + wrapper_engine::MAX_AUDIO_LANES;
 
 /// The finest sub-block the schedule is sized for.
 pub const MIN_QUANTUM: u32 = 16;

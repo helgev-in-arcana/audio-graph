@@ -576,18 +576,33 @@ impl GraphEditor {
             NodeKind::Plugin { instance, ports } => {
                 changed |= self.plugin_controls(ui, *instance, ports, ctx);
             }
-            NodeKind::Mix { inputs, .. } => {
+            NodeKind::Mix { inputs, gains, .. } => {
                 ui.horizontal(|ui| {
                     ui.label("inputs");
                     let mut count = *inputs as u32;
+                    // One is allowed, and useful: a mix of one input *is* a
+                    // gain, which is what turns a feedback delay's loop down
+                    // below unity so it decays.
                     if ui
-                        .add(egui::DragValue::new(&mut count).range(2..=8))
+                        .add(egui::DragValue::new(&mut count).range(1..=8))
                         .changed()
                     {
                         *inputs = count as u8;
                         changed = true;
                     }
                 });
+                // Grown here rather than at load: a patch saved before the
+                // gains existed has none, and every missing one is unity.
+                gains.resize(*inputs as usize, 1.0);
+                for (i, gain) in gains.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("gain {}", i + 1));
+                        changed |= ui
+                            .add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
+                            .changed();
+                    });
+                }
+                ui.weak("a gain is used only while its socket is unconnected");
             }
             NodeKind::AudioIn { bus, .. } | NodeKind::AudioOut { bus, .. } => {
                 ui.horizontal(|ui| {
@@ -889,6 +904,20 @@ fn catalogue() -> Vec<(&'static str, NodeKind)> {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                gains: vec![1.0, 1.0],
+            },
+        ),
+        (
+            "Gain",
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 1,
+                // Half back round is a delay that decays over a few repeats,
+                // which is what a one-input mix is nearly always dropped in to
+                // do. It is the same node as the one above — only the starting
+                // shape differs, and having both in the menu is cheaper than
+                // making the user work that out.
+                gains: vec![0.5],
             },
         ),
     ]

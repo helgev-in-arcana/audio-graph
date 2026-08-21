@@ -12,7 +12,7 @@
 
 use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType, Rate};
 use crate::program::{
-    MAX_DELAY_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
+    MAX_AUDIO_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
     ParamTarget, Program, RateSpec, Reg,
 };
 
@@ -131,9 +131,10 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     // (§14.12). The evaluator writes them the same way it writes a slot, so
     // nothing below the compiler has to know the difference.
     let mut param_targets: Vec<ParamTarget> = Vec::new();
-    // The same idea one range further along, for automated delay times: the
-    // node it belongs to, and the lane number it was given (§14.5).
-    let mut delay_lanes: Vec<(NodeId, u16)> = Vec::new();
+    // The same idea one range further along, for the two things the *audio*
+    // half reads: a delay time (§14.5) and a gain. The node it belongs to, and
+    // the lane number it was given.
+    let mut audio_lanes: Vec<((NodeId, u8), u16)> = Vec::new();
 
     let mut next_reg: usize = 0;
     let mut alloc = || -> Result<Reg, CompileError> {
@@ -284,22 +285,8 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                         // the audio pass runs after every sub-block of the
                         // param pass, so a register would hold the wrong one).
                         if let Some(reg) = time_reg {
-                            let lane = match delay_lanes.iter().position(|&(n, _)| n == id) {
-                                Some(existing) => existing,
-                                None => {
-                                    if delay_lanes.len() >= MAX_DELAY_LANES {
-                                        return Err(CompileError::TooLarge {
-                                            what: "automated delay times",
-                                            limit: MAX_DELAY_LANES,
-                                        });
-                                    }
-                                    delay_lanes.push((id, 0));
-                                    delay_lanes.len() - 1
-                                }
-                            };
-                            let number = (slot_count + MAX_GRAPH_PARAMS + lane) as u16;
-                            delay_lanes[lane].1 = number;
-                            outputs.push((number, reg));
+                            let lane = audio_lane(&mut audio_lanes, slot_count, (id, 0))?;
+                            outputs.push((lane, reg));
                         }
                     }
                     _ => {
@@ -370,16 +357,25 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     }
                 }
             }
-            NodeKind::AudioIn { .. }
-            | NodeKind::AudioOut { .. }
-            | NodeKind::NoteIn
-            | NodeKind::Mix { .. } => {}
+            // A mix's gains are params, so the param half is where their lanes
+            // are booked; the scaling itself is the audio half's. The gain
+            // sockets sit after the audio inputs.
+            NodeKind::Mix { inputs, .. } => {
+                for i in 0..inputs {
+                    let Some(reg) = input(inputs + i) else {
+                        continue;
+                    };
+                    let lane = audio_lane(&mut audio_lanes, slot_count, (id, inputs + i))?;
+                    outputs.push((lane, reg));
+                }
+            }
+            NodeKind::AudioIn { .. } | NodeKind::AudioOut { .. } | NodeKind::NoteIn => {}
         }
     }
 
     ops.append(&mut writes);
 
-    let audio = crate::audio::compile_audio(graph, &order, &lines, &delay_lanes)?;
+    let audio = crate::audio::compile_audio(graph, &order, &lines, &audio_lanes)?;
 
     outputs.sort_unstable();
     Ok(Program {
@@ -394,8 +390,38 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         audio_delay_nodes: audio.delay_nodes,
+        audio_ring_seconds: audio.ring_seconds,
+        // Filled in on the main thread, which is the only side that knows the
+        // sample rate and the only side allowed to allocate (§9.1).
+        audio_ring_len: Vec::new(),
+        audio_rings: Vec::new(),
         lfo_nodes,
     })
+}
+
+/// The lane a node's audio-side control is written to, booking one if this is
+/// the node's first.
+///
+/// A range of its own, past the slot table and past §14.12's parameter lanes,
+/// so that each consumer reads only what it understands: the sub-plugin adapter
+/// never sees one of these, and the audio half never sees a parameter.
+fn audio_lane(
+    lanes: &mut Vec<((NodeId, u8), u16)>,
+    slot_count: usize,
+    socket: (NodeId, u8),
+) -> Result<u16, CompileError> {
+    if let Some(&(_, lane)) = lanes.iter().find(|&&(s, _)| s == socket) {
+        return Ok(lane);
+    }
+    if lanes.len() >= MAX_AUDIO_LANES {
+        return Err(CompileError::TooLarge {
+            what: "automated delay times and gains",
+            limit: MAX_AUDIO_LANES,
+        });
+    }
+    let lane = (slot_count + MAX_GRAPH_PARAMS + lanes.len()) as u16;
+    lanes.push((socket, lane));
+    Ok(lane)
 }
 
 /// One delay line, as the compiler sees it.

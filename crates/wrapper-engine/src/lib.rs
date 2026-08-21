@@ -31,7 +31,7 @@ pub use graph::{
 };
 pub use handoff::Handoff;
 pub use program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY, MAX_AUDIO_DELAY_LINES, MAX_CHANNELS,
-    MAX_DELAY_LANES, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS,
-    NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
+    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
+    MAX_AUDIO_LANES, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS, MAX_LFOS,
+    MAX_REGISTERS, NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
 };

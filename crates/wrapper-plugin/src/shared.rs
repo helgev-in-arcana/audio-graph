@@ -67,6 +67,13 @@ pub struct MainState {
     /// Read at activate, like the slot bindings, so a new socket only reaches
     /// audio after a restart.
     pub graph_params: Vec<ParamTarget>,
+    /// Which delay ring was last handed to the audio thread, and how long it
+    /// was (§14.5).
+    ///
+    /// Only so the next publish can tell whether anything changed. A recompile
+    /// happens on every drag of every control, and allocating 700 kB each time
+    /// to replace a ring with an identical one would be silly.
+    pub sized_rings: Vec<(NodeId, usize)>,
 }
 
 /// The live processor, and the only thing the audio thread ever waits on.
@@ -134,6 +141,7 @@ impl Shared {
                 compile_error: None,
                 instance_io: Vec::new(),
                 graph_params: Vec::new(),
+                sized_rings: Vec::new(),
             })),
             audio: Mutex::new(AudioState { processor: None }),
             programs: Handoff::new(),
@@ -220,8 +228,14 @@ impl Shared {
     pub fn publish_graph(&self) {
         let mut state = self.main();
         match compile(&state.graph, SLOT_COUNT) {
-            Ok(program) => {
+            Ok(mut program) => {
                 state.compile_error = None;
+                // The delay rings are allocated here, on the main thread, and
+                // ride over inside the program (§14.5, §9.1). `sized_rings`
+                // remembers what was sent last time so an unchanged line is
+                // handed nothing rather than a fresh copy of what it has.
+                state.sized_rings =
+                    program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
                 // A graph edit can change which buses a sub-plugin needs —
                 // wiring a sidechain is exactly that — and a bus cannot be
                 // switched on while the plugin is active. Whether the change

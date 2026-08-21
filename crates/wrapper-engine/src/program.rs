@@ -39,26 +39,25 @@ pub const MAX_DELAY_LINES: usize = 16;
 /// would mean a reallocation every time the user drags the time control.
 pub const MAX_DELAY_TAPS: usize = 4096;
 
-/// How many *audio* delay lines one program may have, and how long each is.
+/// How many *audio* delay lines one program may have, and how far back one can
+/// read.
 ///
 /// Counted apart from [`MAX_DELAY_LINES`] because an audio line costs a ring of
-/// samples rather than a ring of sub-block values: four stereo lines of 96 000
-/// samples is 3 MB, and sixteen would be 12 MB per activated wrapper. The
-/// length is 2 s at 48 kHz and 1 s at 96 kHz.
-///
-/// §14.5 asks for the ring to be sized from the node's `max_time` at activate.
-/// A fixed ceiling is what is implemented: `prepare` runs before any graph
-/// exists, so the length it would have to ask about is not knowable yet. The
-/// node's `max_time` still bounds what the line will read.
-pub const MAX_AUDIO_DELAY_LINES: usize = 4;
-pub const MAX_AUDIO_DELAY: usize = 96_000;
+/// samples rather than a ring of sub-block values. The length is what a line
+/// may be *asked* for, not what it costs: each ring is allocated from its
+/// node's `max_time` (§14.5), so a 250 ms delay costs 250 ms. 10 s is the
+/// ceiling because something has to bound `max_time`, and a delay longer than
+/// that is a looper rather than a delay.
+pub const MAX_AUDIO_DELAY_LINES: usize = 8;
+pub const MAX_AUDIO_DELAY_SECONDS: f64 = 10.0;
 
-/// Lanes past the slot table that carry a delay time rather than a parameter.
+/// Lanes past the slot table that carry something the *audio* half reads: a
+/// delay time (§14.5) or a gain.
 ///
 /// Same mechanism as §14.12 and a disjoint range of lane numbers, so the
-/// evaluator writes a delay time exactly the way it writes a slot and the
-/// adapter, which only knows about parameters, never sees one.
-pub const MAX_DELAY_LANES: usize = MAX_AUDIO_DELAY_LINES;
+/// evaluator writes one exactly the way it writes a slot and the adapter,
+/// which only knows about parameters, never sees one.
+pub const MAX_AUDIO_LANES: usize = 16;
 
 /// How many parallel paths one program may compensate, and by how much.
 ///
@@ -173,6 +172,18 @@ pub enum Op {
 /// An index into the audio buffer pool.
 pub type Buf = u16;
 
+/// One input of an [`AudioOp::Mix`]: where it comes from, and how loud.
+///
+/// `lane` names the schedule lane carrying the gain when the user has wired
+/// its socket; without one, `gain` is the whole story. Same arrangement as
+/// [`AudioOp::DelayRead`]'s time, and the same range of lane numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixIn {
+    pub buf: Buf,
+    pub lane: Option<u16>,
+    pub gain: f64,
+}
+
 /// How often the audio half of a program is evaluated (§14.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Chunking {
@@ -242,8 +253,12 @@ pub enum AudioOp {
     /// conversion is an op rather than a rule inside `Plugin` so it is visible
     /// in the compiled program and can be asserted on.
     Gather { out: Buf, buses: Vec<(Buf, u16)> },
-    /// Sum several buffers into one.
-    Mix { out: Buf, inputs: Vec<Buf> },
+    /// Sum several buffers into one, each scaled first.
+    ///
+    /// `out` may be the first input's buffer — that is what makes the mix an
+    /// accumulate rather than a copy, and with one input it makes a gain a
+    /// scaling in place that costs no buffer at all.
+    Mix { out: Buf, inputs: Vec<MixIn> },
     /// Delay a buffer by a fixed number of samples.
     ///
     /// Inserted by the compiler to line up parallel paths (§14.6), never placed
@@ -281,6 +296,21 @@ pub struct Program {
     /// Which slot each output drives, and where its value ends up. Sorted by
     /// slot, and at most one entry per slot.
     pub outputs: Vec<(u16, Reg)>,
+    /// Audio line index → how many samples per channel its ring holds.
+    ///
+    /// From the node's `max_time` and the sample rate, so a line costs what it
+    /// was asked for (§14.5). The compiler cannot fill it in — it does not know
+    /// the sample rate — so the main thread does, in `size_rings`.
+    pub audio_ring_len: Vec<usize>,
+    /// Rings for the lines whose length has changed, allocated on the main
+    /// thread and handed over with the program (§9.1, §9.4).
+    ///
+    /// Empty — the usual case — means "keep the ones you have". A recompile
+    /// happens on every drag of every control, and reallocating 700 kB each
+    /// time to hand back something the same size would be silly.
+    pub audio_rings: Vec<Vec<f32>>,
+    /// Audio line index → the longest a read on it asks for, in seconds.
+    pub audio_ring_seconds: Vec<f64>,
     /// Audio line index → the `DelayWrite` node it belongs to.
     ///
     /// Separate from `delay_nodes`: audio lines are numbered among themselves,
@@ -337,8 +367,58 @@ impl Program {
             latency: 0,
             delay_nodes: Vec::new(),
             audio_delay_nodes: Vec::new(),
+            audio_ring_len: Vec::new(),
+            audio_rings: Vec::new(),
+            audio_ring_seconds: Vec::new(),
             lfo_nodes: Vec::new(),
         }
+    }
+
+    /// Give each audio delay line a ring as long as its node asked for
+    /// (§14.5).
+    ///
+    /// Main thread only — it allocates, and that is the point: the audio
+    /// thread must never do it (§9.1), and only this side knows both the
+    /// graph's `max_time` and the DAW's sample rate. The rings ride over
+    /// inside the program, so they arrive at exactly the moment the line
+    /// numbering they belong to does.
+    ///
+    /// `previous` is what the last call returned. A line already holding a ring
+    /// of the right length gets an empty entry, which the engine reads as "keep
+    /// the one you have" — otherwise every drag of every control would hand
+    /// over a fresh 700 kB to replace something identical.
+    ///
+    /// Returns what it decided, for the next call to compare against.
+    pub fn size_rings(
+        &mut self,
+        sample_rate: f64,
+        previous: &[(NodeId, usize)],
+    ) -> Vec<(NodeId, usize)> {
+        let ceiling = (MAX_AUDIO_DELAY_SECONDS * sample_rate.max(1.0)) as usize;
+        self.audio_ring_len = self
+            .audio_ring_seconds
+            .iter()
+            // Four samples over what was asked for: the read pointer is
+            // fractional and the interpolator looks two samples past it.
+            .map(|&s| ((s.max(0.0) * sample_rate).ceil() as usize + 4).clamp(64, ceiling))
+            .collect();
+        let want: Vec<(NodeId, usize)> = self
+            .audio_delay_nodes
+            .iter()
+            .copied()
+            .zip(self.audio_ring_len.iter().copied())
+            .collect();
+        self.audio_rings = want
+            .iter()
+            .map(|entry| {
+                if previous.contains(entry) {
+                    Vec::new()
+                } else {
+                    vec![0.0; MAX_CHANNELS * entry.1]
+                }
+            })
+            .collect();
+        want
     }
 
     /// Whether running this program would do nothing observable.

@@ -9,8 +9,8 @@
 
 use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType};
 use crate::program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUX_BUSES, MAX_COMPENSATION,
-    MAX_COMPENSATORS, NoteSource,
+    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
+    MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS, MixIn, NoteSource,
 };
 
 use crate::compile::{CompileError, Line, NO_WRITER};
@@ -24,6 +24,9 @@ pub(crate) struct Audio {
     /// Audio line index → its `DelayWrite` node, so a program swap can carry
     /// the ring contents over (§14.5).
     pub delay_nodes: Vec<NodeId>,
+    /// Audio line index → the longest any read on it asks for, in seconds.
+    /// What the main thread sizes the ring from.
+    pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
     pub chunking: Chunking,
     pub latency: u32,
@@ -115,6 +118,14 @@ impl Pool {
     }
 }
 
+/// The lane the param half booked for one socket, if it booked one.
+fn lane_of(lanes: &[((NodeId, u8), u16)], node: NodeId, port: u8) -> Option<u16> {
+    lanes
+        .iter()
+        .find(|&&(socket, _)| socket == (node, port))
+        .map(|&(_, lane)| lane)
+}
+
 /// The audio index of `line`, assigning one if this is its first mention.
 ///
 /// `delay_nodes` grows alongside, so index `i` always names the writer of the
@@ -123,6 +134,7 @@ impl Pool {
 fn audio_line(
     audio_lines: &mut Vec<LineId>,
     delay_nodes: &mut Vec<NodeId>,
+    ring_seconds: &mut Vec<f64>,
     lines: &[Line],
     line: LineId,
 ) -> Result<u16, CompileError> {
@@ -136,6 +148,7 @@ fn audio_line(
         });
     }
     audio_lines.push(line);
+    ring_seconds.push(0.0);
     delay_nodes.push(
         lines
             .iter()
@@ -171,7 +184,7 @@ pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
     lines: &[Line],
-    delay_lanes: &[(NodeId, u16)],
+    audio_lanes: &[((NodeId, u8), u16)],
 ) -> Result<Audio, CompileError> {
     let mut ops: Vec<AudioOp> = Vec::new();
     let mut pool = Pool::new();
@@ -184,6 +197,7 @@ pub(crate) fn compile_audio(
     // index space.
     let mut audio_lines: Vec<LineId> = Vec::new();
     let mut delay_nodes: Vec<NodeId> = Vec::new();
+    let mut ring_seconds: Vec<f64> = Vec::new();
     // Held back and appended last, for the reason the param half holds its
     // writes back (`compile`): within one chunk every read must see the line as
     // it stood before this chunk was written, or a delay of exactly one chunk
@@ -331,7 +345,11 @@ pub(crate) fn compile_audio(
                     latency: in_latency + ports.latency,
                 });
             }
-            NodeKind::Mix { channels, .. } => {
+            NodeKind::Mix {
+                channels,
+                inputs: count,
+                gains,
+            } => {
                 // §14.6, the merge point: every branch waits for the latest one
                 // or they phase-cancel.
                 let arrive = sources
@@ -340,7 +358,11 @@ pub(crate) fn compile_audio(
                     .max()
                     .unwrap_or(0);
                 let mut inputs = Vec::new();
-                for (buf, late) in sources.iter().flatten().copied() {
+                for (port, (buf, late)) in sources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(port, s)| s.map(|s| (port, s)))
+                {
                     if arrive > late {
                         if compensators as usize >= MAX_COMPENSATORS {
                             return Err(CompileError::TooLarge {
@@ -361,17 +383,23 @@ pub(crate) fn compile_audio(
                         });
                         compensators += 1;
                     }
-                    inputs.push(buf);
+                    inputs.push(MixIn {
+                        buf,
+                        // The gain socket for input `port` sits `count` sockets
+                        // further along.
+                        lane: lane_of(audio_lanes, id, (*count as usize + port) as u8),
+                        gain: gains.get(port).copied().unwrap_or(1.0),
+                    });
                 }
-                for &buf in &inputs {
-                    pool.consume(buf);
+                for input in &inputs {
+                    pool.consume(input.buf);
                 }
                 // The first input may be reused as the destination — that is
                 // what makes the mix an accumulate rather than a copy — but the
                 // rest may not, or the sum would be built out of a buffer that
                 // has already been written over.
-                let out =
-                    pool.alloc_avoiding(*channels, readers, inputs.get(1..).unwrap_or(&[]))?;
+                let avoid: Vec<Buf> = inputs.iter().skip(1).map(|i| i.buf).collect();
+                let out = pool.alloc_avoiding(*channels, readers, &avoid)?;
                 ops.push(AudioOp::Mix { out, inputs });
                 produced.push(Produced {
                     node: id,
@@ -385,12 +413,22 @@ pub(crate) fn compile_audio(
                 max_time,
                 time,
             } => {
-                let index = audio_line(&mut audio_lines, &mut delay_nodes, lines, *line)?;
+                let index = audio_line(
+                    &mut audio_lines,
+                    &mut delay_nodes,
+                    &mut ring_seconds,
+                    lines,
+                    *line,
+                )?;
+                // Several reads may share a line — that is a multi-tap delay —
+                // and the ring has to be long enough for the furthest of them.
+                let want = max_time.clamp(0.0, MAX_AUDIO_DELAY_SECONDS);
+                ring_seconds[index as usize] = ring_seconds[index as usize].max(want);
                 let out = pool.alloc(*channels, readers)?;
                 ops.push(AudioOp::DelayRead {
                     out,
                     line: index,
-                    lane: delay_lanes.iter().find(|&&(n, _)| n == id).map(|&(_, l)| l),
+                    lane: lane_of(audio_lanes, id, 0),
                     time: time.max(0.0),
                     max_time: max_time.max(0.0),
                 });
@@ -407,7 +445,13 @@ pub(crate) fn compile_audio(
                 line,
                 ty: PortType::Audio { .. },
             } => {
-                let index = audio_line(&mut audio_lines, &mut delay_nodes, lines, *line)?;
+                let index = audio_line(
+                    &mut audio_lines,
+                    &mut delay_nodes,
+                    &mut ring_seconds,
+                    lines,
+                    *line,
+                )?;
                 if let Some((buf, _)) = sources[0] {
                     pool.consume(buf);
                     writes.push(AudioOp::DelayWrite {
@@ -433,6 +477,7 @@ pub(crate) fn compile_audio(
         instances,
         ops,
         delay_nodes,
+        ring_seconds,
         buffers: pool.widths,
         chunking: if looped {
             Chunking::SubBlock
@@ -596,6 +641,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
@@ -629,6 +676,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
@@ -684,6 +733,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
@@ -822,6 +873,8 @@ mod tests {
             NodeKind::Mix {
                 channels: 2,
                 inputs: 2,
+                // Empty is unity: what a mix did before it had gains.
+                gains: Vec::new(),
             },
             [0.0, 0.0],
         );
