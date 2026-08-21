@@ -5,6 +5,8 @@ members = [
     "crates/host-window",
     "crates/vst3-host",
     "crates/vst3-host-view",
+    "crates/clap-host",
+    "crates/clap-test-plugin",
     "crates/subhost-adapter",
     "crates/audio-graph-engine",
     "crates/audio-graph-plugin",
@@ -21,6 +23,7 @@ plugin-host-api = { path = "crates/plugin-host-api" }
 vst3-host = { path = "crates/vst3-host" }
 vst3-host-view = { path = "crates/vst3-host-view" }
 host-window = { path = "crates/host-window" }
+clap-host = { path = "crates/clap-host" }
 subhost-adapter = { path = "crates/subhost-adapter" }
 # Nothing depends on this yet; it is the M5 node graph's crate, declared here so
 # the workspace shows where it goes. `cargo add`/`cargo remove` prune workspace
@@ -29,6 +32,7 @@ subhost-adapter = { path = "crates/subhost-adapter" }
 audio-graph-engine = { path = "crates/audio-graph-engine" }
 
 vst3 = "0.3.0"
+clap-sys = "0.5.0"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

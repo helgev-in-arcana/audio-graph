@@ -1,0 +1,21 @@
+[package]
+name = "clap-test-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# A fixture, not a product. `clap-host` has to be exercised against a real
+# module — a `.clap` that is loaded, initialised, activated and processed — and
+# no CLAP plugin ships with the machine the way a VST3 does. Writing the plugin
+# side ourselves makes the backend's tests hermetic and, unlike a third-party
+# plugin, lets a test assert on exact sample values.
+[lib]
+name = "clap_test_plugin"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+clap-sys.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

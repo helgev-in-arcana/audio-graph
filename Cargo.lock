@@ -296,10 +296,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "clap-host"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "host-window",
+ "libc",
+ "log",
+ "plugin-host-api",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "clap-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
+
+[[package]]
+name = "clap-test-plugin"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "clipboard-win"
