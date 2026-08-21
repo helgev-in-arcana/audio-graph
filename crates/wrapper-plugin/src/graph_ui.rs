@@ -239,10 +239,18 @@ impl GraphEditor {
             if ui.button("Centre").clicked() {
                 self.pan = Vec2::ZERO;
             }
+            if ui
+                .button("Reset")
+                .on_hover_text("back to audio in -> audio out")
+                .clicked()
+            {
+                *graph = Graph::default_patch();
+                *changed = true;
+            }
             if !graph.is_empty()
                 && ui
                     .button("Clear")
-                    .on_hover_text("delete every node")
+                    .on_hover_text("delete every node — nothing drawn means silence")
                     .clicked()
             {
                 *graph = Graph::new();

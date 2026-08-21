@@ -127,7 +127,7 @@ impl Shared {
             main: MainThread::new(RefCell::new(MainState {
                 host,
                 config: None,
-                graph: Graph::new(),
+                graph: Graph::default_patch(),
                 compile_error: None,
                 instance_io: Vec::new(),
                 graph_params: Vec::new(),
@@ -254,6 +254,48 @@ impl Shared {
         let resumed = self.resume();
         result?;
         resumed
+    }
+
+    /// Give a patch that has no graph the one it was implicitly running.
+    ///
+    /// Everything saved before this commit relied on the wrapper passing audio
+    /// through by itself — no graph meant "input to output", and one sub-plugin
+    /// with no graph meant "through that plugin". Those paths are gone, so a
+    /// project reopened against this build would go silent unless the routing
+    /// it was already getting is drawn for it.
+    pub fn adopt_default_patch(&self) {
+        {
+            let mut state = self.main();
+            // Empty, or still untouched: `restore_state` adopts before the
+            // development override has had a chance to load anything, so the
+            // patch this finds the second time round is the one it just drew.
+            if !state.graph.is_empty() && state.graph != Graph::default_patch() {
+                return;
+            }
+            state.graph = Graph::default_patch();
+        }
+        // A single loaded sub-plugin was the pre-M8 patch: put it in the middle.
+        if self.main().host.is_loaded(0) {
+            let node = self.main().graph.add(
+                NodeKind::Plugin {
+                    instance: 0,
+                    ports: PluginPorts::default(),
+                },
+                [210.0, 80.0],
+            );
+            // Sockets before links: `discover_ports` prunes, and a link into a
+            // socket the node does not have yet is exactly what it prunes.
+            self.discover_ports(node);
+            let mut state = self.main();
+            let (input, output) = (state.graph.nodes[0].id, state.graph.nodes[1].id);
+            state.graph.links.clear();
+            state.graph.connect(input, 0, node, 0);
+            state.graph.connect(node, 0, output, 0);
+            // Out of the way of the plugin we just slid in.
+            state.graph.node_mut(output).unwrap().pos = [520.0, 80.0];
+            drop(state);
+        }
+        self.publish_graph();
     }
 
     /// Re-read one plugin node's sockets from the plugin itself.

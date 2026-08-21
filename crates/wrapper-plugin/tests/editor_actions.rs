@@ -292,6 +292,48 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
     );
 }
 
+/// A project saved before the canvas showed the through-connection has to keep
+/// making sound: what it was implicitly getting is drawn for it on open.
+#[test]
+fn a_patch_saved_without_a_graph_gets_the_default_one() {
+    use wrapper_engine::{Graph, NodeKind};
+
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
+    shared.main().graph = Graph::new();
+    shared.adopt_default_patch();
+
+    let state = shared.main();
+    assert_eq!(state.graph.nodes.len(), 2);
+    assert!(matches!(
+        state.graph.nodes[0].kind,
+        NodeKind::AudioIn { bus: 0, .. }
+    ));
+    assert!(matches!(
+        state.graph.nodes[1].kind,
+        NodeKind::AudioOut { bus: 0, .. }
+    ));
+    assert_eq!(state.graph.links.len(), 1, "and it is wired");
+}
+
+/// A patch that was deliberately emptied is not a patch that never had a graph,
+/// but nothing tells them apart in the file — so adoption only ever fires on a
+/// graph with no nodes at all, and never touches one the user built.
+#[test]
+fn adoption_leaves_an_existing_graph_alone() {
+    use wrapper_engine::NodeKind;
+
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
+    let before = {
+        let mut state = shared.main();
+        state
+            .graph
+            .add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
+        state.graph.clone()
+    };
+    shared.adopt_default_patch();
+    assert_eq!(shared.main().graph, before);
+}
+
 /// The graph has to survive being saved and reopened, including when the
 /// sub-plugin it was built against is not there (§8.3).
 #[test]
@@ -303,6 +345,7 @@ fn a_graph_survives_the_state_round_trip() {
     shared.set_quantum(64);
     {
         let mut state = shared.main();
+        state.graph = Graph::default_patch();
         let c = state
             .graph
             .add(NodeKind::Constant { value: 0.25 }, [10.0, 20.0]);
@@ -319,8 +362,13 @@ fn a_graph_survives_the_state_round_trip() {
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
     assert_eq!(restored, shared.main().graph);
+    let constant = restored
+        .nodes
+        .iter()
+        .find(|n| matches!(n.kind, NodeKind::Constant { .. }))
+        .expect("the constant was saved");
     assert_eq!(
-        restored.nodes[0].pos,
+        constant.pos,
         [10.0, 20.0],
         "positions are part of the patch"
     );

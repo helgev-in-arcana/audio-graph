@@ -199,14 +199,15 @@ fn the_old_program_is_freed_on_the_main_thread() {
 
 #[test]
 fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
-    // The compatibility claim: a project with no graph must behave exactly as
-    // it did before M5, right down to producing no extra parameter events.
+    // A new instance starts with audio in wired to audio out and nothing else,
+    // so the DAW's automation has to arrive at the slots untouched — the graph
+    // carries audio, but it drives no parameter lane.
     let shared = shared();
     shared.publish_graph();
 
     let mut engine = Engine::new();
     engine.adopt(shared.programs());
-    assert!(!engine.has_program());
+    assert!((0..SLOT_COUNT).all(|slot| !engine.drives(slot)));
 
     let mut slots = vec![0.42; SLOT_COUNT];
     engine.run(

@@ -535,6 +535,34 @@ impl Graph {
         Graph::default()
     }
 
+    /// The patch a new instance starts with: the main input wired straight to
+    /// the main output, drawn.
+    ///
+    /// The wrapper used to pass audio through whenever no graph was running,
+    /// which meant the most common routing of all was the one thing the canvas
+    /// never showed. Making it two nodes and a link costs nothing and keeps the
+    /// rule simple: **what you hear is what is drawn** — an empty canvas is
+    /// silence, not a bypass.
+    pub fn default_patch() -> Graph {
+        let mut graph = Graph::new();
+        let input = graph.add(
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+            [60.0, 80.0],
+        );
+        let output = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [360.0, 80.0],
+        );
+        graph.connect(input, 0, output, 0);
+        graph
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

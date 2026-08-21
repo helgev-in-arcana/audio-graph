@@ -1216,6 +1216,20 @@ mod tests {
         );
     }
 
+    /// The patch a new instance starts with has to be the through-connection
+    /// the wrapper used to make for itself, or every fresh instance is silent.
+    #[test]
+    fn the_default_patch_passes_audio_through() {
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &Graph::default_patch());
+
+        let daw_in: Vec<f32> = (0..2 * 8).map(|i| i as f32 * 0.1).collect();
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(8, &daw_in, &mut daw_out, &mut Adders);
+        assert_eq!(daw_out, daw_in);
+    }
+
     #[test]
     fn an_unconnected_output_leaves_the_daw_buffer_alone() {
         let mut graph = Graph::new();

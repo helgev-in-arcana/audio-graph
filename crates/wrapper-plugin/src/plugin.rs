@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use nice_plug::prelude::*;
 use plugin_host_api::{
-    AudioBuffers, AudioConfig, BufferLayout, Event, EventSink, NoteEvent as ApiNote,
-    ProcessStatus as ApiStatus, TimeContext,
+    AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
 use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
 use wrapper_engine::{BlockContext, Engine, Graph};
@@ -130,6 +129,7 @@ impl Wrapper {
             }
             Err(e) => log::warn!("audio-graph: wrapper state unreadable: {e}"),
         }
+        self.shared.adopt_default_patch();
         self.shared.publish_graph();
         // Publish it back even when nothing was restored. A project saved
         // without the editor ever being opened would otherwise store the empty
@@ -182,6 +182,7 @@ impl Wrapper {
                 Err(_) => log::warn!("audio-graph: AUDIO_GRAPH_SUB_BIND is not a number"),
             }
         }
+        self.shared.adopt_default_patch();
         self.shared.store_state();
     }
 
@@ -427,31 +428,25 @@ impl Wrapper {
                 &mut nodes,
             );
             ApiStatus::Continue
-        } else if let Some(single) = processor.get_mut(0) {
-            // No audio graph: one sub-plugin, straight through. This is the
-            // pre-M8 path and it stays exactly as it was, because most patches
-            // are still one plugin with its parameters driven.
-            let mut buffers = AudioBuffers::new(
-                &self.input_scratch[..(input_channels * frames).max(1) as usize],
-                &mut self.output_scratch[..(out_channels * frames) as usize],
-                input_channels,
-                out_channels,
-                frames,
-                BufferLayout::Planar,
-            );
-            single.process(
-                &mut buffers,
-                &self.schedule,
-                &self.events,
-                &time,
-                &mut self.out_events,
-            )
         } else {
+            // Nothing is drawn between the input and the output, so nothing
+            // comes out. The wrapper used to pass audio through here — and to
+            // run a lone sub-plugin straight through — but an audible route the
+            // canvas does not show is a route the user cannot edit, so the only
+            // routing left is the one in the graph. `Graph::default_patch`
+            // draws the through-connection a new instance starts with.
+            for ch in 0..channels as usize {
+                buffer.as_slice()[ch][..frame_len].fill(0.0);
+            }
             return ProcessStatus::Normal;
         };
 
         if status == ApiStatus::Error {
-            // Bypass rather than emit noise. The input is already in `buffer`.
+            // Silence rather than noise, and rather than a bypass nothing on
+            // the canvas asked for.
+            for ch in 0..channels as usize {
+                buffer.as_slice()[ch][..frame_len].fill(0.0);
+            }
             return ProcessStatus::Normal;
         }
 
