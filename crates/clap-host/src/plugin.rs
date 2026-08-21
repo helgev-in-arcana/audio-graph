@@ -259,6 +259,11 @@ impl ClapPlugin {
     ///
     /// `owner` is the window it should float above: the DAW's root window when
     /// running as a plugin, null when standalone.
+    // `owner` is a window handle, not memory: it is passed straight to the
+    // platform's window creation call and never read by this crate. Clippy
+    // cannot see the difference, and making the function `unsafe` would put the
+    // obligation on every caller for a pointer none of them dereference either.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn open_editor(&mut self, owner: *mut std::ffi::c_void) -> std::result::Result<(), String> {
         if self.editor.is_some() {
             return Ok(());

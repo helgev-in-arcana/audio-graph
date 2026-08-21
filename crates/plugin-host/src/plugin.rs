@@ -31,6 +31,12 @@ pub struct Plugin {
     class: ClassInfo,
 }
 
+// The two variants differ in size by a few hundred bytes, because a
+// `ClapPlugin` carries its own event buffers. Boxing one of them would buy back
+// that difference at the cost of an indirection on every main-thread call and a
+// less obvious drop order — and a host holds at most a handful of these, one per
+// plugin node, none of them on a hot path.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     /// Field order **is** the teardown order (§5.3): the editor holds an
     /// `IPlugView` created by the controller, which must be removed and

@@ -244,7 +244,7 @@ impl HostShim {
             latency: self.latency.swap(false, Ordering::AcqRel),
             audio_ports: self.audio_ports.swap(false, Ordering::AcqRel),
             gui_resize: (packed != NO_RESIZE)
-                .then(|| ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)),
+                .then_some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)),
             gui_closed: self.gui_closed.swap(false, Ordering::AcqRel),
         }
     }
