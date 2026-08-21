@@ -11,20 +11,19 @@
 //! plugin talks back through, and the ordering rules that keep teardown from
 //! crashing.
 
-mod deferred;
 mod editor;
 mod frame;
-mod keys;
 
-pub use deferred::{Deferred, new as deferred};
 pub use editor::{EditorWindow, can_resize};
 pub use frame::PlugFrame;
-pub use keys::forward as forward_key;
 
-// The container window itself is format-agnostic and lives in `host-window`,
-// where the CLAP backend can reach it without depending on VST3. Re-exported
-// so callers that already speak in this crate's names do not have to change.
-pub use host_window::{ContainerWindow, Size, WindowState, pump_events, root_window};
+// The container window, the deferred queue and the key forwarder are all
+// format-agnostic and live in `host-window`, where the CLAP backend can reach
+// them without depending on VST3. Re-exported so callers that already speak in
+// this crate's names do not have to change.
+pub use host_window::{
+    ContainerWindow, Deferred, Size, WindowState, deferred, forward_key, pump_events, root_window,
+};
 
 /// What the platform handle means to a VST3 plugin.
 ///

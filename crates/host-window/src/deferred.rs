@@ -290,7 +290,7 @@ mod tests {
         // guarantee this type exists to provide.
         assert!(!ran.get());
 
-        host_window::pump_events();
+        crate::pump_events();
         assert!(ran.get());
     }
 
@@ -305,7 +305,7 @@ mod tests {
         let c = count.clone();
         deferred.post(move || c.set(c.get() + 1));
 
-        host_window::pump_events();
+        crate::pump_events();
         assert_eq!(count.get(), 2);
     }
 }

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use audio_graph_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
 use audio_graph_plugin::{Shared, WrapperParams};
-use plugin_host_api::{AudioConfig, HostContext, RestartReason};
+use plugin_host::{AudioConfig, HostContext, RestartReason};
 use subhost_adapter::{SLOT_COUNT, SubHost};
 
 struct SilentHost;
@@ -26,7 +26,7 @@ impl HostContext for SilentHost {
     }
     fn request_restart(&self, _reason: RestartReason) {}
     fn latency_changed(&self, _samples: u32) {}
-    fn param_edited(&self, _id: plugin_host_api::ParamId, _value: f64) {}
+    fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
 }
 
 fn shared() -> Arc<Shared> {

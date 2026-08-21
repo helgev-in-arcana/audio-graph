@@ -49,7 +49,13 @@ pub use plugin_host_api::{
 };
 
 // Window plumbing a host application needs and that no backend owns.
-pub use host_window::{ContainerWindow, Size, pump_events, root_window};
+//
+// `Deferred` is here because the rule it exists for belongs to the host, not to
+// a format: a GUI toolkit's draw callback may only *record* that the user asked
+// for a window, never open one.
+pub use host_window::{
+    ContainerWindow, Deferred, Size, deferred, forward_key, pump_events, root_window,
+};
 
 /// Prepare the calling thread for hosting plugins.
 ///
@@ -61,13 +67,4 @@ pub use host_window::{ContainerWindow, Size, pump_events, root_window};
 /// Idempotent; call it on every thread that will load a plugin.
 pub fn init_thread() {
     vst3_host::init_apartment();
-}
-
-/// Forward a key event to the DAW's window.
-///
-/// A sub-plugin editor is a top-level window of ours, so keys typed into it
-/// never reach the DAW. Both formats have the same problem and the same answer,
-/// which is why it lives at this level.
-pub fn forward_key(daw_window: usize, virtual_key: u16, pressed: bool) {
-    vst3_host_view::forward_key(daw_window, virtual_key, pressed);
 }

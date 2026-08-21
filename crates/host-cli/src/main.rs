@@ -855,7 +855,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     use subhost_adapter::SubHost;
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(path), Some(cid))?;
+    sub.load(0, Path::new(path), Some(&cid.to_hex()))?;
 
     let config = plugin_host_api::AudioConfig {
         sample_rate: 48_000.0,
@@ -2077,7 +2077,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let state = edit_wrapper_state(&baseline, &patched)?;
 
     let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(wrapper), Some(class.cid))?;
+    sub.load(0, Path::new(wrapper), Some(&class.cid.to_hex()))?;
     sub.load_sub_state(0, &state)?;
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened the wrapper's editor with a {} node", short(plugin));
@@ -2251,11 +2251,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     use subhost_adapter::SubHost;
 
     let path = args.first().ok_or("expected a plugin path")?;
-    let cid = args
-        .get(1)
-        .map(String::as_str)
-        .filter(|t| !t.is_empty())
-        .and_then(vst3_host::Cid::from_hex);
+    let class_id = args.get(1).map(String::as_str).filter(|t| !t.is_empty());
     let seconds: f64 = args
         .get(2)
         .filter(|s| !s.starts_with("--"))
@@ -2264,7 +2260,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let reverse = args.iter().any(|a| a == "--reverse");
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(path), cid)?;
+    sub.load(0, Path::new(path), class_id)?;
     let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened {name}");

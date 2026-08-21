@@ -125,13 +125,11 @@ dependencies = [
  "nice-plug",
  "nice-plug-egui",
  "parking_lot",
- "plugin-host-api",
+ "plugin-host",
  "raw-window-handle",
  "serde",
  "serde_json",
  "subhost-adapter",
- "vst3-host",
- "vst3-host-view",
 ]
 
 [[package]]
@@ -1961,11 +1959,10 @@ version = "0.1.0"
 dependencies = [
  "audio-graph-engine",
  "log",
+ "plugin-host",
  "plugin-host-api",
  "serde",
  "serde_json",
- "vst3-host",
- "vst3-host-view",
 ]
 
 [[package]]

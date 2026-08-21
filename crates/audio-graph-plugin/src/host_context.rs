@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use plugin_host_api::{HostContext, ParamId, RestartReason};
+use plugin_host::{HostContext, ParamId, RestartReason};
 
 /// The `HostContext` the wrapper injects into the backend.
 ///

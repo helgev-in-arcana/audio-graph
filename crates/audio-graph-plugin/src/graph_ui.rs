@@ -55,9 +55,12 @@ const PORT_SPACING: f32 = 18.0;
 const PORT_RADIUS: f32 = 5.0;
 const GRID: f32 = 24.0;
 
-/// A `.vst3` found on disk, offered in the add-node menu.
+/// A plugin module found on disk, offered in the add-node menu.
 pub struct PluginEntry {
+    /// The file name, extension and all — which is also how the user recognises
+    /// it, since a module's own name is only knowable by loading it.
     pub name: String,
+    pub format: plugin_host::Format,
     pub path: PathBuf,
 }
 
@@ -927,12 +930,17 @@ impl GraphEditor {
                                 .max_height(220.0)
                                 .show(ui, |ui| {
                                     for entry in ctx.plugins {
+                                        // The format is searchable too, so
+                                        // typing "clap" narrows the list to one
+                                        // format without a separate control.
                                         if !needle.is_empty()
                                             && !entry.name.to_lowercase().contains(&needle)
+                                            && !entry.format.tag().contains(needle.as_str())
                                         {
                                             continue;
                                         }
-                                        if ui.selectable_label(false, &entry.name).clicked() {
+                                        let label = format!("{}   {}", entry.name, entry.format);
+                                        if ui.selectable_label(false, label).clicked() {
                                             chosen = Some(entry.path.clone());
                                         }
                                     }

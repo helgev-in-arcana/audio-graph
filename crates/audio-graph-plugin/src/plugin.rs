@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use audio_graph_engine::{BlockContext, Engine, Graph};
 use nice_plug::prelude::*;
-use plugin_host_api::{
+use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
 use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
@@ -174,7 +174,7 @@ impl Wrapper {
                         self.shared
                             .main()
                             .host
-                            .bind_slot(0, 0, plugin_host_api::ParamId(id))
+                            .bind_slot(0, 0, plugin_host::ParamId(id))
                     {
                         log::warn!("audio-graph: AUDIO_GRAPH_SUB_BIND: {e}");
                     }
@@ -586,7 +586,7 @@ fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
 /// on and off were forwarded, because note expression was a §9.3 source with
 /// nothing yet to consume it; now there is.
 fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
-    use plugin_host_api::NoteExpression as Expr;
+    use plugin_host::NoteExpression as Expr;
 
     // The poly expressions all carry the same fields under different names, so
     // the shape is factored out and only the value differs.

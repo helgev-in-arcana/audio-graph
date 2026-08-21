@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use audio_graph_plugin::{Shared, WrapperParams};
-use plugin_host_api::{AudioConfig, HostContext, RestartReason};
+use plugin_host::{AudioConfig, HostContext, RestartReason};
 use subhost_adapter::SubHost;
 
 struct SilentHost;
@@ -23,7 +23,7 @@ impl HostContext for SilentHost {
     }
     fn request_restart(&self, _reason: RestartReason) {}
     fn latency_changed(&self, _samples: u32) {}
-    fn param_edited(&self, _id: plugin_host_api::ParamId, _value: f64) {}
+    fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
 }
 
 /// Plugins this test will not instantiate.
@@ -90,20 +90,21 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
 
 fn candidate_paths() -> Vec<std::path::PathBuf> {
     // A test thread is not an initialised STA and plugins assume one (§13).
-    vst3_host::init_apartment();
+    plugin_host::init_thread();
     if let Ok(explicit) = std::env::var("AUDIO_GRAPH_TEST_SUB") {
         return vec![std::path::PathBuf::from(explicit)];
     }
-    vst3_host::default_plugin_directories()
-        .iter()
-        .flat_map(|d| vst3_host::find_modules(d))
+    // Both formats, exactly as the editor's own rescan sees them.
+    plugin_host::installed_modules()
+        .into_iter()
+        .map(|(_, path)| path)
         .collect()
 }
 
 #[test]
 fn the_editors_actions_work_against_an_installed_plugin() {
     let Some((path, shared)) = a_plugin_with_parameters() else {
-        eprintln!("no installed VST3 with parameters; skipping");
+        eprintln!("no installed plugin with parameters; skipping");
         return;
     };
     eprintln!("driving the editor's actions against {}", path.display());
@@ -120,10 +121,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     });
 
     // "Rescan" — the list the editor draws.
-    let installed: usize = vst3_host::default_plugin_directories()
-        .iter()
-        .map(|d| vst3_host::find_modules(d).len())
-        .sum();
+    let installed = plugin_host::installed_modules().len();
     assert!(installed > 0, "the plugin list would be empty");
 
     // Clicking an entry in that list.
@@ -389,7 +387,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     use audio_graph_engine::{NodeKind, PluginPorts};
 
     let Some((path, shared)) = a_plugin_with_parameters() else {
-        eprintln!("no installed VST3 with parameters; skipping");
+        eprintln!("no installed plugin with parameters; skipping");
         return;
     };
     eprintln!("building a plugin node for {}", path.display());

@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use audio_graph_engine::{Graph, Handoff, Program, compile};
 use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, PluginPorts};
 use parking_lot::Mutex;
-use plugin_host_api::AudioConfig;
+use plugin_host::AudioConfig;
 use subhost_adapter::{
     DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
 };
