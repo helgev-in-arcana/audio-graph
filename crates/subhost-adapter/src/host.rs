@@ -19,7 +19,7 @@ use vst3_host_view::EditorWindow;
 use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
-use wrapper_engine::InstanceIo;
+use wrapper_engine::{InstanceIo, ParamTarget};
 
 pub use crate::state::SubPluginRef;
 
@@ -155,6 +155,32 @@ impl SubHost {
     pub fn capabilities(&self, instance: usize) -> plugin_host_api::Capabilities {
         self.at(instance)
             .map_or_else(Default::default, |l| l.plugin.capabilities())
+    }
+
+    /// Hand one instance its own opaque state blob.
+    ///
+    /// For a harness that wants a plugin to open with a particular patch
+    /// already in it — a DAW does this through the normal state path.
+    pub fn load_sub_state(&mut self, instance: usize, blob: &[u8]) -> Result<(), String> {
+        let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
+        loaded.plugin.load_state(blob).map_err(|e| e.to_string())
+    }
+
+    /// The plugin's buses and note capability, for building a node's sockets
+    /// (§14.2). Empty when nothing is loaded, which draws as a node with no
+    /// sockets rather than as an error.
+    pub fn io_layout(&self, instance: usize) -> plugin_host_api::IoLayout {
+        self.at(instance)
+            .map(|l| SubPluginMain::io_layout(&l.plugin))
+            .unwrap_or_default()
+    }
+
+    /// The lowest instance index nothing is loaded into.
+    ///
+    /// Reused rather than always-increasing so that deleting a plugin node and
+    /// adding another does not walk off the end of [`MAX_INSTANCES`].
+    pub fn free_instance(&self) -> Option<usize> {
+        (0..MAX_INSTANCES).find(|&i| !self.is_loaded(i))
     }
 
     pub fn params(&self, instance: usize) -> &[ParamInfo] {
@@ -364,6 +390,46 @@ impl SubHost {
         Ok(())
     }
 
+    /// Everything driving one instance's parameters, as the audio thread
+    /// wants it: `(lane, target)`.
+    ///
+    /// Two sources, one shape. The slot table is the DAW's automation lanes
+    /// (§8), and the lanes past it are parameter sockets the user wired in the
+    /// graph (§14.12). The merge in `SubHostProcessor::process` does not care
+    /// which is which, and that is the point.
+    fn targets_for(
+        &self,
+        instance: usize,
+        graph_params: &[ParamTarget],
+    ) -> Vec<(usize, ResolvedTarget)> {
+        // Only the slots bound against *this* instance. Handing every instance
+        // the whole table would make one slot drive the same parameter on every
+        // copy (§12-7).
+        let mut targets = self.slots.active_targets(instance as u32);
+        let params = self.params(instance);
+        for (lane, target) in graph_params.iter().enumerate() {
+            if target.instance as usize != instance {
+                continue;
+            }
+            let Some(info) = params.iter().find(|p| p.id.0 == target.param) else {
+                // The parameter went away with a plugin update. The socket
+                // stays in the graph, the same way an unresolved binding stays
+                // in the slot table (§8.3).
+                continue;
+            };
+            targets.push((
+                crate::slots::SLOT_COUNT + lane,
+                ResolvedTarget {
+                    instance: target.instance,
+                    id: info.id,
+                    min: info.min,
+                    max: info.max,
+                },
+            ));
+        }
+        targets
+    }
+
     /// Enter the processing phase, activating every loaded instance.
     ///
     /// All or nothing: if one instance refuses the configuration, the ones
@@ -379,6 +445,7 @@ impl SubHost {
         &mut self,
         config: AudioConfig,
         io: &[InstanceIo],
+        graph_params: &[ParamTarget],
     ) -> Result<SubHostProcessors, String> {
         // One event per slot per sub-block is the worst a graph can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
@@ -387,13 +454,20 @@ impl SubHost {
             .max_block_size
             .div_ceil(crate::schedule::MIN_QUANTUM)
             .max(1) as usize;
-        let capacity = crate::slots::SLOT_COUNT * sub_blocks + INCOMING_EVENT_CAPACITY;
+        let capacity = crate::schedule::LANES * sub_blocks + INCOMING_EVENT_CAPACITY;
 
         let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
         for instance in 0..self.instances.len() {
-            let Some(loaded) = self.at_mut(instance) else {
+            if self.at(instance).is_none() {
                 processors.push(None);
                 continue;
+            }
+            // Worked out before the plugin is borrowed for activation,
+            // because it reads both the slot table and the plugin's own
+            // parameter list.
+            let targets = self.targets_for(instance, graph_params);
+            let Some(loaded) = self.at_mut(instance) else {
+                unreachable!("checked just above")
             };
             // What this instance needs, if the graph routes audio to it.
             let config = match io.iter().find(|e| e.instance as usize == instance) {
@@ -411,11 +485,8 @@ impl SubHost {
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
                         processor,
-                        // Only the slots bound against *this* instance. Handing
-                        // every instance the whole table would make one slot
-                        // drive the same parameter on every copy (§12-7).
-                        targets: self.slots.active_targets(instance as u32),
-                        last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
+                        targets,
+                        last_sent: vec![f64::NAN; crate::schedule::LANES],
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }

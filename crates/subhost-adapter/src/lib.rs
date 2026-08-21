@@ -17,7 +17,7 @@ pub use host::{
     GraphNodes, MAX_INSTANCES, SubHost, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
 pub use main_thread::MainThread;
-pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
+pub use schedule::{DEFAULT_QUANTUM, LANES, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, SLOT_COUNT, Slot, SlotTable};
 pub use state::{InstanceState, WrapperState};
 

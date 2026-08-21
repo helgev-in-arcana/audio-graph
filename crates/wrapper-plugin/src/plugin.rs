@@ -262,7 +262,8 @@ impl Wrapper {
         }
 
         let io = state.instance_io.clone();
-        match state.host.activate(audio_config, &io) {
+        let graph_params = state.graph_params.clone();
+        match state.host.activate(audio_config, &io, &graph_params) {
             Ok(processor) => {
                 // What to report depends on how the audio is routed. A graph
                 // knows its own longest path (§14.6); the direct path is one
@@ -529,7 +530,13 @@ fn run_graph(
             frames: schedule.frames_of(index),
         };
         let values = schedule.block_mut(index);
-        values.copy_from_slice(daw_slots);
+        // The DAW's automation fills the slot lanes; the rest are the graph's
+        // own parameter lanes (§14.12) and start from nothing. Zeroing rather
+        // than leaving the previous sub-block's values means a lane the graph
+        // stops driving stops sending, instead of repeating a stale value.
+        let slots = daw_slots.len().min(values.len());
+        values[..slots].copy_from_slice(&daw_slots[..slots]);
+        values[slots..].fill(0.0);
         engine.run(&context, values);
     }
 
@@ -689,4 +696,94 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
         // would be a separate decision about MIDI routing.
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subhost_adapter::LANES;
+    use wrapper_engine::{Graph, MathOp, NodeKind, Rate, Waveform, compile};
+
+    /// A schedule carries more than the DAW's slots (§14.12), and `run_graph`
+    /// fills the difference itself.
+    ///
+    /// Worth its own test because nothing else goes through this function: the
+    /// engine's tests drive it directly with a slot-sized slice, so widening
+    /// the schedule broke only the real audio path, and only in a DAW.
+    #[test]
+    fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
+        let daw_slots = vec![0.42; SLOT_COUNT];
+        let mut engine = Engine::new();
+        let mut schedule = SlotSchedule::new(512, 32);
+
+        // No program: every sub-block is the DAW's values, and the graph's own
+        // lanes are quiet.
+        run_graph(
+            &mut engine,
+            &mut schedule,
+            &daw_slots,
+            &[],
+            128,
+            32,
+            48_000.0,
+            120.0,
+        );
+        assert!(schedule.blocks() > 0);
+        for index in 0..schedule.blocks() {
+            let block = schedule.block(index);
+            assert_eq!(block.len(), LANES);
+            assert!(block[..SLOT_COUNT].iter().all(|&v| v == 0.42));
+            assert!(
+                block[SLOT_COUNT..].iter().all(|&v| v == 0.0),
+                "a lane nothing drives has to be quiet"
+            );
+        }
+
+        // With one: same width, and the driven slot has moved.
+        let mut graph = Graph::new();
+        let lfo = graph.add(
+            NodeKind::Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(4.0),
+                phase: 0.0,
+                depth: 0.5,
+                offset: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let scale = graph.add(
+            NodeKind::Math {
+                op: MathOp::Multiply,
+                b: 1.0,
+            },
+            [100.0, 0.0],
+        );
+        let out = graph.add(NodeKind::SlotOut { slot: 7 }, [200.0, 0.0]);
+        graph.connect(lfo, 0, scale, 0);
+        graph.connect(scale, 0, out, 0);
+
+        let handoff = wrapper_engine::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOT_COUNT).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        run_graph(
+            &mut engine,
+            &mut schedule,
+            &daw_slots,
+            &[],
+            128,
+            32,
+            48_000.0,
+            120.0,
+        );
+        for index in 0..schedule.blocks() {
+            let block = schedule.block(index);
+            assert_eq!(block.len(), LANES);
+            assert_eq!(block[0], 0.42, "an undriven slot stays the DAW's");
+            assert!(
+                block[SLOT_COUNT..].iter().all(|&v| v == 0.0),
+                "no parameter socket is wired, so no lane is driven"
+            );
+        }
+    }
 }

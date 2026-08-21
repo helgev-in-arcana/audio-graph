@@ -12,6 +12,14 @@
 
 use crate::graph::{ExprSource, MathOp, NodeId, Waveform};
 
+/// How many sub-plugin parameters one graph may drive directly (§14.12).
+///
+/// A ceiling for the same reason the register count is one: the schedule that
+/// carries these to the audio thread is allocated at activate, and a graph that
+/// wants more is refused with a message rather than served with an allocation
+/// inside `process`.
+pub const MAX_GRAPH_PARAMS: usize = 64;
+
 /// Ceilings, so the audio thread can preallocate and never resize.
 ///
 /// A graph that would exceed one is refused at compile time with an error the
@@ -238,6 +246,12 @@ pub struct Program {
     pub delay_nodes: Vec<NodeId>,
     /// The audio half, in order (§14.9).
     pub audio_ops: Vec<AudioOp>,
+    /// Which sub-plugin parameter each graph-driven lane drives (§14.12).
+    ///
+    /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
+    /// evaluator writes it exactly the way it writes a slot and needs to know
+    /// nothing about parameters. Sorted by instance, then by parameter.
+    pub param_targets: Vec<ParamTarget>,
     /// How each plugin instance has to be activated (§14.11).
     ///
     /// Derived from the graph, not from the plugin: whether a sidechain bus is
@@ -267,6 +281,7 @@ impl Program {
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),
+            param_targets: Vec::new(),
             instances: Vec::new(),
             buffers: Vec::new(),
             chunking: Chunking::WholeBlock,
@@ -302,4 +317,17 @@ pub struct InstanceIo {
     /// Aux input buses, in order. Only the ones the graph wired.
     pub aux_inputs: Vec<u16>,
     pub output_channels: u16,
+}
+
+/// One sub-plugin parameter the graph drives directly (§14.12).
+///
+/// The wrapper's slots are the DAW's automation lanes and there are 32 of them;
+/// this is the other way in, and it is not limited that way because nothing
+/// outside the patch has to name it. A `SlotIn` node wired to a parameter
+/// socket is how a DAW lane reaches a parameter now — the slot table is no
+/// longer the only route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamTarget {
+    pub instance: u32,
+    pub param: u32,
 }

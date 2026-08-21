@@ -47,6 +47,7 @@ fn main() -> ExitCode {
         "instrument" => cmd_instrument(rest),
         "sidechain" => cmd_sidechain(rest),
         "gui" => cmd_gui(rest),
+        "editor" => cmd_editor(rest),
         "automate" => cmd_automate(rest),
         "bundle" => cmd_bundle(rest),
         _ => {
@@ -94,6 +95,9 @@ fn usage() {
   host-cli sidechain <WRAPPER.vst3> <COMP.vst3> <SYNTH.vst3> <SC_PARAM_ID>
                                     check a compressor inside the graph ducks
                                     against another node's audio
+  host-cli editor <WRAPPER.vst3> <PLUGIN.vst3> [SECONDS]
+                                    open the wrapper's editor with a plugin
+                                    node already in the patch
   host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
   host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
@@ -857,7 +861,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
         aux_inputs: Default::default(),
         offline: false,
     };
-    let processor = sub.activate(config, &[])?;
+    let processor = sub.activate(config, &[], &[])?;
 
     match sub.open_editor(0, std::ptr::null_mut()) {
         Ok(()) => {}
@@ -1860,6 +1864,121 @@ fn inject_sidechain(
         ],
         "links": links,
         "next_id": 7
+    });
+    Ok(value.to_string())
+}
+
+/// Open the wrapper's own editor with a patch already in it (ROADMAP M8.4).
+///
+/// `host-cli gui` opens an empty one, which never draws a plugin node — and a
+/// plugin node is where the new drawing is. This builds a patch that has one,
+/// with its sockets discovered from the plugin and one parameter socket
+/// already added, so opening it exercises every path the canvas grew.
+fn cmd_editor(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vst3_host::Vst3Plugin;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let plugin = args.get(1).ok_or("expected a plugin to put in a node")?;
+    let seconds: f64 = args
+        .get(2)
+        .map_or(Ok(20.0), |s| s.parse())
+        .map_err(|_| "bad duration")?;
+
+    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+
+    let patched = inject_one_plugin(&read_wrapper_state(&baseline)?, plugin)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
+    sub.load(0, Path::new(wrapper), Some(class.cid))?;
+    sub.load_sub_state(0, &state)?;
+    sub.open_editor(0, std::ptr::null_mut())?;
+    println!("opened the wrapper's editor with a {} node", short(plugin));
+    println!("close the window, or wait {seconds:.0}s");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs_f64(seconds);
+    while Instant::now() < deadline && sub.editor_is_open(0) {
+        vst3_host_view::pump_events();
+        sub.tick_editors();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    let open = sub.editor_is_open(0);
+    sub.close_editor(0);
+    sub.unload_all();
+    println!(
+        "{} after {:.1}s",
+        if open { "still open" } else { "closed itself" },
+        started.elapsed().as_secs_f64()
+    );
+    println!("teardown completed cleanly");
+    Ok(())
+}
+
+/// Audio in -> one plugin node -> audio out, with the plugin's real sockets.
+fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let module = Module::open(plugin).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let loaded = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = loaded.io_layout();
+    let mut ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
+    // One parameter socket, as if the user had pressed "+ param" once.
+    if let Some(first) = loaded.params().first() {
+        ports.params.push(wrapper_engine::ParamPort {
+            id: first.id.0,
+            name: first.name.clone(),
+        });
+    }
+    println!(
+        "{}: {} audio in, {} audio out, notes {}, {} parameters",
+        short(plugin),
+        ports.audio_in.len(),
+        ports.audio_out.len(),
+        ports.accepts_notes,
+        loaded.params().len()
+    );
+    drop(loaded);
+
+    value["sub_plugins"] = serde_json::json!([
+        {
+            "instance": 0,
+            "reference": {
+                "format": "vst3",
+                "plugin_id": class.cid.to_hex(),
+                "path_hint": plugin,
+                "display_name": class.name,
+            }
+        }
+    ]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 60.0],  "kind": { "AudioIn": { "bus": 0, "channels": 2 } } },
+            { "id": 1, "pos": [260.0, 60.0], "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 2, "pos": [520.0, 60.0], "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
+            { "id": 3, "pos": [40.0, 260.0], "kind": { "SlotIn": { "slot": 0 } } }
+        ],
+        "links": [
+            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
+            { "from": 1, "from_port": 0, "to": 2, "to_port": 0 }
+        ],
+        "next_id": 4
     });
     Ok(value.to_string())
 }

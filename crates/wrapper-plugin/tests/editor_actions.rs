@@ -329,3 +329,116 @@ fn a_graph_survives_the_state_round_trip() {
         "a graph does not need a sub-plugin to be saved"
     );
 }
+
+/// The M8.4 editor path, end to end against a real plugin: add a plugin node,
+/// discover its sockets, add a parameter socket, and drive it from the graph.
+///
+/// This is what replaced the slot table as the way a parameter gets driven
+/// (§14.12), so it is worth checking against something that really has
+/// parameters rather than only in the compiler's own tests.
+#[test]
+fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
+    use wrapper_engine::{NodeKind, PluginPorts};
+
+    let Some((path, shared)) = a_plugin_with_parameters() else {
+        eprintln!("no installed VST3 with parameters; skipping");
+        return;
+    };
+    eprintln!("building a plugin node for {}", path.display());
+
+    shared.main().config = Some(AudioConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 512,
+        input_channels: 2,
+        output_channels: 2,
+        aux_inputs: Default::default(),
+        offline: true,
+    });
+
+    // The canvas adds the node first and the plugin arrives afterwards, so the
+    // node starts with no sockets at all.
+    let node = {
+        let mut state = shared.main();
+        state.graph.add(
+            NodeKind::Plugin {
+                instance: 1,
+                ports: PluginPorts::default(),
+            },
+            [0.0, 0.0],
+        )
+    };
+    assert!(
+        shared.main().host.free_instance().is_some(),
+        "a fresh wrapper has room"
+    );
+
+    shared.load_into(1, &path).expect("load into instance 1");
+    shared.discover_ports(node);
+
+    let ports = {
+        let state = shared.main();
+        let Some(NodeKind::Plugin { ports, .. }) = state.graph.node(node).map(|n| n.kind.clone())
+        else {
+            panic!("the node should still be a plugin node");
+        };
+        ports
+    };
+    assert!(
+        !ports.audio_out.is_empty(),
+        "discovery has to find at least an output bus"
+    );
+    assert!(
+        ports.params.is_empty(),
+        "parameter sockets are the user's choice, not the plugin's (§14.12)"
+    );
+
+    // "+ param" on the node, then a Constant wired into it. Port order is
+    // audio inputs, then notes, then parameters.
+    let first = shared.main().host.params(1)[0].clone();
+    let socket = ports.audio_in.len() as u8 + u8::from(ports.accepts_notes);
+    {
+        let mut state = shared.main();
+        let Some(node_mut) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
+            panic!("node vanished")
+        };
+        if let NodeKind::Plugin { ports, .. } = &mut node_mut.kind {
+            ports.params.push(wrapper_engine::ParamPort {
+                id: first.id.0,
+                name: first.name.clone(),
+            });
+        }
+        let constant = state
+            .graph
+            .add(NodeKind::Constant { value: 1.0 }, [-200.0, 0.0]);
+        state.graph.connect(constant, 0, node, socket);
+        // Something has to consume the plugin's audio or the node is not a
+        // sink and never reaches the compiler.
+        let out = state.graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [200.0, 0.0],
+        );
+        state.graph.connect(node, 0, out, 0);
+    }
+    shared.publish_graph();
+
+    let state = shared.main();
+    assert!(
+        state.compile_error.is_none(),
+        "the graph should compile: {:?}",
+        state.compile_error
+    );
+    assert_eq!(
+        state.graph_params.len(),
+        1,
+        "the wired socket should have become a lane (§14.12)"
+    );
+    assert_eq!(state.graph_params[0].instance, 1);
+    assert_eq!(state.graph_params[0].param, first.id.0);
+    assert!(
+        state.instance_io.iter().any(|i| i.instance == 1),
+        "the plugin node should be activated with its own bus layout (§14.11)"
+    );
+}

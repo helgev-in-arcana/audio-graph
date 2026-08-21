@@ -40,8 +40,8 @@ use std::sync::Arc;
 use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
-use plugin_host_api::{ParamId, ParamInfo};
-use subhost_adapter::{MainThread, SLOT_COUNT};
+use plugin_host_api::ParamInfo;
+use subhost_adapter::MainThread;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;
@@ -55,7 +55,16 @@ const TICK_MS: u32 = 16;
 
 /// Something the user asked for, to be carried out once the frame is over.
 enum Command {
-    Load(PathBuf),
+    /// A plugin node was added: load into `instance` and give `node` the
+    /// sockets the plugin turns out to have (§14.2).
+    LoadPlugin {
+        node: wrapper_engine::NodeId,
+        instance: usize,
+        path: PathBuf,
+    },
+    UnloadInstance(usize),
+    OpenSub(usize),
+    CloseSub(usize),
     /// The graph changed: recompile, publish, save.
     ///
     /// Editing the graph itself happens inline — it touches no window, so
@@ -63,14 +72,6 @@ enum Command {
     /// edit is worth doing once per frame rather than once per mouse-move.
     GraphEdited,
     SetQuantum(u32),
-    Unload,
-    OpenSubEditor,
-    CloseSubEditor,
-    Bind {
-        slot: usize,
-        param: ParamId,
-    },
-    ClearSlot(usize),
 }
 
 /// What the editor draws, refreshed from [`Shared`] rather than read through
@@ -91,26 +92,12 @@ struct View {
     params: Vec<ParamInfo>,
     /// `(index, parameter name, currently resolved)`.
     slots: Vec<(usize, String, bool)>,
+    /// One entry per instance slot, for the plugin nodes to draw themselves
+    /// from.
+    instances: Vec<crate::graph_ui::InstanceView>,
+    free_instance: Option<usize>,
     /// Whether the sub-plugin can take per-voice modulation (§3.3).
     poly_modulation: bool,
-}
-
-/// Which half of the editor is on screen.
-#[derive(Default, PartialEq, Eq, Clone, Copy)]
-enum Tab {
-    #[default]
-    Patch,
-    Graph,
-}
-
-/// A `.vst3` found on disk, before anything has been loaded from it.
-///
-/// Scanned by filename rather than by opening each module: opening 30 plugins
-/// to draw a list would take seconds and, as M2 found, some of them crash and
-/// at least one hangs.
-struct Entry {
-    name: String,
-    path: PathBuf,
 }
 
 /// What the last command did, or why it did not.
@@ -138,20 +125,18 @@ pub struct WrapperEditor {
     deferred: Option<MainThread<vst3_host_view::Deferred>>,
 
     /// Populated on first use, refreshed on demand.
-    entries: Vec<Entry>,
+    ///
+    /// Scanned by filename rather than by opening each module: opening 30
+    /// plugins to draw a list would take seconds and, as M2 found, some of them
+    /// crash and at least one hangs.
+    entries: Vec<crate::graph_ui::PluginEntry>,
     scanned: bool,
 
-    plugin_filter: String,
-    param_filter: String,
-    /// Which slot the next parameter click binds to. Advanced automatically so
-    /// binding several parameters in a row needs no extra clicks.
-    next_slot: usize,
     status: Status,
 
     /// Filled while drawing, drained at the end of the same `ui` call.
     commands: Vec<Command>,
     view: View,
-    tab: Tab,
     graph_ui: GraphEditor,
     /// The DAW's top-level window, so the sub-plugin's editor can be owned by
     /// it and stay in front. Null until `build`, and when standalone.
@@ -166,13 +151,9 @@ impl WrapperEditor {
             deferred: None,
             entries: Vec::new(),
             scanned: false,
-            plugin_filter: String::new(),
-            param_filter: String::new(),
-            next_slot: 0,
             status: Status::default(),
             commands: Vec::new(),
             view: View::default(),
-            tab: Tab::default(),
             graph_ui: GraphEditor::default(),
             daw_window: 0,
         }
@@ -188,6 +169,9 @@ impl WrapperEditor {
     /// audio thread has no way to reach it — which is the whole reason having
     /// the editor open no longer costs the audio path anything.
     fn refresh(&mut self) {
+        if !self.scanned {
+            self.rescan();
+        }
         let state = self.shared.main();
 
         self.view.class = state
@@ -204,6 +188,24 @@ impl WrapperEditor {
         }
         self.view.generation = generation;
         self.view.params = state.host.params(0).to_vec();
+
+        self.view.free_instance = state.host.free_instance();
+        self.view.instances = (0..subhost_adapter::MAX_INSTANCES)
+            .map(|i| crate::graph_ui::InstanceView {
+                loaded: state.host.is_loaded(i),
+                name: state
+                    .host
+                    .class(i)
+                    .map_or_else(String::new, |c| c.name.clone()),
+                editor_open: state.host.editor_is_open(i),
+                params: state
+                    .host
+                    .params(i)
+                    .iter()
+                    .map(|p| (p.id.0, p.name.clone()))
+                    .collect(),
+            })
+            .collect();
 
         let table = state.host.slots();
         self.view.slots = table
@@ -224,7 +226,8 @@ impl WrapperEditor {
                 let name = path
                     .file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                self.entries.push(Entry { name, path });
+                self.entries
+                    .push(crate::graph_ui::PluginEntry { name, path });
             }
         }
         self.entries
@@ -232,169 +235,14 @@ impl WrapperEditor {
         self.scanned = true;
     }
 
-    fn sub_plugin_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Sub-plugin");
-        ui.horizontal(|ui| match &self.view.class {
-            Some((name, vendor)) => {
-                ui.label(egui::RichText::new(name).strong());
-                ui.weak(vendor);
-            }
-            None => {
-                ui.weak("none loaded — the wrapper passes audio through");
-            }
-        });
-
-        if self.view.loaded {
-            ui.horizontal(|ui| {
-                if self.view.sub_editor_open {
-                    if ui.button("Close plugin GUI").clicked() {
-                        self.commands.push(Command::CloseSubEditor);
-                    }
-                } else if ui.button("Open plugin GUI").clicked() {
-                    self.commands.push(Command::OpenSubEditor);
-                }
-                if ui.button("Unload").clicked() {
-                    self.commands.push(Command::Unload);
-                }
-            });
-        }
-
-        ui.separator();
-
-        if !self.scanned {
-            self.rescan();
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Filter");
-            ui.text_edit_singleline(&mut self.plugin_filter);
-            if ui.button("Rescan").clicked() {
-                self.rescan();
-            }
-        });
-
-        let needle = self.plugin_filter.to_lowercase();
-        let mut to_load: Option<PathBuf> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("plugins")
-            .max_height(200.0)
-            .show(ui, |ui| {
-                for entry in &self.entries {
-                    if !needle.is_empty() && !entry.name.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    if ui.selectable_label(false, &entry.name).clicked() {
-                        to_load = Some(entry.path.clone());
-                    }
-                }
-            });
-        if let Some(path) = to_load {
-            self.commands.push(Command::Load(path));
-        }
-    }
-
-    fn parameter_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Parameters");
-            ui.weak(format!("{}", self.view.params.len()));
-        });
-        if self.view.params.is_empty() {
-            ui.weak("load a sub-plugin to see its parameters");
-            return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Filter");
-            ui.text_edit_singleline(&mut self.param_filter);
-            ui.label("bind to slot");
-            // Displayed one-based, stored zero-based. nice-plug numbers array
-            // elements from 1 in the parameter id, so the DAW's automation lane
-            // for `next_slot` is called "Slot {next_slot + 1}"; showing the
-            // other number here would leave the two disagreeing about which
-            // slot the user just bound.
-            let mut shown = self.next_slot + 1;
-            ui.add(egui::DragValue::new(&mut shown).range(1..=SLOT_COUNT));
-            self.next_slot = shown.clamp(1, SLOT_COUNT) - 1;
-        });
-
-        let needle = self.param_filter.to_lowercase();
-        let slot = self.next_slot;
-        let mut to_bind: Option<ParamId> = None;
-        let params = &self.view.params;
-        egui::ScrollArea::vertical()
-            .id_salt("params")
-            .max_height(280.0)
-            .show(ui, |ui| {
-                for param in params {
-                    if !needle.is_empty() && !param.name.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button(format!("-> {}", slot + 1)).clicked() {
-                            to_bind = Some(param.id);
-                        }
-                        ui.label(&param.name);
-                        ui.weak(format!("[{} .. {}]", param.min, param.max));
-                    });
-                }
-            });
-
-        if let Some(param) = to_bind {
-            self.commands.push(Command::Bind { slot, param });
-            self.next_slot = (slot + 1).min(SLOT_COUNT - 1);
-        }
-    }
-
-    fn slot_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Slots");
-        ui.weak("the DAW automates these; each drives one sub-plugin parameter");
-
-        let params = self.shared.params();
-        let rows = &self.view.slots;
-        let mut clear: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("slots")
-            .max_height(420.0)
-            .show(ui, |ui| {
-                for (i, name, resolved) in rows {
-                    ui.horizontal(|ui| {
-                        // One-based, to agree with the DAW's automation lane names.
-                        ui.monospace(format!("Slot {}", i + 1));
-                        if *resolved {
-                            ui.label(name);
-                        } else {
-                            // §8.3: a binding outlives a sub-plugin that cannot be
-                            // found, so it has to be shown as such rather than
-                            // silently dropped.
-                            ui.colored_label(egui::Color32::from_rgb(200, 140, 60), name)
-                                .on_hover_text("not resolved against the loaded sub-plugin");
-                        }
-                        let value = params.slots[*i].value.value();
-                        ui.add(
-                            egui::ProgressBar::new(value)
-                                .desired_width(110.0)
-                                .text(format!("{value:.3}")),
-                        );
-                        if ui.small_button("x").clicked() {
-                            clear = Some(*i);
-                        }
-                    });
-                }
-                if rows.is_empty() {
-                    ui.weak("nothing bound yet");
-                }
-            });
-
-        if let Some(i) = clear {
-            self.commands.push(Command::ClearSlot(i));
-        }
-    }
-
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
         // The graph is main-thread state and this is the main thread, so it is
         // edited in place. What must not happen inline is the *consequence* of
         // an edit — see `Command::GraphEdited`.
         let context = GraphContext {
+            plugins: &self.entries,
+            instances: &self.view.instances,
+            free_instance: self.view.free_instance,
             bindings: &self.view.slots,
             poly_modulation: self.view.poly_modulation,
             error: self.shared.main().compile_error.clone(),
@@ -404,6 +252,25 @@ impl WrapperEditor {
         let mut state = self.shared.main();
         let changed = self.graph_ui.ui(ui, &mut state.graph, &context);
         drop(state);
+
+        // Anything the canvas could not do itself: loading a plugin, opening a
+        // window. Same reason as everything else here — see the module comment.
+        for action in self.graph_ui.take_actions() {
+            self.commands.push(match action {
+                crate::graph_ui::GraphAction::LoadPlugin {
+                    node,
+                    instance,
+                    path,
+                } => Command::LoadPlugin {
+                    node,
+                    instance,
+                    path,
+                },
+                crate::graph_ui::GraphAction::UnloadInstance(i) => Command::UnloadInstance(i),
+                crate::graph_ui::GraphAction::OpenSubEditor(i) => Command::OpenSub(i),
+                crate::graph_ui::GraphAction::CloseSubEditor(i) => Command::CloseSub(i),
+            });
+        }
 
         if changed {
             self.commands.push(Command::GraphEdited);
@@ -473,54 +340,40 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 shared.store_state();
                 status.set(format!("modulation rate {quantum} samples"));
             }
-            Command::Load(path) => {
-                let result = shared.load(&path);
-                match result {
-                    Ok(()) => {
-                        shared.store_state();
-                        status.set(format!("loaded {}", path.display()));
-                    }
+            Command::LoadPlugin {
+                node,
+                instance,
+                path,
+            } => {
+                match shared.load_into(instance, &path) {
+                    Ok(()) => status.set(format!("loaded {}", path.display())),
+                    // Not fatal: the node stays, with no sockets and saying so,
+                    // the same way an unresolved binding stays (§8.3).
                     Err(e) => status.set(format!("load failed: {e}")),
                 }
-            }
-            Command::Unload => {
-                shared.unload();
+                // Either way — a plugin that failed to load has no buses, and
+                // the node has to stop showing the ones it used to have.
+                shared.discover_ports(node);
                 shared.store_state();
-                status.set("unloaded");
             }
-            Command::OpenSubEditor => {
+            Command::UnloadInstance(instance) => {
+                shared.unload_instance(instance);
+                shared.store_state();
+                status.set(format!("instance {} unloaded", instance + 1));
+            }
+            Command::OpenSub(instance) => {
                 let result = shared
                     .main()
                     .host
-                    .open_editor(0, owner as *mut std::ffi::c_void);
+                    .open_editor(instance, owner as *mut std::ffi::c_void);
                 match result {
                     Ok(()) => status.set("plugin GUI open"),
                     Err(e) => status.set(format!("open GUI: {e}")),
                 }
             }
-            Command::CloseSubEditor => {
-                shared.main().host.close_editor(0);
+            Command::CloseSub(instance) => {
+                shared.main().host.close_editor(instance);
                 status.set("plugin GUI closed");
-            }
-            Command::Bind { slot, param } => {
-                // The processor reads the resolved targets once, at
-                // activate, so a new binding only reaches audio after a
-                // restart.
-                let bound = shared.main().host.bind_slot(0, slot, param);
-                let result = bound.and_then(|()| shared.rebind());
-                match result {
-                    Ok(()) => {
-                        shared.store_state();
-                        status.set(format!("slot {slot} bound"));
-                    }
-                    Err(e) => status.set(format!("bind failed: {e}")),
-                }
-            }
-            Command::ClearSlot(slot) => {
-                shared.main().host.slots_mut().clear(slot);
-                let _ = shared.rebind();
-                shared.store_state();
-                status.set(format!("slot {slot} cleared"));
             }
         }
     }
@@ -614,47 +467,27 @@ impl NiceEguiApp for WrapperEditor {
         // one frame, which looks like a flicker because it is one.
         self.refresh();
 
+        // One screen: the graph is the editor. A plugin is loaded by adding
+        // a node for it, and what a parameter does is said by what is wired to
+        // its socket -- so there is nothing left for a second page to hold.
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Patch, "Patch");
-            ui.selectable_value(&mut self.tab, Tab::Graph, "Graph");
-            ui.separator();
             self.settings_panel(ui);
+            ui.separator();
+            let status = self.status.get();
+            if !status.is_empty() {
+                ui.weak(status);
+            }
         });
         ui.separator();
-
-        match self.tab {
-            // `columns` rather than a `horizontal` of two `vertical`s: a
-            // vertical layout claims all the width that is going, so the second
-            // one ends up off the edge of the window entirely.
-            Tab::Patch => ui.columns(2, |cols| {
-                self.sub_plugin_panel(&mut cols[0]);
-                cols[0].add_space(8.0);
-                self.parameter_panel(&mut cols[0]);
-                self.slot_panel(&mut cols[1]);
-            }),
-            // Last, and given everything left: the canvas takes the rest of the
-            // window, so the status line below has to go.
-            Tab::Graph => {
-                self.graph_panel(ui);
-                self.dispatch();
-                return;
-            }
-        }
-
-        let status = self.status.get();
-        if !status.is_empty() {
-            ui.separator();
-            ui.weak(status);
-        }
-
+        self.graph_panel(ui);
         self.dispatch();
     }
 
     fn editor_closed(&mut self) {
-        // The wrapper's window is going away, so the sub-plugin's window must
-        // too: it is top level with no owner, and leaving it behind strands it
-        // with nothing ticking it.
-        self.shared.main().host.close_editor(0);
+        // The wrapper's window is going away, so every sub-plugin window must
+        // too: they are top level with no owner, and leaving one behind strands
+        // it with nothing ticking it.
+        self.shared.main().host.close_all_editors();
         // Takes the timer, and anything still queued, with it.
         self.deferred = None;
     }

@@ -18,6 +18,15 @@
 
 use crate::slots::SLOT_COUNT;
 
+/// How many values one sub-block carries.
+///
+/// The 32 slots the DAW automates, and then one lane per parameter the graph
+/// drives directly (§14.12). One buffer rather than two because they are
+/// produced by the same evaluator pass and consumed by the same merge: the
+/// evaluator writes a lane exactly the way it writes a slot, and nothing below
+/// the compiler has to know which is which.
+pub const LANES: usize = SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS;
+
 /// The finest sub-block the schedule is sized for.
 pub const MIN_QUANTUM: u32 = 16;
 
@@ -28,9 +37,10 @@ pub const QUANTUM_CHOICES: [u32; 4] = [16, 32, 64, 128];
 /// The default of §9.2.
 pub const DEFAULT_QUANTUM: u32 = 32;
 
-/// Slot values at each sub-block boundary of one process call.
+/// Slot and graph-parameter values at each sub-block boundary of one process
+/// call.
 pub struct SlotSchedule {
-    /// `SLOT_COUNT` values per sub-block, one sub-block after another.
+    /// [`LANES`] values per sub-block, one sub-block after another.
     values: Vec<f64>,
     quantum: u32,
     /// Set by `begin`, valid until the next one.
@@ -44,7 +54,7 @@ impl SlotSchedule {
     /// Sizing for the finest granularity rather than the current one is what
     /// makes [`set_quantum`][Self::set_quantum] free.
     pub fn new(max_block: u32, quantum: u32) -> SlotSchedule {
-        let capacity = max_block.div_ceil(MIN_QUANTUM).max(1) as usize * SLOT_COUNT;
+        let capacity = max_block.div_ceil(MIN_QUANTUM).max(1) as usize * LANES;
         SlotSchedule {
             values: vec![0.0; capacity],
             quantum: sanitise(quantum),
@@ -56,7 +66,7 @@ impl SlotSchedule {
     /// The largest number of sub-blocks any call can produce, for callers
     /// sizing their own buffers.
     pub fn max_blocks(&self) -> usize {
-        self.values.len() / SLOT_COUNT
+        self.values.len() / LANES
     }
 
     pub fn quantum(&self) -> u32 {
@@ -96,20 +106,26 @@ impl SlotSchedule {
     }
 
     pub fn block(&self, index: usize) -> &[f64] {
-        &self.values[index * SLOT_COUNT..(index + 1) * SLOT_COUNT]
+        &self.values[index * LANES..(index + 1) * LANES]
     }
 
     pub fn block_mut(&mut self, index: usize) -> &mut [f64] {
-        &mut self.values[index * SLOT_COUNT..(index + 1) * SLOT_COUNT]
+        &mut self.values[index * LANES..(index + 1) * LANES]
     }
 
     /// Fill every sub-block with the same values — the shape a wrapper with no
     /// graph produces, and the one that reproduces the pre-M5 behaviour
     /// exactly.
     pub fn fill(&mut self, values: &[f64]) {
-        let n = values.len().min(SLOT_COUNT);
+        let n = values.len().min(LANES);
         for index in 0..self.blocks {
-            self.block_mut(index)[..n].copy_from_slice(&values[..n]);
+            let block = self.block_mut(index);
+            block[..n].copy_from_slice(&values[..n]);
+            // Lanes the caller did not supply are graph-driven ones with no
+            // graph running. Zeroing rather than leaving the last block's
+            // values means a patch that stops driving a parameter stops
+            // sending events for it, instead of repeating a stale one.
+            block[n..].fill(0.0);
         }
     }
 }

@@ -12,7 +12,8 @@
 
 use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType, Rate};
 use crate::program::{
-    MAX_DELAY_LINES, MAX_LFOS, MAX_REGISTERS, Op, Operand, Program, RateSpec, Reg,
+    MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand, ParamTarget, Program,
+    RateSpec, Reg,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +126,10 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     // the line as it stood at the end of the previous sub-block.
     let mut writes: Vec<Op> = Vec::new();
     let mut outputs: Vec<(u16, Reg)> = Vec::new();
+    // Lanes past the slot table, one per parameter socket the user wired
+    // (§14.12). The evaluator writes them the same way it writes a slot, so
+    // nothing below the compiler has to know the difference.
+    let mut param_targets: Vec<ParamTarget> = Vec::new();
 
     let mut next_reg: usize = 0;
     let mut alloc = || -> Result<Reg, CompileError> {
@@ -287,10 +292,46 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             }
             // Audio nodes carry no param register. The audio pass walks the
             // same order again and emits their half (§14.9).
+            NodeKind::Plugin { instance, .. } => {
+                // A plugin node's parameter sockets sit after its audio inputs
+                // and its notes port. Only the ones with something wired to
+                // them cost anything.
+                let NodeKind::Plugin { ports, .. } = &node.kind else {
+                    unreachable!()
+                };
+                let first = ports.audio_in.len() + usize::from(ports.accepts_notes);
+                for (index, param) in ports.params.iter().enumerate() {
+                    let Some(reg) = input((first + index) as u8) else {
+                        continue;
+                    };
+                    if param_targets.len() >= MAX_GRAPH_PARAMS {
+                        return Err(CompileError::TooLarge {
+                            what: "graph-driven parameters",
+                            limit: MAX_GRAPH_PARAMS,
+                        });
+                    }
+                    let target = ParamTarget {
+                        instance: instance as u32,
+                        param: param.id,
+                    };
+                    // Two sockets naming one parameter is a patch the user can
+                    // draw; the last one to compile wins, which at least is a
+                    // rule rather than an accident of node order.
+                    match param_targets.iter().position(|t| *t == target) {
+                        Some(lane) => {
+                            outputs.retain(|&(l, _)| l as usize != slot_count + lane);
+                            outputs.push(((slot_count + lane) as u16, reg));
+                        }
+                        None => {
+                            param_targets.push(target);
+                            outputs.push(((slot_count + param_targets.len() - 1) as u16, reg));
+                        }
+                    }
+                }
+            }
             NodeKind::AudioIn { .. }
             | NodeKind::AudioOut { .. }
             | NodeKind::NoteIn
-            | NodeKind::Plugin { .. }
             | NodeKind::Mix { .. } => {}
         }
     }
@@ -305,6 +346,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         registers: next_reg,
         outputs,
         audio_ops: audio.ops,
+        param_targets,
         instances: audio.instances,
         buffers: audio.buffers,
         chunking: audio.chunking,

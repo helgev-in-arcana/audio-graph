@@ -15,9 +15,13 @@
 //! the frame rather than on every mutation, and that is what the returned
 //! `changed` flag is for.
 
+use std::path::PathBuf;
+
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use subhost_adapter::SLOT_COUNT;
-use wrapper_engine::{ExprSource, Graph, MathOp, NodeId, NodeKind, Rate, Waveform};
+use wrapper_engine::{
+    ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, Rate, Waveform,
+};
 
 const NODE_WIDTH: f32 = 186.0;
 /// Vertical space between a node's top edge and its first port.
@@ -26,8 +30,47 @@ const PORT_SPACING: f32 = 18.0;
 const PORT_RADIUS: f32 = 5.0;
 const GRID: f32 = 24.0;
 
+/// A `.vst3` found on disk, offered in the add-node menu.
+pub struct PluginEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// One sub-plugin instance, as the canvas needs to draw the node holding it.
+#[derive(Default, Clone)]
+pub struct InstanceView {
+    pub loaded: bool,
+    pub name: String,
+    pub editor_open: bool,
+    /// `(id, name)` for every parameter, to fill a socket's dropdown.
+    pub params: Vec<(u32, String)>,
+}
+
+/// Something the canvas cannot do itself, because it loads a plugin or touches
+/// a window — see the module comment on [`crate::editor`] for why that must not
+/// happen inside a draw callback.
+pub enum GraphAction {
+    /// Load `path` into `instance` and give `node` the sockets it turns out to
+    /// have (§14.2).
+    LoadPlugin {
+        node: NodeId,
+        instance: usize,
+        path: PathBuf,
+    },
+    UnloadInstance(usize),
+    OpenSubEditor(usize),
+    CloseSubEditor(usize),
+}
+
 /// What the canvas needs to know about the world outside the graph.
 pub struct GraphContext<'a> {
+    /// What can be loaded, scanned from the plugin directories.
+    pub plugins: &'a [PluginEntry],
+    /// Indexed by instance number, so a plugin node can look itself up.
+    pub instances: &'a [InstanceView],
+    /// The lowest instance number nothing is loaded into, or `None` when the
+    /// wrapper is full.
+    pub free_instance: Option<usize>,
     /// Slot index → the sub-plugin parameter it drives, for the ones that have
     /// one. Shown on slot nodes so the graph reads as "drive the filter cutoff"
     /// rather than as "drive slot 12".
@@ -46,10 +89,15 @@ pub struct GraphEditor {
     pan: Vec2,
     /// The node being dragged and where inside it the pointer grabbed.
     dragging: Option<(NodeId, Vec2)>,
-    /// An output port the user has picked up but not yet dropped.
-    linking: Option<NodeId>,
+    /// An output port the user has picked up but not yet dropped, and which
+    /// of the node's outputs it was.
+    linking: Option<(NodeId, u8)>,
     /// Where a right-click asked for a new node, in graph coordinates.
     add_at: Option<Pos2>,
+    /// Filter text in the add-node menu's plugin list.
+    plugin_filter: String,
+    /// Actions for the caller to carry out once the frame is over.
+    actions: Vec<GraphAction>,
 }
 
 impl GraphEditor {
@@ -81,9 +129,9 @@ impl GraphEditor {
         let link_layer = painter.add(egui::Shape::Noop);
 
         let origin = canvas.min + self.pan;
-        let mut ports: Vec<(NodeId, Pos2, Vec<Pos2>)> = Vec::with_capacity(graph.nodes.len());
+        let mut ports: Vec<(NodeId, Vec<Pos2>, Vec<Pos2>)> = Vec::with_capacity(graph.nodes.len());
         let mut to_remove: Option<NodeId> = None;
-        let mut to_connect: Option<(NodeId, NodeId, u8)> = None;
+        let mut to_connect: Option<(NodeId, u8, NodeId, u8)> = None;
         let mut to_disconnect: Option<(NodeId, u8)> = None;
 
         for index in 0..graph.nodes.len() {
@@ -97,17 +145,17 @@ impl GraphEditor {
             }
             if let Some(input) = outcome.clicked_input {
                 match self.linking.take() {
-                    Some(from) => to_connect = Some((from, id, input)),
+                    Some((from, from_port)) => to_connect = Some((from, from_port, id, input)),
                     // Clicking a connected input with nothing in hand takes the
                     // link off, which is the same gesture as making one and so
                     // needs no separate control.
                     None => to_disconnect = Some((id, input)),
                 }
             }
-            if outcome.clicked_output {
-                self.linking = Some(id);
+            if let Some(output) = outcome.clicked_output {
+                self.linking = Some((id, output));
             }
-            ports.push((id, outcome.output_port, outcome.input_ports));
+            ports.push((id, outcome.output_ports, outcome.input_ports));
         }
 
         // Drawing the links, now that every node has been placed.
@@ -115,18 +163,20 @@ impl GraphEditor {
         for link in &graph.links {
             let from = ports.iter().find(|(id, _, _)| *id == link.from);
             let to = ports.iter().find(|(id, _, _)| *id == link.to);
-            if let (Some((_, out, _)), Some((_, _, ins))) = (from, to)
+            if let (Some((_, outs, _)), Some((_, _, ins))) = (from, to)
+                && let Some(&source) = outs.get(link.from_port as usize)
                 && let Some(&target) = ins.get(link.to_port as usize)
             {
-                shapes.push(link_shape(*out, target, ui.visuals().weak_text_color()));
+                shapes.push(link_shape(source, target, ui.visuals().weak_text_color()));
             }
         }
-        if let Some(from) = self.linking
-            && let Some((_, out, _)) = ports.iter().find(|(id, _, _)| *id == from)
+        if let Some((from, from_port)) = self.linking
+            && let Some((_, outs, _)) = ports.iter().find(|(id, _, _)| *id == from)
+            && let Some(&source) = outs.get(from_port as usize)
             && let Some(pointer) = ui.ctx().pointer_latest_pos()
         {
             shapes.push(link_shape(
-                *out,
+                source,
                 pointer,
                 ui.visuals().selection.stroke.color,
             ));
@@ -134,11 +184,17 @@ impl GraphEditor {
         painter.set(link_layer, egui::Shape::Vec(shapes));
 
         if let Some(id) = to_remove {
+            // Deleting the node is what unloads the plugin. There is no
+            // separate "unload" anywhere, because a node with no plugin in it
+            // is not a thing the user asked for.
+            if let Some(NodeKind::Plugin { instance, .. }) = graph.node(id).map(|n| &n.kind) {
+                self.actions.push(GraphAction::UnloadInstance(*instance));
+            }
             graph.remove(id);
             changed = true;
         }
-        if let Some((from, to, input)) = to_connect {
-            graph.connect(from, 0, to, input);
+        if let Some((from, from_port, to, input)) = to_connect {
+            graph.connect(from, from_port, to, input);
             changed = true;
         }
         if let Some((to, input)) = to_disconnect {
@@ -161,7 +217,7 @@ impl GraphEditor {
         {
             self.add_at = Some(pointer - self.pan - canvas.min.to_vec2());
         }
-        changed |= self.add_menu(ui, canvas, graph);
+        changed |= self.add_menu(ui, canvas, graph, ctx);
 
         changed
     }
@@ -318,21 +374,25 @@ impl GraphEditor {
             let centre = Pos2::new(rect.min.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
             let connected = graph.source_of(id, i as u8).is_some();
             let label = format!("{} ({})", port.name, port.ty.label());
-            if self.port(ui, &painter, (id, i as u8 + 1), centre, connected, &label) {
+            if self.port(ui, &painter, (id, i as u8), centre, connected, &label) {
                 outcome.clicked_input = Some(i as u8);
             }
             outcome.input_ports.push(centre);
         }
-        // One output socket for now. A plugin node has one per bus, and the
-        // canvas grows a second column of sockets when M8.2 makes them run.
-        if let Some(port) = outputs.first() {
-            let centre = Pos2::new(rect.max.x, rect.min.y + PORT_TOP);
-            let connected = graph.links.iter().any(|l| l.from == id);
+        // One socket per output bus, down the right-hand edge.
+        for (i, port) in outputs.iter().enumerate() {
+            let centre = Pos2::new(rect.max.x, rect.min.y + PORT_TOP + i as f32 * PORT_SPACING);
+            let connected = graph
+                .links
+                .iter()
+                .any(|l| l.from == id && l.from_port == i as u8);
             let label = format!("{} ({})", port.name, port.ty.label());
-            if self.port(ui, &painter, (id, 0), centre, connected, &label) {
-                outcome.clicked_output = true;
+            // Output keys start past the inputs so the two never collide.
+            let key = (id, 128 + i as u8);
+            if self.port(ui, &painter, key, centre, connected, &label) {
+                outcome.clicked_output = Some(i as u8);
             }
-            outcome.output_port = centre;
+            outcome.output_ports.push(centre);
         }
 
         outcome
@@ -368,7 +428,7 @@ impl GraphEditor {
     }
 
     /// The per-kind controls inside a node. Returns whether anything changed.
-    fn controls(&self, ui: &mut egui::Ui, kind: &mut NodeKind, ctx: &GraphContext<'_>) -> bool {
+    fn controls(&mut self, ui: &mut egui::Ui, kind: &mut NodeKind, ctx: &GraphContext<'_>) -> bool {
         let mut changed = false;
         match kind {
             NodeKind::Constant { value } => {
@@ -454,20 +514,137 @@ impl GraphEditor {
                 });
                 ui.weak("held at one sub-block minimum while in a loop");
             }
-            // Sinks and sources with nothing to set. The M8 audio nodes have
-            // their controls in M8.2, where they start doing something.
-            NodeKind::DelayWrite { .. }
-            | NodeKind::Mix { .. }
-            | NodeKind::AudioIn { .. }
-            | NodeKind::AudioOut { .. }
-            | NodeKind::NoteIn
-            | NodeKind::Plugin { .. } => {}
+            NodeKind::Plugin { instance, ports } => {
+                changed |= self.plugin_controls(ui, *instance, ports, ctx);
+            }
+            NodeKind::Mix { inputs, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("inputs");
+                    let mut count = *inputs as u32;
+                    if ui
+                        .add(egui::DragValue::new(&mut count).range(2..=8))
+                        .changed()
+                    {
+                        *inputs = count as u8;
+                        changed = true;
+                    }
+                });
+            }
+            NodeKind::AudioIn { bus, .. } | NodeKind::AudioOut { bus, .. } => {
+                ui.horizontal(|ui| {
+                    ui.label("bus");
+                    // One-based on screen: the DAW calls them "Main" and
+                    // "Sidechain", not "0" and "1".
+                    let mut shown = *bus as u32 + 1;
+                    if ui
+                        .add(egui::DragValue::new(&mut shown).range(1..=2))
+                        .changed()
+                    {
+                        *bus = (shown - 1) as usize;
+                        changed = true;
+                    }
+                    ui.weak(if *bus == 0 { "main" } else { "sidechain" });
+                });
+            }
+            // Sinks and sources with nothing to set.
+            NodeKind::DelayWrite { .. } | NodeKind::NoteIn => {}
+        }
+        changed
+    }
+
+    /// A plugin node: what is loaded in it, and its parameter sockets.
+    ///
+    /// The sockets are the user's choice, not the plugin's (§14.12). A
+    /// compressor has ninety parameters and a node with ninety sockets would be
+    /// unusable, so they are added one at a time and each one picks what it
+    /// drives from a dropdown.
+    fn plugin_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        instance: usize,
+        ports: &mut PluginPorts,
+        ctx: &GraphContext<'_>,
+    ) -> bool {
+        let mut changed = false;
+        let view = ctx.instances.get(instance).cloned().unwrap_or_default();
+
+        if view.loaded {
+            ui.label(egui::RichText::new(&view.name).strong());
+        } else {
+            ui.colored_label(Color32::from_rgb(200, 140, 60), "not loaded")
+                .on_hover_text(
+                    "the plugin could not be found, or is still loading. Its links and                      parameter sockets are kept either way (§8.3).",
+                );
+        }
+
+        ui.horizontal(|ui| {
+            if view.loaded {
+                if view.editor_open {
+                    if ui.small_button("close GUI").clicked() {
+                        self.actions.push(GraphAction::CloseSubEditor(instance));
+                    }
+                } else if ui.small_button("GUI").clicked() {
+                    self.actions.push(GraphAction::OpenSubEditor(instance));
+                }
+            }
+            if ui.small_button("+ param").clicked() {
+                // The first parameter it has, so a freshly added socket points
+                // at something real rather than at nothing.
+                let (id, name) = view
+                    .params
+                    .first()
+                    .cloned()
+                    .unwrap_or((0, "parameter".to_string()));
+                ports.params.push(ParamPort { id, name });
+                changed = true;
+            }
+        });
+
+        let mut remove: Option<usize> = None;
+        for (index, param) in ports.params.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let label = if param.name.is_empty() {
+                    format!("#{}", param.id)
+                } else {
+                    param.name.clone()
+                };
+                egui::ComboBox::from_id_salt(("param", index))
+                    .selected_text(shorten(&label))
+                    .width(112.0)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &view.params {
+                            if ui.selectable_label(*id == param.id, name).clicked()
+                                && *id != param.id
+                            {
+                                param.id = *id;
+                                param.name = name.clone();
+                                changed = true;
+                            }
+                        }
+                        if view.params.is_empty() {
+                            ui.weak("load a plugin to choose");
+                        }
+                    });
+                if ui.small_button("x").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            ports.params.remove(index);
+            changed = true;
         }
         changed
     }
 
     /// The "add a node" menu, shown wherever the user asked for it.
-    fn add_menu(&mut self, ui: &mut egui::Ui, canvas: Rect, graph: &mut Graph) -> bool {
+    fn add_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        canvas: Rect,
+        graph: &mut Graph,
+        ctx: &GraphContext<'_>,
+    ) -> bool {
         let Some(at) = self.add_at else { return false };
         let mut added = false;
         let mut close = false;
@@ -477,14 +654,73 @@ impl GraphEditor {
             .fixed_pos(canvas.min + at.to_vec2() + self.pan)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(150.0);
-                    for (label, kind) in catalogue() {
-                        if ui.button(label).clicked() {
-                            graph.add(kind, [at.x, at.y]);
-                            added = true;
-                            close = true;
+                    ui.set_max_width(260.0);
+
+                    // Plugins first: adding one is what this menu is mostly
+                    // for, and there is no other way to load one.
+                    ui.strong("Plugin");
+                    match ctx.free_instance {
+                        Some(instance) => {
+                            ui.horizontal(|ui| {
+                                ui.label("filter");
+                                ui.text_edit_singleline(&mut self.plugin_filter);
+                            });
+                            let needle = self.plugin_filter.to_lowercase();
+                            let mut chosen: Option<PathBuf> = None;
+                            egui::ScrollArea::vertical()
+                                .id_salt("add-plugin")
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for entry in ctx.plugins {
+                                        if !needle.is_empty()
+                                            && !entry.name.to_lowercase().contains(&needle)
+                                        {
+                                            continue;
+                                        }
+                                        if ui.selectable_label(false, &entry.name).clicked() {
+                                            chosen = Some(entry.path.clone());
+                                        }
+                                    }
+                                });
+                            if let Some(path) = chosen {
+                                // The node appears now and its sockets arrive
+                                // when the plugin has finished loading, which
+                                // takes hundreds of milliseconds.
+                                let node = graph.add(
+                                    NodeKind::Plugin {
+                                        instance,
+                                        ports: PluginPorts::default(),
+                                    },
+                                    [at.x, at.y],
+                                );
+                                self.actions.push(GraphAction::LoadPlugin {
+                                    node,
+                                    instance,
+                                    path,
+                                });
+                                added = true;
+                                close = true;
+                            }
+                        }
+                        None => {
+                            ui.weak("no free instance — the wrapper is full");
                         }
                     }
+
+                    ui.separator();
+                    ui.strong("Node");
+                    egui::ScrollArea::vertical()
+                        .id_salt("add-kind")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (label, kind) in catalogue() {
+                                if ui.button(label).clicked() {
+                                    graph.add(kind, [at.x, at.y]);
+                                    added = true;
+                                    close = true;
+                                }
+                            }
+                        });
                     ui.separator();
                     if ui.button("cancel").clicked() {
                         close = true;
@@ -494,8 +730,14 @@ impl GraphEditor {
 
         if close {
             self.add_at = None;
+            self.plugin_filter.clear();
         }
         added
+    }
+
+    /// Actions the caller has to carry out after the frame.
+    pub fn take_actions(&mut self) -> Vec<GraphAction> {
+        std::mem::take(&mut self.actions)
     }
 }
 
@@ -505,8 +747,8 @@ struct NodeOutcome {
     changed: bool,
     remove: bool,
     clicked_input: Option<u8>,
-    clicked_output: bool,
-    output_port: Pos2,
+    clicked_output: Option<u8>,
+    output_ports: Vec<Pos2>,
     input_ports: Vec<Pos2>,
 }
 
@@ -551,7 +793,37 @@ fn catalogue() -> Vec<(&'static str, NodeKind)> {
             },
         ),
         ("Slot out", NodeKind::SlotOut { slot: 0 }),
+        (
+            "Audio in",
+            NodeKind::AudioIn {
+                bus: 0,
+                channels: 2,
+            },
+        ),
+        (
+            "Audio out",
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+        ),
+        ("Note in", NodeKind::NoteIn),
+        (
+            "Mix",
+            NodeKind::Mix {
+                channels: 2,
+                inputs: 2,
+            },
+        ),
     ]
+}
+
+/// Combo boxes are only so wide, and a parameter name can be long.
+fn shorten(text: &str) -> String {
+    if text.chars().count() <= 16 {
+        return text.to_string();
+    }
+    text.chars().take(15).collect::<String>() + "\u{2026}"
 }
 
 fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, ctx: &GraphContext<'_>) -> bool {

@@ -38,8 +38,8 @@ use plugin_host_api::AudioConfig;
 use subhost_adapter::{
     DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
 };
-use wrapper_engine::InstanceIo;
 use wrapper_engine::{Graph, Handoff, Program, compile};
+use wrapper_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, PluginPorts};
 
 use crate::params::WrapperParams;
 
@@ -63,6 +63,10 @@ pub struct MainState {
     /// on the audio side of the wrapper, and this is needed on the main thread
     /// every time something is re-activated.
     pub instance_io: Vec<InstanceIo>,
+    /// Which sub-plugin parameter each graph-driven lane drives (§14.12).
+    /// Read at activate, like the slot bindings, so a new socket only reaches
+    /// audio after a restart.
+    pub graph_params: Vec<ParamTarget>,
 }
 
 /// The live processor, and the only thing the audio thread ever waits on.
@@ -73,6 +77,12 @@ pub struct AudioState {
 }
 
 /// The handle both halves of the plugin hold.
+///
+/// `main` is declared before `audio`, so Rust drops the sub-plugins *first* —
+/// which is exactly backwards, because a processor holds an interface pointer
+/// into the plugin that produced it. [`Drop`] below hands the processors back
+/// before anything is released; the field order is left alone because relying
+/// on it would be a rule nothing states.
 pub struct Shared {
     main: MainThread<RefCell<MainState>>,
     audio: Mutex<AudioState>,
@@ -100,6 +110,17 @@ pub struct Shared {
     generation: AtomicU64,
 }
 
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Hand every processor back before its plugin is released. A DAW always
+        // calls `deactivate` first and this never fires there — but a panic
+        // anywhere between activate and deactivate would otherwise turn into an
+        // access violation during unwinding, which is a much worse thing to
+        // debug than the panic that caused it.
+        self.suspend();
+    }
+}
+
 impl Shared {
     pub fn new(host: SubHost, params: Arc<WrapperParams>) -> Arc<Shared> {
         Arc::new(Shared {
@@ -109,6 +130,7 @@ impl Shared {
                 graph: Graph::new(),
                 compile_error: None,
                 instance_io: Vec::new(),
+                graph_params: Vec::new(),
             })),
             audio: Mutex::new(AudioState { processor: None }),
             programs: Handoff::new(),
@@ -191,8 +213,10 @@ impl Shared {
                 // switched on while the plugin is active. Whether the change
                 // has to be acted on is `reactivate`'s decision; recording it
                 // is this one's.
-                let changed = state.instance_io != program.instances;
+                let changed = state.instance_io != program.instances
+                    || state.graph_params != program.param_targets;
                 state.instance_io = program.instances.clone();
+                state.graph_params = program.param_targets.clone();
                 self.programs.send(Box::new(program));
                 drop(state);
                 if changed {
@@ -213,14 +237,64 @@ impl Shared {
 
     /// Swap in a different sub-plugin while the DAW is running.
     pub fn load(&self, path: &Path) -> Result<(), String> {
+        self.load_into(0, path)
+    }
+
+    /// Load a plugin into one instance slot and hand its ports to the node
+    /// that named it (§14.2).
+    ///
+    /// The node is added first and the plugin arrives afterwards, which is why
+    /// this takes a node id: a plugin takes hundreds of milliseconds to load,
+    /// and a canvas that froze until it had finished would be worse than one
+    /// where the sockets appear a moment later. A node whose plugin fails to
+    /// load simply keeps no sockets, and says so.
+    pub fn load_into(&self, instance: usize, path: &Path) -> Result<(), String> {
         self.suspend();
-        self.main().host.load(0, path, None)?;
-        self.resume()
+        let result = self.main().host.load(instance, path, None);
+        let resumed = self.resume();
+        result?;
+        resumed
+    }
+
+    /// Re-read one plugin node's sockets from the plugin itself.
+    ///
+    /// Called after a load, and after the plugin says its I/O changed. Links to
+    /// sockets that no longer exist are dropped by `prune`, which is the same
+    /// rule a patch reopened against a newer plugin follows.
+    pub fn discover_ports(&self, node: NodeId) {
+        let mut state = self.main();
+        let Some(instance) = state.graph.node(node).and_then(|n| match n.kind {
+            NodeKind::Plugin { instance, .. } => Some(instance),
+            _ => None,
+        }) else {
+            return;
+        };
+        let layout = state.host.io_layout(instance);
+        let latency = state.host.sub_latency(instance);
+        let discovered = PluginPorts::from_layout(&layout, latency);
+        let Some(node) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
+            return;
+        };
+        if let NodeKind::Plugin { ports, .. } = &mut node.kind {
+            // The parameter sockets are the user's, not the plugin's (§14.12):
+            // discovery replaces the buses and leaves the sockets alone.
+            let params = std::mem::take(&mut ports.params);
+            *ports = discovered;
+            ports.params = params;
+        }
+        state.graph.prune();
+        drop(state);
+        self.publish_graph();
     }
 
     pub fn unload(&self) {
+        self.unload_instance(0);
+    }
+
+    pub fn unload_instance(&self, instance: usize) {
         self.suspend();
-        self.main().host.unload(0);
+        self.main().host.unload(instance);
+        let _ = self.resume();
     }
 
     /// Re-activate after something the processor caches has changed — the slot
@@ -252,7 +326,8 @@ impl Shared {
             return Ok(());
         };
         let io = state.instance_io.clone();
-        let processor = state.host.activate(config, &io)?;
+        let graph_params = state.graph_params.clone();
+        let processor = state.host.activate(config, &io, &graph_params)?;
         drop(state);
         self.audio().processor = Some(processor);
         Ok(())
