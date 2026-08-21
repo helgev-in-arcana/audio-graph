@@ -7,6 +7,7 @@ members = [
     "crates/vst3-host-view",
     "crates/clap-host",
     "crates/clap-test-plugin",
+    "crates/plugin-host",
     "crates/subhost-adapter",
     "crates/audio-graph-engine",
     "crates/audio-graph-plugin",
@@ -24,6 +25,7 @@ vst3-host = { path = "crates/vst3-host" }
 vst3-host-view = { path = "crates/vst3-host-view" }
 host-window = { path = "crates/host-window" }
 clap-host = { path = "crates/clap-host" }
+plugin-host = { path = "crates/plugin-host" }
 subhost-adapter = { path = "crates/subhost-adapter" }
 # Nothing depends on this yet; it is the M5 node graph's crate, declared here so
 # the workspace shows where it goes. `cargo add`/`cargo remove` prune workspace

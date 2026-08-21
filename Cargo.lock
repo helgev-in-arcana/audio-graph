@@ -1639,6 +1639,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plugin-host"
+version = "0.1.0"
+dependencies = [
+ "clap-host",
+ "clap-test-plugin",
+ "host-window",
+ "log",
+ "plugin-host-api",
+ "vst3-host",
+ "vst3-host-view",
+]
+
+[[package]]
 name = "plugin-host-api"
 version = "0.1.0"
 
