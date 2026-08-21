@@ -20,7 +20,7 @@ use vst3_host_view::EditorWindow;
 use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
-use wrapper_engine::{InstanceIo, ParamTarget};
+use audio_graph_engine::{InstanceIo, ParamTarget};
 
 pub use crate::state::SubPluginRef;
 
@@ -761,14 +761,14 @@ pub struct GraphNodes<'a> {
     out_events: &'a mut EventSink,
 }
 
-impl wrapper_engine::AudioNodes for GraphNodes<'_> {
+impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
     fn process(
         &mut self,
         instance: u32,
-        notes: wrapper_engine::NoteSource,
+        notes: audio_graph_engine::NoteSource,
         input: &[f32],
         output: &mut [f32],
-        chunk: wrapper_engine::AudioChunk,
+        chunk: audio_graph_engine::AudioChunk,
     ) {
         let Some(processor) = self.processors.get_mut(instance as usize) else {
             // A node whose plugin failed to load, or was deleted while the
@@ -799,7 +799,7 @@ impl wrapper_engine::AudioNodes for GraphNodes<'_> {
         // nothing — which is the whole point, since before M8.3 every instance
         // was handed every event and two synths played in unison.
         let events: &[Event] = match notes {
-            wrapper_engine::NoteSource::Daw { bus: 0 } => self.events,
+            audio_graph_engine::NoteSource::Daw { bus: 0 } => self.events,
             _ => &[],
         };
         processor.process(
@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
         use plugin_host_api::NoteEvent;
-        use wrapper_engine::{AudioChunk, AudioNodes, NoteSource};
+        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());

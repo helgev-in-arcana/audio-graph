@@ -1,0 +1,258 @@
+//! What the audio thread is and is not allowed to wait for.
+//!
+//! ARCHITECTURE.md §9.1 and §12-5. The rule these tests exist to hold down is
+//! narrow and easy to break by accident: *routine* main-thread work — drawing
+//! the editor, ticking the sub-plugin's window, recompiling the graph on every
+//! frame of a drag — must not be able to make the audio thread miss a block.
+//! Rare heavy work — starting or stopping a sub-plugin — may, and does.
+//!
+//! Before M5 that distinction did not exist. One mutex covered everything, so
+//! having the editor open at all put a lock acquisition in the audio thread's
+//! path sixty times a second, and losing the race meant a block of audio passed
+//! through unprocessed. Audibly, a click. These tests are the difference.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use plugin_host_api::{AudioConfig, HostContext, RestartReason};
+use subhost_adapter::{SLOT_COUNT, SubHost};
+use audio_graph_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
+use audio_graph_plugin::{Shared, WrapperParams};
+
+struct SilentHost;
+impl HostContext for SilentHost {
+    fn host_name(&self) -> &str {
+        "audio-thread test"
+    }
+    fn request_restart(&self, _reason: RestartReason) {}
+    fn latency_changed(&self, _samples: u32) {}
+    fn param_edited(&self, _id: plugin_host_api::ParamId, _value: f64) {}
+}
+
+fn shared() -> Arc<Shared> {
+    Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new())
+}
+
+/// Build the graph the editor builds when someone drops an LFO on the canvas.
+fn lfo_into(shared: &Arc<Shared>, slot: usize, rate: f64) {
+    let mut state = shared.main();
+    state.graph = audio_graph_engine::Graph::new();
+    let lfo = state.graph.add(
+        NodeKind::Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(rate),
+            phase: 0.0,
+            depth: 0.5,
+            offset: 0.5,
+        },
+        [0.0, 0.0],
+    );
+    let out = state.graph.add(NodeKind::SlotOut { slot }, [200.0, 0.0]);
+    state.graph.connect(lfo, 0, out, 0);
+}
+
+#[test]
+fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
+    let shared = shared();
+    // A configuration, as if the DAW had activated us. Nothing is loaded, so
+    // the audio side's lock is uncontended unless somebody puts contention
+    // there — which is exactly what is being measured.
+    shared.main().config = Some(AudioConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 512,
+        input_channels: 2,
+        output_channels: 2,
+        aux_inputs: Default::default(),
+        offline: true,
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let edits = Arc::new(AtomicUsize::new(0));
+
+    // The audio thread. It does what `Wrapper::process` does on the paths that
+    // matter: take the program if one is waiting, then try the audio lock.
+    let audio = {
+        let shared = shared.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut engine = Engine::new();
+            let mut slots = vec![0.0; SLOT_COUNT];
+            let mut blocks = 0usize;
+            let mut missed = 0usize;
+            let mut adopted = 0usize;
+
+            while !stop.load(Ordering::Relaxed) {
+                if engine.adopt(shared.programs()) {
+                    adopted += 1;
+                }
+                match shared.try_audio() {
+                    Some(_state) => {
+                        engine.run(
+                            &BlockContext {
+                                sample_rate: 48_000.0,
+                                tempo_bpm: 120.0,
+                                frames: 32,
+                            },
+                            &mut slots,
+                        );
+                    }
+                    None => missed += 1,
+                }
+                blocks += 1;
+            }
+            (blocks, missed, adopted)
+        })
+    };
+
+    // The main thread, dragging an LFO's rate control. Every frame of that drag
+    // is a recompile and a publish.
+    for i in 0..20_000 {
+        lfo_into(&shared, 3, 0.5 + (i % 100) as f64 * 0.1);
+        shared.publish_graph();
+        // The editor's tick, which also frees what the audio thread returns.
+        shared.reclaim();
+        edits.fetch_add(1, Ordering::Relaxed);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let (blocks, missed, adopted) = audio.join().expect("the audio thread panicked");
+    assert!(blocks > 0, "the audio thread never ran");
+    assert_eq!(
+        missed, 0,
+        "{missed} of {blocks} blocks were dropped while the graph was being edited; \
+         editing must not reach the audio thread's lock at all"
+    );
+    assert!(
+        adopted > 0,
+        "the audio thread never picked up any of the {} published programs",
+        edits.load(Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn drawing_the_editor_never_reaches_the_audio_lock() {
+    // The narrower version of the same claim, and the one that was actually
+    // wrong before M5: simply *having the editor open* used to contend, because
+    // the redraw and the sub-plugin's window tick both took the one lock.
+    let shared = shared();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let audio = {
+        let shared = shared.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut missed = 0usize;
+            let mut blocks = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                if shared.try_audio().is_none() {
+                    missed += 1;
+                }
+                blocks += 1;
+            }
+            (blocks, missed)
+        })
+    };
+
+    for _ in 0..200_000 {
+        // What the editor does every frame.
+        let state = shared.main();
+        let _ = state.host.is_loaded(0);
+        let _ = state.host.class(0);
+        let _ = state.host.slots().slots().len();
+        let _ = state.host.capabilities(0);
+        drop(state);
+        // And what its timer does.
+        shared.main().host.tick_editors();
+        let _ = shared.live_slots();
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let (blocks, missed) = audio.join().expect("the audio thread panicked");
+    assert_eq!(
+        missed, 0,
+        "{missed} of {blocks} blocks lost to the editor drawing itself"
+    );
+}
+
+#[test]
+fn the_old_program_is_freed_on_the_main_thread() {
+    // §9.1's other half. The audio thread must not run a destructor, so a
+    // superseded program has to travel back up before anything frees it.
+    let shared = shared();
+    let mut engine = Engine::new();
+
+    lfo_into(&shared, 0, 1.0);
+    shared.publish_graph();
+    assert!(engine.adopt(shared.programs()));
+
+    for rate in 1..64 {
+        lfo_into(&shared, 0, rate as f64);
+        shared.publish_graph();
+        assert!(engine.adopt(shared.programs()), "rate {rate} never arrived");
+    }
+
+    // The return path is four deep and the audio thread declines rather than
+    // freeing when it is full, so a main thread that never drains would show up
+    // as a swap that stopped happening. It did not, so it drained.
+    shared.reclaim();
+}
+
+#[test]
+fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
+    // A new instance starts with audio in wired to audio out and nothing else,
+    // so the DAW's automation has to arrive at the slots untouched — the graph
+    // carries audio, but it drives no parameter lane.
+    let shared = shared();
+    shared.publish_graph();
+
+    let mut engine = Engine::new();
+    engine.adopt(shared.programs());
+    assert!((0..SLOT_COUNT).all(|slot| !engine.drives(slot)));
+
+    let mut slots = vec![0.42; SLOT_COUNT];
+    engine.run(
+        &BlockContext {
+            sample_rate: 48_000.0,
+            tempo_bpm: 120.0,
+            frames: 32,
+        },
+        &mut slots,
+    );
+    assert!(slots.iter().all(|&v| v == 0.42));
+}
+
+#[test]
+fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
+    let shared = shared();
+    lfo_into(&shared, 1, 2.0);
+    shared.publish_graph();
+
+    let mut engine = Engine::new();
+    assert!(engine.adopt(shared.programs()));
+    assert!(engine.drives(1));
+
+    // Now the user wires an output to a second output — halfway through
+    // rearranging something, and not a state worth stopping the music for.
+    {
+        let mut state = shared.main();
+        let a = state.graph.add(
+            NodeKind::Math {
+                op: MathOp::Add,
+                b: 0.0,
+            },
+            [0.0, 100.0],
+        );
+        let one = state
+            .graph
+            .add(NodeKind::SlotOut { slot: 1 }, [200.0, 100.0]);
+        state.graph.connect(a, 0, one, 0);
+    }
+    shared.publish_graph();
+
+    assert!(shared.main().compile_error.is_some());
+    assert!(
+        !engine.adopt(shared.programs()),
+        "a failed compile must publish nothing"
+    );
+    assert!(engine.drives(1), "the last good program keeps playing");
+}

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use subhost_adapter::SLOT_COUNT;
-use wrapper_engine::{
+use audio_graph_engine::{
     ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
 };
 
@@ -39,7 +39,7 @@ mod socket {
 }
 
 /// The colour of one socket, and of the links leaving it.
-fn socket_colour(port: &wrapper_engine::Port) -> Color32 {
+fn socket_colour(port: &audio_graph_engine::Port) -> Color32 {
     match port.ty {
         PortType::Audio { .. } if port.aux => socket::AUX,
         PortType::Audio { .. } => socket::AUDIO,

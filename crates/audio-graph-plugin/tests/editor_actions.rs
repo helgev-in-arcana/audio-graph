@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use plugin_host_api::{AudioConfig, HostContext, RestartReason};
 use subhost_adapter::SubHost;
-use wrapper_plugin::{Shared, WrapperParams};
+use audio_graph_plugin::{Shared, WrapperParams};
 
 struct SilentHost;
 
@@ -186,7 +186,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 /// format-agnostic, which is the point of §9.
 #[test]
 fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
-    use wrapper_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
+    use audio_graph_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
@@ -296,7 +296,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
 /// making sound: what it was implicitly getting is drawn for it on open.
 #[test]
 fn a_patch_saved_without_a_graph_gets_the_default_one() {
-    use wrapper_engine::{Graph, NodeKind};
+    use audio_graph_engine::{Graph, NodeKind};
 
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
     shared.main().graph = Graph::new();
@@ -320,7 +320,7 @@ fn a_patch_saved_without_a_graph_gets_the_default_one() {
 /// graph with no nodes at all, and never touches one the user built.
 #[test]
 fn adoption_leaves_an_existing_graph_alone() {
-    use wrapper_engine::NodeKind;
+    use audio_graph_engine::NodeKind;
 
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
     let before = {
@@ -338,7 +338,7 @@ fn adoption_leaves_an_existing_graph_alone() {
 /// sub-plugin it was built against is not there (§8.3).
 #[test]
 fn a_graph_survives_the_state_round_trip() {
-    use wrapper_engine::{Graph, NodeKind};
+    use audio_graph_engine::{Graph, NodeKind};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params.clone());
@@ -386,7 +386,7 @@ fn a_graph_survives_the_state_round_trip() {
 /// parameters rather than only in the compiler's own tests.
 #[test]
 fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
-    use wrapper_engine::{NodeKind, PluginPorts};
+    use audio_graph_engine::{NodeKind, PluginPorts};
 
     let Some((path, shared)) = a_plugin_with_parameters() else {
         eprintln!("no installed VST3 with parameters; skipping");
@@ -450,7 +450,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
             panic!("node vanished")
         };
         if let NodeKind::Plugin { ports, .. } = &mut node_mut.kind {
-            ports.params.push(wrapper_engine::ParamPort {
+            ports.params.push(audio_graph_engine::ParamPort {
                 id: first.id.0,
                 name: first.name.clone(),
             });

@@ -106,6 +106,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 
 [[package]]
+name = "audio-graph-engine"
+version = "0.1.0"
+dependencies = [
+ "plugin-host-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "audio-graph-plugin"
+version = "0.1.0"
+dependencies = [
+ "audio-graph-engine",
+ "egui",
+ "log",
+ "nice-log",
+ "nice-plug",
+ "nice-plug-egui",
+ "parking_lot",
+ "plugin-host-api",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "subhost-adapter",
+ "vst3-host",
+ "vst3-host-view",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -796,12 +825,12 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 name = "host-cli"
 version = "0.1.0"
 dependencies = [
+ "audio-graph-engine",
  "plugin-host-api",
  "serde_json",
  "subhost-adapter",
  "vst3-host",
  "vst3-host-view",
- "wrapper-engine",
 ]
 
 [[package]]
@@ -1890,13 +1919,13 @@ dependencies = [
 name = "subhost-adapter"
 version = "0.1.0"
 dependencies = [
+ "audio-graph-engine",
  "log",
  "plugin-host-api",
  "serde",
  "serde_json",
  "vst3-host",
  "vst3-host-view",
- "wrapper-engine",
 ]
 
 [[package]]
@@ -2563,35 +2592,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "wrapper-engine"
-version = "0.1.0"
-dependencies = [
- "plugin-host-api",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "wrapper-plugin"
-version = "0.1.0"
-dependencies = [
- "egui",
- "log",
- "nice-log",
- "nice-plug",
- "nice-plug-egui",
- "parking_lot",
- "plugin-host-api",
- "raw-window-handle",
- "serde",
- "serde_json",
- "subhost-adapter",
- "vst3-host",
- "vst3-host-view",
- "wrapper-engine",
 ]
 
 [[package]]

@@ -5,8 +5,8 @@ members = [
     "crates/vst3-host",
     "crates/vst3-host-view",
     "crates/subhost-adapter",
-    "crates/wrapper-engine",
-    "crates/wrapper-plugin",
+    "crates/audio-graph-engine",
+    "crates/audio-graph-plugin",
     "crates/host-cli",
 ]
 
@@ -24,7 +24,7 @@ subhost-adapter = { path = "crates/subhost-adapter" }
 # the workspace shows where it goes. `cargo add`/`cargo remove` prune workspace
 # dependencies nothing uses, so put it back rather than letting the scaffolding
 # quietly disappear.
-wrapper-engine = { path = "crates/wrapper-engine" }
+audio-graph-engine = { path = "crates/audio-graph-engine" }
 
 vst3 = "0.3.0"
 log = "0.4"

@@ -31,7 +31,7 @@ use crate::slots::SLOT_COUNT;
 /// only its own: the sub-plugin adapter never sees a delay time or a gain, and
 /// the audio half never sees a parameter.
 pub const LANES: usize =
-    SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS + wrapper_engine::MAX_AUDIO_LANES;
+    SLOT_COUNT + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES;
 
 /// The finest sub-block the schedule is sized for.
 pub const MIN_QUANTUM: u32 = 16;

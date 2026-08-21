@@ -273,8 +273,8 @@ fn cmd_buses(args: &[String]) -> Result<(), String> {
 
     // The same thing again, as the graph will show it.
     println!("\nas a plugin node:");
-    let ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
-    let node = wrapper_engine::NodeKind::Plugin { instance: 0, ports };
+    let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
+    let node = audio_graph_engine::NodeKind::Plugin { instance: 0, ports };
     for port in node.input_ports() {
         println!("  in  {} ({})", port.name, port.ty.label());
     }
@@ -1889,23 +1889,23 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
     value["sub_plugin"] = serde_json::Value::Null;
     value["sub_state"] = serde_json::Value::Null;
 
-    let mut graph = wrapper_engine::Graph::new();
+    let mut graph = audio_graph_engine::Graph::new();
     let input = graph.add(
-        wrapper_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn {
             bus: 0,
             channels: 2,
         },
         [40.0, 40.0],
     );
     let output = graph.add(
-        wrapper_engine::NodeKind::AudioOut {
+        audio_graph_engine::NodeKind::AudioOut {
             bus: 0,
             channels: 2,
         },
         [600.0, 40.0],
     );
     let mix = graph.add(
-        wrapper_engine::NodeKind::Mix {
+        audio_graph_engine::NodeKind::Mix {
             channels: 2,
             inputs: 2,
             // The dry signal at unity, the loop below it, so the repeats fade
@@ -1915,8 +1915,8 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
         },
         [320.0, 40.0],
     );
-    let (write, read) = graph.add_delay(wrapper_engine::PortType::STEREO, [320.0, 240.0]);
-    if let Some(wrapper_engine::NodeKind::DelayRead {
+    let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [320.0, 240.0]);
+    if let Some(audio_graph_engine::NodeKind::DelayRead {
         time: t, max_time, ..
     }) = graph.node_mut(read).map(|n| &mut n.kind)
     {
@@ -1950,7 +1950,7 @@ fn inject_sidechain(
         let plugin = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
             .map_err(|e| e.to_string())?;
         let layout = plugin.io_layout();
-        let ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
+        let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
         Ok((
             serde_json::json!({
                 "format": "vst3",
@@ -2115,10 +2115,10 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
     let loaded = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
         .map_err(|e| e.to_string())?;
     let layout = loaded.io_layout();
-    let mut ports = wrapper_engine::PluginPorts::from_layout(&layout, 0);
+    let mut ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
     // One parameter socket, as if the user had pressed "+ param" once.
     if let Some(first) = loaded.params().first() {
-        ports.params.push(wrapper_engine::ParamPort {
+        ports.params.push(audio_graph_engine::ParamPort {
             id: first.id.0,
             name: first.name.clone(),
         });
@@ -2149,30 +2149,30 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
     // Every kind of socket at once: audio, an aux input, a param and (if the
     // plugin takes them) notes. The canvas colours sockets by type, and a patch
     // with only one type in it is a patch that cannot show whether it works.
-    let mut graph = wrapper_engine::Graph::new();
+    let mut graph = audio_graph_engine::Graph::new();
     let input = graph.add(
-        wrapper_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn {
             bus: 0,
             channels: 2,
         },
         [40.0, 60.0],
     );
     let sidechain = graph.add(
-        wrapper_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn {
             bus: 1,
             channels: 2,
         },
         [40.0, 200.0],
     );
     let node = graph.add(
-        wrapper_engine::NodeKind::Plugin {
+        audio_graph_engine::NodeKind::Plugin {
             instance: 0,
             ports: ports.clone(),
         },
         [300.0, 60.0],
     );
     let mix = graph.add(
-        wrapper_engine::NodeKind::Mix {
+        audio_graph_engine::NodeKind::Mix {
             channels: 2,
             inputs: 2,
             gains: vec![1.0, 0.5],
@@ -2180,14 +2180,14 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         [560.0, 60.0],
     );
     let output = graph.add(
-        wrapper_engine::NodeKind::AudioOut {
+        audio_graph_engine::NodeKind::AudioOut {
             bus: 0,
             channels: 2,
         },
         [800.0, 60.0],
     );
-    let (write, read) = graph.add_delay(wrapper_engine::PortType::STEREO, [300.0, 340.0]);
-    let slot = graph.add(wrapper_engine::NodeKind::SlotIn { slot: 0 }, [40.0, 400.0]);
+    let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [300.0, 340.0]);
+    let slot = graph.add(audio_graph_engine::NodeKind::SlotIn { slot: 0 }, [40.0, 400.0]);
 
     graph.connect(input, 0, node, 0);
     if ports.audio_in.len() > 1 {

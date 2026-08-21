@@ -58,7 +58,7 @@ enum Command {
     /// A plugin node was added: load into `instance` and give `node` the
     /// sockets the plugin turns out to have (§14.2).
     LoadPlugin {
-        node: wrapper_engine::NodeId,
+        node: audio_graph_engine::NodeId,
         instance: usize,
         path: PathBuf,
     },
