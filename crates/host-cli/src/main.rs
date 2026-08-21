@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         "chain" => cmd_chain(rest),
         "instrument" => cmd_instrument(rest),
         "sidechain" => cmd_sidechain(rest),
+        "delay" => cmd_delay(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
         "automate" => cmd_automate(rest),
@@ -1753,6 +1754,158 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
 
 /// Tone -> compressor -> out, with an instrument keying the compressor's aux
 /// bus, and a `Constant` driving a slot bound to the sidechain-enable switch.
+/// M8.5's DoD, through the real wrapper: a feedback delay sounds the same at
+/// any block size, and the echo lands where the delay time says it does.
+///
+/// A DAW check by nature — the DAW is what chooses the block size — so it is
+/// done here instead (ROADMAP). No sub-plugin is involved: the patch is an
+/// input, a mix, a delay line and an output, which is the smallest thing that
+/// puts §14.4's cut in the middle of a cycle.
+fn cmd_delay(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use vst3_host::Vst3Plugin;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 2.0) as usize;
+    // Well above the 32-sample floor of §14.4, and short enough that several
+    // repeats fit in two seconds.
+    let delay = 0.25f64;
+
+    // One click, then silence. Everything after it in the output came out of
+    // the delay line.
+    let mut input = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    for ch in 0..2usize {
+        input.samples[ch * frames] = 1.0;
+    }
+
+    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
+    let class = render::choose_class(&module, None)?;
+    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let patched = inject_delay(&read_wrapper_state(&baseline)?, delay)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let render = |block: u32| -> Result<wav::Audio, String> {
+        render::render_with_state(Path::new(wrapper), None, Some(&state), &input, block, &[])
+            .map(|o| o.audio)
+    };
+
+    let big = render(512)?;
+    let small = render(64)?;
+
+    // Where the repeats are. A peak every `delay` seconds is the line running
+    // at the time it was told, and the count is the feedback going round.
+    let expected = (delay * f64::from(sample_rate)).round() as usize;
+    let mut repeats: Vec<usize> = Vec::new();
+    let mut i = 1;
+    while i < big.frames {
+        if big.samples[i].abs() > 0.2 {
+            repeats.push(i);
+            i += expected / 2;
+        }
+        i += 1;
+    }
+    println!(
+        "delay {delay} s = {expected} samples; {} repeats at {:?}",
+        repeats.len(),
+        &repeats[..repeats.len().min(4)]
+    );
+    if repeats.len() < 3 {
+        return Err(format!(
+            "expected the feedback to repeat; found {} peaks",
+            repeats.len()
+        ));
+    }
+    for (n, &at) in repeats.iter().enumerate() {
+        let want = expected * (n + 1);
+        // One sample of slack: the read pointer is fractional, so a peak can
+        // straddle two samples.
+        if at.abs_diff(want) > 1 {
+            return Err(format!("repeat {} landed at {at}, expected {want}", n + 1));
+        }
+    }
+
+    let worst = big
+        .samples
+        .iter()
+        .zip(&small.samples)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("  512 vs 64 samples per block: largest difference {worst:.9}");
+    if worst > 1e-6 {
+        return Err(format!(
+            "the loop sounds different at a different block size ({worst})"
+        ));
+    }
+    println!("  ok");
+    Ok(())
+}
+
+/// A feedback delay patch, written straight into the wrapper's saved state.
+///
+/// ```text
+///   AudioIn ─┐                ┌─> AudioOut
+///            ├─> Mix ─────────┤
+///   DelayRead┘                └─> DelayWrite
+/// ```
+///
+/// The read and the write are joined by the line number and by nothing else,
+/// which is what keeps this out of the cycle check (§14.4).
+fn inject_delay(state: &str, time: f64) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    value["sub_plugins"] = serde_json::json!([]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    let mut graph = wrapper_engine::Graph::new();
+    let input = graph.add(
+        wrapper_engine::NodeKind::AudioIn {
+            bus: 0,
+            channels: 2,
+        },
+        [40.0, 40.0],
+    );
+    let output = graph.add(
+        wrapper_engine::NodeKind::AudioOut {
+            bus: 0,
+            channels: 2,
+        },
+        [600.0, 40.0],
+    );
+    let mix = graph.add(
+        wrapper_engine::NodeKind::Mix {
+            channels: 2,
+            inputs: 2,
+        },
+        [320.0, 40.0],
+    );
+    let (write, read) = graph.add_delay(wrapper_engine::PortType::STEREO, [320.0, 240.0]);
+    if let Some(wrapper_engine::NodeKind::DelayRead {
+        time: t, max_time, ..
+    }) = graph.node_mut(read).map(|n| &mut n.kind)
+    {
+        *t = time;
+        *max_time = time * 2.0;
+    }
+    // The loop has no gain node in it: the graph has no audio multiply yet, so
+    // the repeats come back at full height rather than fading. That makes the
+    // block-size comparison sharper, and two seconds is not long enough for it
+    // to be a problem.
+    graph.connect(input, 0, mix, 0);
+    graph.connect(read, 0, mix, 1);
+    graph.connect(mix, 0, output, 0);
+    graph.connect(mix, 0, write, 0);
+
+    value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
+    Ok(value.to_string())
+}
+
 fn inject_sidechain(
     state: &str,
     comp: &str,

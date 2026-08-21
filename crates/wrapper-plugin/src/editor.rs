@@ -247,6 +247,8 @@ impl WrapperEditor {
             poly_modulation: self.view.poly_modulation,
             error: self.shared.main().compile_error.clone(),
             live: self.shared.live_slots(),
+            quantum: self.shared.quantum(),
+            sample_rate: self.shared.sample_rate() as f64,
         };
 
         let mut state = self.shared.main();

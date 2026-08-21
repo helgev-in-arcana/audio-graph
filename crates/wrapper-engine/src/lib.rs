@@ -24,14 +24,14 @@ mod program;
 
 pub use audio::MAX_BUFFERS;
 pub use compile::{CompileError, compile};
-pub use engine::{AudioChunk, AudioNodes, BlockContext, Engine, NoNodes};
+pub use engine::{AudioChunk, AudioContext, AudioNodes, BlockContext, Engine, NoNodes};
 pub use graph::{
     ExprSource, Graph, LineId, Link, MathOp, Node, NodeId, NodeKind, ParamPort, PluginPorts, Port,
     PortType, Rate, Waveform,
 };
 pub use handoff::Handoff;
 pub use program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
-    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, Operand, ParamTarget, Program,
-    RateSpec, Reg,
+    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY, MAX_AUDIO_DELAY_LINES, MAX_CHANNELS,
+    MAX_DELAY_LANES, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS,
+    NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
 };

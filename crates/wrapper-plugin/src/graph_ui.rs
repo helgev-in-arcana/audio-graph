@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use subhost_adapter::SLOT_COUNT;
 use wrapper_engine::{
-    ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, Rate, Waveform,
+    ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
 };
 
 const NODE_WIDTH: f32 = 186.0;
@@ -81,6 +81,12 @@ pub struct GraphContext<'a> {
     pub error: Option<String>,
     /// The value each slot currently has after the graph has had its say.
     pub live: [f32; SLOT_COUNT],
+    /// The sub-block size and the sample rate, which together are the floor a
+    /// delay time cannot go below (§14.4). The editor shows it and holds the
+    /// control at it; the audio thread applies it again regardless, because
+    /// these two can change while a patch is loaded.
+    pub quantum: u32,
+    pub sample_rate: f64,
 }
 
 /// Canvas state that belongs to the view rather than to the patch.
@@ -527,14 +533,45 @@ impl GraphEditor {
                 });
                 changed |= ui.checkbox(clamp, "clamp").changed();
             }
-            NodeKind::DelayRead { time, .. } => {
+            NodeKind::DelayRead {
+                line,
+                ty,
+                max_time,
+                time,
+            } => {
+                changed |= line_control(ui, line);
+                // The floor of §14.4, in the units the control is in. It is
+                // the sub-block size, which the user chose, so it moves when
+                // they change that setting — and the value is raised with
+                // it rather than the delay quietly running longer than it says.
+                let floor = ctx.quantum as f64 / ctx.sample_rate.max(1.0);
+                if *time < floor {
+                    *time = floor;
+                    changed = true;
+                }
                 ui.horizontal(|ui| {
                     ui.label("time (s)");
                     changed |= ui
-                        .add(egui::DragValue::new(time).speed(0.001).range(0.0..=10.0))
+                        .add(
+                            egui::DragValue::new(time)
+                                .speed(0.001)
+                                .range(floor..=*max_time),
+                        )
                         .changed();
                 });
-                ui.weak("held at one sub-block minimum while in a loop");
+                ui.horizontal(|ui| {
+                    ui.label("max (s)");
+                    changed |= ui
+                        .add(egui::DragValue::new(max_time).speed(0.01).range(0.01..=2.0))
+                        .changed();
+                });
+                if matches!(ty, PortType::Audio { .. }) {
+                    ui.weak(format!(
+                        "at least {:.1} ms — one sub-block (§14.4)",
+                        floor * 1000.0
+                    ));
+                    ui.weak("wire the time socket to sweep it — the pitch moves with it");
+                }
             }
             NodeKind::Plugin { instance, ports } => {
                 changed |= self.plugin_controls(ui, *instance, ports, ctx);
@@ -568,8 +605,11 @@ impl GraphEditor {
                     ui.weak(if *bus == 0 { "main" } else { "sidechain" });
                 });
             }
-            // Sinks and sources with nothing to set.
-            NodeKind::DelayWrite { .. } | NodeKind::NoteIn => {}
+            NodeKind::DelayWrite { line, .. } => {
+                changed |= line_control(ui, line);
+            }
+            // A source with nothing to set.
+            NodeKind::NoteIn => {}
         }
         changed
     }
@@ -730,6 +770,20 @@ impl GraphEditor {
                     }
 
                     ui.separator();
+                    ui.strong("Delay");
+                    ui.weak("two nodes on one line: a write and a read (§14.4)");
+                    for (label, ty) in [
+                        ("Audio delay", PortType::STEREO),
+                        ("Param delay", PortType::Param),
+                    ] {
+                        if ui.button(label).clicked() {
+                            graph.add_delay(ty, [at.x, at.y]);
+                            added = true;
+                            close = true;
+                        }
+                    }
+
+                    ui.separator();
                     ui.strong("Node");
                     egui::ScrollArea::vertical()
                         .id_salt("add-kind")
@@ -846,6 +900,26 @@ fn shorten(text: &str) -> String {
         return text.to_string();
     }
     text.chars().take(15).collect::<String>() + "\u{2026}"
+}
+
+/// Which delay line a half belongs to.
+///
+/// One-based on screen for the same reason a slot is: the two halves are paired
+/// by this number and nothing else, so it has to be readable at a glance.
+fn line_control(ui: &mut egui::Ui, line: &mut u32) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label("line");
+        let mut shown = *line + 1;
+        if ui
+            .add(egui::DragValue::new(&mut shown).range(1..=16))
+            .changed()
+        {
+            *line = shown.max(1) - 1;
+            changed = true;
+        }
+    });
+    changed
 }
 
 fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, ctx: &GraphContext<'_>) -> bool {

@@ -7,10 +7,10 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::graph::{Graph, NodeId, NodeKind, PortType};
+use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType};
 use crate::program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS,
-    NoteSource,
+    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUX_BUSES, MAX_COMPENSATION,
+    MAX_COMPENSATORS, NoteSource,
 };
 
 use crate::compile::{CompileError, Line, NO_WRITER};
@@ -21,6 +21,9 @@ pub const MAX_BUFFERS: usize = 64;
 /// The audio half of a `Program`.
 pub(crate) struct Audio {
     pub ops: Vec<AudioOp>,
+    /// Audio line index → its `DelayWrite` node, so a program swap can carry
+    /// the ring contents over (§14.5).
+    pub delay_nodes: Vec<NodeId>,
     pub buffers: Vec<u16>,
     pub chunking: Chunking,
     pub latency: u32,
@@ -112,6 +115,37 @@ impl Pool {
     }
 }
 
+/// The audio index of `line`, assigning one if this is its first mention.
+///
+/// `delay_nodes` grows alongside, so index `i` always names the writer of the
+/// line at `audio_lines[i]` — that pairing is what lets a program swap keep the
+/// ring contents (§14.5).
+fn audio_line(
+    audio_lines: &mut Vec<LineId>,
+    delay_nodes: &mut Vec<NodeId>,
+    lines: &[Line],
+    line: LineId,
+) -> Result<u16, CompileError> {
+    if let Some(index) = audio_lines.iter().position(|&l| l == line) {
+        return Ok(index as u16);
+    }
+    if audio_lines.len() >= MAX_AUDIO_DELAY_LINES {
+        return Err(CompileError::TooLarge {
+            what: "audio delay lines",
+            limit: MAX_AUDIO_DELAY_LINES,
+        });
+    }
+    audio_lines.push(line);
+    delay_nodes.push(
+        lines
+            .iter()
+            .find(|l| l.id == line)
+            .map(|l| l.writer)
+            .unwrap_or(NO_WRITER),
+    );
+    Ok((audio_lines.len() - 1) as u16)
+}
+
 /// Which note stream a plugin node is wired to (§14.10).
 ///
 /// `None` when nothing is connected, which is the answer that makes an
@@ -137,6 +171,7 @@ pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
     lines: &[Line],
+    delay_lanes: &[(NodeId, u16)],
 ) -> Result<Audio, CompileError> {
     let mut ops: Vec<AudioOp> = Vec::new();
     let mut pool = Pool::new();
@@ -144,6 +179,16 @@ pub(crate) fn compile_audio(
     let mut latency = 0u32;
     let mut compensators = 0u16;
     let mut instances: Vec<InstanceIo> = Vec::new();
+    // Audio lines are numbered among themselves: their rings are a scarcer
+    // resource than a param line's, so they get their own ceiling and their own
+    // index space.
+    let mut audio_lines: Vec<LineId> = Vec::new();
+    let mut delay_nodes: Vec<NodeId> = Vec::new();
+    // Held back and appended last, for the reason the param half holds its
+    // writes back (`compile`): within one chunk every read must see the line as
+    // it stood before this chunk was written, or a delay of exactly one chunk
+    // would read back what it had just written.
+    let mut writes: Vec<AudioOp> = Vec::new();
 
     for &id in order {
         let node = graph.node(id).expect("ordering only contains real nodes");
@@ -334,9 +379,48 @@ pub(crate) fn compile_audio(
                     latency: arrive,
                 });
             }
+            NodeKind::DelayRead {
+                line,
+                ty: PortType::Audio { channels },
+                max_time,
+                time,
+            } => {
+                let index = audio_line(&mut audio_lines, &mut delay_nodes, lines, *line)?;
+                let out = pool.alloc(*channels, readers)?;
+                ops.push(AudioOp::DelayRead {
+                    out,
+                    line: index,
+                    lane: delay_lanes.iter().find(|&&(n, _)| n == id).map(|&(_, l)| l),
+                    time: time.max(0.0),
+                    max_time: max_time.max(0.0),
+                });
+                produced.push(Produced {
+                    node: id,
+                    buf: out,
+                    // A line is a cut, not an edge: what comes out of it did not
+                    // travel here through the paths §14.6 is lining up, so it
+                    // arrives with no latency of its own to compensate for.
+                    latency: 0,
+                });
+            }
+            NodeKind::DelayWrite {
+                line,
+                ty: PortType::Audio { .. },
+            } => {
+                let index = audio_line(&mut audio_lines, &mut delay_nodes, lines, *line)?;
+                if let Some((buf, _)) = sources[0] {
+                    pool.consume(buf);
+                    writes.push(AudioOp::DelayWrite {
+                        line: index,
+                        a: buf,
+                    });
+                }
+            }
             _ => {}
         }
     }
+
+    ops.append(&mut writes);
 
     // §14.9. An audio line with both halves present closes a loop, and then
     // every plugin in the program has to run at sub-block granularity.
@@ -348,6 +432,7 @@ pub(crate) fn compile_audio(
     Ok(Audio {
         instances,
         ops,
+        delay_nodes,
         buffers: pool.widths,
         chunking: if looped {
             Chunking::SubBlock
@@ -360,9 +445,22 @@ pub(crate) fn compile_audio(
 
 #[cfg(test)]
 mod tests {
+
+    /// A context for a test that only cares about the frame count: no
+    /// automation, and a quantum big enough that a whole-block program stays
+    /// one chunk.
+    fn ctx(frames: u32) -> AudioContext<'static> {
+        AudioContext {
+            frames,
+            quantum: 32,
+            sample_rate: 48_000.0,
+            lanes: &[],
+            lanes_per_row: 0,
+        }
+    }
     use super::*;
     use crate::compile::compile;
-    use crate::engine::{AudioChunk, AudioNodes};
+    use crate::engine::{AudioChunk, AudioContext, AudioNodes};
     use crate::graph::PluginPorts;
     use crate::program::AudioOp;
 
@@ -907,7 +1005,7 @@ mod tests {
         let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
         let mut daw_out = [0.0f32; 8];
         let mut seen = RecordInput::default();
-        engine.run_audio(4, &daw_in, &mut daw_out, &mut seen);
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut seen);
 
         assert_eq!(seen.channels, 3, "stereo main plus mono sidechain");
         assert_eq!(seen.first_of_each, vec![1.0, 2.0, 3.0]);

@@ -91,6 +91,9 @@ pub struct Shared {
     /// `MainState` because the audio thread reads it every block and must not
     /// have to ask anybody's permission.
     quantum: AtomicU32,
+    /// What the DAW is running at, so the editor can put the floor of §14.4 in
+    /// seconds on a delay node. Bits of an `f32`, the same trick `live` uses.
+    sample_rate: AtomicU32,
     /// What each slot is actually worth after the graph has had its say.
     ///
     /// Written by the audio thread once per block and read by the editor. Two
@@ -135,6 +138,9 @@ impl Shared {
             audio: Mutex::new(AudioState { processor: None }),
             programs: Handoff::new(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
+            // Until the DAW says otherwise. A wrong rate here only makes the
+            // floor shown in the editor wrong, never the audio.
+            sample_rate: AtomicU32::new(48_000f32.to_bits()),
             live: array::from_fn(|_| AtomicU32::new(0)),
             params,
             generation: AtomicU64::new(0),
@@ -173,6 +179,14 @@ impl Shared {
 
     pub fn set_quantum(&self, quantum: u32) {
         self.quantum.store(quantum, Ordering::Relaxed);
+    }
+
+    pub fn sample_rate(&self) -> f32 {
+        f32::from_bits(self.sample_rate.load(Ordering::Relaxed))
+    }
+
+    pub fn set_sample_rate(&self, rate: f32) {
+        self.sample_rate.store(rate.to_bits(), Ordering::Relaxed);
     }
 
     /// Report the slot values the sub-plugin is actually being driven with.

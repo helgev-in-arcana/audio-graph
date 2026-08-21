@@ -64,6 +64,20 @@ impl ParamEvent {
             _ => 0,
         }
     }
+
+    /// The same event, timed at `offset` instead.
+    ///
+    /// A gesture has no offset to move; it is returned unchanged rather than
+    /// refused, so a caller rebasing a whole stream does not have to know which
+    /// events carry a time.
+    pub fn at_offset(mut self, offset: u32) -> ParamEvent {
+        if let ParamEvent::SetValue { sample_offset, .. }
+        | ParamEvent::Modulate { sample_offset, .. } = &mut self
+        {
+            *sample_offset = offset;
+        }
+        self
+    }
 }
 
 /// Per-note continuous controllers. Both formats have these; VST3 declares the
@@ -135,6 +149,17 @@ impl NoteEvent {
             | NoteEvent::Midi { sample_offset, .. } => sample_offset,
         }
     }
+
+    /// The same event, timed at `offset` instead.
+    pub fn at_offset(mut self, offset: u32) -> NoteEvent {
+        let (NoteEvent::NoteOn { sample_offset, .. }
+        | NoteEvent::NoteOff { sample_offset, .. }
+        | NoteEvent::NoteEnd { sample_offset, .. }
+        | NoteEvent::Expression { sample_offset, .. }
+        | NoteEvent::Midi { sample_offset, .. }) = &mut self;
+        *sample_offset = offset;
+        self
+    }
 }
 
 /// Everything that can be handed to `process`, in one ordered stream.
@@ -149,6 +174,19 @@ impl Event {
         match self {
             Event::Param(e) => e.sample_offset(),
             Event::Note(e) => e.sample_offset(),
+        }
+    }
+
+    /// The same event, timed at `offset` instead.
+    ///
+    /// Used when a block is cut into chunks and each chunk is handed to the
+    /// sub-plugin as its own `process` call (§14.9): an event at sample 40 of
+    /// the block is at sample 8 of the chunk that starts at 32, and handing it
+    /// over still saying 40 would put it past the end of a 32-sample buffer.
+    pub fn at_offset(self, offset: u32) -> Event {
+        match self {
+            Event::Param(e) => Event::Param(e.at_offset(offset)),
+            Event::Note(e) => Event::Note(e.at_offset(offset)),
         }
     }
 }

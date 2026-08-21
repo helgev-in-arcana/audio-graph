@@ -12,8 +12,8 @@
 
 use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType, Rate};
 use crate::program::{
-    MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand, ParamTarget, Program,
-    RateSpec, Reg,
+    MAX_DELAY_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
+    ParamTarget, Program, RateSpec, Reg,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +131,9 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     // (§14.12). The evaluator writes them the same way it writes a slot, so
     // nothing below the compiler has to know the difference.
     let mut param_targets: Vec<ParamTarget> = Vec::new();
+    // The same idea one range further along, for automated delay times: the
+    // node it belongs to, and the lane number it was given (§14.5).
+    let mut delay_lanes: Vec<(NodeId, u16)> = Vec::new();
 
     let mut next_reg: usize = 0;
     let mut alloc = || -> Result<Reg, CompileError> {
@@ -263,25 +266,62 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     outputs.push((slot as u16, reg));
                 }
             }
-            NodeKind::DelayRead { line, time, .. } => {
+            NodeKind::DelayRead { line, ty, time, .. } => {
                 let index = lines
                     .iter()
                     .position(|l| l.id == line)
                     .expect("collect_lines saw every DelayRead");
-                let out = alloc()?;
-                ops.push(Op::DelayRead {
-                    out,
-                    line: index as u16,
-                    // A negative time would read the future.
-                    time: time.max(0.0),
-                });
-                reg_of.push(((id, 0), out));
+                // A negative time would read the future.
+                let time = time.max(0.0);
+                let time_reg = input(0);
+                match ty {
+                    PortType::Audio { .. } => {
+                        // The audio half owns this line. All the param half
+                        // does is carry the time across to it, and only when
+                        // the user has wired something to the control: a lane
+                        // is a scarce thing to spend on a number that never
+                        // changes (§14.12, and §14.5 for why a lane at all —
+                        // the audio pass runs after every sub-block of the
+                        // param pass, so a register would hold the wrong one).
+                        if let Some(reg) = time_reg {
+                            let lane = match delay_lanes.iter().position(|&(n, _)| n == id) {
+                                Some(existing) => existing,
+                                None => {
+                                    if delay_lanes.len() >= MAX_DELAY_LANES {
+                                        return Err(CompileError::TooLarge {
+                                            what: "automated delay times",
+                                            limit: MAX_DELAY_LANES,
+                                        });
+                                    }
+                                    delay_lanes.push((id, 0));
+                                    delay_lanes.len() - 1
+                                }
+                            };
+                            let number = (slot_count + MAX_GRAPH_PARAMS + lane) as u16;
+                            delay_lanes[lane].1 = number;
+                            outputs.push((number, reg));
+                        }
+                    }
+                    _ => {
+                        let out = alloc()?;
+                        ops.push(Op::DelayRead {
+                            out,
+                            line: index as u16,
+                            time,
+                            time_reg,
+                        });
+                        reg_of.push(((id, 0), out));
+                    }
+                }
             }
-            NodeKind::DelayWrite { line, .. } => {
+            NodeKind::DelayWrite { line, ty } => {
                 let index = lines
                     .iter()
                     .position(|l| l.id == line)
                     .expect("collect_lines saw every DelayWrite");
+                if matches!(ty, PortType::Audio { .. }) {
+                    continue;
+                }
                 // Nothing plugged in writes silence, the same way an unwired
                 // SlotOut simply does not take its slot over.
                 if let Some(reg) = input(0) {
@@ -339,7 +379,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
 
     ops.append(&mut writes);
 
-    let audio = crate::audio::compile_audio(graph, &order, &lines)?;
+    let audio = crate::audio::compile_audio(graph, &order, &lines, &delay_lanes)?;
 
     outputs.sort_unstable();
     Ok(Program {
@@ -353,6 +393,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         chunking: audio.chunking,
         latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
+        audio_delay_nodes: audio.delay_nodes,
         lfo_nodes,
     })
 }

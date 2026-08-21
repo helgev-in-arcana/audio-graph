@@ -39,6 +39,27 @@ pub const MAX_DELAY_LINES: usize = 16;
 /// would mean a reallocation every time the user drags the time control.
 pub const MAX_DELAY_TAPS: usize = 4096;
 
+/// How many *audio* delay lines one program may have, and how long each is.
+///
+/// Counted apart from [`MAX_DELAY_LINES`] because an audio line costs a ring of
+/// samples rather than a ring of sub-block values: four stereo lines of 96 000
+/// samples is 3 MB, and sixteen would be 12 MB per activated wrapper. The
+/// length is 2 s at 48 kHz and 1 s at 96 kHz.
+///
+/// §14.5 asks for the ring to be sized from the node's `max_time` at activate.
+/// A fixed ceiling is what is implemented: `prepare` runs before any graph
+/// exists, so the length it would have to ask about is not knowable yet. The
+/// node's `max_time` still bounds what the line will read.
+pub const MAX_AUDIO_DELAY_LINES: usize = 4;
+pub const MAX_AUDIO_DELAY: usize = 96_000;
+
+/// Lanes past the slot table that carry a delay time rather than a parameter.
+///
+/// Same mechanism as §14.12 and a disjoint range of lane numbers, so the
+/// evaluator writes a delay time exactly the way it writes a slot and the
+/// adapter, which only knows about parameters, never sees one.
+pub const MAX_DELAY_LANES: usize = MAX_AUDIO_DELAY_LINES;
+
 /// How many parallel paths one program may compensate, and by how much.
 ///
 /// Both are preallocated (§9.1), so both are ceilings rather than guidance. A
@@ -126,6 +147,9 @@ pub enum Op {
     },
     /// Read from a delay line, `time` seconds back (§14.4).
     ///
+    /// `time_reg`, when present, is the register the time control is wired to
+    /// and overrides `time` (§14.5).
+    ///
     /// Clamped at run time to at least one sub-block, which is the floor of
     /// §14.4 expressed in the param domain. The compiler cannot do it: the
     /// floor depends on the sample rate and the quantum, and it knows neither.
@@ -133,6 +157,7 @@ pub enum Op {
         out: Reg,
         line: u16,
         time: f64,
+        time_reg: Option<Reg>,
     },
     /// Write this sub-block's value into a delay line.
     ///
@@ -227,6 +252,24 @@ pub enum AudioOp {
     Compensate { buf: Buf, slot: u16, samples: u32 },
     /// Fill a buffer with silence. Emitted for an input nobody connected.
     Silence { out: Buf },
+    /// Read an audio delay line into a buffer (§14.4, §14.5).
+    ///
+    /// The read pointer is fractional and interpolated, so moving the time
+    /// moves the pitch — the tape behaviour, which is what falls out of writing
+    /// this the obvious way. `lane` names the schedule lane carrying the time
+    /// when it is automated; without one, `time` is the whole story.
+    DelayRead {
+        out: Buf,
+        line: u16,
+        lane: Option<u16>,
+        /// Seconds, used when `lane` is `None`.
+        time: f64,
+        /// Seconds. The line never reads further back than this, whatever the
+        /// automation says.
+        max_time: f64,
+    },
+    /// Write a buffer into an audio delay line.
+    DelayWrite { line: u16, a: Buf },
 }
 
 /// A graph, compiled.
@@ -238,6 +281,12 @@ pub struct Program {
     /// Which slot each output drives, and where its value ends up. Sorted by
     /// slot, and at most one entry per slot.
     pub outputs: Vec<(u16, Reg)>,
+    /// Audio line index → the `DelayWrite` node it belongs to.
+    ///
+    /// Separate from `delay_nodes`: audio lines are numbered among themselves,
+    /// because their rings are a scarcer resource than a param line's
+    /// (`MAX_AUDIO_DELAY_LINES`). Carried across a swap for the same reason.
+    pub audio_delay_nodes: Vec<NodeId>,
     /// Line index → the `DelayWrite` node it belongs to.
     ///
     /// Carried across a swap for the same reason as `lfo_nodes`: §14.5. A
@@ -287,6 +336,7 @@ impl Program {
             chunking: Chunking::WholeBlock,
             latency: 0,
             delay_nodes: Vec::new(),
+            audio_delay_nodes: Vec::new(),
             lfo_nodes: Vec::new(),
         }
     }

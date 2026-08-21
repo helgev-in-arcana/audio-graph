@@ -240,6 +240,10 @@ impl Wrapper {
         // The graph's audio buffers (§14.7). Sized for the ceilings rather than
         // for the current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
+        // The editor needs it to show a delay's floor in seconds (§14.4). It
+        // never reaches the audio path this way — that gets the rate from the
+        // transport, block by block.
+        self.shared.set_sample_rate(config.sample_rate);
 
         let audio_config = AudioConfig {
             sample_rate: config.sample_rate as f64,
@@ -339,11 +343,12 @@ impl Wrapper {
             Some(state) => state,
             None => return pass_through(buffer, self.kind),
         };
-        let Some(processor) = &mut state.processor else {
-            // Pass-through. `buffer` already holds the input, so an effect
-            // needs no work; an instrument has nothing to play.
-            return pass_through(buffer, self.kind);
-        };
+        // Nothing loaded is not the same as nothing to do: a patch can be a
+        // delay line and a mix with no sub-plugin anywhere in it (§14.4), and
+        // passing the input through would be exactly the invisible route
+        // §14.13 got rid of. The graph runs either way; a plugin node with no
+        // plugin behind it produces silence, which `NoNodes` is.
+        let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
         run_graph(
@@ -419,13 +424,29 @@ impl Wrapper {
             // The graph decides where the audio goes and which plugins see it
             // (§14). Sub-plugins are reached through `AudioNodes`, so the
             // engine still knows nothing about what a plugin is.
-            let mut nodes =
-                processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
+            let mut loaded;
+            let mut empty = wrapper_engine::NoNodes;
+            let nodes: &mut dyn wrapper_engine::AudioNodes = match processor {
+                Some(processor) => {
+                    loaded =
+                        processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
+                    &mut loaded
+                }
+                None => &mut empty,
+            };
             self.engine.run_audio(
-                frames,
+                &wrapper_engine::AudioContext {
+                    frames,
+                    quantum: self.schedule.quantum(),
+                    sample_rate: transport.sample_rate as f64,
+                    // The same buffer the parameter lanes ride in. The audio
+                    // half reads only the delay-time range out of it (§14.5).
+                    lanes: self.schedule.rows(),
+                    lanes_per_row: subhost_adapter::LANES,
+                },
                 &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
-                &mut nodes,
+                nodes,
             );
             ApiStatus::Continue
         } else {

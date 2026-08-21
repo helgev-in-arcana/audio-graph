@@ -20,12 +20,17 @@ use crate::slots::SLOT_COUNT;
 
 /// How many values one sub-block carries.
 ///
-/// The 32 slots the DAW automates, and then one lane per parameter the graph
-/// drives directly (§14.12). One buffer rather than two because they are
-/// produced by the same evaluator pass and consumed by the same merge: the
-/// evaluator writes a lane exactly the way it writes a slot, and nothing below
-/// the compiler has to know which is which.
-pub const LANES: usize = SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS;
+/// The 32 slots the DAW automates, then one lane per parameter the graph drives
+/// directly (§14.12), then one per automated delay time (§14.5). One buffer
+/// rather than three because they are produced by the same evaluator pass and
+/// consumed by the same merge: the evaluator writes a lane exactly the way it
+/// writes a slot, and nothing below the compiler has to know which is which.
+///
+/// The ranges are disjoint and fixed, which is what lets each consumer read
+/// only its own: the sub-plugin adapter never sees a delay time, and the audio
+/// half never sees a parameter.
+pub const LANES: usize =
+    SLOT_COUNT + wrapper_engine::MAX_GRAPH_PARAMS + wrapper_engine::MAX_DELAY_LANES;
 
 /// The finest sub-block the schedule is sized for.
 pub const MIN_QUANTUM: u32 = 16;
@@ -93,6 +98,11 @@ impl SlotSchedule {
         self.blocks
     }
 
+    /// How many samples the current block covers.
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
     /// Where sub-block `index` starts, as a sample offset into the block.
     pub fn offset(&self, index: usize) -> u32 {
         (index as u32 * self.quantum).min(self.frames.saturating_sub(1))
@@ -103,6 +113,12 @@ impl SlotSchedule {
     pub fn frames_of(&self, index: usize) -> u32 {
         let start = index as u32 * self.quantum;
         self.frames.saturating_sub(start).min(self.quantum)
+    }
+
+    /// Every row, one after another — the shape the audio half wants, because
+    /// it walks chunks itself and picks a row per chunk (§14.9).
+    pub fn rows(&self) -> &[f64] {
+        &self.values[..self.blocks * LANES]
     }
 
     pub fn block(&self, index: usize) -> &[f64] {

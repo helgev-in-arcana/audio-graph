@@ -4,6 +4,7 @@
 //! main-thread half that loads, binds and saves, and it hands out a
 //! [`SubHostProcessor`] for the audio thread.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -616,24 +617,49 @@ impl SubHostProcessor {
     /// The two streams are merged in offset order. A sub-plugin is entitled to
     /// assume its input events are sorted, and several real ones misbehave
     /// quietly rather than loudly when they are not.
+    ///
+    /// `chunk` is the part of the block this call covers (§14.9). It is the
+    /// whole block unless an audio delay line put the program on sub-block
+    /// granularity, in which case this runs once per sub-block and each call
+    /// must be handed *its own* events, rebased: a note at sample 40 belongs to
+    /// the chunk starting at 32, at offset 8, and to no other. Handing every
+    /// chunk the whole block would replay every note once per chunk.
     pub fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,
         slots: &SlotSchedule,
         events: &[Event],
+        chunk: Range<u32>,
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
         self.scratch.clear();
+        // Everything before the chunk has already been sent, on an earlier
+        // call; everything after it belongs to a later one.
+        let events = slice(events, &chunk);
         let mut next_note = 0;
 
         for index in 0..slots.blocks() {
             let offset = slots.offset(index);
+            // Rows outside this chunk are another call's business. The last
+            // chunk of a block is short whenever the block is not a multiple of
+            // the quantum, so `<` on the end is what keeps the boundary row out
+            // of both calls' way rather than in both.
+            if offset < chunk.start || offset >= chunk.end.max(chunk.start + 1) {
+                continue;
+            }
+            let offset = offset - chunk.start;
 
             // Anything the DAW sent that lands before this boundary goes first,
             // so the stream stays sorted.
-            while next_note < events.len() && events[next_note].sample_offset() < offset {
-                push(&mut self.scratch, events[next_note]);
+            while next_note < events.len()
+                && events[next_note].sample_offset() - chunk.start < offset
+            {
+                let event = events[next_note];
+                push(
+                    &mut self.scratch,
+                    event.at_offset(event.sample_offset() - chunk.start),
+                );
                 next_note += 1;
             }
 
@@ -662,7 +688,10 @@ impl SubHostProcessor {
         }
 
         for &event in &events[next_note..] {
-            push(&mut self.scratch, event);
+            push(
+                &mut self.scratch,
+                event.at_offset(event.sample_offset() - chunk.start),
+            );
         }
 
         self.processor
@@ -777,10 +806,22 @@ impl wrapper_engine::AudioNodes for GraphNodes<'_> {
             &mut buffers,
             self.slots,
             events,
+            chunk.offset..chunk.offset + chunk.frames,
             self.context,
             self.out_events,
         );
     }
+}
+
+/// The events landing inside `chunk`.
+///
+/// The stream is sorted, so this is a range rather than a filter — which is
+/// what makes it free of allocation and of any per-event work at all on the
+/// blocks where every event falls in the first chunk.
+fn slice<'a>(events: &'a [Event], chunk: &Range<u32>) -> &'a [Event] {
+    let start = events.partition_point(|e| e.sample_offset() < chunk.start);
+    let end = events.partition_point(|e| e.sample_offset() < chunk.end);
+    &events[start..end.max(start)]
 }
 
 /// Append, unless the buffer is full.
@@ -796,7 +837,7 @@ fn push(scratch: &mut Vec<Event>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_host_api::{BufferLayout, ParamFlags};
+    use plugin_host_api::{BufferLayout, NoteEvent, ParamFlags};
 
     /// A processor that records what it was handed.
     struct Recorder {
@@ -849,6 +890,7 @@ mod tests {
             &mut buffers,
             schedule,
             events,
+            0..schedule.frames(),
             &TimeContext::default(),
             &mut sink,
         );
@@ -934,6 +976,92 @@ mod tests {
         let (mut p, seen) = harness(Vec::new());
         run(&mut p, &vec![0.5; crate::slots::SLOT_COUNT]);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// §14.9. A program with an audio feedback loop runs once per sub-block,
+    /// and each of those calls is a `process` of its own. An event belongs to
+    /// exactly one of them, at an offset measured from *that* call's start —
+    /// handing every chunk the whole block would sound each note once per
+    /// chunk, and at offsets past the end of a 32-sample buffer.
+    #[test]
+    fn a_chunk_hears_only_its_own_events_rebased() {
+        let (mut p, seen) = harness(Vec::new());
+        let note = Event::Note(NoteEvent::NoteOn {
+            note_id: -1,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+            sample_offset: 40,
+        });
+
+        let mut schedule = SlotSchedule::new(128, 32);
+        schedule.begin(64);
+
+        let input = [0.0f32; 64];
+        let mut output = [0.0f32; 64];
+        let mut sink = EventSink::new();
+        for chunk in [0..32u32, 32..64] {
+            let mut buffers =
+                AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
+            p.process(
+                &mut buffers,
+                &schedule,
+                &[note],
+                chunk,
+                &TimeContext::default(),
+                &mut sink,
+            );
+        }
+
+        let notes: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, Event::Note(_)))
+            .map(|e| e.sample_offset())
+            .collect();
+        assert_eq!(notes, vec![8], "once, in the second chunk, at offset 8");
+    }
+
+    /// The parameter side of the same cut: a slot boundary belongs to the chunk
+    /// that contains it, and its offset is rebased too.
+    #[test]
+    fn a_chunk_sends_only_its_own_slot_boundaries() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+            min: 0.0,
+            max: 1.0,
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+
+        let mut schedule = SlotSchedule::new(128, 32);
+        let blocks = schedule.begin(128);
+        for i in 0..blocks {
+            schedule.block_mut(i)[0] = i as f64 / 4.0;
+        }
+
+        let input = [0.0f32; 64];
+        let mut output = [0.0f32; 64];
+        let mut sink = EventSink::new();
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
+        p.process(
+            &mut buffers,
+            &schedule,
+            &[],
+            64..96,
+            &TimeContext::default(),
+            &mut sink,
+        );
+
+        let offsets: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.sample_offset())
+            .collect();
+        assert_eq!(offsets, vec![0], "the boundary at 64, seen from 64");
     }
 
     #[test]
@@ -1087,6 +1215,7 @@ mod tests {
             output_channels: 2,
             aux_inputs: Default::default(),
             frames: 4,
+            offset: 0,
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];

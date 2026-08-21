@@ -410,8 +410,12 @@ impl NodeKind {
             | NodeKind::Lfo { .. }
             | NodeKind::Expression { .. }
             | NodeKind::AudioIn { .. }
-            | NodeKind::NoteIn
-            | NodeKind::DelayRead { .. } => Vec::new(),
+            | NodeKind::NoteIn => Vec::new(),
+            // The one input a `DelayRead` has is its own delay time (§14.5).
+            // It is a param, never audio, so it cannot close a loop through
+            // the line it belongs to — the type check in `check_links` is what
+            // makes that true rather than a convention.
+            NodeKind::DelayRead { .. } => vec![Port::param("time")],
             NodeKind::Math { .. } => vec![Port::param("a"), Port::param("b")],
             NodeKind::RangeMap { .. } | NodeKind::SlotOut { .. } => vec![Port::param("in")],
             NodeKind::AudioOut { channels, .. } => {
@@ -585,6 +589,44 @@ impl Graph {
             kind,
         });
         id
+    }
+
+    /// Add both halves of a delay line, on a line nothing else is using.
+    ///
+    /// One call because they are one thing to the user (§14.4): the split into
+    /// a writer and a reader is what keeps a cycle out of the topological sort,
+    /// not something anyone sat down wanting. They are still two nodes, and can
+    /// be moved apart, deleted separately, or joined by further reads — a
+    /// second read on the same line is a multi-tap delay.
+    ///
+    /// Returns `(write, read)`.
+    pub fn add_delay(&mut self, ty: PortType, pos: [f32; 2]) -> (NodeId, NodeId) {
+        let line = self.free_line();
+        let write = self.add(NodeKind::DelayWrite { line, ty }, pos);
+        let read = self.add(
+            NodeKind::DelayRead {
+                line,
+                ty,
+                // Long enough for an echo, short enough that the control is
+                // usable without zooming in on it.
+                max_time: 2.0,
+                time: 0.25,
+            },
+            [pos[0] + 170.0, pos[1]],
+        );
+        (write, read)
+    }
+
+    /// The lowest line number no node mentions.
+    pub fn free_line(&self) -> LineId {
+        let mut line = 0;
+        while self.nodes.iter().any(|n| match n.kind {
+            NodeKind::DelayWrite { line: l, .. } | NodeKind::DelayRead { line: l, .. } => l == line,
+            _ => false,
+        }) {
+            line += 1;
+        }
+        line
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
@@ -847,7 +889,11 @@ mod tests {
             time: 0.5,
         };
         assert!(write.output_ports().is_empty());
-        assert!(read.input_ports().is_empty());
+        // The read has one input, but it is the delay time (§14.5) and it is a
+        // param — never the line's own signal, which is what would make an edge
+        // between the halves and put a cycle back into the graph.
+        assert_eq!(read.input_ports().len(), 1);
+        assert!(matches!(read.input_ports()[0].ty, PortType::Param));
     }
 
     #[test]
