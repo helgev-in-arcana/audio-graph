@@ -270,6 +270,10 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::capabilities(p))
     }
 
+    fn voice_info(&self) -> Option<plugin_host_api::VoiceInfo> {
+        delegate!(self, p => SubPluginMain::voice_info(p))
+    }
+
     fn io_layout(&self) -> IoLayout {
         delegate!(self, p => SubPluginMain::io_layout(p))
     }

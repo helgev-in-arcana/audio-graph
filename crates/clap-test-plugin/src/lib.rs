@@ -54,6 +54,10 @@ use clap_sys::ext::render::{
     clap_plugin_render_mode,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::voice_info::{
+    CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_plugin_voice_info,
+    clap_voice_info,
+};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::id::clap_id;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -551,6 +555,8 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const EXT_PORTS_ACTIVATION).cast()
     } else if id == CLAP_EXT_RENDER {
         (&raw const EXT_RENDER).cast()
+    } else if id == CLAP_EXT_VOICE_INFO {
+        (&raw const EXT_VOICE_INFO).cast()
     } else {
         std::ptr::null()
     }
@@ -984,6 +990,34 @@ unsafe extern "C" fn ports_set_active(
     } else {
         instance.active_ports &= !(1 << bit);
     }
+    true
+}
+
+// --- clap.voice-info ------------------------------------------------------
+
+/// What the fixture claims. Distinct numbers, and not round ones, so a host
+/// that reports a default or swaps the two fields is visible in the assert.
+pub const VOICE_COUNT: u32 = 3;
+pub const VOICE_CAPACITY: u32 = 7;
+
+static EXT_VOICE_INFO: clap_plugin_voice_info = clap_plugin_voice_info {
+    get: Some(voice_info_get),
+};
+
+unsafe extern "C" fn voice_info_get(
+    _plugin: *const clap_plugin,
+    out: *mut clap_voice_info,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    unsafe {
+        *out = clap_voice_info {
+            voice_count: VOICE_COUNT,
+            voice_capacity: VOICE_CAPACITY,
+            flags: CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES,
+        }
+    };
     true
 }
 

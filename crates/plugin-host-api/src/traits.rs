@@ -13,7 +13,7 @@
 use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
 use crate::events::{Event, EventSink, TimeContext};
-use crate::params::{Capabilities, IoLayout, ParamId, ParamInfo, ParamSnapshot};
+use crate::params::{Capabilities, IoLayout, ParamId, ParamInfo, ParamSnapshot, VoiceInfo};
 
 /// What the sub-plugin reported about its output for this block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,16 @@ pub trait SubPluginMain {
     fn params(&self) -> &[ParamInfo];
 
     fn capabilities(&self) -> Capabilities;
+
+    /// How many voices an instrument has, if the format has a way to ask.
+    ///
+    /// Defaulted to `None` rather than made mandatory: CLAP's `voice-info` has
+    /// no VST3 counterpart, and a backend that invented a number would be
+    /// making one up. Nothing in the engine branches on it — it is reported,
+    /// the way `params` is.
+    fn voice_info(&self) -> Option<VoiceInfo> {
+        None
+    }
 
     /// The plugin's buses and whether it takes notes (§14.2).
     ///

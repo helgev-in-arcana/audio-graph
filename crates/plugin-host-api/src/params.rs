@@ -105,6 +105,24 @@ pub struct Capabilities {
     pub dynamic_params: bool,
 }
 
+/// How many voices an instrument has, when it will say (ARCHITECTURE.md §3.3).
+///
+/// CLAP's `voice-info` is the only place this comes from; VST3 has no
+/// equivalent, so a VST3 sub-plugin reports `None` rather than a guess.
+/// Read after loading and again whenever the plugin says it changed — Surge XT
+/// changes it when the patch's polyphony setting moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceInfo {
+    /// Voices the plugin will actually use with its current patch.
+    pub count: u32,
+    /// The most it could ever use. Never smaller than `count`.
+    pub capacity: u32,
+    /// Whether two notes with the same key and channel may overlap. A host
+    /// that ends notes by key alone gets this wrong for the plugins that say
+    /// yes, which is why the flag exists at all.
+    pub overlapping_notes: bool,
+}
+
 /// Minimal stand-in for the `bitflags` crate.
 ///
 /// Only a handful of ops are needed and this keeps `plugin-host-api`

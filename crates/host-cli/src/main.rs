@@ -431,12 +431,31 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     let class = render::choose_class(Path::new(path), args.get(1).map(String::as_str))?;
 
     let host = Arc::new(host::CliHost::new());
-    let plugin = Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
+    let mut plugin =
+        Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
+    // A plugin may only be able to answer some of the questions below once it
+    // has had a main-thread turn — voice counts are the usual one. The real
+    // host ticks every frame; this is the harness catching up with it.
+    plugin.tick();
 
     let (ins, outs) = render::bus_widths(&plugin);
     println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
     println!("capabilities: {:?}", plugin.capabilities());
+    // Only CLAP instruments answer this, so most plugins print nothing rather
+    // than a line of zeroes.
+    if let Some(voices) = SubPluginMain::voice_info(&plugin) {
+        println!(
+            "voices: {} of {}{}",
+            voices.count,
+            voices.capacity,
+            if voices.overlapping_notes {
+                ", overlapping notes"
+            } else {
+                ""
+            }
+        );
+    }
 
     let snapshot = plugin.snapshot();
     let params = SubPluginMain::params(&plugin);
@@ -918,7 +937,12 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("{}: activate: {e}", class.name))?;
             plugin.deactivate(processor);
             if round == 1 {
-                println!("{} | {params} params | {ins}->{outs}", class.name);
+                // Voices after activate, not before: an instrument that has no
+                // sample rate yet often declines to answer.
+                let voices = SubPluginMain::voice_info(&plugin)
+                    .map(|v| format!(" | {} of {} voices", v.count, v.capacity))
+                    .unwrap_or_default();
+                println!("{} | {params} params | {ins}->{outs}{voices}", class.name);
             }
         }
     }

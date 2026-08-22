@@ -37,6 +37,7 @@ use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check}
 use clap_sys::ext::timer_support::{
     CLAP_EXT_TIMER_SUPPORT, clap_host_timer_support, clap_plugin_timer_support,
 };
+use clap_sys::ext::voice_info::{CLAP_EXT_VOICE_INFO, clap_host_voice_info};
 use clap_sys::host::clap_host;
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::clap_plugin;
@@ -115,6 +116,8 @@ pub struct PendingRequests {
     pub latency: bool,
     /// Its bus layout changed.
     pub audio_ports: bool,
+    /// Its voice count or capacity changed.
+    pub voice_info: bool,
     /// Its editor asked to be resized, in logical pixels.
     pub gui_resize: Option<(u32, u32)>,
     /// Its editor closed itself.
@@ -148,6 +151,7 @@ pub(crate) struct HostShim {
     param_rescan: AtomicU32,
     latency: AtomicBool,
     audio_ports: AtomicBool,
+    voice_info: AtomicBool,
     /// Packed `(width << 32) | height`, or `NO_RESIZE` for "nothing pending".
     gui_resize: AtomicU64,
     gui_closed: AtomicBool,
@@ -210,6 +214,7 @@ impl HostShim {
             param_rescan: AtomicU32::new(0),
             latency: AtomicBool::new(false),
             audio_ports: AtomicBool::new(false),
+            voice_info: AtomicBool::new(false),
             gui_resize: AtomicU64::new(NO_RESIZE),
             gui_closed: AtomicBool::new(false),
             timers: Mutex::new(Vec::new()),
@@ -243,6 +248,7 @@ impl HostShim {
             param_rescan: self.param_rescan.swap(0, Ordering::AcqRel),
             latency: self.latency.swap(false, Ordering::AcqRel),
             audio_ports: self.audio_ports.swap(false, Ordering::AcqRel),
+            voice_info: self.voice_info.swap(false, Ordering::AcqRel),
             gui_resize: (packed != NO_RESIZE)
                 .then_some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)),
             gui_closed: self.gui_closed.swap(false, Ordering::AcqRel),
@@ -342,6 +348,8 @@ unsafe extern "C" fn get_extension(host: *const clap_host, id: *const c_char) ->
         (&raw const HOST_NOTE_PORTS).cast()
     } else if id == CLAP_EXT_TAIL {
         (&raw const HOST_TAIL).cast()
+    } else if id == CLAP_EXT_VOICE_INFO {
+        (&raw const HOST_VOICE_INFO).cast()
     } else {
         std::ptr::null()
     };
@@ -627,6 +635,21 @@ unsafe extern "C" fn note_ports_rescan(host: *const clap_host, _flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
         shim.audio_ports.store(true, Ordering::Release);
         shim.context.request_restart(RestartReason::IoConfig);
+    }
+}
+
+// --- clap.voice-info ------------------------------------------------------
+
+static HOST_VOICE_INFO: clap_host_voice_info = clap_host_voice_info {
+    changed: Some(voice_info_changed),
+};
+
+unsafe extern "C" fn voice_info_changed(host: *const clap_host) {
+    if let Some(shim) = unsafe { shim(host) } {
+        // Re-read on the next tick rather than here: the plugin may call this
+        // from anywhere, and asking it a question back inside its own callback
+        // is the shape of every reentrancy bug in this crate.
+        shim.voice_info.store(true, Ordering::Release);
     }
 }
 

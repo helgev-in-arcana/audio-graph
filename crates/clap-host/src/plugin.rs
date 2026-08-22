@@ -43,6 +43,10 @@ use clap_sys::ext::render::{
     CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
 };
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::voice_info::{
+    CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_plugin_voice_info,
+    clap_voice_info,
+};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{
     CLAP_PROCESS_ERROR, CLAP_PROCESS_SLEEP, clap_process, clap_process_status,
@@ -51,7 +55,7 @@ use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
     IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, Result,
-    SubPluginMain, SubPluginProcessor, TimeContext,
+    SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -133,6 +137,8 @@ pub struct ClapPlugin {
     /// Optional. Lets the host say whether this is a live take or an offline
     /// bounce; see `set_render_mode`.
     ext_render: *const clap_plugin_render,
+    /// Optional, and instruments only in practice.
+    ext_voice_info: *const clap_plugin_voice_info,
     /// Optional. Lets the host tell a plugin that a port is not worth
     /// computing; see `set_port_activation`.
     ext_ports_activation: *const clap_plugin_audio_ports_activation,
@@ -143,6 +149,9 @@ pub struct ClapPlugin {
 
     active: Cell<bool>,
     latency: Cell<u32>,
+    /// Last answer from `clap.voice-info`, re-read when the plugin says it
+    /// changed. `None` when the plugin does not implement the extension.
+    voices: Cell<Option<VoiceInfo>>,
     /// Main-thread edits waiting for the processor, exactly as the VST3 backend
     /// keeps them: CLAP delivers values only through events, so an edit made
     /// while audio is running has to ride the next block.
@@ -211,6 +220,8 @@ impl ClapPlugin {
         let ext_latency = unsafe { extension::<clap_plugin_latency>(plugin, CLAP_EXT_LATENCY) };
         let ext_gui = unsafe { extension::<clap_plugin_gui>(plugin, CLAP_EXT_GUI) };
         let ext_render = unsafe { extension::<clap_plugin_render>(plugin, CLAP_EXT_RENDER) };
+        let ext_voice_info =
+            unsafe { extension::<clap_plugin_voice_info>(plugin, CLAP_EXT_VOICE_INFO) };
         let ext_audio_ports =
             unsafe { extension::<clap_plugin_audio_ports>(plugin, CLAP_EXT_AUDIO_PORTS) };
         let ext_note_ports =
@@ -249,10 +260,12 @@ impl ClapPlugin {
             ext_latency,
             ext_gui,
             ext_render,
+            ext_voice_info,
             ext_ports_activation,
             editor: None,
             active: Cell::new(false),
             latency: Cell::new(0),
+            voices: Cell::new(unsafe { read_voice_info(plugin, ext_voice_info) }),
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EVENTS_PER_BLOCK))),
             flush_buffers: RefCell::new((
                 InputEvents::new(MAX_EVENTS_PER_BLOCK),
@@ -392,6 +405,11 @@ impl ClapPlugin {
             // reading half of it because only `TEXT` was set is how a stale
             // range survives a plugin update.
             self.params = unsafe { read_params(self.plugin, self.ext_params) };
+        }
+
+        if requests.voice_info {
+            self.voices
+                .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
         }
 
         if requests.latency {
@@ -561,6 +579,10 @@ impl SubPluginMain for ClapPlugin {
         ClapPlugin::io_layout(self)
     }
 
+    fn voice_info(&self) -> Option<VoiceInfo> {
+        self.voices.get()
+    }
+
     fn capabilities(&self) -> Capabilities {
         // Probed, not fixed: this is the format that actually has these, and
         // which of them a given plugin offers is per-parameter (§3.3).
@@ -727,6 +749,12 @@ impl SubPluginMain for ClapPlugin {
             )));
         }
         self.active.set(true);
+
+        // Voice counts often are not knowable until the plugin has a patch and
+        // a sample rate — Surge XT answers `false` before that — so this is
+        // re-read here as well as when the plugin says it changed.
+        self.voices
+            .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
 
         // Latency is only meaningful once activated, which is why it is read
         // here rather than at construction.
@@ -1180,6 +1208,35 @@ unsafe fn read_latency(plugin: *const clap_plugin, ext: *const clap_plugin_laten
         Some(get) => unsafe { get(plugin) },
         None => 0,
     }
+}
+
+/// Ask an instrument how many voices it has, if it will say.
+///
+/// # Safety
+/// `plugin` must be live; `ext` may be null.
+unsafe fn read_voice_info(
+    plugin: *const clap_plugin,
+    ext: *const clap_plugin_voice_info,
+) -> Option<VoiceInfo> {
+    if ext.is_null() {
+        return None;
+    }
+    let get = unsafe { (*ext).get }?;
+    let mut info = clap_voice_info {
+        voice_count: 0,
+        voice_capacity: 0,
+        flags: 0,
+    };
+    // A plugin is allowed to answer "not right now" — Surge XT does while it
+    // has no patch — and that is not the same as not implementing this.
+    if !unsafe { get(plugin, &mut info) } {
+        return None;
+    }
+    Some(VoiceInfo {
+        count: info.voice_count,
+        capacity: info.voice_capacity,
+        overlapping_notes: info.flags & CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES != 0,
+    })
 }
 
 /// Read the plugin's parameter list into the core's model.

@@ -316,6 +316,15 @@ fn the_backend_drives_a_real_clap_module() {
         "the wired output stays on"
     );
 
+    // --- what the plugin says about its voices ------------------------------
+
+    // Mirrors `clap_test_plugin::VOICE_COUNT` / `VOICE_CAPACITY`: two different
+    // numbers, so a backend that reported one field twice would fail here.
+    let voices = SubPluginMain::voice_info(&plugin).expect("the fixture implements voice-info");
+    assert_eq!(voices.count, 3);
+    assert_eq!(voices.capacity, 7);
+    assert!(voices.overlapping_notes);
+
     // --- the plugin was told this is an offline render ---------------------
 
     // `AudioConfig::offline` is the only thing that says so, and CLAP's only
