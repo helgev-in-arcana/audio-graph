@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "scan" => cmd_scan(rest),
         "info" => cmd_info(rest),
         "buses" => cmd_buses(rest),
+        "outbus" => cmd_outbus(rest),
         "dirs" => cmd_dirs(),
         "churn" => cmd_churn(rest),
         "params" => cmd_params(rest),
@@ -97,6 +98,10 @@ fn usage() {
                                     rendered one after the other
   host-cli buses <PLUGIN> [ID]      list the plugin's buses as the node graph
                                     will see them (§14.2)
+  host-cli outbus <WRAPPER.vst3> <PLUGIN> [ID]
+                                    render a plugin with more than one output
+                                    bus once per output socket, and report what
+                                    each socket carries
   host-cli instrument <WRAPPER.vst3> <SYNTH> <A> <B>
                                     check notes reach the instrument the graph
                                     points at, and only that one
@@ -426,12 +431,31 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     let class = render::choose_class(Path::new(path), args.get(1).map(String::as_str))?;
 
     let host = Arc::new(host::CliHost::new());
-    let plugin = Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
+    let mut plugin =
+        Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
+    // A plugin may only be able to answer some of the questions below once it
+    // has had a main-thread turn — voice counts are the usual one. The real
+    // host ticks every frame; this is the harness catching up with it.
+    plugin.tick();
 
     let (ins, outs) = render::bus_widths(&plugin);
     println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
     println!("capabilities: {:?}", plugin.capabilities());
+    // Only CLAP instruments answer this, so most plugins print nothing rather
+    // than a line of zeroes.
+    if let Some(voices) = SubPluginMain::voice_info(&plugin) {
+        println!(
+            "voices: {} of {}{}",
+            voices.count,
+            voices.capacity,
+            if voices.overlapping_notes {
+                ", overlapping notes"
+            } else {
+                ""
+            }
+        );
+    }
 
     let snapshot = plugin.snapshot();
     let params = SubPluginMain::params(&plugin);
@@ -678,6 +702,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         input_channels: ins.min(2),
         output_channels: if outs == 0 { 2 } else { outs.min(2) },
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: true,
     };
     let frames = 64u32;
@@ -906,6 +931,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 input_channels: ins.min(2),
                 output_channels: if outs == 0 { 2 } else { outs.min(2) },
                 aux_inputs: Default::default(),
+                aux_outputs: Default::default(),
                 offline: true,
             };
             let processor = plugin
@@ -913,7 +939,12 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("{}: activate: {e}", class.name))?;
             plugin.deactivate(processor);
             if round == 1 {
-                println!("{} | {params} params | {ins}->{outs}", class.name);
+                // Voices after activate, not before: an instrument that has no
+                // sample rate yet often declines to answer.
+                let voices = SubPluginMain::voice_info(&plugin)
+                    .map(|v| format!(" | {} of {} voices", v.count, v.capacity))
+                    .unwrap_or_default();
+                println!("{} | {params} params | {ins}->{outs}{voices}", class.name);
             }
         }
     }
@@ -938,6 +969,7 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
         input_channels: 2,
         output_channels: 2,
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: false,
     };
     let processor = sub.activate(config, &[], &[])?;
@@ -1621,6 +1653,212 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
     }
 
     println!("notes reach the instrument the graph points at, and only that one");
+    Ok(())
+}
+
+/// Every output socket of a multi-output plugin, one render each (§14.2).
+///
+/// The node graph gives a plugin one output socket per declared bus. Until
+/// 2026-08-23 nothing had ever wired one other than the first, and when this
+/// check was written it turned out all three of Surge XT's sockets rendered
+/// the main output — the compiler kept a plugin's audio by node rather than by
+/// port, and handed the plugin one output bus at activate.
+///
+/// So this renders the same material once per socket. What it can assert
+/// without knowing the plugin is narrow, because which of its buses carry
+/// anything is the patch's business: socket 0 has to produce something, and
+/// the sockets must not all be the same signal. Each render is its own
+/// instance, and a synth with a free-running oscillator does not repeat
+/// itself, so socket 0 is rendered twice to establish what "the same" is worth
+/// here.
+fn cmd_outbus(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use audio_graph_engine::{Graph, NodeKind, PluginPorts};
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let plugin = args
+        .get(1)
+        .ok_or("expected a plugin with several outputs")?;
+    let class_id = args.get(2).map(String::as_str).filter(|t| !t.is_empty());
+
+    let (class, loaded) = render::load(Path::new(plugin), class_id, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = loaded.io_layout();
+    let ports = PluginPorts::from_layout(&layout, 0);
+    drop(loaded);
+
+    let outputs = ports.audio_out.len();
+    if outputs < 2 {
+        return Err(format!(
+            "{} declares {outputs} output bus(es); this check needs a plugin with more than one (Surge XT has three)",
+            short(plugin)
+        ));
+    }
+    // The graph can hand a plugin the main bus and `MAX_AUX_BUSES` more, in
+    // either direction — every buffer in the engine's pool is as wide as the
+    // widest region, so the ceiling is memory rather than taste (§14.7). A
+    // 16-out drum machine has more outputs than that, and the ones past the
+    // ceiling are refused at compile time; rendering them here would show
+    // silence and read like the plugin's doing.
+    let reachable = (1 + plugin_host::MAX_AUX_BUSES).min(outputs);
+    println!(
+        "{}: {} output sockets ({reachable} within the graph's reach), {} audio in, notes {}",
+        short(plugin),
+        outputs,
+        ports.audio_in.len(),
+        ports.accepts_notes
+    );
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 2.0) as usize;
+
+    // Whatever the plugin will react to: a note if it takes them, a tone if it
+    // does not. A socket reading silence has to mean "this bus is silent", not
+    // "nothing was ever fed in".
+    let mut input = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    if !ports.accepts_notes {
+        for ch in 0..2usize {
+            for i in 0..frames {
+                let phase = i as f32 / sample_rate * 220.0 * std::f32::consts::TAU;
+                input.samples[ch * frames + i] = 0.3 * phase.sin();
+            }
+        }
+    }
+    let events = if ports.accepts_notes {
+        render::note(
+            60,
+            (sample_rate * 0.1) as usize,
+            (sample_rate * 1.5) as usize,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let (_wrapper_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |socket: usize| -> Result<render::RenderOutcome, String> {
+        let mut value: serde_json::Value = serde_json::from_str(&baseline_json)
+            .map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+        value["sub_plugins"] = serde_json::json!([
+            {
+                "instance": 0,
+                "reference": {
+                    "format": class.format.tag(),
+                    "plugin_id": class.id,
+                    "path_hint": plugin,
+                    "display_name": class.name,
+                }
+            }
+        ]);
+        value["sub_plugin"] = serde_json::Value::Null;
+        value["sub_state"] = serde_json::Value::Null;
+
+        let mut graph = Graph::new();
+        let source = graph.add(
+            if ports.accepts_notes {
+                NodeKind::NoteIn
+            } else {
+                NodeKind::AudioIn {
+                    bus: 0,
+                    channels: 2,
+                }
+            },
+            [40.0, 60.0],
+        );
+        let node = graph.add(
+            NodeKind::Plugin {
+                instance: 0,
+                ports: ports.clone(),
+            },
+            [300.0, 60.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [560.0, 60.0],
+        );
+        // Input sockets are the audio buses first and the notes port after
+        // them, which is what makes an instrument's notes port socket 0.
+        let sink = if ports.accepts_notes {
+            ports.audio_in.len() as u8
+        } else {
+            0
+        };
+        graph.connect(source, 0, node, sink);
+        graph.connect(node, socket as u8, out, 0);
+        value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
+
+        let state = edit_wrapper_state(&baseline, &value.to_string())?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &input,
+            BLOCK,
+            &events,
+        )
+    };
+
+    let mut rendered = Vec::with_capacity(reachable);
+    for socket in 0..reachable {
+        let outcome = run(socket)?;
+        println!(
+            "  socket {socket} ({}): peak {:.6}  rms {:.6}",
+            layout.outputs[socket].name,
+            outcome.audio.peak(),
+            outcome.audio.rms()
+        );
+        rendered.push(outcome.audio);
+    }
+
+    if rendered[0].peak() < 1e-4 {
+        return Err(format!(
+            "socket 0 is silent, so nothing here would mean anything; {} may need a preset loaded first",
+            short(plugin)
+        ));
+    }
+
+    // The floor: two renders of the *same* socket, compared by level rather
+    // than sample by sample. Each render is its own instance, and a synth with
+    // a free-running oscillator starts at a different phase every time, so two
+    // renders of one bus differ by nearly the whole signal while their levels
+    // agree to four decimal places.
+    let control = run(0)?;
+    let noise = (rendered[0].rms() - control.audio.rms()).abs();
+    println!("  socket 0 rendered twice differs in level by {noise:.9} (the floor)");
+
+    let mut distinct = 0;
+    for (socket, audio) in rendered.iter().enumerate().skip(1) {
+        let d = (audio.rms() - rendered[0].rms()).abs();
+        let verdict = if d > noise * 4.0 + 1e-4 {
+            distinct += 1;
+            "its own bus"
+        } else {
+            "indistinguishable from socket 0"
+        };
+        println!("  socket {socket} vs socket 0: {d:.9} — {verdict}");
+    }
+
+    if distinct == 0 {
+        return Err(format!(
+            "no output socket carried anything socket 0 did not. Either the graph is reading one bus for all of them, or {} mirrors its buses in this patch — check the plugin's own metering before believing the first",
+            short(plugin)
+        ));
+    }
+    println!(
+        "{distinct} of the {} reachable sockets past the first carry their own bus",
+        reachable - 1
+    );
     Ok(())
 }
 

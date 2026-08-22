@@ -21,9 +21,11 @@
 //! cannot unwind. Clicking "Open plugin GUI" took the host down with it.
 //!
 //! So the commands go to [`plugin_host::Deferred`], which runs them on the
-//! next turn of the DAW's message loop, once the frame is over. The same
-//! applies to the sub-plugin window's periodic tick, which answers `resizeView`
-//! by resizing a window: it runs on a timer, not in the draw callback.
+//! next turn of the DAW's message loop, once the frame is over. The
+//! sub-plugin window's periodic tick, which answers `resizeView` by resizing a
+//! window, is the same kind of work and is likewise kept out of the draw
+//! callback — it runs from the plugin instance's own tick (`crate::tick`),
+//! which keeps going whether or not this editor is open.
 //!
 //! # Threads
 //!
@@ -45,13 +47,6 @@ use subhost_adapter::MainThread;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;
-
-/// How often the sub-plugin's window gets its tick, in milliseconds.
-///
-/// Only resize bookkeeping and the close check happen here (§5.2) — the DAW
-/// pumps the actual messages — so 60 Hz is generous, and it costs nothing while
-/// no sub-editor is open.
-const TICK_MS: u32 = 16;
 
 /// Something the user asked for, to be carried out once the frame is over.
 enum Command {
@@ -438,24 +433,14 @@ impl NiceEguiApp for WrapperEditor {
         self.daw_window = plugin_host::root_window(raw_window(frame)) as usize;
 
         match plugin_host::deferred() {
-            Ok(deferred) => {
-                let shared = self.shared.clone();
-                // The sub-plugin's window needs a tick to answer its resize
-                // requests and to notice the user closing it (§5.2). It cannot
-                // ride on the draw callback: answering a resize means resizing
-                // a window, which is precisely what must not happen there.
-                deferred.set_tick(TICK_MS, move || {
-                    shared.main().host.tick_editors();
-                    // The same turn of the loop is as good a moment as any to
-                    // free the programs the audio thread has handed back
-                    // (§9.1). Nothing else on the main thread is guaranteed to
-                    // run while a patch just sits there playing.
-                    shared.reclaim();
-                });
-                self.deferred = Some(MainThread::new(deferred));
-            }
+            Ok(deferred) => self.deferred = Some(MainThread::new(deferred)),
             Err(e) => log::warn!("audio-graph: {e}"),
         }
+        // No tick is set up here. The sub-plugin's window needs one to answer
+        // its resize requests and to notice the user closing it (§5.2), and so
+        // does a CLAP sub-plugin's main-thread callback — but both have to keep
+        // happening while this window is shut, so the plugin instance owns that
+        // timer now (see `crate::tick`).
         Ok(())
     }
 
@@ -497,7 +482,7 @@ impl NiceEguiApp for WrapperEditor {
         // too: they are top level with no owner, and leaving one behind strands
         // it with nothing ticking it.
         self.shared.main().host.close_all_editors();
-        // Takes the timer, and anything still queued, with it.
+        // Takes anything still queued with it.
         self.deferred = None;
     }
 }

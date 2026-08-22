@@ -119,6 +119,7 @@ pub fn render_with_state(
         input_channels,
         output_channels,
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: true,
     };
 

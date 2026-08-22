@@ -49,7 +49,15 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_STEPPED, clap_param_info,
     clap_plugin_params,
 };
+use clap_sys::ext::render::{
+    CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
+    clap_plugin_render_mode,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::voice_info::{
+    CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_plugin_voice_info,
+    clap_voice_info,
+};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::id::clap_id;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
@@ -79,7 +87,15 @@ pub const PARAM_ACTIVE_PORTS: clap_id = 4;
 /// the thing named by [`Ask`]. Nothing else in the fixture ever calls back, so
 /// a host that drops one of these has nowhere to hide.
 pub const PARAM_ASK: clap_id = 5;
-pub const PARAM_COUNT: u32 = 6;
+/// Read-only, and the only way a test can see which render mode the host
+/// asked for.
+///
+/// 0 while nobody has said (which is also what CLAP's realtime mode is worth),
+/// 1 once the host has switched this instance to offline. Like
+/// [`PARAM_ACTIVE_PORTS`], `clap.render` is a pure command with nothing to
+/// read back, so the fixture reports it as a parameter or not at all.
+pub const PARAM_RENDER_MODE: clap_id = 6;
+pub const PARAM_COUNT: u32 = 7;
 
 /// Values for [`PARAM_ASK`].
 pub mod ask {
@@ -100,6 +116,14 @@ pub const SIDECHAIN_GAIN: f32 = 0.5;
 
 /// What one held note adds to every output sample.
 pub const NOTE_LEVEL: f32 = 0.25;
+
+/// What the second output bus carries, relative to the first.
+///
+/// The fixture has two outputs so the multi-output routing of §14.2 has
+/// something deterministic to bind to. Negative and not a power of two, so a
+/// host that read the wrong bus, summed the two, or copied one over the other
+/// cannot land on this by accident.
+pub const AUX_OUTPUT_GAIN: f32 = -0.75;
 
 /// Counts live instances, so a test can prove `destroy` actually runs.
 static LIVE_INSTANCES: AtomicU32 = AtomicU32::new(0);
@@ -173,6 +197,10 @@ pub(crate) struct Instance {
     /// Which ports the host left switched on. Every port starts active, which
     /// is what CLAP says a fresh instance looks like.
     active_ports: u32,
+    /// The last mode the host set through `clap.render`; see
+    /// [`PARAM_RENDER_MODE`]. Realtime is the value a fresh instance has,
+    /// which is what CLAP says too.
+    render_mode: i32,
     /// Declared last so it drops last, which is the wrong order on purpose:
     /// the host is required to call `gui.destroy` before the instance goes, and
     /// a fixture that cleaned up after a host that forgot would hide the bug
@@ -319,6 +347,7 @@ unsafe extern "C" fn factory_create(
         initialised: false,
         // CLAP says every port starts active.
         active_ports: u32::MAX,
+        render_mode: CLAP_RENDER_REALTIME,
         gui: gui::Gui::default(),
     });
     // Only once the box has its final address.
@@ -423,6 +452,7 @@ unsafe extern "C" fn plugin_process(
         return CLAP_PROCESS_ERROR;
     }
     let out = unsafe { &*data.audio_outputs };
+    let aux_out = unsafe { bus(data.audio_outputs, data.audio_outputs_count, 1) };
     let main_in = unsafe { bus(data.audio_inputs, data.audio_inputs_count, 0) };
     let side_in = unsafe { bus(data.audio_inputs, data.audio_inputs_count, 1) };
 
@@ -437,6 +467,21 @@ unsafe extern "C" fn plugin_process(
             let dry = src.map_or(0.0, |p| unsafe { *p.add(frame) });
             let sc = side.map_or(0.0, |p| unsafe { *p.add(frame) });
             unsafe { *dst.add(frame) = dry * gain + offset + sc * SIDECHAIN_GAIN + note_sum };
+        }
+
+        // The second bus, written whether or not anybody asked for it: a host
+        // that binds it to the wrong memory should be caught by the memory it
+        // corrupts, not spared because the fixture was tactful.
+        let Some(aux) = aux_out else { continue };
+        if channel >= aux.channel_count as usize || aux.data32.is_null() {
+            continue;
+        }
+        let aux_dst = unsafe { *aux.data32.add(channel) };
+        if aux_dst.is_null() {
+            return CLAP_PROCESS_ERROR;
+        }
+        for frame in 0..frames {
+            unsafe { *aux_dst.add(frame) = *dst.add(frame) * AUX_OUTPUT_GAIN };
         }
     }
 
@@ -532,6 +577,10 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const gui::EXT_GUI).cast()
     } else if id == CLAP_EXT_AUDIO_PORTS_ACTIVATION {
         (&raw const EXT_PORTS_ACTIVATION).cast()
+    } else if id == CLAP_EXT_RENDER {
+        (&raw const EXT_RENDER).cast()
+    } else if id == CLAP_EXT_VOICE_INFO {
+        (&raw const EXT_VOICE_INFO).cast()
     } else {
         std::ptr::null()
     }
@@ -600,7 +649,8 @@ unsafe extern "C" fn params_get_info(
             65535.0,
             CLAP_PARAM_IS_STEPPED,
         ),
-        _ => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        5 => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        _ => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
     };
 
     let out = unsafe { &mut *info };
@@ -636,6 +686,12 @@ unsafe extern "C" fn params_get_value(
     let (Some(instance), false) = (unsafe { Instance::from_host(plugin) }, out.is_null()) else {
         return false;
     };
+    if id == PARAM_RENDER_MODE {
+        // Reported rather than stored with the rest, for the same reason as
+        // the ports below: the host set it, not the user.
+        unsafe { *out = f64::from(instance.render_mode) };
+        return true;
+    }
     if id == PARAM_ACTIVE_PORTS {
         // Reported rather than stored with the rest: this one is the host's
         // doing, not the user's.
@@ -761,9 +817,10 @@ static EXT_AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports {
     get: Some(audio_ports_get),
 };
 
-unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, is_input: bool) -> u32 {
-    // Two inputs so the aux/sidechain path of §14.11 has something to bind to.
-    if is_input { 2 } else { 1 }
+unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, _is_input: bool) -> u32 {
+    // Two of each: the inputs for the aux/sidechain path of §14.11, the
+    // outputs for the extra-output-bus path of §14.2.
+    2
 }
 
 unsafe extern "C" fn audio_ports_get(
@@ -778,6 +835,7 @@ unsafe extern "C" fn audio_ports_get(
     let name = match (is_input, index) {
         (true, 0) | (false, 0) => "Main",
         (true, 1) => "Sidechain",
+        (false, 1) => "Aux Out",
         _ => return false,
     };
     let out = unsafe { &mut *info };
@@ -944,7 +1002,7 @@ unsafe extern "C" fn ports_set_active(
         return false;
     }
 
-    let limit = if is_input { 2 } else { 1 };
+    let limit = 2;
     if port_index >= limit {
         return false;
     }
@@ -958,6 +1016,61 @@ unsafe extern "C" fn ports_set_active(
     } else {
         instance.active_ports &= !(1 << bit);
     }
+    true
+}
+
+// --- clap.voice-info ------------------------------------------------------
+
+/// What the fixture claims. Distinct numbers, and not round ones, so a host
+/// that reports a default or swaps the two fields is visible in the assert.
+pub const VOICE_COUNT: u32 = 3;
+pub const VOICE_CAPACITY: u32 = 7;
+
+static EXT_VOICE_INFO: clap_plugin_voice_info = clap_plugin_voice_info {
+    get: Some(voice_info_get),
+};
+
+unsafe extern "C" fn voice_info_get(
+    _plugin: *const clap_plugin,
+    out: *mut clap_voice_info,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    unsafe {
+        *out = clap_voice_info {
+            voice_count: VOICE_COUNT,
+            voice_capacity: VOICE_CAPACITY,
+            flags: CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES,
+        }
+    };
+    true
+}
+
+// --- clap.render ----------------------------------------------------------
+
+static EXT_RENDER: clap_plugin_render = clap_plugin_render {
+    has_hard_realtime_requirement: Some(render_has_hard_realtime_requirement),
+    set: Some(render_set),
+};
+
+/// False, so the host is expected to switch this fixture to offline. A plugin
+/// that said yes may never be switched, and then the check below could not
+/// tell "the host respected the requirement" from "the host never called".
+unsafe extern "C" fn render_has_hard_realtime_requirement(_plugin: *const clap_plugin) -> bool {
+    false
+}
+
+unsafe extern "C" fn render_set(plugin: *const clap_plugin, mode: clap_plugin_render_mode) -> bool {
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    // A mode nobody defined is refused rather than stored: CLAP has exactly
+    // two, and a host that invented a third should hear about it.
+    if mode != CLAP_RENDER_REALTIME && mode != CLAP_RENDER_OFFLINE {
+        return false;
+    }
+    instance.render_mode = mode;
     true
 }
 

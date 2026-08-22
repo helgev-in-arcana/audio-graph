@@ -1,0 +1,235 @@
+//! The wrapper's heartbeat: a periodic call onto the host's main thread, for
+//! as long as the plugin instance exists.
+//!
+//! # Why this is not the editor's job
+//!
+//! CLAP does not treat the main-thread callback as a courtesy. A hosted plugin
+//! may ask its host for a periodic timer (`timer-support`) and may call
+//! `request_callback()` from anywhere, including the audio thread, and the
+//! host owes it an `on_main_thread` in return. A plugin that never gets either
+//! does not merely feel sluggish — it stops finishing whatever it deferred:
+//! parameter rescans, state that is written lazily, resize answers.
+//!
+//! Until now the only thing driving that was the `Deferred` tick the wrapper's
+//! own editor sets up when its window opens, so a project that loads and plays
+//! without anyone opening the wrapper's UI — the ordinary case, since
+//! `restore_state` loads every sub-plugin at project load — starved its
+//! sub-plugins for the whole session.
+//!
+//! # How it gets onto the main thread
+//!
+//! A plain thread does the waiting, and hands the work over with nice-plug's
+//! `execute_gui`. That is the one route to the main thread that exists before
+//! any window does: under CLAP it becomes `request_callback()`, and under VST3
+//! it goes through the wrapper's own message-loop hook. A platform timer in
+//! `host-window` would have worked on Windows only — its non-Windows half is
+//! still a stub — and would have had to be written once per platform.
+//!
+//! The exception is VST3 on Linux, where nice-plug runs `execute_gui` tasks on
+//! a worker thread because X11 has no main thread to speak of. The tick checks
+//! before touching anything and skips rather than panicking; CLAP on Linux
+//! goes through `request_callback()` and is unaffected.
+//!
+//! # Cost
+//!
+//! A resident 60 Hz timer per instance is not free, and most instances are not
+//! doing anything that needs it. So the period is chosen by what the last tick
+//! found: [`BUSY_MS`] while a sub-plugin is loaded, [`IDLE_MS`] when none is.
+//! The idle rate still has to be brisk enough that the first tick after a
+//! plugin is loaded is not visible as a stall.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use parking_lot::{Condvar, Mutex};
+
+use crate::shared::Shared;
+
+/// The period while at least one sub-plugin is loaded, in milliseconds.
+///
+/// Only bookkeeping happens per tick — the DAW pumps the actual messages — so
+/// 60 Hz is generous. `clap-host` floors a plugin's own requested timers at
+/// 8 ms, so this is what those effectively resolve to.
+const BUSY_MS: u32 = 16;
+
+/// The period while nothing is loaded, in milliseconds.
+///
+/// An empty wrapper has nobody to tick, and waking the host's UI thread sixty
+/// times a second to discover that is exactly the resident cost worth avoiding.
+const IDLE_MS: u32 = 200;
+
+/// The only background task this plugin has.
+#[derive(Clone, Copy)]
+pub enum Task {
+    /// Drive every loaded sub-plugin for one main-thread tick.
+    Tick,
+}
+
+/// What the waiting thread and the main-thread half say to each other.
+pub struct TickState {
+    /// Set when a tick has been posted and not yet run. Stops ticks piling up
+    /// behind a main thread that is busy — a queue of them would all run back
+    /// to back and none of them would mean anything.
+    pending: AtomicBool,
+    period_ms: AtomicU32,
+    stop: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl TickState {
+    pub fn new() -> Arc<TickState> {
+        Arc::new(TickState {
+            pending: AtomicBool::new(false),
+            period_ms: AtomicU32::new(IDLE_MS),
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        })
+    }
+}
+
+/// Run one tick. Call only on the host's main thread.
+///
+/// Skips rather than waits if the state is already borrowed further up the
+/// stack: this runs from the host's callback, and the callback can arrive
+/// while a command that is loading a plugin is dispatching messages.
+pub fn run(shared: &Arc<Shared>, state: &TickState) {
+    state.pending.store(false, Ordering::Release);
+
+    if !shared.on_main_thread() {
+        // VST3 on Linux; see the module comment. Nothing here is safe to do
+        // from here, and there is no other thread to hand it to.
+        return;
+    }
+
+    let busy = {
+        let Some(mut main) = shared.try_main() else {
+            return;
+        };
+        main.host.tick_editors();
+        main.host.any_loaded()
+    };
+    // As good a moment as any to free the programs the audio thread has handed
+    // back (§9.1). Nothing else on the main thread is guaranteed to run while
+    // a patch just sits there playing.
+    shared.reclaim();
+
+    state
+        .period_ms
+        .store(if busy { BUSY_MS } else { IDLE_MS }, Ordering::Relaxed);
+}
+
+/// The thread that does the waiting.
+///
+/// Owned by the plugin instance, so it lives exactly as long as the instance
+/// does — which is the whole point of moving it off the editor.
+pub struct Ticker {
+    state: Arc<TickState>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Ticker {
+    /// Start ticking. `post` must put [`Task::Tick`] onto the host's main
+    /// thread; it is called from the ticking thread, never from this one.
+    pub fn spawn(state: Arc<TickState>, post: impl Fn() + Send + 'static) -> Ticker {
+        let thread_state = state.clone();
+        let join = std::thread::Builder::new()
+            .name("audio-graph tick".into())
+            .spawn(move || {
+                let state = thread_state;
+                loop {
+                    let period =
+                        Duration::from_millis(state.period_ms.load(Ordering::Relaxed) as u64);
+                    let mut stop = state.stop.lock();
+                    if !*stop {
+                        state.wake.wait_for(&mut stop, period);
+                    }
+                    if *stop {
+                        return;
+                    }
+                    drop(stop);
+
+                    // Already one in flight: the main thread is busy, and a
+                    // second tick would only queue behind the first.
+                    if !state.pending.swap(true, Ordering::AcqRel) {
+                        post();
+                    }
+                }
+            });
+        match join {
+            Ok(join) => Ticker {
+                state,
+                join: Some(join),
+            },
+            Err(e) => {
+                log::warn!("audio-graph: could not start the tick thread: {e}");
+                Ticker { state, join: None }
+            }
+        }
+    }
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        *self.state.stop.lock() = true;
+        self.state.wake.notify_all();
+        if let Some(join) = self.join.take() {
+            // Joined rather than detached: the thread posts work that reaches
+            // this instance, and letting it outlive the instance is how you
+            // get a tick against a half-destroyed plugin.
+            let _ = join.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The thing the whole module exists for: it keeps posting, on its own,
+    /// with nobody's window open.
+    #[test]
+    fn it_keeps_posting_until_dropped() {
+        let state = TickState::new();
+        state.period_ms.store(10, Ordering::Relaxed);
+
+        let posts = Arc::new(AtomicU32::new(0));
+        let counter = posts.clone();
+        // Stands in for the main thread running the task: without clearing
+        // `pending`, exactly one post would ever be made.
+        let ran = state.clone();
+        let ticker = Ticker::spawn(state, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            ran.pending.store(false, Ordering::Release);
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        drop(ticker);
+        let posted = posts.load(Ordering::Relaxed);
+        assert!(posted > 5, "only {posted} ticks in 200ms at 10ms");
+
+        // And dropping it stops them, rather than leaving a thread posting at
+        // an instance that is going away.
+        let after = posts.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(posts.load(Ordering::Relaxed), after);
+    }
+
+    /// A main thread that never gets round to the task must not accumulate a
+    /// queue of ticks that all fire back to back once it does.
+    #[test]
+    fn a_tick_nobody_ran_is_not_posted_twice() {
+        let state = TickState::new();
+        state.period_ms.store(5, Ordering::Relaxed);
+
+        let posts = Arc::new(AtomicU32::new(0));
+        let counter = posts.clone();
+        let ticker = Ticker::spawn(state, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        drop(ticker);
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+    }
+}

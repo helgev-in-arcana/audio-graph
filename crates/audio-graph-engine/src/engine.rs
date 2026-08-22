@@ -121,10 +121,13 @@ fn expression_index(kind: NoteExpression) -> usize {
 pub struct AudioChunk {
     /// Channels in the input region: the main bus plus every aux bus (§14.11).
     pub input_channels: u16,
+    /// Channels in the output region, counted the same way (§14.2).
     pub output_channels: u16,
     /// Where the joins in the input region are. Empty for the usual one-bus
     /// plugin.
     pub aux_inputs: plugin_host_api::AuxBuses,
+    /// Where the joins in the output region are. Empty in the same case.
+    pub aux_outputs: plugin_host_api::AuxBuses,
     pub frames: u32,
     /// Where this chunk starts inside the block the DAW handed us.
     ///
@@ -734,14 +737,28 @@ impl Engine {
                         at += want as usize;
                     }
                 }
+                AudioOp::Split {
+                    from,
+                    out,
+                    channel,
+                    width,
+                } => {
+                    // One bus out of a plugin's output region. No conversion:
+                    // both sides are the width the plugin negotiated.
+                    for ch in 0..*width as usize {
+                        let src = self.at(*from, *channel as usize + ch, frames);
+                        let dst = self.at(*out, ch, frames);
+                        self.pool.copy_within(src..src + frames, dst);
+                    }
+                }
                 AudioOp::Plugin {
                     instance,
                     input,
                     input_buses,
                     output,
+                    output_buses,
                     notes,
                 } => {
-                    let width = program.buffers[*output as usize];
                     // The compiler guarantees these differ, so the two regions
                     // cannot overlap and `split_at_mut` is enough to prove it.
                     let span = MAX_BUFFER_CHANNELS * self.stride;
@@ -759,11 +776,12 @@ impl Engine {
                         (&high[..], low)
                     };
                     let in_width: u16 = input_buses.iter().sum();
+                    let out_width: u16 = output_buses.iter().sum();
                     // Only what the plugin will actually read is handed over.
                     // The buffer behind it is as wide as any buffer in the
                     // pool; the region it owns is its own buses (§14.11).
                     let packed_in = in_width as usize * frames;
-                    let packed_out = width as usize * frames;
+                    let packed_out = out_width as usize * frames;
                     nodes.process(
                         *instance,
                         *notes,
@@ -771,9 +789,12 @@ impl Engine {
                         &mut dest[..packed_out],
                         AudioChunk {
                             input_channels: in_width,
-                            output_channels: width,
+                            output_channels: out_width,
                             aux_inputs: plugin_host_api::AuxBuses::new(
                                 input_buses.get(1..).unwrap_or(&[]),
+                            ),
+                            aux_outputs: plugin_host_api::AuxBuses::new(
+                                output_buses.get(1..).unwrap_or(&[]),
                             ),
                             frames: frames as u32,
                             offset: start as u32,

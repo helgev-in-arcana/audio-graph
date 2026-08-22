@@ -32,6 +32,7 @@ const PARAM_ACTIVE_PORTS: ParamId = ParamId(4);
 /// reads without a second file open.
 const OUTPUT_PORT_BIT: u32 = 8;
 const PARAM_ASK: ParamId = ParamId(5);
+const PARAM_RENDER_MODE: ParamId = ParamId(6);
 /// Mirrors `clap_test_plugin::ask`, spelled out for the same reason as
 /// `OUTPUT_PORT_BIT`: this crate does not depend on the fixture's Rust API,
 /// only on the module it builds.
@@ -170,7 +171,7 @@ fn the_backend_drives_a_real_clap_module() {
         ClapPlugin::create(&module, &class.id, Arc::clone(&context)).expect("instantiates");
 
     let params = SubPluginMain::params(&plugin).to_vec();
-    assert_eq!(params.len(), 6, "{params:#?}");
+    assert_eq!(params.len(), 7, "{params:#?}");
 
     let gain = params.iter().find(|p| p.id == PARAM_GAIN).expect("gain");
     // Plain values with a real range, straight from the plugin — the whole
@@ -225,7 +226,9 @@ fn the_backend_drives_a_real_clap_module() {
         "the sidechain is the aux socket (§14.2)"
     );
     assert_eq!(io.aux_inputs().len(), 1);
-    assert_eq!(io.outputs.len(), 1);
+    assert_eq!(io.outputs.len(), 2, "main plus the aux output of §14.2");
+    assert_eq!(io.outputs[1].name, "Aux Out");
+    assert!(io.outputs[1].is_aux);
     assert_eq!(io.main_input_channels(), 2);
     assert!(io.accepts_notes);
     assert!(!io.emits_notes);
@@ -270,6 +273,7 @@ fn the_backend_drives_a_real_clap_module() {
         input_channels: 2,
         output_channels: 2,
         aux_inputs: AuxBuses::default(),
+        aux_outputs: AuxBuses::default(),
         offline: true,
     };
 
@@ -313,6 +317,61 @@ fn the_backend_drives_a_real_clap_module() {
         mask & (1 << OUTPUT_PORT_BIT),
         1 << OUTPUT_PORT_BIT,
         "the wired output stays on"
+    );
+
+    // --- what the plugin says about its voices ------------------------------
+
+    // Mirrors `clap_test_plugin::VOICE_COUNT` / `VOICE_CAPACITY`: two different
+    // numbers, so a backend that reported one field twice would fail here.
+    let voices = SubPluginMain::voice_info(&plugin).expect("the fixture implements voice-info");
+    assert_eq!(voices.count, 3);
+    assert_eq!(voices.capacity, 7);
+    assert!(voices.overlapping_notes);
+
+    // --- the second output bus is its own signal ---------------------------
+
+    // Nothing asked for the aux output in the config above, so the plugin
+    // wrote it into the backend's scratch and the caller's region is
+    // untouched. Ask for it and it arrives, packed after the main bus the same
+    // way an aux *input* is packed after the main one.
+    SubPluginMain::deactivate(&mut plugin, processor);
+    let two_out = AudioConfig {
+        aux_outputs: AuxBuses::new(&[2]),
+        ..config
+    };
+    let mut processor =
+        SubPluginMain::activate(&mut plugin, two_out).expect("activates with an aux output");
+    let mut wide = vec![-99.0f32; (FRAMES * 4) as usize];
+    {
+        let mut buffers = AudioBuffers::new(&input, &mut wide, 2, 4, FRAMES, BufferLayout::Planar)
+            .with_aux_outputs(AuxBuses::new(&[2]));
+        processor.process(&mut buffers, &[], &context_time, &mut sink);
+    }
+    let (main_region, aux_region) = wide.split_at((FRAMES * 2) as usize);
+    // Mirrors `clap_test_plugin::AUX_OUTPUT_GAIN`.
+    for (i, (&m, &a)) in main_region.iter().zip(aux_region).enumerate() {
+        assert!(
+            (a - m * -0.75).abs() < 1e-6,
+            "frame {i}: aux {a} is not the main bus {m} times -0.75"
+        );
+    }
+    assert!(
+        main_region.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+        "the main bus changed when a second one was asked for: {:?}",
+        &main_region[..4]
+    );
+    SubPluginMain::deactivate(&mut plugin, processor);
+    let mut processor = SubPluginMain::activate(&mut plugin, config).expect("activates");
+
+    // --- the plugin was told this is an offline render ---------------------
+
+    // `AudioConfig::offline` is the only thing that says so, and CLAP's only
+    // way to pass it on is `clap.render`. The fixture refuses a mode it does
+    // not recognise, so a wrong value fails here rather than being stored.
+    assert_eq!(
+        SubPluginMain::snapshot(&plugin).get(PARAM_RENDER_MODE),
+        Some(1.0),
+        "an offline config has to reach the plugin as offline render mode"
     );
 
     // --- parameter events arrive as events ---------------------------------
@@ -397,6 +456,23 @@ fn the_backend_drives_a_real_clap_module() {
         &output[..4]
     );
 
+    SubPluginMain::deactivate(&mut plugin, processor);
+
+    // --- and a live take is told it is a live take --------------------------
+
+    // Set on every activate, in both directions: the mode belongs to the
+    // instance, so one bounced offline and then played live would otherwise
+    // still think it has all the time in the world.
+    let realtime = AudioConfig {
+        offline: false,
+        ..config
+    };
+    let processor = SubPluginMain::activate(&mut plugin, realtime).expect("activates realtime");
+    assert_eq!(
+        SubPluginMain::snapshot(&plugin).get(PARAM_RENDER_MODE),
+        Some(0.0),
+        "the offline mode from the previous activate was never taken back"
+    );
     SubPluginMain::deactivate(&mut plugin, processor);
 
     // --- a configuration the plugin cannot have is refused ------------------

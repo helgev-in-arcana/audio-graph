@@ -12,6 +12,7 @@ use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
 use crate::shared::Shared;
+use crate::tick::{Task, TickState, Ticker};
 
 /// Which form the DAW loaded. Only the bus layout differs, but the sub-plugin
 /// has to be activated with a matching input channel count.
@@ -49,6 +50,14 @@ pub struct Wrapper {
 
     kind: WrapperKind,
     channels: u32,
+
+    /// The periodic main-thread tick CLAP requires of us (see [`crate::tick`]).
+    ///
+    /// Started when nice-plug hands over the executor that can reach the main
+    /// thread, which is at instance creation and not when a window opens. The
+    /// state outlives the thread because the task executor holds it too.
+    tick_state: Arc<TickState>,
+    ticker: Option<Ticker>,
 }
 
 impl Default for Wrapper {
@@ -70,6 +79,8 @@ impl Default for Wrapper {
             output_scratch: Vec::new(),
             kind: WrapperKind::Effect,
             channels: 2,
+            tick_state: TickState::new(),
+            ticker: None,
         }
     }
 }
@@ -85,6 +96,29 @@ impl Wrapper {
 
     pub fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// What runs a [`Task`] once it has reached the main thread.
+    ///
+    /// Queried once, at instance creation, before [`Wrapper::start_ticking`].
+    pub fn task_executor(&mut self) -> impl Fn(Task) + Send + 'static {
+        let shared = self.shared.clone();
+        let state = self.tick_state.clone();
+        move |task| match task {
+            Task::Tick => crate::tick::run(&shared, &state),
+        }
+    }
+
+    /// Begin ticking, using `post` to reach the main thread.
+    ///
+    /// Called from `editor()`, which is where nice-plug hands over the only
+    /// thing that can do that — and which it calls once when the instance is
+    /// created, whether or not the user ever opens a window. That is the
+    /// property the whole arrangement rests on.
+    pub fn start_ticking(&mut self, post: impl Fn() + Send + 'static) {
+        if self.ticker.is_none() {
+            self.ticker = Some(Ticker::spawn(self.tick_state.clone(), post));
+        }
     }
 
     /// Restore the wrapper's own state from the persisted blob.
@@ -251,6 +285,7 @@ impl Wrapper {
             input_channels,
             output_channels: self.channels,
             aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
             offline: false,
         };
         // Remembered even when nothing is loaded: the editor uses it to

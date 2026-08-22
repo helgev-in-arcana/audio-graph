@@ -77,7 +77,7 @@ fn the_facade_loads_a_clap_by_path_alone() {
     let mut plugin =
         Plugin::load(&path, Some(&class.id), Arc::new(TestHost)).expect("loads through the facade");
     assert_eq!(plugin.format(), Format::Clap);
-    assert_eq!(SubPluginMain::params(&plugin).len(), 6);
+    assert_eq!(SubPluginMain::params(&plugin).len(), 7);
     assert_eq!(SubPluginMain::io_layout(&plugin).inputs.len(), 2);
     // A tick with no editor open must still be safe, since the caller is told
     // to call it every frame regardless — CLAP's timers and main-thread

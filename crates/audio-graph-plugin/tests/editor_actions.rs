@@ -117,6 +117,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         input_channels: 2,
         output_channels: 2,
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: true,
     });
 
@@ -398,6 +399,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
         input_channels: 2,
         output_channels: 2,
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: true,
     });
 

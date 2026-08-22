@@ -39,7 +39,14 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info,
     clap_plugin_params,
 };
+use clap_sys::ext::render::{
+    CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
+use clap_sys::ext::voice_info::{
+    CLAP_EXT_VOICE_INFO, CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES, clap_plugin_voice_info,
+    clap_voice_info,
+};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::process::{
     CLAP_PROCESS_ERROR, CLAP_PROCESS_SLEEP, clap_process, clap_process_status,
@@ -48,7 +55,7 @@ use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
     IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, Result,
-    SubPluginMain, SubPluginProcessor, TimeContext,
+    SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -127,6 +134,11 @@ pub struct ClapPlugin {
     ext_state: *const clap_plugin_state,
     ext_latency: *const clap_plugin_latency,
     ext_gui: *const clap_plugin_gui,
+    /// Optional. Lets the host say whether this is a live take or an offline
+    /// bounce; see `set_render_mode`.
+    ext_render: *const clap_plugin_render,
+    /// Optional, and instruments only in practice.
+    ext_voice_info: *const clap_plugin_voice_info,
     /// Optional. Lets the host tell a plugin that a port is not worth
     /// computing; see `set_port_activation`.
     ext_ports_activation: *const clap_plugin_audio_ports_activation,
@@ -137,6 +149,9 @@ pub struct ClapPlugin {
 
     active: Cell<bool>,
     latency: Cell<u32>,
+    /// Last answer from `clap.voice-info`, re-read when the plugin says it
+    /// changed. `None` when the plugin does not implement the extension.
+    voices: Cell<Option<VoiceInfo>>,
     /// Main-thread edits waiting for the processor, exactly as the VST3 backend
     /// keeps them: CLAP delivers values only through events, so an edit made
     /// while audio is running has to ride the next block.
@@ -204,6 +219,9 @@ impl ClapPlugin {
         let ext_state = unsafe { extension::<clap_plugin_state>(plugin, CLAP_EXT_STATE) };
         let ext_latency = unsafe { extension::<clap_plugin_latency>(plugin, CLAP_EXT_LATENCY) };
         let ext_gui = unsafe { extension::<clap_plugin_gui>(plugin, CLAP_EXT_GUI) };
+        let ext_render = unsafe { extension::<clap_plugin_render>(plugin, CLAP_EXT_RENDER) };
+        let ext_voice_info =
+            unsafe { extension::<clap_plugin_voice_info>(plugin, CLAP_EXT_VOICE_INFO) };
         let ext_audio_ports =
             unsafe { extension::<clap_plugin_audio_ports>(plugin, CLAP_EXT_AUDIO_PORTS) };
         let ext_note_ports =
@@ -241,10 +259,13 @@ impl ClapPlugin {
             ext_state,
             ext_latency,
             ext_gui,
+            ext_render,
+            ext_voice_info,
             ext_ports_activation,
             editor: None,
             active: Cell::new(false),
             latency: Cell::new(0),
+            voices: Cell::new(unsafe { read_voice_info(plugin, ext_voice_info) }),
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EVENTS_PER_BLOCK))),
             flush_buffers: RefCell::new((
                 InputEvents::new(MAX_EVENTS_PER_BLOCK),
@@ -386,6 +407,11 @@ impl ClapPlugin {
             self.params = unsafe { read_params(self.plugin, self.ext_params) };
         }
 
+        if requests.voice_info {
+            self.voices
+                .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
+        }
+
         if requests.latency {
             let latency = unsafe { read_latency(self.plugin, self.ext_latency) };
             if latency != self.latency.get() {
@@ -461,6 +487,52 @@ impl ClapPlugin {
         apply(false, &plan.outputs);
     }
 
+    /// Tell the plugin whether this is a live take or an offline bounce.
+    ///
+    /// The VST3 side has always said so — `processMode` is part of the setup
+    /// struct — and a plugin that is told will often spend the extra cycles it
+    /// would never risk in a live take: longer FFTs, more oversampling, a
+    /// smoother interpolator.
+    ///
+    /// Set at every activate rather than once, and set explicitly in both
+    /// directions: the mode is a property of the instance, not of the run, so
+    /// an instance bounced offline and then played live would otherwise stay
+    /// in offline mode.
+    ///
+    /// A plugin with a hard realtime requirement — an analog modelling plugin
+    /// tied to wall-clock, a hardware bridge — is left alone. CLAP says such a
+    /// plugin cannot be used offline at all; that is the caller's problem to
+    /// have, and refusing to switch it is the least surprising thing to do.
+    fn set_render_mode(&self, offline: bool) {
+        if self.ext_render.is_null() {
+            return;
+        }
+        let Some(set) = (unsafe { (*self.ext_render).set }) else {
+            return;
+        };
+        if offline
+            && let Some(hard) = unsafe { (*self.ext_render).has_hard_realtime_requirement }
+            && unsafe { hard(self.plugin) }
+        {
+            log::debug!(
+                "{}: has a hard realtime requirement; left in realtime mode",
+                self.class.name
+            );
+            return;
+        }
+
+        let mode = if offline {
+            CLAP_RENDER_OFFLINE
+        } else {
+            CLAP_RENDER_REALTIME
+        };
+        if !unsafe { set(self.plugin, mode) } {
+            // Refusing is allowed and costs nothing: the plugin simply renders
+            // the way it always does.
+            log::debug!("{}: refused render mode {mode}", self.class.name);
+        }
+    }
+
     /// Deliver queued main-thread edits without a process call.
     ///
     /// The inactive half of `set_param`. While audio is running the processor
@@ -505,6 +577,10 @@ impl SubPluginMain for ClapPlugin {
 
     fn io_layout(&self) -> IoLayout {
         ClapPlugin::io_layout(self)
+    }
+
+    fn voice_info(&self) -> Option<VoiceInfo> {
+        self.voices.get()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -657,6 +733,7 @@ impl SubPluginMain for ClapPlugin {
         let plan = bind_ports(&self.ports, &config)?;
         // Before `activate`, which is when CLAP allows it unconditionally.
         self.set_port_activation(&plan);
+        self.set_render_mode(config.offline);
 
         let activate = unsafe { (*self.plugin).activate }.ok_or_else(|| HostError::Backend {
             context: "clap_plugin::activate is null".into(),
@@ -672,6 +749,12 @@ impl SubPluginMain for ClapPlugin {
             )));
         }
         self.active.set(true);
+
+        // Voice counts often are not knowable until the plugin has a patch and
+        // a sample rate — Surge XT answers `false` before that — so this is
+        // re-read here as well as when the plugin says it changed.
+        self.voices
+            .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
 
         // Latency is only meaningful once activated, which is why it is read
         // here rather than at construction.
@@ -801,23 +884,39 @@ fn bind_ports(ports: &PortLayout, config: &AudioConfig) -> Result<BindingPlan> {
         )));
     }
 
+    // The caller's output region is shaped exactly like the input one: main
+    // bus first, then each aux bus the graph asked for, packed. A bus the
+    // graph does not read is written somewhere harmless rather than into the
+    // caller — the plugin still has it, nobody is listening.
     let mut outputs = Vec::with_capacity(ports.outputs.len());
     let mut scratch_channels = 0usize;
+    let mut caller_offset = 0usize;
+    let mut aux_out = config.aux_outputs.iter();
     for (index, port) in ports.outputs.iter().enumerate() {
-        // Only the main output reaches the graph today (§14.2 lists the rest as
-        // untested); the others are written somewhere harmless.
-        if index == 0 && config.output_channels > 0 {
-            if config.output_channels != u32::from(port.channels) {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "output port 0 ({}) is {} channels, not {}",
-                    port.name, port.channels, config.output_channels
-                )));
-            }
-            outputs.push((port.channels, Binding::Caller(0)));
+        let wanted = if index == 0 {
+            config.output_channels
+        } else {
+            aux_out.next().map_or(0, u32::from)
+        };
+        if wanted == 0 {
+            outputs.push((port.channels, Binding::Scratch(scratch_channels)));
+            scratch_channels += port.channels as usize;
             continue;
         }
-        outputs.push((port.channels, Binding::Scratch(scratch_channels)));
-        scratch_channels += port.channels as usize;
+        if wanted != u32::from(port.channels) {
+            return Err(HostError::UnsupportedBusConfig(format!(
+                "output port {index} ({}) is {} channels, not {wanted}",
+                port.name, port.channels
+            )));
+        }
+        outputs.push((port.channels, Binding::Caller(caller_offset)));
+        caller_offset += port.channels as usize;
+    }
+    if aux_out.next().is_some() {
+        return Err(HostError::UnsupportedBusConfig(format!(
+            "the graph read more output buses than the plugin's {} output port(s)",
+            ports.outputs.len()
+        )));
     }
 
     // An effect the graph routed audio into that declares no output at all
@@ -1125,6 +1224,35 @@ unsafe fn read_latency(plugin: *const clap_plugin, ext: *const clap_plugin_laten
         Some(get) => unsafe { get(plugin) },
         None => 0,
     }
+}
+
+/// Ask an instrument how many voices it has, if it will say.
+///
+/// # Safety
+/// `plugin` must be live; `ext` may be null.
+unsafe fn read_voice_info(
+    plugin: *const clap_plugin,
+    ext: *const clap_plugin_voice_info,
+) -> Option<VoiceInfo> {
+    if ext.is_null() {
+        return None;
+    }
+    let get = unsafe { (*ext).get }?;
+    let mut info = clap_voice_info {
+        voice_count: 0,
+        voice_capacity: 0,
+        flags: 0,
+    };
+    // A plugin is allowed to answer "not right now" — Surge XT does while it
+    // has no patch — and that is not the same as not implementing this.
+    if !unsafe { get(plugin, &mut info) } {
+        return None;
+    }
+    Some(VoiceInfo {
+        count: info.voice_count,
+        capacity: info.voice_capacity,
+        overlapping_notes: info.flags & CLAP_VOICE_INFO_SUPPORTS_OVERLAPPING_NOTES != 0,
+    })
 }
 
 /// Read the plugin's parameter list into the core's model.

@@ -161,6 +161,30 @@ impl Shared {
         self.main.get().borrow_mut()
     }
 
+    /// Whether this thread is the one the plugin was created on.
+    ///
+    /// For callers that have to *ask* rather than assert. The periodic tick is
+    /// posted through nice-plug's `execute_gui`, and one backend — VST3 on
+    /// Linux — runs those on a worker thread rather than a main thread,
+    /// because Linux has no main thread to speak of. Panicking there would
+    /// turn a tick we simply cannot deliver into a crash.
+    pub fn on_main_thread(&self) -> bool {
+        self.main.is_owner()
+    }
+
+    /// Main-thread access that declines rather than panicking when the state
+    /// is already borrowed further up the stack.
+    ///
+    /// Ticking resizes windows, resizing dispatches messages, and a message
+    /// can land back inside something that is already holding this. The tick
+    /// is periodic, so skipping one costs a frame and nothing else.
+    ///
+    /// # Panics
+    /// If called from any thread but the one that created the plugin.
+    pub fn try_main(&self) -> Option<RefMut<'_, MainState>> {
+        self.main.get().try_borrow_mut().ok()
+    }
+
     /// Audio-thread access to the processor. Declines rather than waiting.
     pub fn try_audio(&self) -> Option<parking_lot::MutexGuard<'_, AudioState>> {
         self.audio.try_lock()

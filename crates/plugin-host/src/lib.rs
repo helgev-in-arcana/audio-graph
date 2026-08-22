@@ -45,7 +45,7 @@ pub use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, BusInfo, Capabilities, Event, EventSink,
     HostContext, HostError, IoLayout, MAX_AUX_BUSES, NoteEvent, NoteExpression, ParamEvent,
     ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, RestartReason,
-    Result, SubPluginMain, SubPluginProcessor, Target, TimeContext,
+    Result, SubPluginMain, SubPluginProcessor, Target, TimeContext, VoiceInfo,
 };
 
 // Window plumbing a host application needs and that no backend owns.

@@ -241,9 +241,29 @@ pub enum AudioOp {
         /// instrument. The engine needs it to tell the adapter where the joins
         /// in `input` are.
         input_buses: Vec<u16>,
+        /// The whole output region: main bus first, then each aux bus the
+        /// graph reads, packed — the mirror of `input`. Taken apart by
+        /// [`AudioOp::Split`] when there is more than one.
         output: Buf,
+        /// Channel width of each output bus, main first. One entry in the
+        /// common case; more only when a patch reads a plugin's extra outputs
+        /// (§14.2).
+        output_buses: Vec<u16>,
         /// Which note stream this instance hears (§14.10).
         notes: NoteSource,
+    },
+    /// Copy one bus out of a plugin's output region (§14.2).
+    ///
+    /// The mirror of [`AudioOp::Gather`], and simpler: the widths are the
+    /// plugin's own on both sides, so nothing is converted. Emitted once per
+    /// output bus something reads, and not at all for the one-bus case — where
+    /// the plugin writes straight into the buffer the next node reads.
+    Split {
+        from: Buf,
+        out: Buf,
+        /// First channel of the bus inside `from`.
+        channel: u16,
+        width: u16,
     },
     /// Assemble a plugin's input region out of one buffer per bus (§14.11).
     ///
@@ -446,7 +466,11 @@ pub struct InstanceIo {
     pub input_channels: u16,
     /// Aux input buses, in order. Only the ones the graph wired.
     pub aux_inputs: Vec<u16>,
+    /// Main output bus width.
     pub output_channels: u16,
+    /// Aux output buses, in order. Only as far as the graph reads them, so a
+    /// plugin's third output is absent when only the second is wired.
+    pub aux_outputs: Vec<u16>,
 }
 
 /// One sub-plugin parameter the graph drives directly (§14.12).
