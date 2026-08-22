@@ -149,7 +149,12 @@ impl SubHost {
     /// already in it — a DAW does this through the normal state path.
     pub fn load_sub_state(&mut self, instance: usize, blob: &[u8]) -> Result<(), String> {
         let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
-        loaded.plugin.load_state(blob).map_err(|e| e.to_string())
+        loaded.plugin.load_state(blob).map_err(|e| e.to_string())?;
+        // The other half of the rule in `save_state`: a plugin may finish
+        // taking the blob on a main-thread callback, and until then it still
+        // reports its old values.
+        loaded.plugin.tick();
+        Ok(())
     }
 
     /// The plugin's buses and note capability, for building a node's sockets
@@ -305,12 +310,17 @@ impl SubHost {
     /// the parts that are ours.
     ///
     /// That is the contract; the wrapper does not yet keep it. The only thing
-    /// calling this is the `Deferred` tick the editor sets up in `attached`, so
-    /// nothing runs while the wrapper's own window is closed. CHOWTapeModel
-    /// shows what that costs: it folds parameter edits into its saved state on
-    /// a timer, so a plugin that never gets ticked can save a stale preset.
-    /// Fixing it means moving the `Deferred` from the editor to the plugin
-    /// itself. Recorded in ROADMAP.md.
+    /// calling this periodically is the `Deferred` tick the editor sets up in
+    /// `attached`, so nothing runs while the wrapper's own window is closed —
+    /// and a project that plays without anyone opening the editor is the
+    /// ordinary case, not an edge one.
+    ///
+    /// What is covered meanwhile: `save_state`, `load_state` and
+    /// `load_sub_state` each tick around the plugin, which is where a missed
+    /// callback costs data rather than responsiveness. The periodic half needs
+    /// the `Deferred` to move from the editor to the plugin itself, and that is
+    /// held until the non-Windows window backend grows a real timer, since
+    /// otherwise it would fix only one platform. Both steps are in ROADMAP.md.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {
@@ -462,9 +472,19 @@ impl SubHost {
     }
 
     /// Collect everything that goes into the DAW's project file (§8.3).
-    pub fn save_state(&self) -> WrapperState {
+    ///
+    /// Takes `&mut self` so it can tick first. A plugin is entitled to fold
+    /// recent edits into what it serialises on one of its own main-thread
+    /// callbacks rather than immediately, and until the wrapper ticks
+    /// unconditionally (see `tick_editors`) this is the only thing that runs
+    /// them before a save. CHOWTapeModel does exactly that; without the tick it
+    /// saves the values it held before the last edit.
+    pub fn save_state(&mut self) -> WrapperState {
         let mut state = WrapperState::new(self.slots.to_state());
         for instance in 0..self.instances.len() {
+            if let Some(loaded) = self.at_mut(instance) {
+                loaded.plugin.tick();
+            }
             let Some(loaded) = self.at(instance) else {
                 continue;
             };
@@ -509,13 +529,17 @@ impl SubHost {
             }
             match entry.state_bytes() {
                 Some(bytes) => {
-                    if let Some(loaded) = self.at_mut(entry.instance)
-                        && let Err(e) = loaded.plugin.load_state(&bytes)
-                    {
-                        problems.push(format!(
-                            "{} loaded but its settings did not restore: {e}",
-                            reference.display_name
-                        ));
+                    if let Some(loaded) = self.at_mut(entry.instance) {
+                        if let Err(e) = loaded.plugin.load_state(&bytes) {
+                            problems.push(format!(
+                                "{} loaded but its settings did not restore: {e}",
+                                reference.display_name
+                            ));
+                        }
+                        // As in `load_sub_state`. This is the path a project
+                        // open takes, and it runs with the wrapper's own editor
+                        // closed, so nothing else would tick these plugins.
+                        loaded.plugin.tick();
                     }
                 }
                 None => problems.push(format!(

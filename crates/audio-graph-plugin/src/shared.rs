@@ -409,7 +409,7 @@ impl Shared {
     /// Called after every edit made from the editor, so whenever the DAW
     /// decides to save the project there is something current waiting for it.
     pub fn store_state(&self) {
-        let state = self.main();
+        let mut state = self.main();
         let mut blob = state.host.save_state();
         blob.graph = serde_json::to_value(&state.graph).ok();
         blob.sub_block = self.quantum();
