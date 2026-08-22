@@ -11,14 +11,51 @@
 //! plugin talks back through, and the ordering rules that keep teardown from
 //! crashing.
 
-mod deferred;
 mod editor;
 mod frame;
-mod keys;
-mod window;
 
-pub use deferred::{Deferred, new as deferred};
 pub use editor::{EditorWindow, can_resize};
 pub use frame::PlugFrame;
-pub use keys::forward as forward_key;
-pub use window::{ContainerWindow, PLATFORM_TYPE, Size, WindowState, pump_events, root_window};
+
+// The container window, the deferred queue and the key forwarder are all
+// format-agnostic and live in `host-window`, where the CLAP backend can reach
+// them without depending on VST3. Re-exported so callers that already speak in
+// this crate's names do not have to change.
+pub use host_window::{
+    ContainerWindow, Deferred, Size, WindowState, deferred, forward_key, pump_events, root_window,
+};
+
+/// What the platform handle means to a VST3 plugin.
+///
+/// VST3 identifies the parent it is given by a string constant, and passing the
+/// wrong one to a plugin that supports several is how an editor ends up
+/// attached to nothing. CLAP names the same handles differently (`"win32"`,
+/// `"cocoa"`, `"x11"`), which is why this constant belongs to the backend that
+/// speaks it and not to [`ContainerWindow`].
+pub const PLATFORM_TYPE: &str = {
+    #[cfg(windows)]
+    {
+        "HWND"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "NSView"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "X11EmbedWindowID"
+    }
+};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn platform_type_matches_what_we_pass_to_attached() {
+        // Handing a plugin the wrong platform string is how an editor attaches
+        // to nothing at all, silently.
+        #[cfg(windows)]
+        assert_eq!(super::PLATFORM_TYPE, "HWND");
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::PLATFORM_TYPE, "NSView");
+    }
+}

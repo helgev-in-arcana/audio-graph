@@ -12,12 +12,12 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use plugin_host_api::SubPluginMain;
-use vst3_host::{Module, default_plugin_directories, find_modules};
+use plugin_host::SubPluginMain;
+use plugin_host::{Format, Plugin};
 
 fn main() -> ExitCode {
     fault::install_crash_handler();
-    vst3_host::init_apartment();
+    plugin_host::init_thread();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         "chain" => cmd_chain(rest),
         "instrument" => cmd_instrument(rest),
         "sidechain" => cmd_sidechain(rest),
+        "aux" => cmd_aux(rest),
         "delay" => cmd_delay(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
@@ -69,44 +70,57 @@ fn main() -> ExitCode {
 fn usage() {
     eprintln!(
         "usage:
-  host-cli dirs                     list the conventional VST3 directories
-  host-cli scan [DIR...]            load every module found and list its classes
-  host-cli info <PATH.vst3>         detail one module
-  host-cli churn <PATH.vst3> [N]    load/unload N times (default 1000)
-  host-cli params <PATH.vst3> [CID] instantiate and list parameters
-  host-cli render <PATH.vst3> <IN.wav> <OUT.wav> [CID]
+  Every PLUGIN argument may be a .vst3 or a .clap; the extension picks the
+  backend. ID is that format's own plugin id -- a VST3 class id in hex, or a
+  CLAP reverse-DNS name -- as printed by `scan` and `info`.
+
+  host-cli dirs                     list the conventional plugin directories
+  host-cli scan [DIR...]            load every module found and list its plugins
+  host-cli info <PLUGIN> [ID]       detail one module, and list the CLAP
+                                    extensions or VST3 interfaces one of its
+                                    plugins implements
+  host-cli churn <PLUGIN> [N]       load/unload N times (default 1000)
+  host-cli params <PLUGIN> [ID]     instantiate and list parameters
+  host-cli render <PLUGIN> <IN.wav> <OUT.wav> [ID]
                                     run audio through the plugin
-  host-cli synth <PATH.vst3> <OUT.wav> [CID]
+  host-cli synth <PLUGIN> <OUT.wav> [ID]
                                     play a note into an instrument
   host-cli sweep [DIR...]           lifecycle-test every plugin, one child process each
-  host-cli probe <PATH.vst3>        lifecycle-test one module in this process
-  host-cli nest <WRAPPER.vst3> [CID]
+  host-cli probe <PLUGIN>           lifecycle-test one module in this process
+  host-cli nest <WRAPPER.vst3> [ID]
                                     check the wrapper reloads its sub-plugin from state
   host-cli graph <WRAPPER.vst3> <IN.wav> [RATE_HZ]
                                     check an LFO in the node graph reaches the sub-plugin
                                     (set AUDIO_GRAPH_SUB and AUDIO_GRAPH_SUB_BIND first)
-  host-cli chain <WRAPPER.vst3> <IN.wav> <A.vst3> <B.vst3>
+  host-cli chain <WRAPPER.vst3> <IN.wav> <A> <B>
                                     check the graph routing A -> B matches A and B
                                     rendered one after the other
-  host-cli buses <PATH.vst3> [CID]   list the plugin's buses as the node graph
+  host-cli buses <PLUGIN> [ID]      list the plugin's buses as the node graph
                                     will see them (§14.2)
-  host-cli instrument <WRAPPER.vst3> <SYNTH.vst3> <A.vst3> <B.vst3>
+  host-cli instrument <WRAPPER.vst3> <SYNTH> <A> <B>
                                     check notes reach the instrument the graph
                                     points at, and only that one
-  host-cli sidechain <WRAPPER.vst3> <COMP.vst3> <SYNTH.vst3> <SC_PARAM_ID>
+  host-cli sidechain <WRAPPER.vst3> <COMP> <SYNTH> <SC_PARAM_ID>
                                     check a compressor inside the graph ducks
                                     against another node's audio
-  host-cli delay <WRAPPER.vst3>      check a feedback delay in the graph sounds the
+  host-cli aux <WRAPPER.vst3> <PLUGIN> <SYNTH> [ID=VALUE]
+                                    weaker form of the above for a plugin with
+                                    no sidechain-enable parameter: check that
+                                    wiring the aux bus changes the output.
+                                    ID=VALUE holds one parameter for the whole
+                                    render, for a plugin that reads its aux bus
+                                    only in some modes
+  host-cli delay <WRAPPER.vst3>     check a feedback delay in the graph sounds the
                                     same at any block size, and that the mix's
                                     gains fade the repeats
-  host-cli editor <WRAPPER.vst3> <PLUGIN.vst3> [SECONDS]
+  host-cli editor <WRAPPER.vst3> <PLUGIN> [SECONDS]
                                     open the wrapper's editor with a plugin
                                     node already in the patch
-  host-cli gui <PATH.vst3> [CID [SECONDS]] [--reverse]
+  host-cli gui <PLUGIN> [ID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down
-  host-cli twice <PATH.vst3> [N]    instantiate N times in sequence
-  host-cli state <PATH.vst3> [CID]  save/restore a parameter across instances
-  host-cli automate <PATH.vst3> <IN.wav> [CID [PARAM_ID]]
+  host-cli twice <PLUGIN> [N]       instantiate N times in sequence
+  host-cli state <PLUGIN> [ID]      save/restore a parameter across instances
+  host-cli automate <PLUGIN> <IN.wav> [ID [PARAM_ID]]
                                     check a mid-block parameter change lands
   host-cli bundle <DLL> <OUT.vst3>  wrap a built cdylib as a VST3 bundle"
     );
@@ -148,8 +162,8 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_dirs() -> Result<(), String> {
-    for d in default_plugin_directories() {
-        println!("{}", d.display());
+    for (format, d) in plugin_host::default_plugin_directories() {
+        println!("{format:<5} {}", d.display());
     }
     Ok(())
 }
@@ -163,18 +177,24 @@ fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
         .filter(|a| !a.starts_with("--"))
         .cloned()
         .collect();
-    let dirs: Vec<PathBuf> = if args.is_empty() {
-        default_plugin_directories()
-    } else {
-        args.iter().map(PathBuf::from).collect()
-    };
+    if args.is_empty() {
+        // Both formats, in the conventional places.
+        return plugin_host::installed_modules()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    }
 
     let mut out = Vec::new();
-    for d in dirs {
-        if d.extension().is_some_and(|e| e == "vst3") {
+    for d in args.iter().map(PathBuf::from) {
+        // A path that is itself a module is taken as one; anything else is a
+        // directory to search, and it is searched for every format.
+        if Format::from_path(&d).is_some() {
             out.push(d);
-        } else {
-            out.extend(find_modules(&d));
+            continue;
+        }
+        for format in plugin_host::FORMATS {
+            out.extend(plugin_host::find_modules(format, &d));
         }
     }
     out
@@ -183,7 +203,7 @@ fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
 fn cmd_scan(args: &[String]) -> Result<(), String> {
     let modules = modules_from_args(args);
     if modules.is_empty() {
-        return Err("no .vst3 modules found".into());
+        return Err("no plugin modules found".into());
     }
 
     let mut loaded = 0usize;
@@ -193,31 +213,19 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
     for path in &modules {
         // A scan must survive a broken or foreign-architecture plugin: report
         // and continue, never abort the sweep.
-        match Module::open(path) {
-            Ok(module) => {
+        match plugin_host::scan_module(path) {
+            Ok(list) => {
                 loaded += 1;
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 println!("\n{name}");
-                if let Ok(info) = module.factory_info() {
-                    println!("  vendor: {}", info.vendor);
+                for c in &list {
+                    classes += 1;
+                    let kind = if c.is_instrument { "instrument" } else { "fx" };
+                    println!("  [{}] [{kind}] {} ({})", c.format, c.name, c.category);
+                    println!("        {} v{}  {}", c.id, c.version, c.vendor);
                 }
-                match module.audio_modules() {
-                    Ok(list) => {
-                        for c in &list {
-                            classes += 1;
-                            let kind = if c.is_instrument() {
-                                "instrument"
-                            } else {
-                                "fx"
-                            };
-                            println!("  [{kind}] {} ({})", c.name, c.subcategories);
-                            println!("        cid {} v{}", c.cid, c.version);
-                        }
-                        if list.is_empty() {
-                            println!("  (no audio module classes)");
-                        }
-                    }
-                    Err(e) => println!("  class enumeration failed: {e}"),
+                if list.is_empty() {
+                    println!("  (nothing instantiable)");
                 }
             }
             Err(e) => {
@@ -228,7 +236,7 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
     }
 
     println!(
-        "\n{} module(s): {loaded} loaded, {failed} failed, {classes} audio module class(es)",
+        "\n{} module(s): {loaded} loaded, {failed} failed, {classes} plugin(s)",
         modules.len()
     );
     Ok(())
@@ -243,17 +251,18 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
 /// sockets from -- and §14.11 re-checks the negotiation at activate.
 fn cmd_buses(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a plugin path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
-    let plugin = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let (class, plugin) = render::load(
+        Path::new(path),
+        args.get(1).map(String::as_str),
+        Arc::new(host::CliHost::new()),
+    )
+    .map_err(|e| e.to_string())?;
 
     let layout = plugin.io_layout();
     println!("{}", class.name);
-    let show = |label: &str, buses: &[plugin_host_api::BusInfo]| {
+    let show = |label: &str, buses: &[plugin_host::BusInfo]| {
         if buses.is_empty() {
             println!("  {label}: none");
             return;
@@ -285,31 +294,50 @@ fn cmd_buses(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_info(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("expected a path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
+    let path = Path::new(args.first().ok_or("expected a path")?);
+    let wanted = args.get(1).map(String::as_str);
+    let format = Format::from_path(path).ok_or("not a .vst3 or .clap path")?;
+    let classes = plugin_host::scan_module(path).map_err(|e| e.to_string())?;
 
-    let info = module.factory_info().map_err(|e| e.to_string())?;
-    println!("path:    {}", module.path().display());
-    println!("vendor:  {}", info.vendor);
-    println!("url:     {}", info.url);
-    println!("email:   {}", info.email);
-    println!("unicode: {}", info.unicode);
+    println!("path:    {}", path.display());
+    println!("format:  {format}");
 
-    match module.module_info() {
-        Some(mi) => println!("moduleinfo.json: {} classes declared", mi.classes.len()),
-        None => println!("moduleinfo.json: absent"),
-    }
-
-    println!("\nclasses:");
-    for c in module.classes().map_err(|e| e.to_string())? {
-        println!("  {} — {}", c.name, c.category);
-        println!("    cid  {}", c.cid);
-        if !c.subcategories.is_empty() {
-            println!("    tags {}", c.subcategories);
+    println!("\nplugins:");
+    for c in &classes {
+        println!("  {} — {}", c.name, c.vendor);
+        println!("    id   {}", c.id);
+        if !c.category.is_empty() {
+            println!("    tags {}", c.category);
         }
         if !c.version.is_empty() {
-            println!("    ver  {} (sdk {})", c.version, c.sdk_version);
+            println!("    ver  {}", c.version);
         }
+    }
+
+    // Reading the factory says what a module offers; only an instance can say
+    // what it implements, because both formats answer that question through the
+    // instance (`get_extension` / `queryInterface`). So one plugin is loaded --
+    // the one named, or the first -- rather than all of them: a module like
+    // Airwindows Consolidated has hundreds of classes, and instantiating every
+    // one to print the same list is not worth the wait.
+    let (class, plugin) = render::load(path, wanted, std::sync::Arc::new(host::CliHost::new()))?;
+    println!(
+        "
+implemented by {} ({}):",
+        class.name, class.id
+    );
+    if classes.len() > 1 && wanted.is_none() {
+        println!(
+            "  (first of {} plugins; pass an ID for another)",
+            classes.len()
+        );
+    }
+    let names = plugin.format_interfaces();
+    if names.is_empty() {
+        println!("  (none of the names we know)");
+    }
+    for name in names {
+        println!("  {name}");
     }
     Ok(())
 }
@@ -324,14 +352,12 @@ fn cmd_churn(args: &[String]) -> Result<(), String> {
     let path = Path::new(path);
 
     for i in 0..iterations {
-        let module = Module::open(path).map_err(|e| format!("iteration {i}: {e}"))?;
-        let classes = module
-            .classes()
-            .map_err(|e| format!("iteration {i}: {e}"))?;
+        // One scan is one module load and unload: the module is opened, its
+        // factory read, and the handle dropped before the next round.
+        let classes = plugin_host::scan_module(path).map_err(|e| format!("iteration {i}: {e}"))?;
         if classes.is_empty() {
             return Err(format!("iteration {i}: no classes"));
         }
-        drop(module);
     }
 
     println!("{iterations} load/unload cycles completed");
@@ -342,17 +368,15 @@ fn cmd_churn(args: &[String]) -> Result<(), String> {
 /// plugin's own formatting of each current value.
 fn cmd_params(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+    let class = render::choose_class(Path::new(path), args.get(1).map(String::as_str))?;
 
     let host = Arc::new(host::CliHost::new());
-    let plugin = Vst3Plugin::create(&module, class.cid, host).map_err(|e| e.to_string())?;
+    let plugin = Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
 
-    let (ins, outs) = plugin.bus_channel_counts();
-    println!("{} [{}]", class.name, class.subcategories);
+    let (ins, outs) = render::bus_widths(&plugin);
+    println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
     println!("capabilities: {:?}", plugin.capabilities());
 
@@ -482,16 +506,15 @@ fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {
 /// from the transport on every block.
 fn cmd_state(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     const CANDIDATES: usize = 8;
 
     let path = args.first().ok_or("expected a path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+    let class = render::choose_class(Path::new(path), args.get(1).map(String::as_str))?;
     let host = Arc::new(host::CliHost::new());
 
-    let probe = Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    let probe =
+        Plugin::load(Path::new(path), Some(&class.id), host.clone()).map_err(|e| e.to_string())?;
     let candidates = writable_params(&probe);
     drop(probe);
     if candidates.is_empty() {
@@ -500,7 +523,7 @@ fn cmd_state(args: &[String]) -> Result<(), String> {
 
     let mut rejected = Vec::new();
     for target in candidates.iter().take(CANDIDATES) {
-        match state_round_trip(&module, &class, host.clone(), target) {
+        match state_round_trip(Path::new(path), &class, host.clone(), target) {
             Ok(report) => {
                 println!("parameter: {} ({})", target.name, target.id.0);
                 println!("{report}");
@@ -524,15 +547,12 @@ fn cmd_state(args: &[String]) -> Result<(), String> {
 /// Set a parameter, run a block so the processor hears it, save, and restore
 /// into a fresh instance.
 fn state_round_trip(
-    module: &Module,
-    class: &vst3_host::ClassInfo,
+    path: &Path,
+    class: &plugin_host::ClassInfo,
     host: std::sync::Arc<host::CliHost>,
-    target: &plugin_host_api::ParamInfo,
+    target: &plugin_host::ParamInfo,
 ) -> Result<String, String> {
-    use vst3_host::Vst3Plugin;
-
-    let mut first =
-        Vst3Plugin::create(module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+    let mut first = Plugin::load(path, Some(&class.id), host.clone()).map_err(|e| e.to_string())?;
     let before = first.snapshot().get(target.id).unwrap_or(target.default);
 
     // Move to whichever end is further away, so the check cannot pass because
@@ -552,6 +572,13 @@ fn state_round_trip(
     // a preset silently comes back wrong.
     run_one_block(&mut first)?;
 
+    // And a plugin may only fold an edit into what it serialises on one of its
+    // own timer callbacks, which run through `tick`. CHOWTapeModel does exactly
+    // that: without this line it saves the value it had before the edit, and
+    // the preset comes back wrong through no fault of the save/load path. The
+    // real host ticks every frame, so this is the harness catching up with it.
+    first.tick();
+
     let saved = first.snapshot().get(target.id).unwrap_or(f64::NAN);
     let span = (target.max - target.min).abs().max(1e-9);
     if (saved - wanted).abs() > span * 1e-3 {
@@ -563,9 +590,14 @@ fn state_round_trip(
     let blob = first.save_state().map_err(|e| e.to_string())?;
     drop(first);
 
-    let mut second = Vst3Plugin::create(module, class.cid, host).map_err(|e| e.to_string())?;
+    let mut second = Plugin::load(path, Some(&class.id), host).map_err(|e| e.to_string())?;
     let fresh = second.snapshot().get(target.id).unwrap_or(f64::NAN);
     second.load_state(&blob).map_err(|e| e.to_string())?;
+    // A plugin may finish loading on a main-thread callback rather than inside
+    // `load`, so give it the pump the real host runs every frame before asking
+    // what it now believes. Without this, a plugin that defers reads back its
+    // old values and looks like it lost the preset.
+    second.tick();
     let restored = second.snapshot().get(target.id).unwrap_or(f64::NAN);
 
     if (restored - saved).abs() > span * 1e-6 {
@@ -583,10 +615,10 @@ fn state_round_trip(
 }
 
 /// Activate, process one silent block, deactivate.
-fn run_one_block(plugin: &mut vst3_host::Vst3Plugin) -> Result<(), String> {
-    use plugin_host_api::{AudioBuffers, AudioConfig, BufferLayout, EventSink, TimeContext};
+fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
+    use plugin_host::{AudioBuffers, AudioConfig, BufferLayout, EventSink, TimeContext};
 
-    let (ins, outs) = plugin.bus_channel_counts();
+    let (ins, outs) = render::bus_widths(plugin);
     let config = AudioConfig {
         sample_rate: 48_000.0,
         max_block_size: 512,
@@ -622,8 +654,8 @@ fn run_one_block(plugin: &mut vst3_host::Vst3Plugin) -> Result<(), String> {
 /// one the plugin recomputes from the transport (a host-synced tempo, say) and
 /// therefore overwrites on the next block. Neither is a host fault, so the
 /// caller works down the list.
-fn writable_params(plugin: &vst3_host::Vst3Plugin) -> Vec<plugin_host_api::ParamInfo> {
-    use plugin_host_api::ParamFlags;
+fn writable_params(plugin: &Plugin) -> Vec<plugin_host::ParamInfo> {
+    use plugin_host::ParamFlags;
     SubPluginMain::params(plugin)
         .iter()
         .filter(|p| {
@@ -636,7 +668,7 @@ fn writable_params(plugin: &vst3_host::Vst3Plugin) -> Vec<plugin_host_api::Param
         .collect()
 }
 
-fn pick_writable_param(plugin: &vst3_host::Vst3Plugin) -> Option<plugin_host_api::ParamInfo> {
+fn pick_writable_param(plugin: &Plugin) -> Option<plugin_host::ParamInfo> {
     writable_params(plugin).into_iter().next()
 }
 
@@ -646,9 +678,8 @@ fn pick_writable_param(plugin: &vst3_host::Vst3Plugin) -> Option<plugin_host_api
 /// Rendering twice and diffing is the only way to see this from outside: the
 /// plugin is a black box, so the evidence is *where* the two renders diverge.
 fn cmd_automate(args: &[String]) -> Result<(), String> {
-    use plugin_host_api::{Event, ParamEvent, Target};
+    use plugin_host::{Event, ParamEvent, Target};
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a plugin path")?;
     let input_path = args.get(1).ok_or("expected an input wav")?;
@@ -658,9 +689,7 @@ fn cmd_automate(args: &[String]) -> Result<(), String> {
     let wanted_id: Option<u32> = args.get(3).and_then(|s| s.parse().ok());
 
     let input = wav::read(Path::new(input_path))?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, cid)?;
-    let probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+    let (_class, probe) = render::load(Path::new(path), cid, Arc::new(host::CliHost::new()))
         .map_err(|e| e.to_string())?;
     let target = match wanted_id {
         Some(id) => SubPluginMain::params(&probe)
@@ -754,20 +783,18 @@ fn cmd_automate(args: &[String]) -> Result<(), String> {
 /// is where per-instance/per-module lifetime confusion shows up.
 fn cmd_twice(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a path")?;
     let count: usize = args
         .get(1)
         .map_or(Ok(3), |s| s.parse())
         .map_err(|_| "bad count")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
+    let class = render::choose_class(Path::new(path), None)?;
     let host = Arc::new(host::CliHost::new());
 
     for i in 0..count {
         eprintln!("[instance {i}] creating");
-        let plugin = Vst3Plugin::create(&module, class.cid, host.clone())
+        let plugin = Plugin::load(Path::new(path), Some(&class.id), host.clone())
             .map_err(|e| format!("instance {i}: {e}"))?;
         eprintln!(
             "[instance {i}] {} params",
@@ -786,19 +813,15 @@ fn cmd_twice(args: &[String]) -> Result<(), String> {
 /// mistaken for per-instance state, so it is the shape the probe uses.
 fn cmd_probe(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected a path")?;
 
     // Enumerate, then let the module go before doing anything else. Holding a
     // second handle open across the editor probe is not something a host would
     // do, and TH3 faults when we do it.
-    let classes = {
-        let module = Module::open(path).map_err(|e| e.to_string())?;
-        module.audio_modules().map_err(|e| e.to_string())?
-    };
+    let classes = plugin_host::scan_module(Path::new(path)).map_err(|e| e.to_string())?;
     if classes.is_empty() {
-        return Err("no audio module classes".into());
+        return Err("the module exports nothing instantiable".into());
     }
 
     // Editors are opened only on request: it takes seconds per plugin, and
@@ -813,19 +836,18 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     };
     if let Some(reverse) = gui_order {
         for class in &classes {
-            probe_editor(path, class.cid, &class.name, reverse)?;
+            probe_editor(path, &class.id, &class.name, reverse)?;
         }
     }
 
-    let module = Module::open(path).map_err(|e| e.to_string())?;
     for class in classes {
         let host = Arc::new(host::CliHost::new());
         for round in 0..2 {
-            let mut plugin = Vst3Plugin::create(&module, class.cid, host.clone())
+            let mut plugin = Plugin::load(Path::new(path), Some(&class.id), host.clone())
                 .map_err(|e| format!("{}: round {round}: {e}", class.name))?;
             let params = SubPluginMain::params(&plugin).len();
-            let (ins, outs) = plugin.bus_channel_counts();
-            let config = plugin_host_api::AudioConfig {
+            let (ins, outs) = render::bus_widths(&plugin);
+            let config = plugin_host::AudioConfig {
                 sample_rate: 48_000.0,
                 max_block_size: 512,
                 input_channels: ins.min(2),
@@ -850,14 +872,14 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 /// The second order is the one that matters: some DAWs terminate a plugin
 /// without ever sending a close notification, so correctness cannot depend on
 /// a caller remembering to close the editor first.
-fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> Result<(), String> {
+fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result<(), String> {
     use std::sync::Arc;
     use subhost_adapter::SubHost;
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(path), Some(cid))?;
+    sub.load(0, Path::new(path), Some(class_id))?;
 
-    let config = plugin_host_api::AudioConfig {
+    let config = plugin_host::AudioConfig {
         sample_rate: 48_000.0,
         max_block_size: 512,
         input_channels: 2,
@@ -883,7 +905,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
     // Long enough for the plugin to finish its first paint, which is when a
     // badly attached editor tends to fault.
     for _ in 0..20 {
-        vst3_host_view::pump_events();
+        plugin_host::pump_events();
         sub.tick_editors();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -898,7 +920,7 @@ fn probe_editor(path: &str, cid: vst3_host::Cid, name: &str, reverse: bool) -> R
         sub.deactivate(processor);
         drop(sub);
     }
-    vst3_host_view::pump_events();
+    plugin_host::pump_events();
 
     let order = if reverse {
         "instance dropped with editor open"
@@ -1015,17 +1037,15 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
 /// 8.3 exists for.
 fn cmd_nest(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected the wrapper's path")?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, args.get(1).map(String::as_str))?;
+    let class = render::choose_class(Path::new(path), args.get(1).map(String::as_str))?;
     let host = Arc::new(host::CliHost::new());
 
     // The first instance picks up its sub-plugin however it can — in
     // development that is AUDIO_GRAPH_SUB, since there is no editor yet.
     let mut first =
-        Vst3Plugin::create(&module, class.cid, host.clone()).map_err(|e| e.to_string())?;
+        Plugin::load(Path::new(path), Some(&class.id), host.clone()).map_err(|e| e.to_string())?;
     run_one_block(&mut first)?;
     let blob = first.save_state().map_err(|e| e.to_string())?;
     drop(first);
@@ -1041,7 +1061,8 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
     }
     println!("state references: {}", names[0].escape_debug());
 
-    let mut second = Vst3Plugin::create(&module, class.cid, host).map_err(|e| e.to_string())?;
+    let mut second =
+        Plugin::load(Path::new(path), Some(&class.id), host).map_err(|e| e.to_string())?;
     second.load_state(&blob).map_err(|e| e.to_string())?;
     run_one_block(&mut second)?;
     let restored = second.save_state().map_err(|e| e.to_string())?;
@@ -1071,21 +1092,23 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
 ///     cargo run -p host-cli -- graph target/AudioGraph.vst3 tone.wav
 fn cmd_graph(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let path = args.first().ok_or("expected the wrapper's path")?;
     let input_path = args.get(1).ok_or("expected an input wav")?;
     let rate: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4.0);
 
     let input = wav::read(Path::new(input_path))?;
-    let module = Module::open(path).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
+    let class = render::choose_class(Path::new(path), None)?;
 
     // One instance, purely to get a state blob with a sub-plugin and a binding
     // in it. In a DAW the user does this with the editor; here it is
     // AUDIO_GRAPH_SUB and AUDIO_GRAPH_SUB_BIND.
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let mut probe = Plugin::load(
+        Path::new(path),
+        Some(&class.id),
+        Arc::new(host::CliHost::new()),
+    )
+    .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline_state = probe.save_state().map_err(|e| e.to_string())?;
     drop(probe);
@@ -1308,7 +1331,6 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
 /// two identical float paths deserve, not "close enough".
 fn cmd_chain(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let input_path = args.get(1).ok_or("expected an input wav")?;
@@ -1335,10 +1357,9 @@ fn cmd_chain(args: &[String]) -> Result<(), String> {
     );
 
     // The wrapper's own saved state, to graft a patch onto.
-    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline = probe.save_state().map_err(|e| e.to_string())?;
     drop(probe);
@@ -1398,11 +1419,10 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
 
     let reference = |path: &str| -> Result<serde_json::Value, String> {
-        let module = Module::open(path).map_err(|e| e.to_string())?;
-        let class = render::choose_class(&module, None)?;
+        let class = render::choose_class(Path::new(path), None)?;
         Ok(serde_json::json!({
-            "format": "vst3",
-            "plugin_id": class.cid.to_hex(),
+            "format": class.format.tag(),
+            "plugin_id": class.id,
             "path_hint": path,
             "display_name": class.name,
         }))
@@ -1460,7 +1480,6 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
 /// does.
 fn cmd_instrument(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let synth = args.get(1).ok_or("expected an instrument plugin")?;
@@ -1485,10 +1504,9 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline = probe.save_state().map_err(|e| e.to_string())?;
     drop(probe);
@@ -1574,11 +1592,10 @@ fn inject_instrument(
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
 
     let reference = |path: &str| -> Result<serde_json::Value, String> {
-        let module = Module::open(path).map_err(|e| e.to_string())?;
-        let class = render::choose_class(&module, None)?;
+        let class = render::choose_class(Path::new(path), None)?;
         Ok(serde_json::json!({
-            "format": "vst3",
-            "plugin_id": class.cid.to_hex(),
+            "format": class.format.tag(),
+            "plugin_id": class.id,
             "path_hint": path,
             "display_name": class.name,
         }))
@@ -1650,7 +1667,6 @@ fn inject_instrument(
 /// exercises the parameter path and the audio path at once.
 fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let comp = args.get(1).ok_or("expected a compressor plugin")?;
@@ -1677,17 +1693,16 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     }
     let events = render::note(48, note_at, (sample_rate * 1.0) as usize);
 
-    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline = probe.save_state().map_err(|e| e.to_string())?;
     drop(probe);
     let baseline_json = read_wrapper_state(&baseline)?;
 
     let run = |keyed: bool| -> Result<render::RenderOutcome, String> {
-        let patched = inject_sidechain(&baseline_json, comp, synth, switch, keyed)?;
+        let patched = inject_sidechain(&baseline_json, comp, synth, Some((switch, 1.0)), keyed)?;
         let state = edit_wrapper_state(&baseline, &patched)?;
         render::render_with_state(
             Path::new(wrapper),
@@ -1757,6 +1772,124 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The same wiring as `sidechain`, for a plugin that has no switch to throw.
+///
+/// `sidechain` asks a compressor to duck, which is a strong check but needs a
+/// plugin whose sidechain is (a) optional and (b) reached through one
+/// parameter. Plenty of plugins fail one of those and still read their aux bus
+/// -- the CLAP fixture always mixes it, Surge XT Effects hides the switch
+/// inside whichever effect is loaded -- so this asks the weaker question that
+/// applies to all of them: does wiring the aux bus change the output at all?
+///
+/// Direction is not asserted. A compressor ducks, a mixer adds, a vocoder does
+/// something else entirely; what is under test is the graph's aux plumbing, not
+/// the plugin's taste.
+fn cmd_aux(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let plugin = args.get(1).ok_or("expected a plugin with an aux input")?;
+    let synth = args
+        .get(2)
+        .ok_or("expected an instrument to feed the aux")?;
+    // Optional `ID=VALUE`: a parameter held at a value through slot 0 for the
+    // whole render, for a plugin that reads its aux bus only in some modes.
+    let preset = match args.get(3) {
+        None => None,
+        Some(text) => {
+            let (id, value) = text
+                .split_once('=')
+                .ok_or("the fourth argument looks like PARAM_ID=VALUE")?;
+            Some((
+                id.parse::<u32>()
+                    .map_err(|_| "the parameter id must be a number")?,
+                value
+                    .parse::<f64>()
+                    .map_err(|_| "the value must be a number")?,
+            ))
+        }
+    };
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 3.0) as usize;
+    let note_at = (sample_rate * 1.0) as usize;
+
+    let mut tone = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    for ch in 0..2usize {
+        for i in 0..frames {
+            let phase = i as f32 / sample_rate * 220.0 * std::f32::consts::TAU;
+            // Quieter than `sidechain`'s tone on purpose: what the aux bus
+            // contributes is measured against this, and a loud carrier buries
+            // it.
+            tone.samples[ch * frames + i] = 0.05 * phase.sin();
+        }
+    }
+    let events = render::note(48, note_at, (sample_rate * 1.0) as usize);
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |keyed: bool| -> Result<render::RenderOutcome, String> {
+        let patched = inject_sidechain(&baseline_json, plugin, synth, preset, keyed)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &tone,
+            BLOCK,
+            &events,
+        )
+    };
+
+    // Only the keyed second is compared: before the note the aux bus is silent
+    // either way, so any difference there would be the plugin drifting rather
+    // than the wiring doing anything.
+    let rms = |out: &wav::Audio| -> f32 {
+        let from = note_at + 4800;
+        let to = (note_at + (sample_rate * 0.9) as usize).min(out.frames);
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for ch in 0..out.channels as usize {
+            for i in from..to {
+                let s = out.samples[ch * out.frames + i] as f64;
+                sum += s * s;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            0.0
+        } else {
+            (sum / n as f64).sqrt() as f32
+        }
+    };
+
+    let unkeyed = run(false)?;
+    let keyed = run(true)?;
+    let (a, b) = (rms(&unkeyed.audio), rms(&keyed.audio));
+    println!("aux not wired: {a:.6}");
+    println!("aux wired:     {b:.6}");
+    if a < 1e-4 && b < 1e-4 {
+        return Err("the plugin produced nothing either way; the tone is not reaching it".into());
+    }
+    let change = (b - a).abs() / a.max(b);
+    println!("  level moved by {:.1}%", change * 100.0);
+    if change < 0.05 {
+        return Err(format!(
+            "wiring the aux bus changed the output by {:.1}%; either nothing              reaches the aux port or this plugin ignores it",
+            change * 100.0
+        ));
+    }
+    println!("another node's audio reaches the plugin's aux input");
+    Ok(())
+}
+
 /// Tone -> compressor -> out, with an instrument keying the compressor's aux
 /// bus, and a `Constant` driving a slot bound to the sidechain-enable switch.
 /// M8.5's DoD, through the real wrapper: a feedback delay sounds the same at
@@ -1771,7 +1904,6 @@ const FEEDBACK: f64 = 0.7;
 
 fn cmd_delay(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let sample_rate = 48_000.0f32;
@@ -1787,10 +1919,9 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
         input.samples[ch * frames] = 1.0;
     }
 
-    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
-        .map_err(|e| e.to_string())?;
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline = probe.save_state().map_err(|e| e.to_string())?;
     drop(probe);
@@ -1936,7 +2067,15 @@ fn inject_sidechain(
     state: &str,
     comp: &str,
     synth: &str,
-    switch: u32,
+    // A parameter to hold at a value through slot 0, when the plugin needs one
+    // set before it will read its aux bus at all -- a sidechain-enable switch,
+    // or Surge XT Effects' choice of which effect is loaded. `None` wires the
+    // aux bus and leaves the parameters alone.
+    //
+    // Driven through a slot rather than written directly because that is the
+    // path a real patch uses, and because some plugins act on a parameter only
+    // when it arrives as an event during `process`.
+    switch: Option<(u32, f64)>,
     keyed: bool,
 ) -> Result<String, String> {
     let mut value: serde_json::Value =
@@ -1944,21 +2083,18 @@ fn inject_sidechain(
 
     let describe = |path: &str| -> Result<(serde_json::Value, String, Vec<u16>, bool), String> {
         use std::sync::Arc;
-        use vst3_host::Vst3Plugin;
-        let module = Module::open(path).map_err(|e| e.to_string())?;
-        let class = render::choose_class(&module, None)?;
-        let plugin = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+        let (class, plugin) = render::load(Path::new(path), None, Arc::new(host::CliHost::new()))
             .map_err(|e| e.to_string())?;
         let layout = plugin.io_layout();
         let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
         Ok((
             serde_json::json!({
-                "format": "vst3",
-                "plugin_id": class.cid.to_hex(),
+                "format": class.format.tag(),
+                "plugin_id": class.id,
                 "path_hint": path,
                 "display_name": class.name,
             }),
-            class.cid.to_hex(),
+            class.id,
             ports.audio_in.clone(),
             ports.accepts_notes,
         ))
@@ -1994,15 +2130,17 @@ fn inject_sidechain(
     let mut slots: Vec<serde_json::Value> = (0..32)
         .map(|_| serde_json::json!({ "name": null, "binding": null }))
         .collect();
-    slots[0] = serde_json::json!({
-        "name": "SC Active",
-        "binding": {
-            "instance": 0,
-            "plugin_id": comp_id,
-            "param_id": switch,
-            "param_name": "SC Active",
-        }
-    });
+    if let Some((switch, _)) = switch {
+        slots[0] = serde_json::json!({
+            "name": "SC Active",
+            "binding": {
+                "instance": 0,
+                "plugin_id": comp_id,
+                "param_id": switch,
+                "param_name": "SC Active",
+            }
+        });
+    }
     value["slots"] = serde_json::Value::Array(slots);
 
     let comp_ports = serde_json::json!({
@@ -2038,7 +2176,7 @@ fn inject_sidechain(
             { "id": 2, "pos": [220.0, 220.0], "kind": { "Plugin": { "instance": 1, "ports": synth_ports } } },
             { "id": 3, "pos": [40.0, 220.0],  "kind": "NoteIn" },
             { "id": 4, "pos": [600.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
-            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": 1.0 } } },
+            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": switch.map_or(1.0, |(_, v)| v) } } },
             { "id": 6, "pos": [220.0, 400.0], "kind": { "SlotOut": { "slot": 0 } } }
         ],
         "links": links,
@@ -2056,7 +2194,6 @@ fn inject_sidechain(
 fn cmd_editor(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vst3_host::Vst3Plugin;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let plugin = args.get(1).ok_or("expected a plugin to put in a node")?;
@@ -2065,9 +2202,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
         .map_or(Ok(20.0), |s| s.parse())
         .map_err(|_| "bad duration")?;
 
-    let module = Module::open(wrapper).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let mut probe = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+    let (class, mut probe) = render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
         .map_err(|e| e.to_string())?;
     run_one_block(&mut probe)?;
     let baseline = probe.save_state().map_err(|e| e.to_string())?;
@@ -2077,7 +2212,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let state = edit_wrapper_state(&baseline, &patched)?;
 
     let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(wrapper), Some(class.cid))?;
+    sub.load(0, Path::new(wrapper), Some(&class.id))?;
     sub.load_sub_state(0, &state)?;
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened the wrapper's editor with a {} node", short(plugin));
@@ -2086,7 +2221,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(seconds);
     while Instant::now() < deadline && sub.editor_is_open(0) {
-        vst3_host_view::pump_events();
+        plugin_host::pump_events();
         sub.tick_editors();
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -2105,14 +2240,11 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
 /// Audio in -> one plugin node -> audio out, with the plugin's real sockets.
 fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
     use std::sync::Arc;
-    use vst3_host::Vst3Plugin;
 
     let mut value: serde_json::Value =
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
 
-    let module = Module::open(plugin).map_err(|e| e.to_string())?;
-    let class = render::choose_class(&module, None)?;
-    let loaded = Vst3Plugin::create(&module, class.cid, Arc::new(host::CliHost::new()))
+    let (class, loaded) = render::load(Path::new(plugin), None, Arc::new(host::CliHost::new()))
         .map_err(|e| e.to_string())?;
     let layout = loaded.io_layout();
     let mut ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
@@ -2137,8 +2269,8 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         {
             "instance": 0,
             "reference": {
-                "format": "vst3",
-                "plugin_id": class.cid.to_hex(),
+                "format": class.format.tag(),
+                "plugin_id": class.id,
                 "path_hint": plugin,
                 "display_name": class.name,
             }
@@ -2187,7 +2319,10 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         [800.0, 60.0],
     );
     let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [300.0, 340.0]);
-    let slot = graph.add(audio_graph_engine::NodeKind::SlotIn { slot: 0 }, [40.0, 400.0]);
+    let slot = graph.add(
+        audio_graph_engine::NodeKind::SlotIn { slot: 0 },
+        [40.0, 400.0],
+    );
 
     graph.connect(input, 0, node, 0);
     if ports.audio_in.len() > 1 {
@@ -2248,11 +2383,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     use subhost_adapter::SubHost;
 
     let path = args.first().ok_or("expected a plugin path")?;
-    let cid = args
-        .get(1)
-        .map(String::as_str)
-        .filter(|t| !t.is_empty())
-        .and_then(vst3_host::Cid::from_hex);
+    let class_id = args.get(1).map(String::as_str).filter(|t| !t.is_empty());
     let seconds: f64 = args
         .get(2)
         .filter(|s| !s.starts_with("--"))
@@ -2261,7 +2392,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let reverse = args.iter().any(|a| a == "--reverse");
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
-    sub.load(0, Path::new(path), cid)?;
+    sub.load(0, Path::new(path), class_id)?;
     let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened {name}");
@@ -2271,7 +2402,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(seconds);
     while Instant::now() < deadline && sub.editor_is_open(0) {
-        vst3_host_view::pump_events();
+        plugin_host::pump_events();
         sub.tick_editors();
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -2297,7 +2428,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
 
     // Dispatch anything the plugin posted while tearing down. A bad ordering
     // usually surfaces here rather than at the moment of the mistake.
-    vst3_host_view::pump_events();
+    plugin_host::pump_events();
 
     println!("teardown completed cleanly");
     Ok(())

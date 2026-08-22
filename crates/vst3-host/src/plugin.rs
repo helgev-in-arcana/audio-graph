@@ -31,6 +31,17 @@ use vst3::Steinberg::Vst::{
     IParameterChanges, ParameterInfo, ProcessData, ProcessSetup, SpeakerArrangement, String128,
     TChar,
 };
+// Named only so `Vst3Plugin::interfaces` can ask for them by type; none of
+// these are called.
+use vst3::Steinberg::Vst::{
+    IAudioPresentationLatency, IAutomationState, IEditController2, IEditControllerHostEditing,
+    IKeyswitchController, IMidiMapping, INoteExpressionController,
+    INoteExpressionPhysicalUIMapping, IParameterFunctionName, IPrefetchableSupport,
+    IProcessContextRequirements, IProgramListData, IUnitData, IUnitInfo,
+    IXmlRepresentationController,
+};
+// Nested one level deeper than the rest, hence its own import.
+use vst3::Steinberg::Vst::ChannelContext::IInfoListener;
 use vst3::Steinberg::{
     FUnknown, IPluginBaseTrait, IPluginFactoryTrait, TUID, kNotImplemented, kResultFalse,
     kResultOk, kResultTrue,
@@ -294,6 +305,56 @@ impl Vst3Plugin {
             count(BusDirections_::kInput as i32),
             count(BusDirections_::kOutput as i32),
         )
+    }
+
+    /// Which of the interfaces we know the names of this instance answers to.
+    ///
+    /// The VST3 counterpart of `ClapPlugin::extensions`, and purely diagnostic
+    /// in the same way: nothing branches on it. `queryInterface` is what VST3
+    /// has instead of `get_extension`, so the question "what does this plugin
+    /// actually implement" is asked here by casting rather than by name.
+    ///
+    /// Both halves are asked, because a plugin splits its optional interfaces
+    /// between them — `IMidiMapping` lives on the controller while
+    /// `IProcessContextRequirements` lives on the component — and the caller
+    /// has no reason to care which half answered.
+    pub fn interfaces(&self) -> Vec<&'static str> {
+        let mut found = Vec::new();
+
+        macro_rules! probe {
+            ($($i:ident),* $(,)?) => {$(
+                if self.component.cast::<$i>().is_some()
+                    || self.controller.as_ref().is_some_and(|c| c.cast::<$i>().is_some())
+                {
+                    found.push(stringify!($i));
+                }
+            )*};
+        }
+
+        probe!(
+            IComponent,
+            IAudioProcessor,
+            IEditController,
+            IEditController2,
+            IEditControllerHostEditing,
+            IConnectionPoint,
+            IUnitInfo,
+            IUnitData,
+            IProgramListData,
+            IMidiMapping,
+            INoteExpressionController,
+            INoteExpressionPhysicalUIMapping,
+            IKeyswitchController,
+            IProcessContextRequirements,
+            IAudioPresentationLatency,
+            IPrefetchableSupport,
+            IAutomationState,
+            IParameterFunctionName,
+            IXmlRepresentationController,
+            IInfoListener,
+        );
+
+        found
     }
 
     pub fn params(&self) -> &[ParamInfo] {

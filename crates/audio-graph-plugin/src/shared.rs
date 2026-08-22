@@ -33,13 +33,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use audio_graph_engine::{Graph, Handoff, Program, compile};
+use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, PluginPorts};
 use parking_lot::Mutex;
-use plugin_host_api::AudioConfig;
+use plugin_host::AudioConfig;
 use subhost_adapter::{
     DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
 };
-use audio_graph_engine::{Graph, Handoff, Program, compile};
-use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, PluginPorts};
 
 use crate::params::WrapperParams;
 
@@ -409,7 +409,7 @@ impl Shared {
     /// Called after every edit made from the editor, so whenever the DAW
     /// decides to save the project there is something current waiting for it.
     pub fn store_state(&self) {
-        let state = self.main();
+        let mut state = self.main();
         let mut blob = state.host.save_state();
         blob.graph = serde_json::to_value(&state.graph).ok();
         blob.sub_block = self.quantum();

@@ -246,6 +246,17 @@ pub struct TimeContext {
     pub playing: bool,
     pub recording: bool,
     pub loop_active: bool,
+    /// The loop's bounds in quarter notes, when the host knows them.
+    ///
+    /// Separate from `loop_active` because the two are not the same claim: a
+    /// host can know a loop is running without being able to say where it is,
+    /// and both formats care about the difference. VST3 spells it out with
+    /// `kCycleValid`; CLAP has no such flag, so the CLAP backend reports no
+    /// loop at all rather than a loop of length zero.
+    pub loop_range_music: Option<(f64, f64)>,
+    /// The same bounds in seconds, which CLAP asks for separately and VST3
+    /// does not carry at all.
+    pub loop_range_seconds: Option<(f64, f64)>,
 }
 
 impl Default for TimeContext {
@@ -260,6 +271,8 @@ impl Default for TimeContext {
             playing: false,
             recording: false,
             loop_active: false,
+            loop_range_music: None,
+            loop_range_seconds: None,
         }
     }
 }

@@ -125,13 +125,11 @@ dependencies = [
  "nice-plug",
  "nice-plug-egui",
  "parking_lot",
- "plugin-host-api",
+ "plugin-host",
  "raw-window-handle",
  "serde",
  "serde_json",
  "subhost-adapter",
- "vst3-host",
- "vst3-host-view",
 ]
 
 [[package]]
@@ -296,10 +294,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "clap-host"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "host-window",
+ "libc",
+ "log",
+ "plugin-host-api",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "clap-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
+
+[[package]]
+name = "clap-test-plugin"
+version = "0.1.0"
+dependencies = [
+ "clap-sys",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "clipboard-win"
@@ -826,11 +844,16 @@ name = "host-cli"
 version = "0.1.0"
 dependencies = [
  "audio-graph-engine",
- "plugin-host-api",
+ "plugin-host",
  "serde_json",
  "subhost-adapter",
- "vst3-host",
- "vst3-host-view",
+]
+
+[[package]]
+name = "host-window"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1612,6 +1635,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plugin-host"
+version = "0.1.0"
+dependencies = [
+ "clap-host",
+ "clap-test-plugin",
+ "host-window",
+ "log",
+ "plugin-host-api",
+ "vst3-host",
+ "vst3-host-view",
+]
+
+[[package]]
 name = "plugin-host-api"
 version = "0.1.0"
 
@@ -1921,11 +1957,10 @@ version = "0.1.0"
 dependencies = [
  "audio-graph-engine",
  "log",
+ "plugin-host",
  "plugin-host-api",
  "serde",
  "serde_json",
- "vst3-host",
- "vst3-host-view",
 ]
 
 [[package]]
@@ -2235,6 +2270,7 @@ dependencies = [
 name = "vst3-host-view"
 version = "0.1.0"
 dependencies = [
+ "host-window",
  "log",
  "vst3",
  "windows-sys 0.61.2",

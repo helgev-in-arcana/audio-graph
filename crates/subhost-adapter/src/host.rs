@@ -9,13 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::schedule::SlotSchedule;
-use plugin_host_api::{
-    AudioBuffers, AudioConfig, Event, EventSink, HostContext, ParamEvent, ParamId, ParamInfo,
-    ProcessStatus, SubPluginMain, SubPluginProcessor, Target, TimeContext,
+use plugin_host::{
+    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, ParamEvent,
+    ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor, Target,
+    TimeContext,
 };
-use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin};
-
-use vst3_host_view::EditorWindow;
 
 use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
@@ -48,28 +46,15 @@ pub struct SubHost {
 /// the user starts drawing.
 pub const MAX_INSTANCES: usize = 16;
 
-/// Field order here *is* the teardown order, and §5.3 is entirely about
-/// teardown order.
+/// One loaded sub-plugin, plus how it was found.
 ///
-/// The editor holds an `IPlugView` created by the controller. VST3 requires
-/// that view to be removed from its parent and released before the controller
-/// terminates; doing it the other way round leaves the plugin operating on a
-/// window that no longer exists, and it faults. Declaring the editor first
-/// makes the correct order the one that happens automatically — including on
-/// the path §5.3 warns about, where the DAW destroys the whole instance without
-/// ever telling us to close the editor.
+/// The §5.3 teardown order — editor before instance, instance before module —
+/// used to be spelled out here as field order. It now lives inside
+/// `plugin_host::Plugin`, which owns all three and is the same shape for both
+/// formats, so there is one place to get it right instead of one per caller.
 struct Loaded {
-    editor: Option<EditorWindow>,
-    /// Released before `module`: the instance must go before the library its
-    /// code lives in.
-    plugin: Vst3Plugin,
-    /// Held, not used: the instance's vtables point into this module's code, so
-    /// it must outlive the instance. Dropping it first unloads the library out
-    /// from under the plugin.
-    #[allow(dead_code)]
-    module: Module,
+    plugin: Plugin,
     reference: SubPluginRef,
-    class: ClassInfo,
 }
 
 impl SubHost {
@@ -153,7 +138,7 @@ impl SubHost {
     /// The default — everything false — is also the honest answer when nothing
     /// is loaded: a graph cannot send per-voice modulation to a plugin that is
     /// not there.
-    pub fn capabilities(&self, instance: usize) -> plugin_host_api::Capabilities {
+    pub fn capabilities(&self, instance: usize) -> plugin_host::Capabilities {
         self.at(instance)
             .map_or_else(Default::default, |l| l.plugin.capabilities())
     }
@@ -164,13 +149,18 @@ impl SubHost {
     /// already in it — a DAW does this through the normal state path.
     pub fn load_sub_state(&mut self, instance: usize, blob: &[u8]) -> Result<(), String> {
         let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
-        loaded.plugin.load_state(blob).map_err(|e| e.to_string())
+        loaded.plugin.load_state(blob).map_err(|e| e.to_string())?;
+        // The other half of the rule in `save_state`: a plugin may finish
+        // taking the blob on a main-thread callback, and until then it still
+        // reports its old values.
+        loaded.plugin.tick();
+        Ok(())
     }
 
     /// The plugin's buses and note capability, for building a node's sockets
     /// (§14.2). Empty when nothing is loaded, which draws as a node with no
     /// sockets rather than as an error.
-    pub fn io_layout(&self, instance: usize) -> plugin_host_api::IoLayout {
+    pub fn io_layout(&self, instance: usize) -> plugin_host::IoLayout {
         self.at(instance)
             .map(|l| SubPluginMain::io_layout(&l.plugin))
             .unwrap_or_default()
@@ -191,38 +181,29 @@ impl SubHost {
         }
     }
 
-    /// Load a sub-plugin, choosing `class_cid` or the module's first audio
-    /// module class.
+    /// Load a sub-plugin, choosing `class_id` or the module's first offering.
     ///
     /// Replaces whatever was loaded. Slot *bindings* are kept and re-resolved
     /// against the new plugin, so swapping a plugin for a newer version of
     /// itself keeps every mapping (§8.3).
+    ///
+    /// The format is the path's business, not the caller's: `plugin-host`
+    /// reads it off the extension, so a `.clap` and a `.vst3` arrive here the
+    /// same way and nothing below this line branches on which it was.
     pub fn load(
         &mut self,
         instance: usize,
         path: &Path,
-        class_cid: Option<Cid>,
+        class_id: Option<&str>,
     ) -> Result<(), String> {
         self.reserve(instance)?;
-        let module = Module::open(path).map_err(|e| e.to_string())?;
-        let classes = module.audio_modules().map_err(|e| e.to_string())?;
-        let class = match class_cid {
-            Some(cid) => classes
-                .into_iter()
-                .find(|c| c.cid == cid)
-                .ok_or_else(|| format!("{path:?} has no class {cid}"))?,
-            None => classes
-                .into_iter()
-                .next()
-                .ok_or_else(|| format!("{path:?} exports no audio module class"))?,
-        };
+        let plugin =
+            Plugin::load(path, class_id, Arc::clone(&self.context)).map_err(|e| e.to_string())?;
 
-        let plugin = Vst3Plugin::create(&module, class.cid, Arc::clone(&self.context))
-            .map_err(|e| e.to_string())?;
-
+        let class = plugin.class();
         let reference = SubPluginRef {
-            format: "vst3".into(),
-            plugin_id: class.cid.to_hex(),
+            format: class.format.tag().into(),
+            plugin_id: class.id.clone(),
             path_hint: path.to_string_lossy().into_owned(),
             display_name: class.name.clone(),
         };
@@ -235,13 +216,7 @@ impl SubHost {
             &reference.plugin_id,
             SubPluginMain::params(&plugin),
         );
-        self.instances[instance] = Some(MainThread::new(Loaded {
-            editor: None,
-            plugin,
-            module,
-            reference,
-            class,
-        }));
+        self.instances[instance] = Some(MainThread::new(Loaded { plugin, reference }));
         Ok(())
     }
 
@@ -270,32 +245,21 @@ impl SubHost {
     /// directory should not cost the user their patch. The class id is the
     /// authority; the path is only a hint (§8.3).
     pub fn resolve_reference(reference: &SubPluginRef) -> Option<PathBuf> {
-        let hint = PathBuf::from(&reference.path_hint);
-        if hint.exists() {
-            return Some(hint);
-        }
-        let Some(wanted) = Cid::from_hex(&reference.plugin_id) else {
-            return None;
-        };
-
-        for dir in vst3_host::default_plugin_directories() {
-            for candidate in vst3_host::find_modules(&dir) {
-                let Ok(module) = Module::open(&candidate) else {
-                    continue;
-                };
-                let Ok(classes) = module.audio_modules() else {
-                    continue;
-                };
-                if classes.iter().any(|c| c.cid == wanted) {
-                    return Some(candidate);
-                }
-            }
-        }
-        None
+        // A reference saved before CLAP existed has no format tag worth
+        // trusting beyond `"vst3"`, and one saved by a newer build might name a
+        // format this build does not have. Both are "not found" rather than an
+        // error, which is what the caller already handles.
+        let format = Format::from_tag(&reference.format)?;
+        plugin_host::resolve_reference(&plugin_host::PluginRef {
+            format,
+            id: reference.plugin_id.clone(),
+            path_hint: PathBuf::from(&reference.path_hint),
+            display_name: reference.display_name.clone(),
+        })
     }
 
     pub fn class(&self, instance: usize) -> Option<&ClassInfo> {
-        self.at(instance).map(|l| &l.class)
+        self.at(instance).map(|l| l.plugin.class())
     }
 
     /// Open the sub-plugin's own editor in a top-level window (§5.1).
@@ -315,23 +279,13 @@ impl SubHost {
         owner: *mut std::ffi::c_void,
     ) -> Result<(), String> {
         let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
-        if loaded.editor.is_some() {
-            return Ok(());
-        }
-        let view = loaded
-            .plugin
-            .create_view()
-            .ok_or("this plugin has no editor")?;
-        loaded.editor = Some(EditorWindow::open(view, &loaded.class.name, owner)?);
-        Ok(())
+        loaded.plugin.open_editor(owner)
     }
 
     /// Close the sub-plugin's editor, running the §5.3 sequence.
     pub fn close_editor(&mut self, instance: usize) {
         if let Some(loaded) = self.at_mut(instance) {
-            // Dropping the EditorWindow runs the sequence; there is no way to
-            // close one without it.
-            loaded.editor = None;
+            loaded.plugin.close_editor();
         }
     }
 
@@ -344,32 +298,34 @@ impl SubHost {
     }
 
     pub fn editor_is_open(&self, instance: usize) -> bool {
-        self.at(instance).is_some_and(|l| l.editor.is_some())
+        self.at(instance).is_some_and(|l| l.plugin.editor_is_open())
     }
 
-    /// Drive the editor for one UI tick: apply pending resizes, and close it if
-    /// the user asked.
+    /// Drive every loaded sub-plugin for one UI tick.
     ///
-    /// Call from the host's UI thread. A plugin must not pump messages itself —
-    /// the DAW is already doing that — so this only handles the parts that are
-    /// ours.
+    /// Call from the host's UI thread, every frame, whether or not any editor
+    /// is open — a CLAP plugin's main-thread callbacks and timers run through
+    /// here too, and one starved of them stalls. A plugin must not pump
+    /// messages itself, since the DAW is already doing that; this only handles
+    /// the parts that are ours.
+    ///
+    /// That is the contract; the wrapper does not yet keep it. The only thing
+    /// calling this periodically is the `Deferred` tick the editor sets up in
+    /// `attached`, so nothing runs while the wrapper's own window is closed —
+    /// and a project that plays without anyone opening the editor is the
+    /// ordinary case, not an edge one.
+    ///
+    /// What is covered meanwhile: `save_state`, `load_state` and
+    /// `load_sub_state` each tick around the plugin, which is where a missed
+    /// callback costs data rather than responsiveness. The periodic half needs
+    /// the `Deferred` to move from the editor to the plugin itself, and that is
+    /// held until the non-Windows window backend grows a real timer, since
+    /// otherwise it would fix only one platform. Both steps are in ROADMAP.md.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
-            self.tick_editor(instance);
-        }
-    }
-
-    fn tick_editor(&mut self, instance: usize) {
-        let Some(loaded) = self.at_mut(instance) else {
-            return;
-        };
-        let Some(editor) = loaded.editor.as_mut() else {
-            return;
-        };
-
-        editor.sync_size();
-        if editor.close_requested() {
-            loaded.editor = None;
+            if let Some(loaded) = self.at_mut(instance) {
+                loaded.plugin.tick();
+            }
         }
     }
 
@@ -516,9 +472,19 @@ impl SubHost {
     }
 
     /// Collect everything that goes into the DAW's project file (§8.3).
-    pub fn save_state(&self) -> WrapperState {
+    ///
+    /// Takes `&mut self` so it can tick first. A plugin is entitled to fold
+    /// recent edits into what it serialises on one of its own main-thread
+    /// callbacks rather than immediately, and until the wrapper ticks
+    /// unconditionally (see `tick_editors`) this is the only thing that runs
+    /// them before a save. CHOWTapeModel does exactly that; without the tick it
+    /// saves the values it held before the last edit.
+    pub fn save_state(&mut self) -> WrapperState {
         let mut state = WrapperState::new(self.slots.to_state());
         for instance in 0..self.instances.len() {
+            if let Some(loaded) = self.at_mut(instance) {
+                loaded.plugin.tick();
+            }
             let Some(loaded) = self.at(instance) else {
                 continue;
             };
@@ -557,20 +523,23 @@ impl SubHost {
                 ));
                 continue;
             };
-            let cid = Cid::from_hex(&reference.plugin_id);
-            if let Err(e) = self.load(entry.instance, &path, cid) {
+            if let Err(e) = self.load(entry.instance, &path, Some(&reference.plugin_id)) {
                 problems.push(format!("could not load {}: {e}", reference.display_name));
                 continue;
             }
             match entry.state_bytes() {
                 Some(bytes) => {
-                    if let Some(loaded) = self.at_mut(entry.instance)
-                        && let Err(e) = loaded.plugin.load_state(&bytes)
-                    {
-                        problems.push(format!(
-                            "{} loaded but its settings did not restore: {e}",
-                            reference.display_name
-                        ));
+                    if let Some(loaded) = self.at_mut(entry.instance) {
+                        if let Err(e) = loaded.plugin.load_state(&bytes) {
+                            problems.push(format!(
+                                "{} loaded but its settings did not restore: {e}",
+                                reference.display_name
+                            ));
+                        }
+                        // As in `load_sub_state`. This is the path a project
+                        // open takes, and it runs with the wrapper's own editor
+                        // closed, so nothing else would tick these plugins.
+                        loaded.plugin.tick();
                     }
                 }
                 None => problems.push(format!(
@@ -1187,8 +1156,8 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use plugin_host_api::NoteEvent;
         use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
+        use plugin_host_api::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());

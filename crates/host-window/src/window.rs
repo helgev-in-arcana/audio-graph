@@ -1,4 +1,4 @@
-//! The container window a sub-plugin's editor is attached to.
+//! The container window a hosted plugin's editor is attached to.
 //!
 //! ARCHITECTURE.md §5.2: this window draws nothing. It is a titled, resizable
 //! frame and nothing else, so wgpu, Vello, layout and a windowing crate are all
@@ -24,26 +24,6 @@ impl Size {
         Size { width, height }
     }
 }
-
-/// What the platform handle means to the plugin.
-///
-/// VST3 identifies the parent it is given by a string constant, and passing the
-/// wrong one to a plugin that supports several is how an editor ends up
-/// attached to nothing.
-pub const PLATFORM_TYPE: &str = {
-    #[cfg(windows)]
-    {
-        "HWND"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "NSView"
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        "X11EmbedWindowID"
-    }
-};
 
 /// Shared state a window's message handler needs to reach.
 #[derive(Default)]
@@ -478,16 +458,6 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn platform_type_matches_what_we_pass_to_attached() {
-        // Handing a plugin the wrong platform string is how an editor attaches
-        // to nothing at all, silently.
-        #[cfg(windows)]
-        assert_eq!(PLATFORM_TYPE, "HWND");
-        #[cfg(target_os = "macos")]
-        assert_eq!(PLATFORM_TYPE, "NSView");
-    }
 
     #[cfg(windows)]
     #[test]

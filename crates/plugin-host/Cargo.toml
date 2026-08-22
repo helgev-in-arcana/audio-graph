@@ -1,0 +1,16 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+plugin-host-api.workspace = true
+vst3-host.workspace = true
+vst3-host-view.workspace = true
+clap-host.workspace = true
+host-window.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+clap-test-plugin = { path = "../clap-test-plugin" }

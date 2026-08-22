@@ -20,7 +20,7 @@
 //! `STATUS_STACK_BUFFER_OVERRUN`, because it happens inside a callback that
 //! cannot unwind. Clicking "Open plugin GUI" took the host down with it.
 //!
-//! So the commands go to [`vst3_host_view::Deferred`], which runs them on the
+//! So the commands go to [`plugin_host::Deferred`], which runs them on the
 //! next turn of the DAW's message loop, once the frame is over. The same
 //! applies to the sub-plugin window's periodic tick, which answers `resizeView`
 //! by resizing a window: it runs on a timer, not in the draw callback.
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
-use plugin_host_api::ParamInfo;
+use plugin_host::ParamInfo;
 use subhost_adapter::MainThread;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
@@ -122,7 +122,7 @@ pub struct WrapperEditor {
     repaint: RepaintNotifier,
     /// `None` until `build`: it binds to the message loop of the thread the
     /// editor actually runs on, which is not known until then.
-    deferred: Option<MainThread<vst3_host_view::Deferred>>,
+    deferred: Option<MainThread<plugin_host::Deferred>>,
 
     /// Populated on first use, refreshed on demand.
     ///
@@ -219,17 +219,24 @@ impl WrapperEditor {
             .collect();
     }
 
+    /// List every plugin module on the machine, both formats together.
+    ///
+    /// Paths only — the module is not opened. Enumerating the classes inside
+    /// would mean running every installed vendor's code just to draw a menu,
+    /// and the loader gets the identity right on its own when the user picks
+    /// one.
     fn rescan(&mut self) {
         self.entries.clear();
-        for dir in vst3_host::default_plugin_directories() {
-            for path in vst3_host::find_modules(&dir) {
-                let name = path
-                    .file_name()
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                self.entries
-                    .push(crate::graph_ui::PluginEntry { name, path });
-            }
+        for (format, path) in plugin_host::installed_modules() {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            self.entries
+                .push(crate::graph_ui::PluginEntry { name, format, path });
         }
+        // By name, not by format: a user looking for "Raum" should not have to
+        // know which format it was installed as, and the tag on the row says
+        // which one they are about to load.
         self.entries
             .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         self.scanned = true;
@@ -387,7 +394,7 @@ impl WrapperEditor {
     /// The editor window has focus while the user is looking at it, and a child
     /// window is where keyboard messages stop — so without this, the space bar
     /// goes nowhere and the DAW will not start or stop. See
-    /// `vst3_host_view::forward_key`.
+    /// `plugin_host::forward_key`.
     ///
     /// The rule is egui's own: if it wants keyboard input, a text field is
     /// being edited and every key belongs to it. Otherwise the key is ours only
@@ -411,7 +418,7 @@ impl WrapperEditor {
                 .collect()
         });
         for (vk, pressed) in forward {
-            vst3_host_view::forward_key(self.daw_window, vk, pressed);
+            plugin_host::forward_key(self.daw_window, vk, pressed);
         }
     }
 }
@@ -428,9 +435,9 @@ impl NiceEguiApp for WrapperEditor {
         // anywhere else. Our own view sits deep inside the DAW's window tree,
         // so walk up to the root — see `ContainerWindow::new` for why it has to
         // be the root and not this view.
-        self.daw_window = vst3_host_view::root_window(raw_window(frame)) as usize;
+        self.daw_window = plugin_host::root_window(raw_window(frame)) as usize;
 
-        match vst3_host_view::deferred() {
+        match plugin_host::deferred() {
             Ok(deferred) => {
                 let shared = self.shared.clone();
                 // The sub-plugin's window needs a tick to answer its resize
