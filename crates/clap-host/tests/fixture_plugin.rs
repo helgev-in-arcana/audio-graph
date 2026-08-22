@@ -32,6 +32,7 @@ const PARAM_ACTIVE_PORTS: ParamId = ParamId(4);
 /// reads without a second file open.
 const OUTPUT_PORT_BIT: u32 = 8;
 const PARAM_ASK: ParamId = ParamId(5);
+const PARAM_RENDER_MODE: ParamId = ParamId(6);
 /// Mirrors `clap_test_plugin::ask`, spelled out for the same reason as
 /// `OUTPUT_PORT_BIT`: this crate does not depend on the fixture's Rust API,
 /// only on the module it builds.
@@ -170,7 +171,7 @@ fn the_backend_drives_a_real_clap_module() {
         ClapPlugin::create(&module, &class.id, Arc::clone(&context)).expect("instantiates");
 
     let params = SubPluginMain::params(&plugin).to_vec();
-    assert_eq!(params.len(), 6, "{params:#?}");
+    assert_eq!(params.len(), 7, "{params:#?}");
 
     let gain = params.iter().find(|p| p.id == PARAM_GAIN).expect("gain");
     // Plain values with a real range, straight from the plugin — the whole
@@ -315,6 +316,17 @@ fn the_backend_drives_a_real_clap_module() {
         "the wired output stays on"
     );
 
+    // --- the plugin was told this is an offline render ---------------------
+
+    // `AudioConfig::offline` is the only thing that says so, and CLAP's only
+    // way to pass it on is `clap.render`. The fixture refuses a mode it does
+    // not recognise, so a wrong value fails here rather than being stored.
+    assert_eq!(
+        SubPluginMain::snapshot(&plugin).get(PARAM_RENDER_MODE),
+        Some(1.0),
+        "an offline config has to reach the plugin as offline render mode"
+    );
+
     // --- parameter events arrive as events ---------------------------------
 
     let events = [Event::Param(ParamEvent::SetValue {
@@ -397,6 +409,23 @@ fn the_backend_drives_a_real_clap_module() {
         &output[..4]
     );
 
+    SubPluginMain::deactivate(&mut plugin, processor);
+
+    // --- and a live take is told it is a live take --------------------------
+
+    // Set on every activate, in both directions: the mode belongs to the
+    // instance, so one bounced offline and then played live would otherwise
+    // still think it has all the time in the world.
+    let realtime = AudioConfig {
+        offline: false,
+        ..config
+    };
+    let processor = SubPluginMain::activate(&mut plugin, realtime).expect("activates realtime");
+    assert_eq!(
+        SubPluginMain::snapshot(&plugin).get(PARAM_RENDER_MODE),
+        Some(0.0),
+        "the offline mode from the previous activate was never taken back"
+    );
     SubPluginMain::deactivate(&mut plugin, processor);
 
     // --- a configuration the plugin cannot have is refused ------------------

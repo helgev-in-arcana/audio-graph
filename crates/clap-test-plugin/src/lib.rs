@@ -49,6 +49,10 @@ use clap_sys::ext::params::{
     CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_STEPPED, clap_param_info,
     clap_plugin_params,
 };
+use clap_sys::ext::render::{
+    CLAP_EXT_RENDER, CLAP_RENDER_OFFLINE, CLAP_RENDER_REALTIME, clap_plugin_render,
+    clap_plugin_render_mode,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_plugin_state};
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
 use clap_sys::id::clap_id;
@@ -79,7 +83,15 @@ pub const PARAM_ACTIVE_PORTS: clap_id = 4;
 /// the thing named by [`Ask`]. Nothing else in the fixture ever calls back, so
 /// a host that drops one of these has nowhere to hide.
 pub const PARAM_ASK: clap_id = 5;
-pub const PARAM_COUNT: u32 = 6;
+/// Read-only, and the only way a test can see which render mode the host
+/// asked for.
+///
+/// 0 while nobody has said (which is also what CLAP's realtime mode is worth),
+/// 1 once the host has switched this instance to offline. Like
+/// [`PARAM_ACTIVE_PORTS`], `clap.render` is a pure command with nothing to
+/// read back, so the fixture reports it as a parameter or not at all.
+pub const PARAM_RENDER_MODE: clap_id = 6;
+pub const PARAM_COUNT: u32 = 7;
 
 /// Values for [`PARAM_ASK`].
 pub mod ask {
@@ -173,6 +185,10 @@ pub(crate) struct Instance {
     /// Which ports the host left switched on. Every port starts active, which
     /// is what CLAP says a fresh instance looks like.
     active_ports: u32,
+    /// The last mode the host set through `clap.render`; see
+    /// [`PARAM_RENDER_MODE`]. Realtime is the value a fresh instance has,
+    /// which is what CLAP says too.
+    render_mode: i32,
     /// Declared last so it drops last, which is the wrong order on purpose:
     /// the host is required to call `gui.destroy` before the instance goes, and
     /// a fixture that cleaned up after a host that forgot would hide the bug
@@ -319,6 +335,7 @@ unsafe extern "C" fn factory_create(
         initialised: false,
         // CLAP says every port starts active.
         active_ports: u32::MAX,
+        render_mode: CLAP_RENDER_REALTIME,
         gui: gui::Gui::default(),
     });
     // Only once the box has its final address.
@@ -532,6 +549,8 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const gui::EXT_GUI).cast()
     } else if id == CLAP_EXT_AUDIO_PORTS_ACTIVATION {
         (&raw const EXT_PORTS_ACTIVATION).cast()
+    } else if id == CLAP_EXT_RENDER {
+        (&raw const EXT_RENDER).cast()
     } else {
         std::ptr::null()
     }
@@ -600,7 +619,8 @@ unsafe extern "C" fn params_get_info(
             65535.0,
             CLAP_PARAM_IS_STEPPED,
         ),
-        _ => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        5 => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        _ => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
     };
 
     let out = unsafe { &mut *info };
@@ -636,6 +656,12 @@ unsafe extern "C" fn params_get_value(
     let (Some(instance), false) = (unsafe { Instance::from_host(plugin) }, out.is_null()) else {
         return false;
     };
+    if id == PARAM_RENDER_MODE {
+        // Reported rather than stored with the rest, for the same reason as
+        // the ports below: the host set it, not the user.
+        unsafe { *out = f64::from(instance.render_mode) };
+        return true;
+    }
     if id == PARAM_ACTIVE_PORTS {
         // Reported rather than stored with the rest: this one is the host's
         // doing, not the user's.
@@ -958,6 +984,33 @@ unsafe extern "C" fn ports_set_active(
     } else {
         instance.active_ports &= !(1 << bit);
     }
+    true
+}
+
+// --- clap.render ----------------------------------------------------------
+
+static EXT_RENDER: clap_plugin_render = clap_plugin_render {
+    has_hard_realtime_requirement: Some(render_has_hard_realtime_requirement),
+    set: Some(render_set),
+};
+
+/// False, so the host is expected to switch this fixture to offline. A plugin
+/// that said yes may never be switched, and then the check below could not
+/// tell "the host respected the requirement" from "the host never called".
+unsafe extern "C" fn render_has_hard_realtime_requirement(_plugin: *const clap_plugin) -> bool {
+    false
+}
+
+unsafe extern "C" fn render_set(plugin: *const clap_plugin, mode: clap_plugin_render_mode) -> bool {
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    // A mode nobody defined is refused rather than stored: CLAP has exactly
+    // two, and a host that invented a third should hear about it.
+    if mode != CLAP_RENDER_REALTIME && mode != CLAP_RENDER_OFFLINE {
+        return false;
+    }
+    instance.render_mode = mode;
     true
 }
 
