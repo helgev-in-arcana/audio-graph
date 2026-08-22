@@ -254,6 +254,20 @@ pub(crate) fn compile_audio(
                 }
             }
             NodeKind::Plugin { instance, ports } => {
+                // A plugin's extra output buses get a socket each, because the
+                // node has to show what the plugin declares — but nothing
+                // downstream can read one yet. A plugin is handed exactly one
+                // output bus at activate (`InstanceIo::output_channels`), and
+                // `produced` is keyed by node rather than by port, so a link
+                // from "out 2" would quietly deliver bus 0's audio. Surge XT
+                // made that concrete on 2026-08-23: `Scene A` and `Scene B`
+                // both came back carrying the main output. Refused rather than
+                // routed to the wrong bus; the editor shows the reason.
+                if graph.links.iter().any(|l| l.from == id && l.from_port > 0) {
+                    return Err(CompileError::NotYet {
+                        what: "a plugin's second output bus",
+                    });
+                }
                 if out_width == 0 {
                     // A plugin with no output bus cannot be routed through. It
                     // is still legal to place — an analyser is one — but there
@@ -626,6 +640,44 @@ mod tests {
                 assert_ne!(input, output, "{op:?}");
             }
         }
+    }
+
+    /// A plugin's second output bus gets a socket, and wiring it has to be
+    /// refused rather than served bus 0.
+    ///
+    /// Surge XT is the plugin that made this real: it declares `Output`,
+    /// `Scene A` and `Scene B`, and before this, all three sockets rendered
+    /// the main output. Silently wrong beats loudly unfinished in nobody's
+    /// book. When routing lands, this test inverts.
+    #[test]
+    fn a_link_from_a_second_output_bus_is_refused() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = graph.add(
+            NodeKind::Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2, 2],
+                    ..PluginPorts::default()
+                },
+            },
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 1, output, 0);
+
+        let error = compile(&graph, SLOTS).expect_err("the second bus is not routed yet");
+        assert!(matches!(error, CompileError::NotYet { .. }), "{error:?}");
+
+        // The first socket of the same node still compiles: the refusal is
+        // about the bus, not about the plugin having more than one.
+        let mut graph = graph;
+        graph.links.clear();
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+        compile(&graph, SLOTS).expect("the main output is routed as it always was");
     }
 
     /// §14.6. One branch goes through a plugin with latency, the other does

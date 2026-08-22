@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "scan" => cmd_scan(rest),
         "info" => cmd_info(rest),
         "buses" => cmd_buses(rest),
+        "outbus" => cmd_outbus(rest),
         "dirs" => cmd_dirs(),
         "churn" => cmd_churn(rest),
         "params" => cmd_params(rest),
@@ -97,6 +98,10 @@ fn usage() {
                                     rendered one after the other
   host-cli buses <PLUGIN> [ID]      list the plugin's buses as the node graph
                                     will see them (§14.2)
+  host-cli outbus <WRAPPER.vst3> <PLUGIN> [ID]
+                                    render a plugin with more than one output
+                                    bus once per output socket, and report what
+                                    each socket carries
   host-cli instrument <WRAPPER.vst3> <SYNTH> <A> <B>
                                     check notes reach the instrument the graph
                                     points at, and only that one
@@ -1621,6 +1626,186 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
     }
 
     println!("notes reach the instrument the graph points at, and only that one");
+    Ok(())
+}
+
+/// Every output socket of a multi-output plugin, one render each (§14.2).
+///
+/// The node graph gives a plugin one output socket per declared bus, and until
+/// 2026-08-23 nothing had ever wired one other than the first — M8 only ever
+/// ran a single stereo path. Surge XT is what made it concrete: it declares
+/// `Output`, `Scene A` and `Scene B`, and all three sockets came back carrying
+/// the main output, because the compiler keys a plugin's audio by node and not
+/// by port and hands the plugin one output bus at activate.
+///
+/// Routing the extra buses needs an output bus in the host API that does not
+/// exist yet, so the compiler refuses the link instead (`CompileError::NotYet`)
+/// — and this is what shows that from the outside: socket 0 renders, the rest
+/// come back silent because the patch never compiled. **Invert this check when
+/// the routing lands**; a passing run here is a statement about a limitation,
+/// not about a feature.
+fn cmd_outbus(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use audio_graph_engine::{Graph, NodeKind, PluginPorts};
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let plugin = args
+        .get(1)
+        .ok_or("expected a plugin with several outputs")?;
+    let class_id = args.get(2).map(String::as_str).filter(|t| !t.is_empty());
+
+    let (class, loaded) = render::load(Path::new(plugin), class_id, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = loaded.io_layout();
+    let ports = PluginPorts::from_layout(&layout, 0);
+    drop(loaded);
+
+    let outputs = ports.audio_out.len();
+    if outputs < 2 {
+        return Err(format!(
+            "{} declares {outputs} output bus(es); this check needs a plugin with more than one (Surge XT has three)",
+            short(plugin)
+        ));
+    }
+    println!(
+        "{}: {} output sockets, {} audio in, notes {}",
+        short(plugin),
+        outputs,
+        ports.audio_in.len(),
+        ports.accepts_notes
+    );
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 2.0) as usize;
+
+    // Whatever the plugin will react to: a note if it takes them, a tone if it
+    // does not. A socket reading silence has to mean "this bus is silent", not
+    // "nothing was ever fed in".
+    let mut input = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    if !ports.accepts_notes {
+        for ch in 0..2usize {
+            for i in 0..frames {
+                let phase = i as f32 / sample_rate * 220.0 * std::f32::consts::TAU;
+                input.samples[ch * frames + i] = 0.3 * phase.sin();
+            }
+        }
+    }
+    let events = if ports.accepts_notes {
+        render::note(
+            60,
+            (sample_rate * 0.1) as usize,
+            (sample_rate * 1.5) as usize,
+        )
+    } else {
+        Vec::new()
+    };
+
+    let (_wrapper_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |socket: usize| -> Result<render::RenderOutcome, String> {
+        let mut value: serde_json::Value = serde_json::from_str(&baseline_json)
+            .map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+        value["sub_plugins"] = serde_json::json!([
+            {
+                "instance": 0,
+                "reference": {
+                    "format": class.format.tag(),
+                    "plugin_id": class.id,
+                    "path_hint": plugin,
+                    "display_name": class.name,
+                }
+            }
+        ]);
+        value["sub_plugin"] = serde_json::Value::Null;
+        value["sub_state"] = serde_json::Value::Null;
+
+        let mut graph = Graph::new();
+        let source = graph.add(
+            if ports.accepts_notes {
+                NodeKind::NoteIn
+            } else {
+                NodeKind::AudioIn {
+                    bus: 0,
+                    channels: 2,
+                }
+            },
+            [40.0, 60.0],
+        );
+        let node = graph.add(
+            NodeKind::Plugin {
+                instance: 0,
+                ports: ports.clone(),
+            },
+            [300.0, 60.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut {
+                bus: 0,
+                channels: 2,
+            },
+            [560.0, 60.0],
+        );
+        // Input sockets are the audio buses first and the notes port after
+        // them, which is what makes an instrument's notes port socket 0.
+        let sink = if ports.accepts_notes {
+            ports.audio_in.len() as u8
+        } else {
+            0
+        };
+        graph.connect(source, 0, node, sink);
+        graph.connect(node, socket as u8, out, 0);
+        value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
+
+        let state = edit_wrapper_state(&baseline, &value.to_string())?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &input,
+            BLOCK,
+            &events,
+        )
+    };
+
+    let mut rendered = Vec::with_capacity(outputs);
+    for socket in 0..outputs {
+        let outcome = run(socket)?;
+        println!(
+            "  socket {socket} ({}): peak {:.6}  rms {:.6}",
+            layout.outputs[socket].name,
+            outcome.audio.peak(),
+            outcome.audio.rms()
+        );
+        rendered.push(outcome.audio);
+    }
+
+    if rendered[0].peak() < 1e-4 {
+        return Err(format!(
+            "socket 0 is silent, so nothing here would mean anything; {} may need a preset loaded first",
+            short(plugin)
+        ));
+    }
+
+    for (socket, audio) in rendered.iter().enumerate().skip(1) {
+        if audio.peak() > 1e-4 {
+            return Err(format!(
+                "socket {socket} produced audio. Either the extra output buses are routed now — in which case invert this check — or the patch compiled and quietly served bus 0, which is the bug this exists to catch"
+            ));
+        }
+    }
+
+    println!(
+        "socket 0 carries the plugin's main output; the other {} are refused at compile time rather than served bus 0",
+        outputs - 1
+    );
     Ok(())
 }
 
