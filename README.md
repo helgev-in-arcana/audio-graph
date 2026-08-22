@@ -11,7 +11,7 @@
 - 今はアルファ版で、Winのみの対応です。読み込めるプラグインは VST3 と CLAP です。
   - OSはLinuxまで対応可能です。MacOSはGithub Actionsでビルド可能ですが動作確認ができません。
   - CLAP読み込みは自前のテスト用CLAPプラグインでの検証のみで、市販CLAPでの動作確認は未実施です。
-  - VST2対応予定です。DAWから見たときのAudioGraph自身は現在VST3のみです。
+  - VST2ネイティブ対応はライセンスの問題で不可能です。VST3化ツールなど使ってください。
 - UIは現在仮組みです。改良予定です。ゲインが現在dBではなく実数値倍率になっています。
 - 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
 - コード署名が現在ありません。
@@ -335,7 +335,3 @@ cargo build -p audio-graph-plugin --release --features assert_process_allocs
 
 `process` の中で何かが確保したらプロセスを abort します。既定で無効なのは、
 毎ブロックのコストがかかるためです。
-
-## ライセンス
-
-MIT OR Apache-2.0
