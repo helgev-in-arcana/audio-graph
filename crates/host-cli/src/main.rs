@@ -141,12 +141,29 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("the output needs a name ending in .vst3")?;
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64-win"
+    // The bundle layout is per-OS: Windows and Linux put the binary under an
+    // architecture-named directory, macOS under `MacOS` with an Info.plist
+    // beside it. Getting this wrong is invisible until a host silently skips
+    // the bundle, so each platform is spelled out rather than guessed at.
+    let contents = out.join("Contents");
+    let (subdir, ext) = if cfg!(target_os = "windows") {
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64-win"
+        } else {
+            "arm64-win"
+        };
+        (arch, "vst3")
+    } else if cfg!(target_os = "macos") {
+        ("MacOS", "")
     } else {
-        "arm64-win"
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64-linux"
+        } else {
+            "aarch64-linux"
+        };
+        (arch, "so")
     };
-    let contents = out.join("Contents").join(arch);
+    let contents = contents.join(subdir);
 
     // Replaced wholesale: a stale binary next to a fresh one is the kind of
     // thing that costs an hour to notice.
@@ -154,8 +171,44 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
         std::fs::remove_dir_all(out).map_err(|e| format!("clearing {}: {e}", out.display()))?;
     }
     std::fs::create_dir_all(&contents).map_err(|e| e.to_string())?;
-    let target = contents.join(format!("{stem}.vst3"));
+    let name = if ext.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{stem}.{ext}")
+    };
+    let target = contents.join(&name);
     std::fs::copy(dll, &target).map_err(|e| format!("copying {dll}: {e}"))?;
+
+    // macOS identifies a bundle by its Info.plist; without one the loader
+    // treats the directory as an ordinary folder.
+    if cfg!(target_os = "macos") {
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"              \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+             <plist version=\"1.0\">
+<dict>
+             	<key>CFBundleExecutable</key>
+	<string>{stem}</string>
+             	<key>CFBundleIdentifier</key>
+	<string>com.audio-graph.{stem}</string>
+             	<key>CFBundleName</key>
+	<string>{stem}</string>
+             	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+             	<key>CFBundleSignature</key>
+	<string>????</string>
+             	<key>CFBundleVersion</key>
+	<string>1.0</string>
+             </dict>
+</plist>
+"
+        );
+        let dir = out.join("Contents");
+        std::fs::write(dir.join("Info.plist"), plist)
+            .map_err(|e| format!("writing Info.plist: {e}"))?;
+        std::fs::write(dir.join("PkgInfo"), "BNDL????")
+            .map_err(|e| format!("writing PkgInfo: {e}"))?;
+    }
 
     println!("{}", out.display());
     Ok(())
