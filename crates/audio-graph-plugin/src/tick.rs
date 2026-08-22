@@ -187,6 +187,27 @@ impl Drop for Ticker {
 mod tests {
     use super::*;
 
+    /// Wait until `posts` reaches `want`, or give up.
+    ///
+    /// Deliberately not "sleep for N ms and count": the tick rate is a request,
+    /// not a contract — the host's callback decides the real interval — and a
+    /// count-in-a-window assertion measures the runner's scheduler more than it
+    /// measures this module. CI hosts are slow and uneven (the macOS runners
+    /// coalesce short timers, and every runner is oversubscribed by
+    /// `cargo test`'s own parallelism), so we poll and let a slow machine take
+    /// as long as it needs.
+    fn wait_for_posts(posts: &AtomicU32, want: u32) -> u32 {
+        // Generous enough that only a genuinely stuck ticker reaches it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = posts.load(Ordering::Relaxed);
+            if seen >= want || std::time::Instant::now() >= deadline {
+                return seen;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The thing the whole module exists for: it keeps posting, on its own,
     /// with nobody's window open.
     #[test]
@@ -204,13 +225,14 @@ mod tests {
             ran.pending.store(false, Ordering::Release);
         });
 
-        std::thread::sleep(Duration::from_millis(200));
-        drop(ticker);
-        let posted = posts.load(Ordering::Relaxed);
-        assert!(posted > 5, "only {posted} ticks in 200ms at 10ms");
+        let posted = wait_for_posts(&posts, 5);
+        assert!(posted >= 5, "the ticker stalled after {posted} ticks");
 
         // And dropping it stops them, rather than leaving a thread posting at
-        // an instance that is going away.
+        // an instance that is going away. Read the count after the drop has
+        // joined the thread: a tick already in flight when we asked it to stop
+        // is allowed to land, and would otherwise race this.
+        drop(ticker);
         let after = posts.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(posts.load(Ordering::Relaxed), after);
@@ -228,7 +250,12 @@ mod tests {
         let ticker = Ticker::spawn(state, move || {
             counter.fetch_add(1, Ordering::Relaxed);
         });
-        std::thread::sleep(Duration::from_millis(100));
+
+        // Nothing ever clears `pending`, so once the first tick is posted the
+        // count must stay at one however long the ticker runs.
+        assert_eq!(wait_for_posts(&posts, 1), 1, "the first tick never posted");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
         drop(ticker);
         assert_eq!(posts.load(Ordering::Relaxed), 1);
     }
