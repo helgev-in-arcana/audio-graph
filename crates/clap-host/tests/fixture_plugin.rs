@@ -226,7 +226,9 @@ fn the_backend_drives_a_real_clap_module() {
         "the sidechain is the aux socket (§14.2)"
     );
     assert_eq!(io.aux_inputs().len(), 1);
-    assert_eq!(io.outputs.len(), 1);
+    assert_eq!(io.outputs.len(), 2, "main plus the aux output of §14.2");
+    assert_eq!(io.outputs[1].name, "Aux Out");
+    assert!(io.outputs[1].is_aux);
     assert_eq!(io.main_input_channels(), 2);
     assert!(io.accepts_notes);
     assert!(!io.emits_notes);
@@ -271,6 +273,7 @@ fn the_backend_drives_a_real_clap_module() {
         input_channels: 2,
         output_channels: 2,
         aux_inputs: AuxBuses::default(),
+        aux_outputs: AuxBuses::default(),
         offline: true,
     };
 
@@ -324,6 +327,41 @@ fn the_backend_drives_a_real_clap_module() {
     assert_eq!(voices.count, 3);
     assert_eq!(voices.capacity, 7);
     assert!(voices.overlapping_notes);
+
+    // --- the second output bus is its own signal ---------------------------
+
+    // Nothing asked for the aux output in the config above, so the plugin
+    // wrote it into the backend's scratch and the caller's region is
+    // untouched. Ask for it and it arrives, packed after the main bus the same
+    // way an aux *input* is packed after the main one.
+    SubPluginMain::deactivate(&mut plugin, processor);
+    let two_out = AudioConfig {
+        aux_outputs: AuxBuses::new(&[2]),
+        ..config
+    };
+    let mut processor =
+        SubPluginMain::activate(&mut plugin, two_out).expect("activates with an aux output");
+    let mut wide = vec![-99.0f32; (FRAMES * 4) as usize];
+    {
+        let mut buffers = AudioBuffers::new(&input, &mut wide, 2, 4, FRAMES, BufferLayout::Planar)
+            .with_aux_outputs(AuxBuses::new(&[2]));
+        processor.process(&mut buffers, &[], &context_time, &mut sink);
+    }
+    let (main_region, aux_region) = wide.split_at((FRAMES * 2) as usize);
+    // Mirrors `clap_test_plugin::AUX_OUTPUT_GAIN`.
+    for (i, (&m, &a)) in main_region.iter().zip(aux_region).enumerate() {
+        assert!(
+            (a - m * -0.75).abs() < 1e-6,
+            "frame {i}: aux {a} is not the main bus {m} times -0.75"
+        );
+    }
+    assert!(
+        main_region.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+        "the main bus changed when a second one was asked for: {:?}",
+        &main_region[..4]
+    );
+    SubPluginMain::deactivate(&mut plugin, processor);
+    let mut processor = SubPluginMain::activate(&mut plugin, config).expect("activates");
 
     // --- the plugin was told this is an offline render ---------------------
 

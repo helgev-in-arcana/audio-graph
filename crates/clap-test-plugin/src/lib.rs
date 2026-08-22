@@ -117,6 +117,14 @@ pub const SIDECHAIN_GAIN: f32 = 0.5;
 /// What one held note adds to every output sample.
 pub const NOTE_LEVEL: f32 = 0.25;
 
+/// What the second output bus carries, relative to the first.
+///
+/// The fixture has two outputs so the multi-output routing of §14.2 has
+/// something deterministic to bind to. Negative and not a power of two, so a
+/// host that read the wrong bus, summed the two, or copied one over the other
+/// cannot land on this by accident.
+pub const AUX_OUTPUT_GAIN: f32 = -0.75;
+
 /// Counts live instances, so a test can prove `destroy` actually runs.
 static LIVE_INSTANCES: AtomicU32 = AtomicU32::new(0);
 
@@ -444,6 +452,7 @@ unsafe extern "C" fn plugin_process(
         return CLAP_PROCESS_ERROR;
     }
     let out = unsafe { &*data.audio_outputs };
+    let aux_out = unsafe { bus(data.audio_outputs, data.audio_outputs_count, 1) };
     let main_in = unsafe { bus(data.audio_inputs, data.audio_inputs_count, 0) };
     let side_in = unsafe { bus(data.audio_inputs, data.audio_inputs_count, 1) };
 
@@ -458,6 +467,21 @@ unsafe extern "C" fn plugin_process(
             let dry = src.map_or(0.0, |p| unsafe { *p.add(frame) });
             let sc = side.map_or(0.0, |p| unsafe { *p.add(frame) });
             unsafe { *dst.add(frame) = dry * gain + offset + sc * SIDECHAIN_GAIN + note_sum };
+        }
+
+        // The second bus, written whether or not anybody asked for it: a host
+        // that binds it to the wrong memory should be caught by the memory it
+        // corrupts, not spared because the fixture was tactful.
+        let Some(aux) = aux_out else { continue };
+        if channel >= aux.channel_count as usize || aux.data32.is_null() {
+            continue;
+        }
+        let aux_dst = unsafe { *aux.data32.add(channel) };
+        if aux_dst.is_null() {
+            return CLAP_PROCESS_ERROR;
+        }
+        for frame in 0..frames {
+            unsafe { *aux_dst.add(frame) = *dst.add(frame) * AUX_OUTPUT_GAIN };
         }
     }
 
@@ -793,9 +817,10 @@ static EXT_AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports {
     get: Some(audio_ports_get),
 };
 
-unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, is_input: bool) -> u32 {
-    // Two inputs so the aux/sidechain path of §14.11 has something to bind to.
-    if is_input { 2 } else { 1 }
+unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, _is_input: bool) -> u32 {
+    // Two of each: the inputs for the aux/sidechain path of §14.11, the
+    // outputs for the extra-output-bus path of §14.2.
+    2
 }
 
 unsafe extern "C" fn audio_ports_get(
@@ -810,6 +835,7 @@ unsafe extern "C" fn audio_ports_get(
     let name = match (is_input, index) {
         (true, 0) | (false, 0) => "Main",
         (true, 1) => "Sidechain",
+        (false, 1) => "Aux Out",
         _ => return false,
     };
     let out = unsafe { &mut *info };
@@ -976,7 +1002,7 @@ unsafe extern "C" fn ports_set_active(
         return false;
     }
 
-    let limit = if is_input { 2 } else { 1 };
+    let limit = 2;
     if port_index >= limit {
         return false;
     }

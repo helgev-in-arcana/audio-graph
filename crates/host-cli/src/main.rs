@@ -702,6 +702,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         input_channels: ins.min(2),
         output_channels: if outs == 0 { 2 } else { outs.min(2) },
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: true,
     };
     let frames = 64u32;
@@ -930,6 +931,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 input_channels: ins.min(2),
                 output_channels: if outs == 0 { 2 } else { outs.min(2) },
                 aux_inputs: Default::default(),
+                aux_outputs: Default::default(),
                 offline: true,
             };
             let processor = plugin
@@ -967,6 +969,7 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
         input_channels: 2,
         output_channels: 2,
         aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
         offline: false,
     };
     let processor = sub.activate(config, &[], &[])?;
@@ -1655,19 +1658,19 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
 
 /// Every output socket of a multi-output plugin, one render each (§14.2).
 ///
-/// The node graph gives a plugin one output socket per declared bus, and until
-/// 2026-08-23 nothing had ever wired one other than the first — M8 only ever
-/// ran a single stereo path. Surge XT is what made it concrete: it declares
-/// `Output`, `Scene A` and `Scene B`, and all three sockets came back carrying
-/// the main output, because the compiler keys a plugin's audio by node and not
-/// by port and hands the plugin one output bus at activate.
+/// The node graph gives a plugin one output socket per declared bus. Until
+/// 2026-08-23 nothing had ever wired one other than the first, and when this
+/// check was written it turned out all three of Surge XT's sockets rendered
+/// the main output — the compiler kept a plugin's audio by node rather than by
+/// port, and handed the plugin one output bus at activate.
 ///
-/// Routing the extra buses needs an output bus in the host API that does not
-/// exist yet, so the compiler refuses the link instead (`CompileError::NotYet`)
-/// — and this is what shows that from the outside: socket 0 renders, the rest
-/// come back silent because the patch never compiled. **Invert this check when
-/// the routing lands**; a passing run here is a statement about a limitation,
-/// not about a feature.
+/// So this renders the same material once per socket. What it can assert
+/// without knowing the plugin is narrow, because which of its buses carry
+/// anything is the patch's business: socket 0 has to produce something, and
+/// the sockets must not all be the same signal. Each render is its own
+/// instance, and a synth with a free-running oscillator does not repeat
+/// itself, so socket 0 is rendered twice to establish what "the same" is worth
+/// here.
 fn cmd_outbus(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1692,8 +1695,15 @@ fn cmd_outbus(args: &[String]) -> Result<(), String> {
             short(plugin)
         ));
     }
+    // The graph can hand a plugin the main bus and `MAX_AUX_BUSES` more, in
+    // either direction — every buffer in the engine's pool is as wide as the
+    // widest region, so the ceiling is memory rather than taste (§14.7). A
+    // 16-out drum machine has more outputs than that, and the ones past the
+    // ceiling are refused at compile time; rendering them here would show
+    // silence and read like the plugin's doing.
+    let reachable = (1 + plugin_host::MAX_AUX_BUSES).min(outputs);
     println!(
-        "{}: {} output sockets, {} audio in, notes {}",
+        "{}: {} output sockets ({reachable} within the graph's reach), {} audio in, notes {}",
         short(plugin),
         outputs,
         ports.audio_in.len(),
@@ -1799,8 +1809,8 @@ fn cmd_outbus(args: &[String]) -> Result<(), String> {
         )
     };
 
-    let mut rendered = Vec::with_capacity(outputs);
-    for socket in 0..outputs {
+    let mut rendered = Vec::with_capacity(reachable);
+    for socket in 0..reachable {
         let outcome = run(socket)?;
         println!(
             "  socket {socket} ({}): peak {:.6}  rms {:.6}",
@@ -1818,17 +1828,36 @@ fn cmd_outbus(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // The floor: two renders of the *same* socket, compared by level rather
+    // than sample by sample. Each render is its own instance, and a synth with
+    // a free-running oscillator starts at a different phase every time, so two
+    // renders of one bus differ by nearly the whole signal while their levels
+    // agree to four decimal places.
+    let control = run(0)?;
+    let noise = (rendered[0].rms() - control.audio.rms()).abs();
+    println!("  socket 0 rendered twice differs in level by {noise:.9} (the floor)");
+
+    let mut distinct = 0;
     for (socket, audio) in rendered.iter().enumerate().skip(1) {
-        if audio.peak() > 1e-4 {
-            return Err(format!(
-                "socket {socket} produced audio. Either the extra output buses are routed now — in which case invert this check — or the patch compiled and quietly served bus 0, which is the bug this exists to catch"
-            ));
-        }
+        let d = (audio.rms() - rendered[0].rms()).abs();
+        let verdict = if d > noise * 4.0 + 1e-4 {
+            distinct += 1;
+            "its own bus"
+        } else {
+            "indistinguishable from socket 0"
+        };
+        println!("  socket {socket} vs socket 0: {d:.9} — {verdict}");
     }
 
+    if distinct == 0 {
+        return Err(format!(
+            "no output socket carried anything socket 0 did not. Either the graph is reading one bus for all of them, or {} mirrors its buses in this patch — check the plugin's own metering before believing the first",
+            short(plugin)
+        ));
+    }
     println!(
-        "socket 0 carries the plugin's main output; the other {} are refused at compile time rather than served bus 0",
-        outputs - 1
+        "{distinct} of the {} reachable sockets past the first carry their own bus",
+        reachable - 1
     );
     Ok(())
 }

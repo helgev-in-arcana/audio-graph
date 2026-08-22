@@ -13,14 +13,15 @@ pub enum BufferLayout {
     Planar,
 }
 
-/// How many aux input buses one plugin may be given (§14.11).
+/// How many aux buses one plugin may be given in one direction (§14.11).
 ///
-/// Aux means everything after the main bus: a sidechain, a second sidechain, a
-/// key input. Fixed-size so [`AudioConfig`] stays `Copy` and carries no
+/// Aux means everything after the main bus: on the way in a sidechain, a
+/// second sidechain, a key input; on the way out a second stereo pair, a
+/// per-scene output. Fixed-size so [`AudioConfig`] stays `Copy` and carries no
 /// pointer, which is what lets it cross a process boundary unchanged (ADR-6).
 pub const MAX_AUX_BUSES: usize = 3;
 
-/// The aux input buses of one plugin, by channel width.
+/// The aux buses of one plugin in one direction, by channel width.
 ///
 /// Empty is the common case and the default: most plugins have one input bus,
 /// and a graph that wires nothing to a sidechain should not make the host
@@ -83,6 +84,14 @@ pub struct AudioConfig {
     /// because bus 0 is not like the others: it is the one a plugin processes,
     /// and the rest are things it looks at.
     pub aux_inputs: AuxBuses,
+    /// Extra output buses beyond the main one (§14.2).
+    ///
+    /// The same asymmetry as the inputs, read the other way: bus 0 is the
+    /// plugin's output, and the rest are things it also produces — Surge XT's
+    /// per-scene pair, a drum machine's individual outs. Only the buses the
+    /// graph actually reads are asked for; the plugin's own extras beyond
+    /// them are left inactive so it need not compute them.
+    pub aux_outputs: AuxBuses,
     /// True when the host is rendering faster than real time.
     pub offline: bool,
 }
@@ -92,6 +101,11 @@ impl AudioConfig {
     /// together. This is the width of [`AudioBuffers`]'s input region.
     pub fn total_input_channels(&self) -> u32 {
         self.input_channels + self.aux_inputs.total_channels()
+    }
+
+    /// The same on the way out, and the width of the output region.
+    pub fn total_output_channels(&self) -> u32 {
+        self.output_channels + self.aux_outputs.total_channels()
     }
 }
 
@@ -103,6 +117,7 @@ impl Default for AudioConfig {
             input_channels: 2,
             output_channels: 2,
             aux_inputs: AuxBuses::default(),
+            aux_outputs: AuxBuses::default(),
             offline: false,
         }
     }
@@ -112,14 +127,16 @@ impl Default for AudioConfig {
 ///
 /// The input region holds the main bus first and then each aux bus, packed —
 /// so `input_channels` is the total and `aux_inputs` says where the joins are.
-/// One region rather than one per bus because a nested slice cannot live in
-/// shared memory (§4.3), and the buses are contiguous anyway.
+/// The output region is the same shape. One region per direction rather than
+/// one per bus because a nested slice cannot live in shared memory (§4.3), and
+/// the buses are contiguous anyway.
 pub struct AudioBuffers<'a> {
     input: &'a [f32],
     output: &'a mut [f32],
     input_channels: u32,
     output_channels: u32,
     aux_inputs: AuxBuses,
+    aux_outputs: AuxBuses,
     frame_count: u32,
     layout: BufferLayout,
 }
@@ -149,6 +166,7 @@ impl<'a> AudioBuffers<'a> {
             input_channels,
             output_channels,
             aux_inputs: AuxBuses::default(),
+            aux_outputs: AuxBuses::default(),
             frame_count,
             layout,
         }
@@ -173,6 +191,30 @@ impl<'a> AudioBuffers<'a> {
 
     pub fn aux_inputs(&self) -> AuxBuses {
         self.aux_inputs
+    }
+
+    /// Declare that the output region carries aux buses after the main one.
+    /// The mirror of [`AudioBuffers::with_aux_inputs`], and the same rule:
+    /// `output_channels` already counts them.
+    ///
+    /// # Panics
+    /// If the buses do not add up to `output_channels`.
+    pub fn with_aux_outputs(mut self, aux: AuxBuses) -> Self {
+        assert!(
+            aux.total_channels() <= self.output_channels,
+            "aux buses claim more channels than the output region has"
+        );
+        self.aux_outputs = aux;
+        self
+    }
+
+    pub fn aux_outputs(&self) -> AuxBuses {
+        self.aux_outputs
+    }
+
+    /// Channels on the main output bus: everything the aux buses do not claim.
+    pub fn main_output_channels(&self) -> u32 {
+        self.output_channels - self.aux_outputs.total_channels()
     }
 
     /// Channels on the main input bus: everything the aux buses do not claim.

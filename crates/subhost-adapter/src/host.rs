@@ -431,6 +431,7 @@ impl SubHost {
                     input_channels: u32::from(entry.input_channels),
                     output_channels: u32::from(entry.output_channels),
                     aux_inputs: plugin_host_api::AuxBuses::new(&entry.aux_inputs),
+                    aux_outputs: plugin_host_api::AuxBuses::new(&entry.aux_outputs),
                     ..config
                 },
                 None => config,
@@ -761,7 +762,8 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
             chunk.frames,
             plugin_host_api::BufferLayout::Planar,
         )
-        .with_aux_inputs(chunk.aux_inputs);
+        .with_aux_inputs(chunk.aux_inputs)
+        .with_aux_outputs(chunk.aux_outputs);
         // §14.10. The engine routes a *name*; turning it into events is this
         // side's job. A node with nothing wired to its notes port hears
         // nothing — which is the whole point, since before M8.3 every instance
@@ -1182,6 +1184,7 @@ mod tests {
             input_channels: 2,
             output_channels: 2,
             aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
             frames: 4,
             offset: 0,
         };

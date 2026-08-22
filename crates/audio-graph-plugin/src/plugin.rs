@@ -285,6 +285,7 @@ impl Wrapper {
             input_channels,
             output_channels: self.channels,
             aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
             offline: false,
         };
         // Remembered even when nothing is loaded: the editor uses it to

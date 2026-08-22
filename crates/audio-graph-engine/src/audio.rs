@@ -36,6 +36,9 @@ pub(crate) struct Audio {
 /// One node's audio output, once it has been emitted.
 struct Produced {
     node: NodeId,
+    /// Which of the node's output sockets this is. Only a plugin node has
+    /// more than one (§14.2); everything else produces port 0.
+    port: u8,
     buf: Buf,
     /// Samples of delay accumulated on the way here. Two of these arriving at
     /// one `Mix` with different values is what §14.6 exists to fix.
@@ -219,7 +222,11 @@ pub(crate) fn compile_audio(
             .map(|(port, _)| {
                 graph
                     .source_of(id, port as u8)
-                    .and_then(|(from, _)| produced.iter().find(|p| p.node == from))
+                    .and_then(|(from, from_port)| {
+                        produced
+                            .iter()
+                            .find(|p| p.node == from && p.port == from_port)
+                    })
                     .map(|p| (p.buf, p.latency))
             })
             .collect();
@@ -239,6 +246,7 @@ pub(crate) fn compile_audio(
                 });
                 produced.push(Produced {
                     node: id,
+                    port: 0,
                     buf: out,
                     latency: 0,
                 });
@@ -254,20 +262,6 @@ pub(crate) fn compile_audio(
                 }
             }
             NodeKind::Plugin { instance, ports } => {
-                // A plugin's extra output buses get a socket each, because the
-                // node has to show what the plugin declares — but nothing
-                // downstream can read one yet. A plugin is handed exactly one
-                // output bus at activate (`InstanceIo::output_channels`), and
-                // `produced` is keyed by node rather than by port, so a link
-                // from "out 2" would quietly deliver bus 0's audio. Surge XT
-                // made that concrete on 2026-08-23: `Scene A` and `Scene B`
-                // both came back carrying the main output. Refused rather than
-                // routed to the wrong bus; the editor shows the reason.
-                if graph.links.iter().any(|l| l.from == id && l.from_port > 0) {
-                    return Err(CompileError::NotYet {
-                        what: "a plugin's second output bus",
-                    });
-                }
                 if out_width == 0 {
                     // A plugin with no output bus cannot be routed through. It
                     // is still legal to place — an analyser is one — but there
@@ -339,25 +333,94 @@ pub(crate) fn compile_audio(
                     pool.consume(input);
                 }
 
-                let output = pool.alloc_avoiding(out_width, readers, &[input])?;
+                // The same question on the way out (§14.2): a plugin's extra
+                // output buses are handed over only as far as the graph reads
+                // them, so Surge XT's `Scene B` costs nothing in a patch that
+                // ignores it.
+                let mut out_wired = 0usize;
+                for link in graph.links.iter().filter(|l| l.from == id) {
+                    out_wired = out_wired.max(link.from_port as usize + 1);
+                }
+                if out_wired > ports.audio_out.len() {
+                    // A socket the node does not have. `connect` cannot make
+                    // this link, so the patch was hand-edited or written by a
+                    // later version.
+                    return Err(CompileError::TypeMismatch {
+                        node: id,
+                        port: (out_wired - 1) as u8,
+                    });
+                }
+                if out_wired > 1 + MAX_AUX_BUSES {
+                    return Err(CompileError::TooLarge {
+                        what: "output buses read from one plugin",
+                        limit: 1 + MAX_AUX_BUSES,
+                    });
+                }
+                // At least the main bus, even when nothing reads it: a plugin
+                // still has to be given somewhere to write.
+                let out_buses: Vec<u16> = ports.audio_out[..out_wired.max(1)].to_vec();
+                let out_total: u16 = out_buses.iter().sum();
+
+                // One bus is the overwhelmingly common case and stays exactly
+                // as it was: the plugin writes straight into the buffer the
+                // next node reads. Only a patch that reads a second bus pays
+                // for the split.
+                let single = out_buses.len() == 1;
+                let output =
+                    pool.alloc_avoiding(out_total, if single { readers } else { 1 }, &[input])?;
                 ops.push(AudioOp::Plugin {
                     instance: *instance as u32,
                     input,
                     input_buses: buses.clone(),
                     output,
+                    output_buses: out_buses.clone(),
                     notes: note_source(graph, id, ports),
                 });
                 instances.push(InstanceIo {
                     instance: *instance as u32,
                     input_channels: buses.first().copied().unwrap_or(0),
                     aux_inputs: buses.get(1..).unwrap_or(&[]).to_vec(),
-                    output_channels: out_width,
+                    output_channels: out_buses[0],
+                    aux_outputs: out_buses.get(1..).unwrap_or(&[]).to_vec(),
                 });
-                produced.push(Produced {
-                    node: id,
-                    buf: output,
-                    latency: in_latency + ports.latency,
-                });
+                let latency = in_latency + ports.latency;
+                if single {
+                    produced.push(Produced {
+                        node: id,
+                        port: 0,
+                        buf: output,
+                        latency,
+                    });
+                } else {
+                    let mut channel = 0u16;
+                    for (port, &width) in out_buses.iter().enumerate() {
+                        let readers = graph
+                            .links
+                            .iter()
+                            .filter(|l| l.from == id && l.from_port == port as u8)
+                            .count();
+                        // A bus in the middle that nobody reads still occupies
+                        // its channels in the plugin's output region; it just
+                        // never gets copied out of it.
+                        if readers > 0 {
+                            let buf = pool.alloc_avoiding(width, readers, &[input, output])?;
+                            ops.push(AudioOp::Split {
+                                from: output,
+                                out: buf,
+                                channel,
+                                width,
+                            });
+                            produced.push(Produced {
+                                node: id,
+                                port: port as u8,
+                                buf,
+                                latency,
+                            });
+                        }
+                        channel += width;
+                    }
+                    pool.consume(output);
+                }
             }
             NodeKind::Mix {
                 channels, gains, ..
@@ -415,6 +478,7 @@ pub(crate) fn compile_audio(
                 ops.push(AudioOp::Mix { out, inputs });
                 produced.push(Produced {
                     node: id,
+                    port: 0,
                     buf: out,
                     latency: arrive,
                 });
@@ -446,6 +510,7 @@ pub(crate) fn compile_audio(
                 });
                 produced.push(Produced {
                     node: id,
+                    port: 0,
                     buf: out,
                     // A line is a cut, not an edge: what comes out of it did not
                     // travel here through the paths §14.6 is lining up, so it
@@ -642,15 +707,16 @@ mod tests {
         }
     }
 
-    /// A plugin's second output bus gets a socket, and wiring it has to be
-    /// refused rather than served bus 0.
+    /// A plugin's second output bus is its own signal, not a second name for
+    /// the first (§14.2).
     ///
     /// Surge XT is the plugin that made this real: it declares `Output`,
-    /// `Scene A` and `Scene B`, and before this, all three sockets rendered
-    /// the main output. Silently wrong beats loudly unfinished in nobody's
-    /// book. When routing lands, this test inverts.
+    /// `Scene A` and `Scene B`, and until the buses were routed all three
+    /// sockets rendered the main output. What the program has to show is a
+    /// plugin handed one packed output region and a `Split` per bus somebody
+    /// reads.
     #[test]
-    fn a_link_from_a_second_output_bus_is_refused() {
+    fn each_output_bus_is_split_out_of_the_plugins_output_region() {
         let mut graph = Graph::new();
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
@@ -659,7 +725,8 @@ mod tests {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
-                    audio_out: vec![2, 2],
+                    // Three buses, as Surge XT has.
+                    audio_out: vec![2, 2, 2],
                     ..PluginPorts::default()
                 },
             },
@@ -668,16 +735,76 @@ mod tests {
         graph.connect(input, 0, node, 0);
         graph.connect(node, 1, output, 0);
 
-        let error = compile(&graph, SLOTS).expect_err("the second bus is not routed yet");
-        assert!(matches!(error, CompileError::NotYet { .. }), "{error:?}");
+        let program = compile(&graph, SLOTS).expect("the second bus is routable");
 
-        // The first socket of the same node still compiles: the refusal is
-        // about the bus, not about the plugin having more than one.
-        let mut graph = graph;
-        graph.links.clear();
+        // Two buses are handed over, not three: nothing reads `Scene B`, so
+        // the plugin is never asked to produce it.
+        let buses = program.audio_ops.iter().find_map(|op| match op {
+            AudioOp::Plugin { output_buses, .. } => Some(output_buses.clone()),
+            _ => None,
+        });
+        assert_eq!(buses, Some(vec![2, 2]));
+        assert_eq!(
+            program.instances[0].output_channels, 2,
+            "the main bus stays the main bus"
+        );
+        assert_eq!(program.instances[0].aux_outputs, vec![2]);
+
+        // And the bus that is read is copied out of the region at its own
+        // offset — channel 2, not channel 0.
+        let split = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Split { channel, width, .. } => Some((*channel, *width)),
+                _ => None,
+            })
+            .expect("the read bus is split out");
+        assert_eq!(split, (2, 2));
+    }
+
+    /// The one-bus case — every patch until now — must not have grown a copy.
+    #[test]
+    fn one_output_bus_still_writes_straight_into_the_next_node() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = plugin(&mut graph, 0, 0);
         graph.connect(input, 0, node, 0);
         graph.connect(node, 0, output, 0);
-        compile(&graph, SLOTS).expect("the main output is routed as it always was");
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Split { .. })),
+            "{:?}",
+            program.audio_ops
+        );
+    }
+
+    /// A link from a socket the node does not have. `connect` cannot make one,
+    /// so this is a hand-edited or future-versioned patch.
+    #[test]
+    fn a_link_from_an_output_bus_the_plugin_does_not_have_is_refused() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = plugin(&mut graph, 0, 0);
+        graph.connect(input, 0, node, 0);
+        graph.links.push(crate::graph::Link {
+            from: node,
+            from_port: 1,
+            to: output,
+            to_port: 0,
+        });
+
+        let error = compile(&graph, SLOTS).expect_err("there is no second bus");
+        assert!(
+            matches!(error, CompileError::TypeMismatch { .. }),
+            "{error:?}"
+        );
     }
 
     /// §14.6. One branch goes through a plugin with latency, the other does

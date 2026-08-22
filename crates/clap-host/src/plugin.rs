@@ -884,23 +884,39 @@ fn bind_ports(ports: &PortLayout, config: &AudioConfig) -> Result<BindingPlan> {
         )));
     }
 
+    // The caller's output region is shaped exactly like the input one: main
+    // bus first, then each aux bus the graph asked for, packed. A bus the
+    // graph does not read is written somewhere harmless rather than into the
+    // caller — the plugin still has it, nobody is listening.
     let mut outputs = Vec::with_capacity(ports.outputs.len());
     let mut scratch_channels = 0usize;
+    let mut caller_offset = 0usize;
+    let mut aux_out = config.aux_outputs.iter();
     for (index, port) in ports.outputs.iter().enumerate() {
-        // Only the main output reaches the graph today (§14.2 lists the rest as
-        // untested); the others are written somewhere harmless.
-        if index == 0 && config.output_channels > 0 {
-            if config.output_channels != u32::from(port.channels) {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "output port 0 ({}) is {} channels, not {}",
-                    port.name, port.channels, config.output_channels
-                )));
-            }
-            outputs.push((port.channels, Binding::Caller(0)));
+        let wanted = if index == 0 {
+            config.output_channels
+        } else {
+            aux_out.next().map_or(0, u32::from)
+        };
+        if wanted == 0 {
+            outputs.push((port.channels, Binding::Scratch(scratch_channels)));
+            scratch_channels += port.channels as usize;
             continue;
         }
-        outputs.push((port.channels, Binding::Scratch(scratch_channels)));
-        scratch_channels += port.channels as usize;
+        if wanted != u32::from(port.channels) {
+            return Err(HostError::UnsupportedBusConfig(format!(
+                "output port {index} ({}) is {} channels, not {wanted}",
+                port.name, port.channels
+            )));
+        }
+        outputs.push((port.channels, Binding::Caller(caller_offset)));
+        caller_offset += port.channels as usize;
+    }
+    if aux_out.next().is_some() {
+        return Err(HostError::UnsupportedBusConfig(format!(
+            "the graph read more output buses than the plugin's {} output port(s)",
+            ports.outputs.len()
+        )));
     }
 
     // An effect the graph routed audio into that declares no output at all

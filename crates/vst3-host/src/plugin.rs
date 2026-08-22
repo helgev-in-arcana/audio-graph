@@ -705,7 +705,7 @@ impl Vst3Processor {
             input_events: EventList::new(MAX_EVENTS_PER_BLOCK),
             output_events: EventList::new(MAX_EVENTS_PER_BLOCK),
             input_ptrs: vec![std::ptr::null_mut(); config.total_input_channels() as usize],
-            output_ptrs: vec![std::ptr::null_mut(); config.output_channels as usize],
+            output_ptrs: vec![std::ptr::null_mut(); config.total_output_channels() as usize],
             input_buses: declared.inputs.iter().map(empty_bus).collect(),
             output_buses: declared.outputs.iter().map(empty_bus).collect(),
             param_map,
@@ -826,11 +826,14 @@ impl SubPluginProcessor for Vst3Processor {
 
         // The plugin sets silence flags on the output bus when it has nothing
         // to say; honouring that is what lets a chain skip downstream work.
+        // The main bus alone: `output_ptrs` may now span several buses, and a
+        // silent main output says nothing about the aux ones.
+        let main_width = self.config.output_channels as usize;
         if let Some(main) = self.output_buses.first()
             && main.silenceFlags != 0
-            && self.output_ptrs.len() as u32 <= 64
+            && main_width <= 64
         {
-            let all_silent = (0..self.output_ptrs.len()).all(|c| main.silenceFlags & (1 << c) != 0);
+            let all_silent = (0..main_width).all(|c| main.silenceFlags & (1 << c) != 0);
             if all_silent {
                 return ProcessStatus::Silent;
             }
@@ -904,9 +907,18 @@ fn setup_buses(
     for width in config.aux_inputs.iter() {
         inputs.push(arrangement(u32::from(width)));
     }
-    let mut outputs = [arrangement(config.output_channels)];
+    // The same on the way out: the graph may read a plugin's extra output
+    // buses (§14.2), and a bus nobody reads is left out of the negotiation so
+    // the plugin need not compute it.
+    let mut outputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_outputs.len());
+    if config.output_channels > 0 {
+        outputs.push(arrangement(config.output_channels));
+        for width in config.aux_outputs.iter() {
+            outputs.push(arrangement(u32::from(width)));
+        }
+    }
     let num_in = inputs.len() as i32;
-    let num_out = if config.output_channels == 0 { 0 } else { 1 };
+    let num_out = outputs.len() as i32;
 
     let res = unsafe {
         processor.setBusArrangements(inputs.as_mut_ptr(), num_in, outputs.as_mut_ptr(), num_out)
@@ -915,17 +927,21 @@ fn setup_buses(
     // than trust: a plugin that quietly picked mono would otherwise corrupt
     // the second channel's memory.
     if res != kResultOk {
-        let mut actual: SpeakerArrangement = 0;
-        if num_out > 0
-            && unsafe {
-                processor.getBusArrangement(BusDirections_::kOutput as i32, 0, &mut actual)
+        for (index, wanted) in outputs.iter().enumerate() {
+            let mut actual: SpeakerArrangement = 0;
+            if unsafe {
+                processor.getBusArrangement(
+                    BusDirections_::kOutput as i32,
+                    index as i32,
+                    &mut actual,
+                )
             } == kResultOk
-            && actual != outputs[0]
-        {
-            return Err(HostError::UnsupportedBusConfig(format!(
-                "plugin refused a {}-channel output bus",
-                config.output_channels
-            )));
+                && actual != *wanted
+            {
+                return Err(HostError::UnsupportedBusConfig(format!(
+                    "plugin refused the arrangement asked for on output bus {index}"
+                )));
+            }
         }
         // An aux bus that came back different matters just as much: the buffer
         // handed to it is sized from what was asked for, and a plugin that
