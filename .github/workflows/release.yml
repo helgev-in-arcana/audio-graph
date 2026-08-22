@@ -57,7 +57,7 @@ jobs:
           - os: ubuntu-24.04-arm
             name: aarch64-linux
             lib: libaudio_graph_plugin.so
-          - os: macos-13
+          - os: macos-15-intel
             name: x86_64-macos
             lib: libaudio_graph_plugin.dylib
           - os: macos-14
@@ -99,6 +99,12 @@ jobs:
             echo "::error::タグ ${GITHUB_REF_NAME} に対し Cargo.toml のバージョンは $crate です。"
             exit 1
           fi
+
+      # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
+      # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
+      # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
+      - name: Build the test fixtures
+        run: cargo build --workspace
 
       # 壊れたバイナリを配らないための最低限の関門。
       # fmt / clippy は普段の CI 側の仕事なのでここには置かない。

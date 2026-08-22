@@ -38,3 +38,11 @@ clap-sys = "0.5.0"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# baseview 0.3.1 の X11 バックエンドは `AncestorVisibilityState` の `Debug` を
+# `debug_assertions` で条件付けしているのに、それを渡す `dbg!` は素で置いている。
+# その結果 X11 の release ビルドだけが型エラーで落ちる。上流のバグで、こちらの
+# コードからは避けようがない。このパッケージにだけ debug assertions を戻して
+# derive を生かす。baseview が直ったら消す。
+[profile.release.package.baseview]
+debug-assertions = true
