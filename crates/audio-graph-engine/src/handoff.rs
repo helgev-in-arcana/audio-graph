@@ -243,6 +243,18 @@ mod tests {
         assert_eq!(held.as_deref(), Some(&2));
     }
 
+    /// Two real threads on the two halves, with the producer running as fast
+    /// as it can — which is the case this type is built for, and the one where
+    /// values get superseded before anyone takes them.
+    ///
+    /// So this deliberately says nothing about *how many* values the consumer
+    /// observes. A `send` is allowed to drop what the audio thread has not
+    /// picked up yet (that is the point), so on a machine where the producer
+    /// wins the race outright the consumer legitimately sees a single value.
+    /// What must hold whatever the scheduling is: the values never go
+    /// backwards, and the consumer ends up on the newest one.
+    /// [`every_value_arrives_when_the_producer_waits_for_room`] is where the
+    /// round trip itself is pinned down.
     #[test]
     fn it_survives_a_real_producer_and_consumer() {
         let handoff = Arc::new(Handoff::<usize>::new());
@@ -276,6 +288,49 @@ mod tests {
         }
         producer.join().unwrap();
         assert_eq!(last, 9_999, "the consumer must end up on the newest value");
-        assert!(seen > 1, "the consumer only ever saw one value");
+        assert!(seen >= 1, "the consumer never saw anything");
+    }
+
+    /// The round trip, made deterministic: a producer that waits for the slot
+    /// to empty before sending again cannot supersede anything, so every value
+    /// it sends must arrive, in order, and every displaced one must come back.
+    #[test]
+    fn every_value_arrives_when_the_producer_waits_for_room() {
+        const COUNT: usize = 1_000;
+
+        let handoff = Arc::new(Handoff::<usize>::new());
+        let producer = {
+            let handoff = handoff.clone();
+            std::thread::spawn(move || {
+                for i in 0..COUNT {
+                    // Wait for the consumer to take the last one. Reading
+                    // `incoming` from the producer side is what `send` does
+                    // anyway, and there is no other producer to race.
+                    // `yield_now` rather than a bare spin: a CI runner can be
+                    // down to one usable core, and busy-waiting there just
+                    // starves the consumer we are waiting for.
+                    while !handoff.incoming.load(Ordering::Acquire).is_null() {
+                        std::thread::yield_now();
+                    }
+                    handoff.send(Box::new(i));
+                }
+            })
+        };
+
+        let mut held: Option<Box<usize>> = None;
+        let mut seen = 0usize;
+        while seen < COUNT {
+            if handoff.take(&mut held) {
+                assert_eq!(
+                    held.as_deref(),
+                    Some(&seen),
+                    "values must arrive in order, none skipped"
+                );
+                seen += 1;
+            }
+            handoff.reclaim();
+        }
+        producer.join().unwrap();
+        assert_eq!(seen, COUNT);
     }
 }
