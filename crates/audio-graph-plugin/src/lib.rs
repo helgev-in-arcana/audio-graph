@@ -12,6 +12,7 @@ mod host_context;
 mod params;
 mod plugin;
 mod shared;
+mod tick;
 
 use std::sync::Arc;
 
@@ -67,13 +68,26 @@ macro_rules! wrapper_class {
             // no way to point them at anything.
             type Editor = nice_plug_egui::EguiEditor<$crate::editor::WrapperEditor>;
             type SysExMessage = ();
-            type BackgroundTask = ();
+            // One task, and it is the periodic main-thread tick CLAP requires
+            // of a host (see `tick`). It is a *foreground* task in every sense
+            // that matters: it only ever runs through `execute_gui`.
+            type BackgroundTask = $crate::tick::Task;
+
+            fn task_executor(&mut self) -> TaskExecutor<Self> {
+                Box::new(self.0.task_executor())
+            }
 
             fn params(&self) -> Arc<dyn Params> {
                 self.0.params()
             }
 
-            fn editor(&mut self, _executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
+            fn editor(&mut self, executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
+                // Not editor business, but this is the one moment nice-plug
+                // offers a way onto the main thread, and it happens at
+                // instance creation rather than when a window opens.
+                self.0.start_ticking(move || {
+                    executor.execute_gui($crate::tick::Task::Tick);
+                });
                 $crate::editor::create(self.0.shared().clone())
             }
 

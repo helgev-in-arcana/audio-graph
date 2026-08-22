@@ -309,18 +309,17 @@ impl SubHost {
     /// messages itself, since the DAW is already doing that; this only handles
     /// the parts that are ours.
     ///
-    /// That is the contract; the wrapper does not yet keep it. The only thing
-    /// calling this periodically is the `Deferred` tick the editor sets up in
-    /// `attached`, so nothing runs while the wrapper's own window is closed —
-    /// and a project that plays without anyone opening the editor is the
-    /// ordinary case, not an edge one.
+    /// The wrapper keeps that contract from the plugin instance rather than
+    /// from its editor: `audio-graph-plugin`'s `tick` module owns a thread that
+    /// posts this onto the host's main thread for as long as the instance
+    /// exists, whether or not any window is open. `save_state`, `load_state`
+    /// and `load_sub_state` additionally tick around the plugin themselves,
+    /// since a callback missed there costs data rather than responsiveness.
     ///
-    /// What is covered meanwhile: `save_state`, `load_state` and
-    /// `load_sub_state` each tick around the plugin, which is where a missed
-    /// callback costs data rather than responsiveness. The periodic half needs
-    /// the `Deferred` to move from the editor to the plugin itself, and that is
-    /// held until the non-Windows window backend grows a real timer, since
-    /// otherwise it would fix only one platform. Both steps are in ROADMAP.md.
+    /// One platform is still short: VST3 on Linux, where nice-plug runs those
+    /// posts on a worker thread rather than a main thread, so the tick declines
+    /// to do anything. CLAP on Linux goes through `request_callback()` and is
+    /// fine. See ROADMAP.md.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {

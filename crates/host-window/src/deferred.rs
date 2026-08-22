@@ -19,9 +19,11 @@
 //! message, and by the time its handler runs, the frame is over and the toolkit
 //! is no longer inside itself.
 //!
-//! It also carries the periodic tick the sub-plugin's window needs (§5.2). That
-//! cannot live in the draw callback either, for exactly the same reason:
-//! answering `resizeView` means resizing a window.
+//! It carries one-shot work only. The periodic tick the sub-plugin's window
+//! needs (§5.2) used to live here as well, on a Win32 timer, which quietly
+//! meant no tick at all on the platforms whose backend is still a stub. It
+//! belongs to the plugin instance now, which reaches the main thread through
+//! its host rather than through a window — see `audio-graph-plugin`'s `tick`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -38,7 +40,6 @@ pub struct Deferred {
 
 struct Inner {
     queue: RefCell<VecDeque<Box<dyn FnOnce()>>>,
-    tick: RefCell<Option<Box<dyn Fn()>>>,
     /// Guards against a queued closure that dispatches messages causing its own
     /// handler to be entered again.
     running: Cell<bool>,
@@ -58,21 +59,6 @@ impl Inner {
         }
         self.running.set(false);
     }
-
-    fn tick(&self) {
-        if self.running.get() {
-            return;
-        }
-        self.running.set(true);
-        // Cloned out of the `RefCell` before running: a tick that queues more
-        // work must not find the cell already borrowed.
-        let tick = self.tick.borrow_mut().take();
-        if let Some(tick) = tick {
-            tick();
-            *self.tick.borrow_mut() = Some(tick);
-        }
-        self.running.set(false);
-    }
 }
 
 impl Deferred {
@@ -82,16 +68,6 @@ impl Deferred {
     pub fn post(&self, task: impl FnOnce() + 'static) {
         self.inner.queue.borrow_mut().push_back(Box::new(task));
         self.wake();
-    }
-
-    /// Run `tick` every `interval_ms`, on this thread.
-    ///
-    /// Replaces any previous tick. Used for the sub-plugin editor's resize
-    /// conversation, which has to keep happening whether or not the user is
-    /// touching anything.
-    pub fn set_tick(&self, interval_ms: u32, tick: impl Fn() + 'static) {
-        *self.inner.tick.borrow_mut() = Some(Box::new(tick));
-        self.start_timer(interval_ms);
     }
 }
 
@@ -103,10 +79,6 @@ impl Deferred {
     fn wake(&self) {
         imp::wake(self.hwnd);
     }
-
-    fn start_timer(&self, interval_ms: u32) {
-        imp::start_timer(self.hwnd, interval_ms);
-    }
 }
 
 #[cfg(not(windows))]
@@ -117,8 +89,6 @@ impl Deferred {
         // backend is a stub that never opens anything (see `window`).
         self.inner.drain();
     }
-
-    fn start_timer(&self, _interval_ms: u32) {}
 }
 
 /// Create a queue bound to this thread's message loop.
@@ -127,7 +97,6 @@ pub fn new() -> Result<Deferred, String> {
     Ok(Deferred {
         inner: Rc::new(Inner {
             queue: RefCell::new(VecDeque::new()),
-            tick: RefCell::new(None),
             running: Cell::new(false),
         }),
     })
@@ -144,16 +113,12 @@ mod imp {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
-        HWND_MESSAGE, KillTimer, PostMessageW, RegisterClassExW, SetTimer, SetWindowLongPtrW,
-        WM_APP, WM_TIMER, WNDCLASSEXW,
+        HWND_MESSAGE, PostMessageW, RegisterClassExW, SetWindowLongPtrW, WM_APP, WNDCLASSEXW,
     };
 
     use super::{Deferred, Inner};
 
     pub type Hwnd = HWND;
-
-    /// The timer id. Any non-zero value; there is only ever one.
-    const TIMER_ID: usize = 1;
 
     const CLASS_NAME: &[u16] = &[
         b'a' as u16,
@@ -193,7 +158,6 @@ mod imp {
         register();
         let inner = Rc::new(Inner {
             queue: RefCell::new(VecDeque::new()),
-            tick: RefCell::new(None),
             running: Cell::new(false),
         });
 
@@ -229,10 +193,6 @@ mod imp {
         unsafe { PostMessageW(hwnd, WM_APP, 0, 0) };
     }
 
-    pub fn start_timer(hwnd: HWND, interval_ms: u32) {
-        unsafe { SetTimer(hwnd, TIMER_ID, interval_ms, None) };
-    }
-
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
@@ -249,10 +209,6 @@ mod imp {
                     (*inner).drain();
                     0
                 }
-                WM_TIMER => {
-                    (*inner).tick();
-                    0
-                }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
         }
@@ -261,7 +217,6 @@ mod imp {
     impl Drop for Deferred {
         fn drop(&mut self) {
             unsafe {
-                KillTimer(self.hwnd, TIMER_ID);
                 // Clear the back-pointer before destroying: DestroyWindow
                 // dispatches synchronously, and anything still queued refers to
                 // state that is going away.
