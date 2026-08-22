@@ -8,8 +8,9 @@
 
 - 現時点のコミット先頭は全てバイブコードされた状態です。
   - 私(@helgev-in-arcana)が現在コード・設計監査を進めています。
-- 今はアルファ版で、Winのみの対応です。読み込めるプラグインは VST3 と CLAP です。
-  - OSはLinuxまで対応可能です。MacOSはGithub Actionsでビルド可能ですが動作確認ができません。
+- 今はアルファ版で、動作確認ができているのは Windows (x86_64) のみです。読み込めるプラグインは VST3 と CLAP です。
+  - リリースには Windows (x86_64 / arm64)、Linux (x86_64 / arm64)、macOS (Intel / Apple Silicon) のビルドが並びますが、
+    **Windows (x86_64) 以外は一切動作確認できていません**。ビルドが通っているというだけの状態です。
   - CLAP読み込みは自前のテスト用CLAPプラグインでの検証のみで、市販CLAPでの動作確認は未実施です。
   - VST2ネイティブ対応はライセンスの問題で不可能です。VST3化ツールなど使ってください。
 - UIは現在仮組みです。改良予定です。ゲインが現在dBではなく実数値倍率になっています。
@@ -51,6 +52,10 @@
 
 https://github.com/helgev-in-arcana/audio-graph/releases
 
+Windows (x86_64 / arm64)、Linux (x86_64 / arm64)、macOS (Intel / Apple Silicon) 向けのアセットを配布しています。
+ただし **Windows (x86_64) 以外は未検証**です。手元に環境がなく動作確認が取れていないため、
+読み込めない・落ちるといったことは十分にあり得ます。動いた／動かなかったの報告は歓迎します。
+
 ## License
 
 MIT OR Apache-2.0
@@ -77,10 +82,13 @@ Rust（edition 2024 が通る版）が必要です。
 cargo build --release -p audio-graph-plugin
 
 # 2. VST3 バンドルに包む
+#    Linux は libaudio_graph_plugin.so、macOS は libaudio_graph_plugin.dylib を渡します。
 cargo run -p host-cli -- bundle target/release/audio_graph_plugin.dll target/AudioGraph.vst3
 
 # 3. DAW の VST3 フォルダへ配置
 #    Windows: C:\Program Files\Common Files\VST3\
+#    Linux:   ~/.vst3/
+#    macOS:   ~/Library/Audio/Plug-Ins/VST3/
 ```
 
 DAW を再スキャンすると、`Audio Graph FX` と `Audio Graph Instrument` の 2 つが現れます。

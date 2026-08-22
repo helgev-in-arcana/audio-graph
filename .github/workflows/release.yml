@@ -36,31 +36,69 @@ jobs:
             exit 1
           fi
 
+  # ターゲットごとにネイティブのランナーで組む。クロスコンパイルにすると
+  # host-cli の bundle が走るホストとバイナリのアーキテクチャがずれるので、
+  # 素直に各アーキテクチャのランナーを並べる。
   build:
     needs: guard
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: x86_64-windows
+            lib: audio_graph_plugin.dll
+          - os: windows-11-arm
+            name: aarch64-windows
+            lib: audio_graph_plugin.dll
+          - os: ubuntu-latest
+            name: x86_64-linux
+            lib: libaudio_graph_plugin.so
+          - os: ubuntu-24.04-arm
+            name: aarch64-linux
+            lib: libaudio_graph_plugin.so
+          - os: macos-13
+            name: x86_64-macos
+            lib: libaudio_graph_plugin.dylib
+          - os: macos-14
+            name: aarch64-macos
+            lib: libaudio_graph_plugin.dylib
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # X11 のヘッダはエディタまわりが要求する。Linux ランナーには入っていない。
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
 
       # タグとクレートのバージョンがずれると、`v0.2.0` を名乗るリリースの中身が
       # 0.1.0 を報告するプラグイン、という追いにくい形で食い違う。
       - name: Verify the tag matches the crate version
-        shell: pwsh
+        shell: bash
         run: |
           # `-alpha` のような接尾辞は Cargo.toml 側にある場合とない場合があるので、
           # 両側から落として x.y.z だけを突き合わせる。
-          $tag = "${{ github.ref_name }}" -replace '^v', '' -replace '-.*$', ''
-          $crate = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages |
-            Where-Object { $_.name -eq 'audio-graph-plugin' } | Select-Object -ExpandProperty version
-          $crate = $crate -replace '-.*$', ''
-          if ($tag -ne $crate) {
-            Write-Output "::error::タグ ${{ github.ref_name }} に対し Cargo.toml のバージョンは $crate です。"
+          tag="${GITHUB_REF_NAME#v}"
+          tag="${tag%%-*}"
+          # `pkgid` はディレクトリ名がクレート名と一致するかで
+          # `...#audio-graph-plugin@0.1.0` と `...#0.1.0` を返し分けるので、
+          # 最後の `#` か `@` 以降を取る。JSON を読むより追加のツールが要らない。
+          crate=$(cargo pkgid -p audio-graph-plugin)
+          crate="${crate##*[#@]}"
+          crate="${crate%%-*}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::タグ ${GITHUB_REF_NAME} に対し Cargo.toml のバージョンは $crate です。"
             exit 1
-          }
+          fi
 
       # 壊れたバイナリを配らないための最低限の関門。
       # fmt / clippy は普段の CI 側の仕事なのでここには置かない。
@@ -70,22 +108,39 @@ jobs:
       - name: Build
         run: cargo build --workspace --release
 
-      # DAW が期待するのは素の .dll ではなくバンドル。host-cli で包む。
+      # DAW が期待するのは素の共有ライブラリではなくバンドル。host-cli で包む。
       - name: Bundle the VST3
-        run: cargo run -p host-cli --release -- bundle target/release/audio_graph_plugin.dll target/AudioGraph.vst3
+        run: cargo run -p host-cli --release -- bundle target/release/${{ matrix.lib }} target/AudioGraph.vst3
 
+      # Windows のランナーには zip が入っていないので pwsh で固める。
+      # ライセンスと著作権表示はバイナリと一緒に配る。
       - name: Package
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "AudioGraph-${{ github.ref_name }}-x86_64-windows"
-          # ライセンスと著作権表示はバイナリと一緒に配る。
+          $name = "AudioGraph-${{ github.ref_name }}-${{ matrix.name }}"
           Compress-Archive -Path target/AudioGraph.vst3, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY-NOTICES.md, README.md -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
             Out-File -Encoding ascii "$name.zip.sha256"
 
+      # Unix 側は zip でまとめる。Compress-Archive と違い実行ビットとシンボリック
+      # リンクを保てるので、macOS のバンドルがそのまま展開できる。
+      - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="AudioGraph-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          (cd target && zip -qry "../$name.zip" AudioGraph.vst3)
+          zip -qj "$name.zip" LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md README.md
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            shasum -a 256 "$name.zip" > "$name.zip.sha256"
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-vst3
+          name: vst3-${{ matrix.name }}
           path: |
             *.zip
             *.zip.sha256
