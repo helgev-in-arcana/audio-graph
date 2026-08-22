@@ -1,0 +1,85 @@
+name: CI
+
+# PR とmainへのpushで動く。リリースのタグを打ってから
+# 「Linuxでコンパイルが通らない」と気付くのは遅すぎるので、
+# ビルドはリリースと同じ6ターゲットで、同じ手順で回す。
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# 同じブランチに続けてpushした時、古い方は用がない。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 書式と lint はプラットフォームに依らないので1回だけ。
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # 既存の警告が残っているので、まだ `-D warnings` では落とさない。
+      # 掃除が済んだら deny に切り替える。
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+  # リリースと同じ6ターゲット。ここが緑なら、タグを打った時に
+  # 初めて知るコンパイルエラーは残っていない。
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - windows-11-arm
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # X11 のヘッダはエディタまわりが要求する。Linux ランナーには入っていない。
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
+
+      # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
+      # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
+      # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
+      - name: Build the test fixtures
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # リリースで実際に配るのは release ビルドなので、そこまで確かめる。
+      - name: Build release
+        run: cargo build --workspace --release
