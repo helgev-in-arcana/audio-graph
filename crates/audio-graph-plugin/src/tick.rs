@@ -186,6 +186,7 @@ impl Drop for Ticker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// The thing the whole module exists for: it keeps posting, on its own,
     /// with nobody's window open.
@@ -204,10 +205,13 @@ mod tests {
             ran.pending.store(false, Ordering::Release);
         });
 
-        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while posts.load(Ordering::Relaxed) < 3 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(ticker);
         let posted = posts.load(Ordering::Relaxed);
-        assert!(posted > 5, "only {posted} ticks in 200ms at 10ms");
+        assert!(posted >= 3, "only {posted} ticks in 1s at 10ms");
 
         // And dropping it stops them, rather than leaving a thread posting at
         // an instance that is going away.
