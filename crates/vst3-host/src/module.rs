@@ -222,7 +222,10 @@ impl Module {
             vendor: from_char8(&raw.vendor),
             url: from_char8(&raw.url),
             email: from_char8(&raw.email),
-            unicode: raw.flags & kUnicode != 0,
+            // `FactoryFlags` は Windows で `c_int`、他で `c_uint` と符号が違う。
+            // どちらからも損なわずに広げられる i64 で突き合わせれば、
+            // プラットフォームごとの分岐もキャストの重複も要らない。
+            unicode: raw.flags as i64 & kUnicode as i64 != 0,
         })
     }
 
