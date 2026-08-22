@@ -135,6 +135,21 @@ impl Plugin {
         &self.class.name
     }
 
+    /// The format's own names for what this plugin implements — CLAP extension
+    /// ids, or VST3 interface names.
+    ///
+    /// The one place the facade hands back something format-specific on
+    /// purpose. It is a diagnostic for `host-cli info`, not something to branch
+    /// on: a caller that matched on these strings would be doing exactly what
+    /// ADR-12 confines to this crate. The strings are not stable and must never
+    /// be persisted.
+    pub fn format_interfaces(&self) -> Vec<&'static str> {
+        match &self.inner {
+            Backend::Vst3 { plugin, .. } => plugin.interfaces(),
+            Backend::Clap { plugin, .. } => plugin.extensions(),
+        }
+    }
+
     // --- editor ------------------------------------------------------------
 
     pub fn has_editor(&self) -> bool {

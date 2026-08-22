@@ -303,6 +303,14 @@ impl SubHost {
     /// here too, and one starved of them stalls. A plugin must not pump
     /// messages itself, since the DAW is already doing that; this only handles
     /// the parts that are ours.
+    ///
+    /// That is the contract; the wrapper does not yet keep it. The only thing
+    /// calling this is the `Deferred` tick the editor sets up in `attached`, so
+    /// nothing runs while the wrapper's own window is closed. CHOWTapeModel
+    /// shows what that costs: it folds parameter edits into its saved state on
+    /// a timer, so a plugin that never gets ticked can save a stale preset.
+    /// Fixing it means moving the `Deferred` from the editor to the plugin
+    /// itself. Recorded in ROADMAP.md.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {

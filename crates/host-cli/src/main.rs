@@ -75,7 +75,9 @@ fn usage() {
 
   host-cli dirs                     list the conventional plugin directories
   host-cli scan [DIR...]            load every module found and list its plugins
-  host-cli info <PLUGIN>            detail one module
+  host-cli info <PLUGIN> [ID]       detail one module, and list the CLAP
+                                    extensions or VST3 interfaces one of its
+                                    plugins implements
   host-cli churn <PLUGIN> [N]       load/unload N times (default 1000)
   host-cli params <PLUGIN> [ID]     instantiate and list parameters
   host-cli render <PLUGIN> <IN.wav> <OUT.wav> [ID]
@@ -285,6 +287,7 @@ fn cmd_buses(args: &[String]) -> Result<(), String> {
 
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let path = Path::new(args.first().ok_or("expected a path")?);
+    let wanted = args.get(1).map(String::as_str);
     let format = Format::from_path(path).ok_or("not a .vst3 or .clap path")?;
     let classes = plugin_host::scan_module(path).map_err(|e| e.to_string())?;
 
@@ -292,7 +295,7 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     println!("format:  {format}");
 
     println!("\nplugins:");
-    for c in classes {
+    for c in &classes {
         println!("  {} — {}", c.name, c.vendor);
         println!("    id   {}", c.id);
         if !c.category.is_empty() {
@@ -301,6 +304,32 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
         if !c.version.is_empty() {
             println!("    ver  {}", c.version);
         }
+    }
+
+    // Reading the factory says what a module offers; only an instance can say
+    // what it implements, because both formats answer that question through the
+    // instance (`get_extension` / `queryInterface`). So one plugin is loaded --
+    // the one named, or the first -- rather than all of them: a module like
+    // Airwindows Consolidated has hundreds of classes, and instantiating every
+    // one to print the same list is not worth the wait.
+    let (class, plugin) = render::load(path, wanted, std::sync::Arc::new(host::CliHost::new()))?;
+    println!(
+        "
+implemented by {} ({}):",
+        class.name, class.id
+    );
+    if classes.len() > 1 && wanted.is_none() {
+        println!(
+            "  (first of {} plugins; pass an ID for another)",
+            classes.len()
+        );
+    }
+    let names = plugin.format_interfaces();
+    if names.is_empty() {
+        println!("  (none of the names we know)");
+    }
+    for name in names {
+        println!("  {name}");
     }
     Ok(())
 }
@@ -535,6 +564,13 @@ fn state_round_trip(
     // a preset silently comes back wrong.
     run_one_block(&mut first)?;
 
+    // And a plugin may only fold an edit into what it serialises on one of its
+    // own timer callbacks, which run through `tick`. CHOWTapeModel does exactly
+    // that: without this line it saves the value it had before the edit, and
+    // the preset comes back wrong through no fault of the save/load path. The
+    // real host ticks every frame, so this is the harness catching up with it.
+    first.tick();
+
     let saved = first.snapshot().get(target.id).unwrap_or(f64::NAN);
     let span = (target.max - target.min).abs().max(1e-9);
     if (saved - wanted).abs() > span * 1e-3 {
@@ -549,6 +585,11 @@ fn state_round_trip(
     let mut second = Plugin::load(path, Some(&class.id), host).map_err(|e| e.to_string())?;
     let fresh = second.snapshot().get(target.id).unwrap_or(f64::NAN);
     second.load_state(&blob).map_err(|e| e.to_string())?;
+    // A plugin may finish loading on a main-thread callback rather than inside
+    // `load`, so give it the pump the real host runs every frame before asking
+    // what it now believes. Without this, a plugin that defers reads back its
+    // old values and looks like it lost the preset.
+    second.tick();
     let restored = second.snapshot().get(target.id).unwrap_or(f64::NAN);
 
     if (restored - saved).abs() > span * 1e-6 {

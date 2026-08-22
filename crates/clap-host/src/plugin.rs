@@ -224,6 +224,28 @@ impl ClapPlugin {
         &self.class
     }
 
+    /// Which of the extensions we know the names of this instance answers to.
+    ///
+    /// Purely diagnostic — nothing in the host branches on this. It exists so
+    /// `host-cli info` can say what a module actually implements, which is the
+    /// cheapest way to find out whether a real plugin exercises a code path we
+    /// have only ever run against `clap-test-plugin`.
+    ///
+    /// The list is deliberately wider than what this backend supports: an
+    /// extension we do *not* implement is the interesting result, because it
+    /// names work a plugin is asking for and not getting.
+    pub fn extensions(&self) -> Vec<&'static str> {
+        KNOWN_EXTENSIONS
+            .iter()
+            .filter(|id| {
+                // Safety: the instance is live for as long as `self` is, and
+                // `get_extension` is a main-thread call, which this is.
+                !unsafe { extension::<()>(self.plugin, id) }.is_null()
+            })
+            .map(|id| id.to_str().expect("the ids are ASCII literals"))
+            .collect()
+    }
+
     pub fn params(&self) -> &[ParamInfo] {
         &self.params
     }
@@ -901,6 +923,63 @@ fn empty_buffer(channels: u16) -> clap_audio_buffer {
         constant_mask: 0,
     }
 }
+
+/// Every extension id `clap-sys` knows a name for, draft aliases included.
+///
+/// Taken from the bindings rather than written out here, so the spelling —
+/// including the version suffixes CLAP puts in some ids, like
+/// `clap.surround/4` — cannot drift from what plugins actually answer to.
+///
+/// Host-side ids are in the list too. A plugin has no reason to answer
+/// `clap.log`, so if one ever does, that is worth seeing rather than hiding.
+const KNOWN_EXTENSIONS: [&std::ffi::CStr; 46] = [
+    clap_sys::ext::ambisonic::CLAP_EXT_AMBISONIC,
+    clap_sys::ext::ambisonic::CLAP_EXT_AMBISONIC_COMPAT,
+    clap_sys::ext::audio_ports::CLAP_EXT_AUDIO_PORTS,
+    clap_sys::ext::audio_ports_activation::CLAP_EXT_AUDIO_PORTS_ACTIVATION,
+    clap_sys::ext::audio_ports_activation::CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
+    clap_sys::ext::audio_ports_config::CLAP_EXT_AUDIO_PORTS_CONFIG,
+    clap_sys::ext::audio_ports_config::CLAP_EXT_AUDIO_PORTS_CONFIG_INFO,
+    clap_sys::ext::audio_ports_config::CLAP_EXT_AUDIO_PORTS_CONFIG_INFO_COMPAT,
+    clap_sys::ext::configurable_audio_ports::CLAP_EXT_CONFIGURABLE_AUDIO_PORTS,
+    clap_sys::ext::configurable_audio_ports::CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT,
+    clap_sys::ext::context_menu::CLAP_EXT_CONTEXT_MENU,
+    clap_sys::ext::context_menu::CLAP_EXT_CONTEXT_MENU_COMPAT,
+    clap_sys::ext::draft::extensible_audio_ports::CLAP_EXT_EXTENSIBLE_AUDIO_PORTS,
+    clap_sys::ext::draft::resource_directory::CLAP_EXT_RESOURCE_DIRECTORY,
+    clap_sys::ext::draft::transport_control::CLAP_EXT_TRANSPORT_CONTROL,
+    clap_sys::ext::draft::triggers::CLAP_EXT_TRIGGERS,
+    clap_sys::ext::draft::tuning::CLAP_EXT_TUNING,
+    clap_sys::ext::draft::undo::CLAP_EXT_UNDO,
+    clap_sys::ext::draft::undo::CLAP_EXT_UNDO_CONTEXT,
+    clap_sys::ext::draft::undo::CLAP_EXT_UNDO_DELTA,
+    clap_sys::ext::event_registry::CLAP_EXT_EVENT_REGISTRY,
+    clap_sys::ext::gui::CLAP_EXT_GUI,
+    clap_sys::ext::latency::CLAP_EXT_LATENCY,
+    clap_sys::ext::log::CLAP_EXT_LOG,
+    clap_sys::ext::note_name::CLAP_EXT_NOTE_NAME,
+    clap_sys::ext::note_ports::CLAP_EXT_NOTE_PORTS,
+    clap_sys::ext::param_indication::CLAP_EXT_PARAM_INDICATION,
+    clap_sys::ext::param_indication::CLAP_EXT_PARAM_INDICATION_COMPAT,
+    clap_sys::ext::params::CLAP_EXT_PARAMS,
+    clap_sys::ext::posix_fd_support::CLAP_EXT_POSIX_FD_SUPPORT,
+    clap_sys::ext::preset_load::CLAP_EXT_PRESET_LOAD,
+    clap_sys::ext::preset_load::CLAP_EXT_PRESET_LOAD_COMPAT,
+    clap_sys::ext::remote_controls::CLAP_EXT_REMOTE_CONTROLS,
+    clap_sys::ext::remote_controls::CLAP_EXT_REMOTE_CONTROLS_COMPAT,
+    clap_sys::ext::render::CLAP_EXT_RENDER,
+    clap_sys::ext::state::CLAP_EXT_STATE,
+    clap_sys::ext::state_context::CLAP_EXT_STATE_CONTEXT,
+    clap_sys::ext::surround::CLAP_EXT_SURROUND,
+    clap_sys::ext::surround::CLAP_EXT_SURROUND_COMPAT,
+    clap_sys::ext::tail::CLAP_EXT_TAIL,
+    clap_sys::ext::thread_check::CLAP_EXT_THREAD_CHECK,
+    clap_sys::ext::thread_pool::CLAP_EXT_THREAD_POOL,
+    clap_sys::ext::timer_support::CLAP_EXT_TIMER_SUPPORT,
+    clap_sys::ext::track_info::CLAP_EXT_TRACK_INFO,
+    clap_sys::ext::track_info::CLAP_EXT_TRACK_INFO_COMPAT,
+    clap_sys::ext::voice_info::CLAP_EXT_VOICE_INFO,
+];
 
 /// Fetch one extension, or null.
 ///
