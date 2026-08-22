@@ -146,8 +146,12 @@ jobs:
             *.zip.sha256
           if-no-files-found: error
 
+  # 未検証のプラットフォームが 1 つ落ちただけで、動作確認済みの Windows まで
+  # リリースが出ないのは困る。組めたものだけを配り、欠けた分は本文で分かる
+  # ようにする。guard が落ちた場合だけは何も出さない。
   release:
-    needs: build
+    needs: [guard, build]
+    if: always() && needs.guard.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -156,6 +160,26 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # 全滅した時に空のリリースを作らないための確認。ついでに、何が欠けたかを
+      # サマリに残す。ここを読めば、どのターゲットを追いかければいいか分かる。
+      - name: Check what was built
+        run: |
+          shopt -s nullglob
+          built=(dist/*.zip)
+          if [ ${#built[@]} -eq 0 ]; then
+            echo "::error::どのターゲットもビルドできていません。リリースは作りません。"
+            exit 1
+          fi
+          echo "### ビルドできたアセット" >> "$GITHUB_STEP_SUMMARY"
+          for f in "${built[@]}"; do
+            echo "- $(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "${{ needs.build.result }}" != 'success' ]; then
+            echo "::warning::一部のターゲットがビルドに失敗しました。揃っていないままリリースします。"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "一部のターゲットはビルドに失敗しました。" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # リリースノートは自動生成せず、本文は手で書く。
       # `-rc.1` のような接尾辞が付いたタグはプレリリース扱いにする。
