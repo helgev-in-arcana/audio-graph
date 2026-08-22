@@ -417,6 +417,8 @@ impl Wrapper {
             playing: transport.playing,
             recording: transport.recording,
             loop_active: transport.loop_range_samples().is_some(),
+            loop_range_music: transport.loop_range_beats(),
+            loop_range_seconds: transport.loop_range_seconds(),
         };
 
         self.out_events.clear();

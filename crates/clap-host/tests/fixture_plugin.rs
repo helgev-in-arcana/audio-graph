@@ -27,6 +27,17 @@ const NOTE_LEVEL: f32 = 0.25;
 const PARAM_GAIN: ParamId = ParamId(0);
 const PARAM_OFFSET: ParamId = ParamId(1);
 const PARAM_LATENCY: ParamId = ParamId(3);
+const PARAM_ACTIVE_PORTS: ParamId = ParamId(4);
+/// Mirrors `clap_test_plugin::OUTPUT_PORT_BIT`, spelled out here so the test
+/// reads without a second file open.
+const OUTPUT_PORT_BIT: u32 = 8;
+const PARAM_ASK: ParamId = ParamId(5);
+/// Mirrors `clap_test_plugin::ask`, spelled out for the same reason as
+/// `OUTPUT_PORT_BIT`: this crate does not depend on the fixture's Rust API,
+/// only on the module it builds.
+const ASK_RESTART: f64 = 1.0;
+const ASK_AUDIO_PORTS_RESCAN: f64 = 2.0;
+const ASK_NOTE_PORTS_RESCAN: f64 = 3.0;
 
 #[derive(Default)]
 struct TestHost;
@@ -36,6 +47,60 @@ impl HostContext for TestHost {
         "clap-host tests"
     }
     fn request_restart(&self, _reason: RestartReason) {}
+}
+
+/// A host that writes down what it was asked for instead of ignoring it.
+#[derive(Default)]
+struct RecordingHost {
+    reasons: std::sync::Mutex<Vec<RestartReason>>,
+}
+
+impl HostContext for RecordingHost {
+    fn host_name(&self) -> &str {
+        "clap-host tests"
+    }
+    fn request_restart(&self, reason: RestartReason) {
+        self.reasons.lock().expect("not poisoned").push(reason);
+    }
+}
+
+/// The plugin asks; the host has to hear it.
+///
+/// `request_restart`, `audio-ports.rescan` and `note-ports.rescan` are the
+/// three calls a plugin makes when its own shape changes, and none of them is
+/// reachable by driving the host — only the plugin can start them. No plugin on
+/// this machine makes any of the three (Surge XT Effects gets as far as the
+/// latency and parameter notifications and no further), which is why the
+/// fixture has a parameter whose whole job is to make the call.
+#[test]
+fn the_host_forwards_what_the_plugin_asks_for() {
+    let module = Module::open(fixture_path()).expect("the fixture opens");
+
+    for (ask, expected) in [
+        (ASK_RESTART, RestartReason::IoConfig),
+        (ASK_AUDIO_PORTS_RESCAN, RestartReason::IoConfig),
+        (ASK_NOTE_PORTS_RESCAN, RestartReason::IoConfig),
+    ] {
+        let host = Arc::new(RecordingHost::default());
+        let mut plugin = ClapPlugin::create(
+            &module,
+            "dev.audio-graph.clap-test-plugin",
+            Arc::clone(&host) as Arc<dyn HostContext>,
+        )
+        .expect("instantiates");
+
+        assert!(
+            host.reasons.lock().unwrap().is_empty(),
+            "nothing asked for yet"
+        );
+        // Written while inactive, so the value reaches the plugin through
+        // `params.flush` — main thread, which is where all three calls are
+        // legal.
+        SubPluginMain::set_param(&mut plugin, PARAM_ASK, ask).expect("the ask lands");
+
+        let seen = host.reasons.lock().unwrap().clone();
+        assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
+    }
 }
 
 /// Where `cargo` put the fixture's shared library.
@@ -105,7 +170,7 @@ fn the_backend_drives_a_real_clap_module() {
         ClapPlugin::create(&module, &class.id, Arc::clone(&context)).expect("instantiates");
 
     let params = SubPluginMain::params(&plugin).to_vec();
-    assert_eq!(params.len(), 4, "{params:#?}");
+    assert_eq!(params.len(), 6, "{params:#?}");
 
     let gain = params.iter().find(|p| p.id == PARAM_GAIN).expect("gain");
     // Plain values with a real range, straight from the plugin — the whole
@@ -232,6 +297,22 @@ fn the_backend_drives_a_real_clap_module() {
         output.iter().all(|&s| (s - 0.5).abs() < 1e-6),
         "unwired sidechain leaked: {:?}",
         &output[..4]
+    );
+
+    // --- the unwired port was switched off, not merely fed silence ---------
+
+    // The fixture reports what it was told through a read-only parameter, and
+    // refuses a `set_active` made at the wrong moment or with the wrong sample
+    // size — so this failing means the call was wrong, not just absent.
+    let mask = SubPluginMain::snapshot(&plugin)
+        .get(PARAM_ACTIVE_PORTS)
+        .expect("the fixture reports its active ports") as u32;
+    assert_eq!(mask & 1, 1, "the main input stays on");
+    assert_eq!(mask & 2, 0, "the unwired sidechain should be off");
+    assert_eq!(
+        mask & (1 << OUTPUT_PORT_BIT),
+        1 << OUTPUT_PORT_BIT,
+        "the wired output stays on"
     );
 
     // --- parameter events arrive as events ---------------------------------

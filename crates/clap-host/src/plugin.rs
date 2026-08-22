@@ -23,6 +23,10 @@ use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
+use clap_sys::ext::audio_ports_activation::{
+    CLAP_EXT_AUDIO_PORTS_ACTIVATION, CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
+    clap_plugin_audio_ports_activation,
+};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_plugin_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{
@@ -123,6 +127,9 @@ pub struct ClapPlugin {
     ext_state: *const clap_plugin_state,
     ext_latency: *const clap_plugin_latency,
     ext_gui: *const clap_plugin_gui,
+    /// Optional. Lets the host tell a plugin that a port is not worth
+    /// computing; see `set_port_activation`.
+    ext_ports_activation: *const clap_plugin_audio_ports_activation,
 
     /// The editor lives here rather than in the caller, so `destroy` cannot run
     /// before the GUI is torn down no matter what the caller forgets (§5.3).
@@ -137,6 +144,19 @@ pub struct ClapPlugin {
     /// Event buffers for a main-thread `params.flush`, which is the inactive
     /// path for the same edits.
     flush_buffers: RefCell<(InputEvents, OutputEvents)>,
+    /// Values already handed over by `flush`, kept so `activate` can hand them
+    /// over a second time as ordinary events.
+    ///
+    /// CLAP says a flush is enough and most plugins agree, but Surge XT Effects
+    /// takes the value into what `get_value` reports and not into its DSP, so a
+    /// preset set while the plugin was inactive is silently lost. Re-sending on
+    /// the first block costs one event per edited parameter and makes the
+    /// difference invisible from outside.
+    ///
+    /// Dropped by `load_state`, so whichever of the two happened last wins, and
+    /// emptied by the activate that replays it, so a value the audio thread has
+    /// since changed is not undone by a later activate.
+    flushed: RefCell<Vec<(ParamId, f64)>>,
     context: Arc<dyn HostContext>,
 }
 
@@ -188,6 +208,19 @@ impl ClapPlugin {
             unsafe { extension::<clap_plugin_audio_ports>(plugin, CLAP_EXT_AUDIO_PORTS) };
         let ext_note_ports =
             unsafe { extension::<clap_plugin_note_ports>(plugin, CLAP_EXT_NOTE_PORTS) };
+        // Both spellings: the id gained a version suffix when the extension
+        // left draft, and plugins in the wild answer to either.
+        let mut ext_ports_activation = unsafe {
+            extension::<clap_plugin_audio_ports_activation>(plugin, CLAP_EXT_AUDIO_PORTS_ACTIVATION)
+        };
+        if ext_ports_activation.is_null() {
+            ext_ports_activation = unsafe {
+                extension::<clap_plugin_audio_ports_activation>(
+                    plugin,
+                    CLAP_EXT_AUDIO_PORTS_ACTIVATION_COMPAT,
+                )
+            };
+        }
 
         let params = unsafe { read_params(plugin, ext_params) };
         let ports = unsafe { read_ports(plugin, ext_audio_ports) };
@@ -208,6 +241,7 @@ impl ClapPlugin {
             ext_state,
             ext_latency,
             ext_gui,
+            ext_ports_activation,
             editor: None,
             active: Cell::new(false),
             latency: Cell::new(0),
@@ -216,6 +250,7 @@ impl ClapPlugin {
                 InputEvents::new(MAX_EVENTS_PER_BLOCK),
                 OutputEvents::new(MAX_EVENTS_PER_BLOCK),
             )),
+            flushed: RefCell::new(Vec::new()),
             context,
         })
     }
@@ -375,6 +410,57 @@ impl ClapPlugin {
         // arrived (see `host.rs`), which is the path §7.4 describes.
     }
 
+    /// Tell the plugin which of its ports the graph actually wired.
+    ///
+    /// `bind_ports` already gives every unwired port real memory, because CLAP
+    /// has no null buffer — but memory is not the cost that matters. A plugin
+    /// with an unused sidechain still filters it, and one with unused aux
+    /// outputs still renders them; Surge XT computes both of its scene outputs
+    /// whether or not anything reads them. This extension is the only way to
+    /// say "do not bother", and it is the only thing in this backend that saves
+    /// the plugin work rather than teaching us about it.
+    ///
+    /// Every port is set explicitly rather than only the unwired ones: ports
+    /// start active, but an instance outlives a deactivate/activate pair, so a
+    /// port turned off for one configuration would stay off for the next.
+    ///
+    /// Called with the plugin deactivated, which is when CLAP allows this
+    /// unconditionally — so `can_activate_while_processing` never has to be
+    /// asked.
+    fn set_port_activation(&self, plan: &BindingPlan) {
+        if self.ext_ports_activation.is_null() {
+            return;
+        }
+        let Some(set_active) = (unsafe { (*self.ext_ports_activation).set_active }) else {
+            return;
+        };
+
+        let apply = |is_input: bool, bindings: &[(u16, Binding)]| {
+            for (index, (_, binding)) in bindings.iter().enumerate() {
+                let active = matches!(binding, Binding::Caller(_));
+                // The sample size is the buffer's, in bits, and zero when the
+                // port is being turned off. This backend is `f32` throughout.
+                let sample_size = if active { 32 } else { 0 };
+                let ok =
+                    unsafe { set_active(self.plugin, is_input, index as u32, active, sample_size) };
+                if !ok {
+                    // Refusing is allowed, and means the port stays as it was.
+                    // Nothing downstream depends on the answer: the buffers are
+                    // bound either way.
+                    log::debug!(
+                        "{}: refused to set {} port {index} {}",
+                        self.class.name,
+                        if is_input { "input" } else { "output" },
+                        if active { "active" } else { "inactive" },
+                    );
+                }
+            }
+        };
+
+        apply(true, &plan.inputs);
+        apply(false, &plan.outputs);
+    }
+
     /// Deliver queued main-thread edits without a process call.
     ///
     /// The inactive half of `set_param`. While audio is running the processor
@@ -397,9 +483,13 @@ impl ClapPlugin {
         let (input, output) = &mut *buffers;
         input.clear();
         output.clear();
+        let mut flushed = self.flushed.borrow_mut();
         for (id, plain) in pending.drain(..) {
             input.push_param(id, plain, 0);
+            flushed.retain(|(existing, _)| *existing != id);
+            flushed.push((id, plain));
         }
+        drop(flushed);
         drop(pending);
         let in_raw = input.as_raw();
         let out_raw = output.as_raw();
@@ -524,6 +614,12 @@ impl SubPluginMain for ClapPlugin {
         if !unsafe { load(self.plugin, raw) } {
             return Err(HostError::State("clap_plugin_state::load failed".into()));
         }
+        // The blob is newer than any edit made before it, so nothing may be
+        // replayed over the top of it.
+        self.flushed.borrow_mut().clear();
+        if let Ok(mut pending) = self.pending_edits.lock() {
+            pending.clear();
+        }
         Ok(())
     }
 
@@ -538,8 +634,29 @@ impl SubPluginMain for ClapPlugin {
         // Anything queued while inactive has to reach the plugin before it
         // starts, or the first block renders with the old values.
         self.flush_params();
+        // And again on the first block, for a plugin that took the flush into
+        // its parameter cache but not into its DSP. See `flushed`.
+        {
+            // Drained, not copied: this is a one-shot. Once the plugin has been
+            // run, a value that arrived as an ordinary event during `process`
+            // is newer than anything flushed before it, and replaying the old
+            // one on the next activate would undo the user's last edit.
+            let mut flushed = self.flushed.borrow_mut();
+            if !flushed.is_empty()
+                && let Ok(mut pending) = self.pending_edits.lock()
+            {
+                for (id, plain) in flushed.drain(..) {
+                    pending.retain(|(existing, _)| *existing != id);
+                    if pending.len() < pending.capacity() {
+                        pending.push((id, plain));
+                    }
+                }
+            }
+        }
 
         let plan = bind_ports(&self.ports, &config)?;
+        // Before `activate`, which is when CLAP allows it unconditionally.
+        self.set_port_activation(&plan);
 
         let activate = unsafe { (*self.plugin).activate }.ok_or_else(|| HostError::Backend {
             context: "clap_plugin::activate is null".into(),
@@ -838,7 +955,13 @@ impl SubPluginProcessor for ClapProcessor {
             }
             let buffer = &mut self.in_buffers[index];
             buffer.data32 = unsafe { self.in_ptrs.as_mut_ptr().add(at) };
-            buffer.constant_mask = 0;
+            // An unwired port reads the silence buffer, which never changes.
+            // Saying so lets a plugin skip it, and a port deactivated through
+            // `set_port_activation` is required to be marked constant.
+            buffer.constant_mask = match binding {
+                Binding::Caller(_) => 0,
+                Binding::Scratch(_) => (1u64 << width) - 1,
+            };
             at += width;
         }
 
@@ -860,7 +983,7 @@ impl SubPluginProcessor for ClapProcessor {
             at += width;
         }
 
-        let transport = to_transport(context);
+        let transport = to_transport(context, self.config.sample_rate);
         let in_raw = self.in_events.as_raw();
         let out_raw = self.out_events.as_raw();
         let data = clap_process {

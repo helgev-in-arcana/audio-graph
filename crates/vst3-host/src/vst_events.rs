@@ -194,6 +194,13 @@ pub fn to_process_context(context: &TimeContext, sample_rate: f64) -> ProcessCon
     if context.loop_active {
         state |= StatesAndFlags_::kCycleActive;
     }
+    // `kCycleActive` says a loop is running; `kCycleValid` says where it is.
+    // Only the second one depends on the host having told us.
+    if let Some((start, end)) = context.loop_range_music {
+        state |= StatesAndFlags_::kCycleValid;
+        out.cycleStartMusic = start;
+        out.cycleEndMusic = end;
+    }
 
     out.state = state as u32;
     out.sampleRate = sample_rate;
@@ -331,5 +338,27 @@ mod tests {
         assert!(out.state & StatesAndFlags_::kPlaying as u32 != 0);
         assert!(out.state & StatesAndFlags_::kTempoValid as u32 != 0);
         assert_eq!(out.state & StatesAndFlags_::kRecording as u32, 0);
+    }
+
+    #[test]
+    fn a_running_loop_is_only_described_when_its_bounds_are_known() {
+        let running = TimeContext {
+            loop_active: true,
+            ..Default::default()
+        };
+        let out = to_process_context(&running, 48_000.0);
+        assert!(out.state & StatesAndFlags_::kCycleActive as u32 != 0);
+        // Active but not valid: the two are separate claims, and only the
+        // second one needs bounds.
+        assert_eq!(out.state & StatesAndFlags_::kCycleValid as u32, 0);
+
+        let described = TimeContext {
+            loop_range_music: Some((4.0, 8.0)),
+            ..running
+        };
+        let out = to_process_context(&described, 48_000.0);
+        assert!(out.state & StatesAndFlags_::kCycleValid as u32 != 0);
+        assert_eq!(out.cycleStartMusic, 4.0);
+        assert_eq!(out.cycleEndMusic, 8.0);
     }
 }

@@ -21,7 +21,7 @@ use clap_sys::events::{
     clap_event_param_value, clap_event_transport, clap_input_events, clap_note_expression,
     clap_output_events,
 };
-use clap_sys::fixedpoint::CLAP_BEATTIME_FACTOR;
+use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use plugin_host_api::{
     Event, EventSink, NoteEvent, NoteExpression, ParamEvent, ParamId, Target, TimeContext,
 };
@@ -568,8 +568,13 @@ unsafe fn list_ctx_mut<'a, T>(ctx: *mut c_void) -> Option<&'a mut T> {
 ///
 /// CLAP measures musical time in fixed point rather than in doubles, so the
 /// conversion is where precision is lost — nowhere else in this file.
-pub(crate) fn to_transport(context: &TimeContext) -> clap_event_transport {
+///
+/// `sample_rate` is taken rather than assumed because CLAP wants the song
+/// position in seconds as well as in beats, and the core model carries only
+/// samples. The VST3 backend takes it for the same reason.
+pub(crate) fn to_transport(context: &TimeContext, sample_rate: f64) -> clap_event_transport {
     let beats = |quarters: f64| -> i64 { (quarters * CLAP_BEATTIME_FACTOR as f64) as i64 };
+    let secs = |seconds: f64| -> i64 { (seconds * CLAP_SECTIME_FACTOR as f64) as i64 };
 
     let mut flags = CLAP_TRANSPORT_HAS_TEMPO
         | CLAP_TRANSPORT_HAS_BEATS_TIMELINE
@@ -581,21 +586,36 @@ pub(crate) fn to_transport(context: &TimeContext) -> clap_event_transport {
     if context.recording {
         flags |= CLAP_TRANSPORT_IS_RECORDING;
     }
-    if context.loop_active {
+    // Only when the bounds are known, which is not the same question as
+    // whether a loop is running. The `HAS_*_TIMELINE` flags above already
+    // promise that `loop_start`/`loop_end` mean something, and CLAP has no
+    // second flag to withdraw that promise for the loop fields alone the way
+    // VST3's `kCycleValid` does. A loop reported as running but spanning
+    // nothing is worse for a plugin than no loop reported at all, so a host
+    // that cannot describe the loop says nothing about it.
+    let loop_music = context.loop_range_music.unwrap_or((0.0, 0.0));
+    let loop_seconds = context.loop_range_seconds.unwrap_or((0.0, 0.0));
+    if context.loop_active && context.loop_range_music.is_some() {
         flags |= CLAP_TRANSPORT_IS_LOOP_ACTIVE;
     }
+
+    let song_pos_seconds = if sample_rate > 0.0 {
+        context.project_time_samples as f64 / sample_rate
+    } else {
+        0.0
+    };
 
     clap_event_transport {
         header: header(size_of::<clap_event_transport>(), 0, 9),
         flags,
         song_pos_beats: beats(context.project_time_music),
-        song_pos_seconds: 0,
+        song_pos_seconds: secs(song_pos_seconds),
         tempo: context.tempo_bpm,
         tempo_inc: 0.0,
-        loop_start_beats: 0,
-        loop_end_beats: 0,
-        loop_start_seconds: 0,
-        loop_end_seconds: 0,
+        loop_start_beats: beats(loop_music.0),
+        loop_end_beats: beats(loop_music.1),
+        loop_start_seconds: secs(loop_seconds.0),
+        loop_end_seconds: secs(loop_seconds.1),
         bar_start: beats(context.bar_position_music),
         // Derived rather than carried: the core model records where the bar
         // starts, and CLAP wants which bar it is. Both are the DAW's answer to
@@ -618,6 +638,47 @@ fn bar_number(context: &TimeContext) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_song_position_in_seconds_follows_the_sample_count() {
+        let context = TimeContext {
+            project_time_samples: 48_000 * 3,
+            ..TimeContext::default()
+        };
+        let transport = to_transport(&context, 48_000.0);
+        assert_ne!(transport.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, 0);
+        assert_eq!(transport.song_pos_seconds, 3 * CLAP_SECTIME_FACTOR);
+    }
+
+    #[test]
+    fn a_loop_whose_bounds_are_unknown_is_not_reported_at_all() {
+        // CLAP cannot say "looping, but I cannot tell you where", and a plugin
+        // handed a loop of length zero is worse off than one told nothing.
+        let context = TimeContext {
+            loop_active: true,
+            ..TimeContext::default()
+        };
+        let transport = to_transport(&context, 48_000.0);
+        assert_eq!(transport.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE, 0);
+        assert_eq!(transport.loop_start_beats, 0);
+        assert_eq!(transport.loop_end_beats, 0);
+    }
+
+    #[test]
+    fn a_loop_with_bounds_carries_both_timelines() {
+        let context = TimeContext {
+            loop_active: true,
+            loop_range_music: Some((4.0, 8.0)),
+            loop_range_seconds: Some((2.0, 4.0)),
+            ..TimeContext::default()
+        };
+        let transport = to_transport(&context, 48_000.0);
+        assert_ne!(transport.flags & CLAP_TRANSPORT_IS_LOOP_ACTIVE, 0);
+        assert_eq!(transport.loop_start_beats, 4 * CLAP_BEATTIME_FACTOR);
+        assert_eq!(transport.loop_end_beats, 8 * CLAP_BEATTIME_FACTOR);
+        assert_eq!(transport.loop_start_seconds, 2 * CLAP_SECTIME_FACTOR);
+        assert_eq!(transport.loop_end_seconds, 4 * CLAP_SECTIME_FACTOR);
+    }
 
     #[test]
     fn a_param_set_round_trips() {

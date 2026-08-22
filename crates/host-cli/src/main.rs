@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         "chain" => cmd_chain(rest),
         "instrument" => cmd_instrument(rest),
         "sidechain" => cmd_sidechain(rest),
+        "aux" => cmd_aux(rest),
         "delay" => cmd_delay(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
@@ -102,6 +103,13 @@ fn usage() {
   host-cli sidechain <WRAPPER.vst3> <COMP> <SYNTH> <SC_PARAM_ID>
                                     check a compressor inside the graph ducks
                                     against another node's audio
+  host-cli aux <WRAPPER.vst3> <PLUGIN> <SYNTH> [ID=VALUE]
+                                    weaker form of the above for a plugin with
+                                    no sidechain-enable parameter: check that
+                                    wiring the aux bus changes the output.
+                                    ID=VALUE holds one parameter for the whole
+                                    render, for a plugin that reads its aux bus
+                                    only in some modes
   host-cli delay <WRAPPER.vst3>     check a feedback delay in the graph sounds the
                                     same at any block size, and that the mix's
                                     gains fade the repeats
@@ -1694,7 +1702,7 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     let baseline_json = read_wrapper_state(&baseline)?;
 
     let run = |keyed: bool| -> Result<render::RenderOutcome, String> {
-        let patched = inject_sidechain(&baseline_json, comp, synth, switch, keyed)?;
+        let patched = inject_sidechain(&baseline_json, comp, synth, Some((switch, 1.0)), keyed)?;
         let state = edit_wrapper_state(&baseline, &patched)?;
         render::render_with_state(
             Path::new(wrapper),
@@ -1761,6 +1769,124 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
         ));
     }
     println!("another node's audio reaches the sidechain, and the compressor acts on it");
+    Ok(())
+}
+
+/// The same wiring as `sidechain`, for a plugin that has no switch to throw.
+///
+/// `sidechain` asks a compressor to duck, which is a strong check but needs a
+/// plugin whose sidechain is (a) optional and (b) reached through one
+/// parameter. Plenty of plugins fail one of those and still read their aux bus
+/// -- the CLAP fixture always mixes it, Surge XT Effects hides the switch
+/// inside whichever effect is loaded -- so this asks the weaker question that
+/// applies to all of them: does wiring the aux bus change the output at all?
+///
+/// Direction is not asserted. A compressor ducks, a mixer adds, a vocoder does
+/// something else entirely; what is under test is the graph's aux plumbing, not
+/// the plugin's taste.
+fn cmd_aux(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let plugin = args.get(1).ok_or("expected a plugin with an aux input")?;
+    let synth = args
+        .get(2)
+        .ok_or("expected an instrument to feed the aux")?;
+    // Optional `ID=VALUE`: a parameter held at a value through slot 0 for the
+    // whole render, for a plugin that reads its aux bus only in some modes.
+    let preset = match args.get(3) {
+        None => None,
+        Some(text) => {
+            let (id, value) = text
+                .split_once('=')
+                .ok_or("the fourth argument looks like PARAM_ID=VALUE")?;
+            Some((
+                id.parse::<u32>()
+                    .map_err(|_| "the parameter id must be a number")?,
+                value
+                    .parse::<f64>()
+                    .map_err(|_| "the value must be a number")?,
+            ))
+        }
+    };
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f32;
+    let frames = (sample_rate * 3.0) as usize;
+    let note_at = (sample_rate * 1.0) as usize;
+
+    let mut tone = wav::Audio::silence(f64::from(sample_rate), 2, frames);
+    for ch in 0..2usize {
+        for i in 0..frames {
+            let phase = i as f32 / sample_rate * 220.0 * std::f32::consts::TAU;
+            // Quieter than `sidechain`'s tone on purpose: what the aux bus
+            // contributes is measured against this, and a loud carrier buries
+            // it.
+            tone.samples[ch * frames + i] = 0.05 * phase.sin();
+        }
+    }
+    let events = render::note(48, note_at, (sample_rate * 1.0) as usize);
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |keyed: bool| -> Result<render::RenderOutcome, String> {
+        let patched = inject_sidechain(&baseline_json, plugin, synth, preset, keyed)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &tone,
+            BLOCK,
+            &events,
+        )
+    };
+
+    // Only the keyed second is compared: before the note the aux bus is silent
+    // either way, so any difference there would be the plugin drifting rather
+    // than the wiring doing anything.
+    let rms = |out: &wav::Audio| -> f32 {
+        let from = note_at + 4800;
+        let to = (note_at + (sample_rate * 0.9) as usize).min(out.frames);
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for ch in 0..out.channels as usize {
+            for i in from..to {
+                let s = out.samples[ch * out.frames + i] as f64;
+                sum += s * s;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            0.0
+        } else {
+            (sum / n as f64).sqrt() as f32
+        }
+    };
+
+    let unkeyed = run(false)?;
+    let keyed = run(true)?;
+    let (a, b) = (rms(&unkeyed.audio), rms(&keyed.audio));
+    println!("aux not wired: {a:.6}");
+    println!("aux wired:     {b:.6}");
+    if a < 1e-4 && b < 1e-4 {
+        return Err("the plugin produced nothing either way; the tone is not reaching it".into());
+    }
+    let change = (b - a).abs() / a.max(b);
+    println!("  level moved by {:.1}%", change * 100.0);
+    if change < 0.05 {
+        return Err(format!(
+            "wiring the aux bus changed the output by {:.1}%; either nothing              reaches the aux port or this plugin ignores it",
+            change * 100.0
+        ));
+    }
+    println!("another node's audio reaches the plugin's aux input");
     Ok(())
 }
 
@@ -1941,7 +2067,15 @@ fn inject_sidechain(
     state: &str,
     comp: &str,
     synth: &str,
-    switch: u32,
+    // A parameter to hold at a value through slot 0, when the plugin needs one
+    // set before it will read its aux bus at all -- a sidechain-enable switch,
+    // or Surge XT Effects' choice of which effect is loaded. `None` wires the
+    // aux bus and leaves the parameters alone.
+    //
+    // Driven through a slot rather than written directly because that is the
+    // path a real patch uses, and because some plugins act on a parameter only
+    // when it arrives as an event during `process`.
+    switch: Option<(u32, f64)>,
     keyed: bool,
 ) -> Result<String, String> {
     let mut value: serde_json::Value =
@@ -1996,15 +2130,17 @@ fn inject_sidechain(
     let mut slots: Vec<serde_json::Value> = (0..32)
         .map(|_| serde_json::json!({ "name": null, "binding": null }))
         .collect();
-    slots[0] = serde_json::json!({
-        "name": "SC Active",
-        "binding": {
-            "instance": 0,
-            "plugin_id": comp_id,
-            "param_id": switch,
-            "param_name": "SC Active",
-        }
-    });
+    if let Some((switch, _)) = switch {
+        slots[0] = serde_json::json!({
+            "name": "SC Active",
+            "binding": {
+                "instance": 0,
+                "plugin_id": comp_id,
+                "param_id": switch,
+                "param_name": "SC Active",
+            }
+        });
+    }
     value["slots"] = serde_json::Value::Array(slots);
 
     let comp_ports = serde_json::json!({
@@ -2040,7 +2176,7 @@ fn inject_sidechain(
             { "id": 2, "pos": [220.0, 220.0], "kind": { "Plugin": { "instance": 1, "ports": synth_ports } } },
             { "id": 3, "pos": [40.0, 220.0],  "kind": "NoteIn" },
             { "id": 4, "pos": [600.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
-            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": 1.0 } } },
+            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": switch.map_or(1.0, |(_, v)| v) } } },
             { "id": 6, "pos": [220.0, 400.0], "kind": { "SlotOut": { "slot": 0 } } }
         ],
         "links": links,

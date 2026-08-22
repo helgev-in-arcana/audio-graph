@@ -29,12 +29,17 @@ use clap_sys::events::{
     CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE,
     clap_event_note, clap_event_param_value, clap_input_events, clap_output_events,
 };
+use clap_sys::ext::audio_ports::clap_host_audio_ports;
 use clap_sys::ext::audio_ports::{
     CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_STEREO, clap_audio_port_info,
     clap_plugin_audio_ports,
 };
+use clap_sys::ext::audio_ports_activation::{
+    CLAP_EXT_AUDIO_PORTS_ACTIVATION, clap_plugin_audio_ports_activation,
+};
 use clap_sys::ext::gui::CLAP_EXT_GUI;
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
+use clap_sys::ext::note_ports::clap_host_note_ports;
 use clap_sys::ext::note_ports::{
     CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI, clap_note_port_info,
     clap_plugin_note_ports,
@@ -61,7 +66,31 @@ pub const PARAM_GAIN: clap_id = 0;
 pub const PARAM_OFFSET: clap_id = 1;
 pub const PARAM_MODE: clap_id = 2;
 pub const PARAM_LATENCY: clap_id = 3;
-pub const PARAM_COUNT: u32 = 4;
+/// Read-only, and the only way a test can see what the host switched off.
+///
+/// A bitmask of the ports still active: bit `i` is input port `i`, bit `8 + i`
+/// is output port `i`. There is no other route — the host side of
+/// `clap.audio-ports-activation` is a pure command, with nothing to read back.
+pub const PARAM_ACTIVE_PORTS: clap_id = 4;
+/// Write-only, and the only way a test can make the plugin call the host.
+///
+/// Setting it from the main thread while the plugin is inactive — the one
+/// moment all three of these are legal — makes the fixture ask the host for
+/// the thing named by [`Ask`]. Nothing else in the fixture ever calls back, so
+/// a host that drops one of these has nowhere to hide.
+pub const PARAM_ASK: clap_id = 5;
+pub const PARAM_COUNT: u32 = 6;
+
+/// Values for [`PARAM_ASK`].
+pub mod ask {
+    pub const NOTHING: f64 = 0.0;
+    pub const RESTART: f64 = 1.0;
+    pub const AUDIO_PORTS_RESCAN: f64 = 2.0;
+    pub const NOTE_PORTS_RESCAN: f64 = 3.0;
+}
+
+/// Bit positions in [`PARAM_ACTIVE_PORTS`].
+pub const OUTPUT_PORT_BIT: u32 = 8;
 
 /// How much of the sidechain input is mixed into the output.
 ///
@@ -85,6 +114,8 @@ struct Params {
     offset: f64,
     mode: f64,
     latency: f64,
+    /// Cleared as soon as it is acted on; see [`PARAM_ASK`].
+    ask: f64,
 }
 
 impl Default for Params {
@@ -93,6 +124,7 @@ impl Default for Params {
             gain: 1.0,
             offset: 0.0,
             mode: 0.0,
+            ask: ask::NOTHING,
             latency: 0.0,
         }
     }
@@ -105,6 +137,7 @@ impl Params {
             PARAM_OFFSET => self.offset,
             PARAM_MODE => self.mode,
             PARAM_LATENCY => self.latency,
+            PARAM_ASK => self.ask,
             _ => return None,
         })
     }
@@ -115,6 +148,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, 3.0).round(),
             _ => {}
         }
     }
@@ -130,9 +164,15 @@ pub(crate) struct Instance {
     /// Notes currently held, by key. Bounded by the array, which is all a
     /// fixture needs.
     held: [bool; 128],
+    /// Kept so the fixture can call back, which is the only way to exercise
+    /// the host's side of `request_restart` and the rescan notifications.
+    host: *const clap_host_ptr,
     active: bool,
     processing: bool,
     initialised: bool,
+    /// Which ports the host left switched on. Every port starts active, which
+    /// is what CLAP says a fresh instance looks like.
+    active_ports: u32,
     /// Declared last so it drops last, which is the wrong order on purpose:
     /// the host is required to call `gui.destroy` before the instance goes, and
     /// a fixture that cleaned up after a host that forgot would hide the bug
@@ -249,7 +289,7 @@ unsafe extern "C" fn factory_descriptor(
 
 unsafe extern "C" fn factory_create(
     _factory: *const clap_plugin_factory,
-    _host: *const clap_host_ptr,
+    host: *const clap_host_ptr,
     id: *const c_char,
 ) -> *const clap_plugin {
     if id.is_null() || unsafe { CStr::from_ptr(id) } != PLUGIN_ID {
@@ -273,9 +313,12 @@ unsafe extern "C" fn factory_create(
         },
         params: Params::default(),
         held: [false; 128],
+        host,
         active: false,
         processing: false,
         initialised: false,
+        // CLAP says every port starts active.
+        active_ports: u32::MAX,
         gui: gui::Gui::default(),
     });
     // Only once the box has its final address.
@@ -284,7 +327,6 @@ unsafe extern "C" fn factory_create(
     &raw const Box::leak(instance).raw
 }
 
-/// The host struct is opaque to this fixture; it never calls back.
 use clap_sys::host::clap_host as clap_host_ptr;
 
 // --- plugin ---------------------------------------------------------------
@@ -488,6 +530,8 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const EXT_LATENCY).cast()
     } else if id == CLAP_EXT_GUI {
         (&raw const gui::EXT_GUI).cast()
+    } else if id == CLAP_EXT_AUDIO_PORTS_ACTIVATION {
+        (&raw const EXT_PORTS_ACTIVATION).cast()
     } else {
         std::ptr::null()
     }
@@ -545,7 +589,18 @@ unsafe extern "C" fn params_get_info(
             0.0,
             CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_STEPPED,
         ),
-        _ => ("Latency", "", 0.0, 512.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        3 => ("Latency", "", 0.0, 512.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        // Neither of the last two is automatable or modulatable: one reports,
+        // the other commands, and neither belongs on an automation lane.
+        4 => (
+            "Active Ports",
+            "",
+            0.0,
+            65535.0,
+            65535.0,
+            CLAP_PARAM_IS_STEPPED,
+        ),
+        _ => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
     };
 
     let out = unsafe { &mut *info };
@@ -581,6 +636,12 @@ unsafe extern "C" fn params_get_value(
     let (Some(instance), false) = (unsafe { Instance::from_host(plugin) }, out.is_null()) else {
         return false;
     };
+    if id == PARAM_ACTIVE_PORTS {
+        // Reported rather than stored with the rest: this one is the host's
+        // doing, not the user's.
+        unsafe { *out = f64::from(instance.active_ports & 0xffff) };
+        return true;
+    }
     match instance.params.get(id) {
         Some(value) => {
             unsafe { *out = value };
@@ -644,6 +705,52 @@ unsafe extern "C" fn params_flush(
 ) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
         unsafe { apply_events(instance, in_) };
+        // Main thread, and — when this is the inactive flush — a moment when
+        // every one of these calls is legal.
+        unsafe { instance.answer_ask() };
+    }
+}
+
+impl Instance {
+    /// Make the calls [`PARAM_ASK`] was set to, then forget it was set.
+    ///
+    /// # Safety
+    /// Main thread, and `self.host` must still be live.
+    unsafe fn answer_ask(&mut self) {
+        let ask = std::mem::replace(&mut self.params.ask, ask::NOTHING);
+        if self.host.is_null() {
+            return;
+        }
+        let get = match unsafe { (*self.host).get_extension } {
+            Some(get) => get,
+            None => return,
+        };
+        match ask {
+            ask::RESTART => {
+                if let Some(request) = unsafe { (*self.host).request_restart } {
+                    unsafe { request(self.host) };
+                }
+            }
+            ask::AUDIO_PORTS_RESCAN => {
+                let ext = unsafe { get(self.host, CLAP_EXT_AUDIO_PORTS.as_ptr()) }
+                    .cast::<clap_host_audio_ports>();
+                if !ext.is_null()
+                    && let Some(rescan) = unsafe { (*ext).rescan }
+                {
+                    unsafe { rescan(self.host, 0) };
+                }
+            }
+            ask::NOTE_PORTS_RESCAN => {
+                let ext = unsafe { get(self.host, CLAP_EXT_NOTE_PORTS.as_ptr()) }
+                    .cast::<clap_host_note_ports>();
+                if !ext.is_null()
+                    && let Some(rescan) = unsafe { (*ext).rescan }
+                {
+                    unsafe { rescan(self.host, 0) };
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -798,6 +905,59 @@ unsafe extern "C" fn state_load(plugin: *const clap_plugin, stream: *const clap_
     instance.params.offset = value(1);
     instance.params.mode = value(2);
     instance.params.latency = value(3);
+    true
+}
+
+// --- clap.audio-ports-activation ------------------------------------------
+
+static EXT_PORTS_ACTIVATION: clap_plugin_audio_ports_activation =
+    clap_plugin_audio_ports_activation {
+        can_activate_while_processing: Some(ports_can_activate_while_processing),
+        set_active: Some(ports_set_active),
+    };
+
+/// False on purpose, so the host has to do this at the one moment CLAP always
+/// allows it — while the plugin is deactivated. A fixture that said yes would
+/// let a host that got the timing wrong pass.
+unsafe extern "C" fn ports_can_activate_while_processing(_plugin: *const clap_plugin) -> bool {
+    false
+}
+
+unsafe extern "C" fn ports_set_active(
+    plugin: *const clap_plugin,
+    is_input: bool,
+    port_index: u32,
+    is_active: bool,
+    sample_size: u32,
+) -> bool {
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    // The two things a host most easily gets wrong, refused rather than
+    // absorbed: switching a port while running, and naming a sample size for a
+    // port being switched off.
+    if instance.active {
+        return false;
+    }
+    let expected = if is_active { 32 } else { 0 };
+    if sample_size != expected {
+        return false;
+    }
+
+    let limit = if is_input { 2 } else { 1 };
+    if port_index >= limit {
+        return false;
+    }
+    let bit = if is_input {
+        port_index
+    } else {
+        OUTPUT_PORT_BIT + port_index
+    };
+    if is_active {
+        instance.active_ports |= 1 << bit;
+    } else {
+        instance.active_ports &= !(1 << bit);
+    }
     true
 }
 
