@@ -121,9 +121,13 @@ fn usage() {
                                     gains fade the repeats
   host-cli editor <WRAPPER.vst3> <PLUGIN> [SECONDS]
                                     open the wrapper's editor with a plugin
-                                    node already in the patch
+                                    node already in the patch. Without SECONDS
+                                    it stays up until the window is closed
   host-cli gui <PLUGIN> [ID [SECONDS]] [--reverse]
-                                    open a plugin's editor and tear it down
+                                    open a plugin's editor and tear it down.
+                                    Without SECONDS it stays up until the
+                                    window is closed; pass a number, or 0 to
+                                    say so in a script
   host-cli twice <PLUGIN> [N]       instantiate N times in sequence
   host-cli state <PLUGIN> [ID]      save/restore a parameter across instances
   host-cli automate <PLUGIN> <IN.wav> [ID [PARAM_ID]]
@@ -2486,14 +2490,10 @@ fn inject_sidechain(
 /// already added, so opening it exercises every path the canvas grew.
 fn cmd_editor(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let plugin = args.get(1).ok_or("expected a plugin to put in a node")?;
-    let seconds: f64 = args
-        .get(2)
-        .map_or(Ok(20.0), |s| s.parse())
-        .map_err(|_| "bad duration")?;
+    let hold = hold_for(args.get(2))?;
 
     let (class, mut probe) = render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
         .map_err(|e| e.to_string())?;
@@ -2509,22 +2509,18 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     sub.load_sub_state(0, &state)?;
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened the wrapper's editor with a {} node", short(plugin));
-    println!("close the window, or wait {seconds:.0}s");
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs_f64(seconds);
-    while Instant::now() < deadline && sub.editor_is_open(0) {
-        plugin_host::pump_events();
-        sub.tick_editors();
-        std::thread::sleep(Duration::from_millis(16));
+    match hold {
+        Some(limit) => println!("close the window, or wait {:.0}s", limit.as_secs_f64()),
+        None => println!("close the window when you are done looking"),
     }
-    let open = sub.editor_is_open(0);
+
+    let (open, elapsed) = hold_editor_open(&mut sub, hold);
     sub.close_editor(0);
     sub.unload_all();
     println!(
         "{} after {:.1}s",
-        if open { "still open" } else { "closed itself" },
-        started.elapsed().as_secs_f64()
+        if open { "still open" } else { "closed" },
+        elapsed.as_secs_f64()
     );
     println!("teardown completed cleanly");
     Ok(())
@@ -2656,6 +2652,46 @@ fn spread(envelope: &[f32]) -> f32 {
     highest - lowest
 }
 
+/// Pump the message loop until the editor closes, or until `deadline` passes.
+///
+/// A plugin would never do this — the DAW is already pumping — but a harness
+/// has to, or the window comes up and never repaints.
+///
+/// `None` means "until the window is closed", which is what an unattended run
+/// must never ask for and what looking at the thing always wants. Whichever of
+/// the two ended it is worth reporting: a window that closes itself well before
+/// its deadline is the plugin giving up, not the user.
+fn hold_editor_open(
+    sub: &mut subhost_adapter::SubHost,
+    deadline: Option<std::time::Duration>,
+) -> (bool, std::time::Duration) {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    while sub.editor_is_open(0) {
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            break;
+        }
+        plugin_host::pump_events();
+        sub.tick_editors();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    (sub.editor_is_open(0), started.elapsed())
+}
+
+/// How long a harness should hold an editor open, from an optional argument.
+///
+/// Absent means "until the window is closed"; `0` says the same thing out loud,
+/// for a script that would rather not rely on an argument's absence.
+fn hold_for(arg: Option<&String>) -> Result<Option<std::time::Duration>, String> {
+    let Some(text) = arg else { return Ok(None) };
+    let seconds: f64 = text.parse().map_err(|_| "bad duration")?;
+    if seconds <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(std::time::Duration::from_secs_f64(seconds)))
+}
+
 /// M4's acceptance check, run without a DAW.
 ///
 /// Opens a sub-plugin's editor and tears it down in each of the two orders
@@ -2672,16 +2708,11 @@ fn spread(envelope: &[f32]) -> f32 {
 /// first.
 fn cmd_gui(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
     use subhost_adapter::SubHost;
 
     let path = args.first().ok_or("expected a plugin path")?;
     let class_id = args.get(1).map(String::as_str).filter(|t| !t.is_empty());
-    let seconds: f64 = args
-        .get(2)
-        .filter(|s| !s.starts_with("--"))
-        .map_or(Ok(1.5), |s| s.parse())
-        .map_err(|_| "bad duration")?;
+    let hold = hold_for(args.get(2).filter(|s| !s.starts_with("--")))?;
     let reverse = args.iter().any(|a| a == "--reverse");
 
     let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
@@ -2689,25 +2720,16 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened {name}");
-
-    // Stand in for the DAW's message pump. A plugin would never do this — the
-    // DAW is already pumping — but a harness has to.
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs_f64(seconds);
-    while Instant::now() < deadline && sub.editor_is_open(0) {
-        plugin_host::pump_events();
-        sub.tick_editors();
-        std::thread::sleep(Duration::from_millis(16));
+    match hold {
+        Some(limit) => println!("close the window, or wait {:.0}s", limit.as_secs_f64()),
+        None => println!("close the window when you are done looking"),
     }
-    // Which of the two ended it matters: a window that closes itself long
-    // before the deadline is the plugin giving up, not the user.
-    if sub.editor_is_open(0) {
-        println!("held open for {:.1}s", started.elapsed().as_secs_f64());
+
+    let (open, elapsed) = hold_editor_open(&mut sub, hold);
+    if open {
+        println!("held open for {:.1}s", elapsed.as_secs_f64());
     } else {
-        println!(
-            "the editor closed itself after {:.1}s",
-            started.elapsed().as_secs_f64()
-        );
+        println!("the editor closed after {:.1}s", elapsed.as_secs_f64());
     }
 
     if reverse {
