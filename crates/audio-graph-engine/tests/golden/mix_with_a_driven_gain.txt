@@ -1,0 +1,79 @@
+Program {
+    ops: [
+        Lfo {
+            out: 0,
+            state: 0,
+            waveform: Sine,
+            rate: Hz(
+                2.0,
+            ),
+            offset_phase: 0.0,
+            depth: 0.5,
+            centre: 0.5,
+        },
+    ],
+    registers: 1,
+    outputs: [
+        (
+            96,
+            0,
+        ),
+    ],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Input {
+            out: 1,
+            bus: 1,
+        },
+        Input {
+            out: 2,
+            bus: 2,
+        },
+        Mix {
+            out: 0,
+            inputs: [
+                MixIn {
+                    buf: 0,
+                    lane: None,
+                    gain: 1.0,
+                },
+                MixIn {
+                    buf: 1,
+                    lane: Some(
+                        96,
+                    ),
+                    gain: 0.5,
+                },
+                MixIn {
+                    buf: 2,
+                    lane: None,
+                    gain: 0.25,
+                },
+            ],
+        },
+        Output {
+            a: 0,
+            bus: 0,
+        },
+    ],
+    param_targets: [],
+    instances: [],
+    buffers: [
+        2,
+        2,
+        2,
+    ],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [
+        5,
+    ],
+}

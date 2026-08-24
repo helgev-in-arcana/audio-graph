@@ -1,0 +1,61 @@
+Program {
+    ops: [],
+    registers: 0,
+    outputs: [],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [
+        2.0,
+    ],
+    audio_delay_nodes: [
+        1,
+    ],
+    delay_nodes: [
+        1,
+    ],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        DelayRead {
+            out: 1,
+            line: 0,
+            lane: None,
+            time: 0.25,
+            max_time: 2.0,
+        },
+        Mix {
+            out: 0,
+            inputs: [
+                MixIn {
+                    buf: 0,
+                    lane: None,
+                    gain: 1.0,
+                },
+                MixIn {
+                    buf: 1,
+                    lane: None,
+                    gain: 0.5,
+                },
+            ],
+        },
+        Output {
+            a: 0,
+            bus: 0,
+        },
+        DelayWrite {
+            line: 0,
+            a: 0,
+        },
+    ],
+    param_targets: [],
+    instances: [],
+    buffers: [
+        2,
+        2,
+    ],
+    chunking: SubBlock,
+    latency: 0,
+    lfo_nodes: [],
+}

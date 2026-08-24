@@ -1,0 +1,85 @@
+Program {
+    ops: [
+        Const {
+            out: 0,
+            value: 0.75,
+        },
+    ],
+    registers: 1,
+    outputs: [
+        (
+            32,
+            0,
+        ),
+    ],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Input {
+            out: 1,
+            bus: 1,
+        },
+        Gather {
+            out: 2,
+            buses: [
+                (
+                    0,
+                    2,
+                ),
+                (
+                    1,
+                    2,
+                ),
+            ],
+        },
+        Plugin {
+            instance: 0,
+            input: 2,
+            input_buses: [
+                2,
+                2,
+            ],
+            output: 0,
+            output_buses: [
+                2,
+            ],
+            notes: None,
+        },
+        Output {
+            a: 0,
+            bus: 0,
+        },
+    ],
+    param_targets: [
+        ParamTarget {
+            instance: 0,
+            param: 12,
+        },
+    ],
+    instances: [
+        InstanceIo {
+            instance: 0,
+            input_channels: 2,
+            aux_inputs: [
+                2,
+            ],
+            output_channels: 2,
+            aux_outputs: [],
+        },
+    ],
+    buffers: [
+        2,
+        1,
+        4,
+    ],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [],
+}
