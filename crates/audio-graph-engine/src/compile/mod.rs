@@ -10,15 +10,13 @@
 //! state for a graph someone is halfway through drawing; the editor shows the
 //! message and keeps running the last program that compiled.
 
+mod cx;
+
+pub(crate) use cx::ParamCx;
+
 use crate::graph::{Graph, LineId, NodeId};
-use crate::ir::{
-    MAX_AUDIO_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
-    ParamTarget, Program, RateSpec, Reg,
-};
-use crate::nodes::{
-    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-    Plugin, RangeMap, Rate, SlotIn, SlotOut,
-};
+use crate::ir::{MAX_DELAY_LINES, Program};
+use crate::nodes::{DelayRead, DelayWrite, NodeKind};
 use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,280 +118,24 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         visit(graph, &index, root, &mut mark, &mut order)?;
     }
 
-    // Registers, in the order the ops will write them. Keyed by output socket,
-    // not by node: a plugin node has one per bus.
-    let mut reg_of: Vec<((NodeId, u8), Reg)> = Vec::new();
-    let mut ops: Vec<Op> = Vec::new();
-    let mut lfo_nodes: Vec<NodeId> = Vec::new();
-    // Held back and appended last. Where a `DelayWrite` lands in the
-    // topological order is not determined when nothing downstream reads the
-    // line, and "sometimes a sub-block earlier" is not a semantics anyone can
-    // reason about. Putting every write at the end makes one rule: a read sees
-    // the line as it stood at the end of the previous sub-block.
-    let mut writes: Vec<Op> = Vec::new();
-    let mut outputs: Vec<(u16, Reg)> = Vec::new();
-    // Lanes past the slot table, one per parameter socket the user wired
-    // (§14.12). The evaluator writes them the same way it writes a slot, so
-    // nothing below the compiler has to know the difference.
-    let mut param_targets: Vec<ParamTarget> = Vec::new();
-    // The same idea one range further along, for the two things the *audio*
-    // half reads: a delay time (§14.5) and a gain. The node it belongs to, and
-    // the lane number it was given.
-    let mut audio_lanes: Vec<((NodeId, u8), u16)> = Vec::new();
-
-    let mut next_reg: usize = 0;
-    let mut alloc = || -> Result<Reg, CompileError> {
-        if next_reg >= MAX_REGISTERS {
-            return Err(CompileError::TooLarge {
-                what: "nodes",
-                limit: MAX_REGISTERS,
-            });
-        }
-        let reg = next_reg as Reg;
-        next_reg += 1;
-        Ok(reg)
-    };
-
-    let lookup = |reg_of: &Vec<((NodeId, u8), Reg)>, key: (NodeId, u8)| -> Option<Reg> {
-        reg_of.iter().find(|&&(k, _)| k == key).map(|&(_, r)| r)
-    };
-
+    // The registers, the op list and the lane books all live in the context
+    // now; each node reaches for what it needs through it (see `cx.rs`).
+    let mut cx = ParamCx::new(graph, &lines, slot_count);
     for &id in &order {
         let node = graph.node(id).expect("ordering only contains real nodes");
-        // Only ever asked for `Param` inputs below; the type check that makes
-        // that safe is in `check_links`.
-        let input = |port: u8| -> Option<Reg> {
-            graph
-                .source_of(id, port)
-                .and_then(|from| lookup(&reg_of, from))
-        };
-
-        match node.kind {
-            NodeKind::Constant(Constant { value }) => {
-                let out = alloc()?;
-                ops.push(Op::Const { out, value });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::SlotIn(SlotIn { slot }) => {
-                check_slot(id, slot, slot_count)?;
-                let out = alloc()?;
-                ops.push(Op::Slot {
-                    out,
-                    slot: slot as u16,
-                });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::Lfo(Lfo {
-                waveform,
-                rate,
-                phase,
-                depth,
-                offset,
-            }) => {
-                if lfo_nodes.len() >= MAX_LFOS {
-                    return Err(CompileError::TooLarge {
-                        what: "LFOs",
-                        limit: MAX_LFOS,
-                    });
-                }
-                let state = lfo_nodes.len() as u16;
-                lfo_nodes.push(id);
-                let out = alloc()?;
-                ops.push(Op::Lfo {
-                    out,
-                    state,
-                    waveform,
-                    rate: match rate {
-                        Rate::Hz(hz) => RateSpec::Hz(hz.max(0.0)),
-                        // Zero beats per cycle would be an infinitely fast LFO;
-                        // treat it as "does not move" rather than as NaN.
-                        Rate::Beats(beats) if beats > 0.0 => RateSpec::CyclesPerBeat(1.0 / beats),
-                        Rate::Beats(_) => RateSpec::CyclesPerBeat(0.0),
-                    },
-                    offset_phase: phase.rem_euclid(1.0),
-                    depth,
-                    centre: offset,
-                });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::Expression(Expression { source }) => {
-                let out = alloc()?;
-                ops.push(Op::Expr { out, source });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::Math(Math { op, b }) => {
-                // An unconnected `a` contributes nothing. The identity element
-                // for each operator would be a slightly nicer answer, but
-                // "nothing plugged in reads as zero" is one rule instead of six.
-                let a = match input(0) {
-                    Some(reg) => reg,
-                    None => zero(&mut ops, &mut alloc)?,
-                };
-                let b = match input(1) {
-                    Some(reg) => Operand::Reg(reg),
-                    None => Operand::Value(b),
-                };
-                let out = alloc()?;
-                ops.push(Op::Math { out, a, b, op });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::RangeMap(RangeMap {
-                in_lo,
-                in_hi,
-                out_lo,
-                out_hi,
-                clamp,
-            }) => {
-                let a = match input(0) {
-                    Some(reg) => reg,
-                    None => zero(&mut ops, &mut alloc)?,
-                };
-                let out = alloc()?;
-                ops.push(Op::Range {
-                    out,
-                    a,
-                    in_lo,
-                    in_span: in_hi - in_lo,
-                    out_lo,
-                    out_span: out_hi - out_lo,
-                    clamp,
-                });
-                reg_of.push(((id, 0), out));
-            }
-            NodeKind::SlotOut(SlotOut { slot }) => {
-                check_slot(id, slot, slot_count)?;
-                if outputs.iter().any(|&(s, _)| s as usize == slot) {
-                    return Err(CompileError::DuplicateOutput { slot });
-                }
-                // An output with nothing plugged in is not an error — it is a
-                // node the user has placed and not yet wired. It just does not
-                // take the slot over from the DAW.
-                if let Some(reg) = input(0) {
-                    outputs.push((slot as u16, reg));
-                }
-            }
-            NodeKind::DelayRead(DelayRead { line, ty, time, .. }) => {
-                let index = lines
-                    .iter()
-                    .position(|l| l.id == line)
-                    .expect("collect_lines saw every DelayRead");
-                // A negative time would read the future.
-                let time = time.max(0.0);
-                let time_reg = input(0);
-                match ty {
-                    PortType::Audio { .. } => {
-                        // The audio half owns this line. All the param half
-                        // does is carry the time across to it, and only when
-                        // the user has wired something to the control: a lane
-                        // is a scarce thing to spend on a number that never
-                        // changes (§14.12, and §14.5 for why a lane at all —
-                        // the audio pass runs after every sub-block of the
-                        // param pass, so a register would hold the wrong one).
-                        if let Some(reg) = time_reg {
-                            let lane = audio_lane(&mut audio_lanes, slot_count, (id, 0))?;
-                            outputs.push((lane, reg));
-                        }
-                    }
-                    _ => {
-                        let out = alloc()?;
-                        ops.push(Op::DelayRead {
-                            out,
-                            line: index as u16,
-                            time,
-                            time_reg,
-                        });
-                        reg_of.push(((id, 0), out));
-                    }
-                }
-            }
-            NodeKind::DelayWrite(DelayWrite { line, ty }) => {
-                let index = lines
-                    .iter()
-                    .position(|l| l.id == line)
-                    .expect("collect_lines saw every DelayWrite");
-                if matches!(ty, PortType::Audio { .. }) {
-                    continue;
-                }
-                // Nothing plugged in writes silence, the same way an unwired
-                // SlotOut simply does not take its slot over.
-                if let Some(reg) = input(0) {
-                    writes.push(Op::DelayWrite {
-                        line: index as u16,
-                        a: reg,
-                    });
-                }
-            }
-            // Audio nodes carry no param register. The audio pass walks the
-            // same order again and emits their half (§14.9).
-            NodeKind::Plugin(Plugin { instance, .. }) => {
-                // A plugin node's parameter sockets sit after its audio inputs
-                // and its notes port. Only the ones with something wired to
-                // them cost anything.
-                let NodeKind::Plugin(Plugin { ports, .. }) = &node.kind else {
-                    unreachable!()
-                };
-                let first = ports.audio_in.len() + usize::from(ports.accepts_notes);
-                for (index, param) in ports.params.iter().enumerate() {
-                    let Some(reg) = input((first + index) as u8) else {
-                        continue;
-                    };
-                    if param_targets.len() >= MAX_GRAPH_PARAMS {
-                        return Err(CompileError::TooLarge {
-                            what: "graph-driven parameters",
-                            limit: MAX_GRAPH_PARAMS,
-                        });
-                    }
-                    let target = ParamTarget {
-                        instance: instance as u32,
-                        param: param.id,
-                    };
-                    // Two sockets naming one parameter is a patch the user can
-                    // draw; the last one to compile wins, which at least is a
-                    // rule rather than an accident of node order.
-                    match param_targets.iter().position(|t| *t == target) {
-                        Some(lane) => {
-                            outputs.retain(|&(l, _)| l as usize != slot_count + lane);
-                            outputs.push(((slot_count + lane) as u16, reg));
-                        }
-                        None => {
-                            param_targets.push(target);
-                            outputs.push(((slot_count + param_targets.len() - 1) as u16, reg));
-                        }
-                    }
-                }
-            }
-            // A mix's gains are params, so the param half is where their lanes
-            // are booked; the scaling itself is the audio half's. The gain
-            // sockets sit after the audio inputs.
-            NodeKind::Mix(Mix { inputs, .. }) => {
-                for i in 0..inputs {
-                    // Signal, gain, signal, gain: the gain for input `i` is the
-                    // socket right after it.
-                    let port = 2 * i + 1;
-                    let Some(reg) = input(port) else {
-                        continue;
-                    };
-                    let lane = audio_lane(&mut audio_lanes, slot_count, (id, port))?;
-                    outputs.push((lane, reg));
-                }
-            }
-            NodeKind::AudioIn(AudioIn { .. })
-            | NodeKind::AudioOut(AudioOut { .. })
-            | NodeKind::NoteIn => {}
-        }
+        cx.begin(id);
+        node.kind.compile(&mut cx)?;
     }
+    let param = cx.finish();
 
-    ops.append(&mut writes);
+    let audio = crate::audio::compile_audio(graph, &order, &lines, &param.audio_lanes)?;
 
-    let audio = crate::audio::compile_audio(graph, &order, &lines, &audio_lanes)?;
-
-    outputs.sort_unstable();
     Ok(Program {
-        ops,
-        registers: next_reg,
-        outputs,
+        ops: param.ops,
+        registers: param.registers,
+        outputs: param.outputs,
         audio_ops: audio.ops,
-        param_targets,
+        param_targets: param.param_targets,
         instances: audio.instances,
         buffers: audio.buffers,
         chunking: audio.chunking,
@@ -405,33 +147,8 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         // sample rate and the only side allowed to allocate (§9.1).
         audio_ring_len: Vec::new(),
         audio_rings: Vec::new(),
-        lfo_nodes,
+        lfo_nodes: param.lfo_nodes,
     })
-}
-
-/// The lane a node's audio-side control is written to, booking one if this is
-/// the node's first.
-///
-/// A range of its own, past the slot table and past §14.12's parameter lanes,
-/// so that each consumer reads only what it understands: the sub-plugin adapter
-/// never sees one of these, and the audio half never sees a parameter.
-fn audio_lane(
-    lanes: &mut Vec<((NodeId, u8), u16)>,
-    slot_count: usize,
-    socket: (NodeId, u8),
-) -> Result<u16, CompileError> {
-    if let Some(&(_, lane)) = lanes.iter().find(|&&(s, _)| s == socket) {
-        return Ok(lane);
-    }
-    if lanes.len() >= MAX_AUDIO_LANES {
-        return Err(CompileError::TooLarge {
-            what: "automated delay times and gains",
-            limit: MAX_AUDIO_LANES,
-        });
-    }
-    let lane = (slot_count + MAX_GRAPH_PARAMS + lanes.len()) as u16;
-    lanes.push((socket, lane));
-    Ok(lane)
 }
 
 /// One delay line, as the compiler sees it.
@@ -524,31 +241,6 @@ fn check_links(graph: &Graph) -> Result<(), CompileError> {
     Ok(())
 }
 
-/// A register holding zero, for an input nobody has connected yet.
-fn zero(
-    ops: &mut Vec<Op>,
-    alloc: &mut impl FnMut() -> Result<Reg, CompileError>,
-) -> Result<Reg, CompileError> {
-    // Reuse one if this graph already needed it. Constants are free to run but
-    // not free to hold, and a wide graph can want a lot of them.
-    if let Some(&Op::Const { out, .. }) = ops
-        .iter()
-        .find(|op| matches!(op, Op::Const { value, .. } if *value == 0.0))
-    {
-        return Ok(out);
-    }
-    let out = alloc()?;
-    ops.push(Op::Const { out, value: 0.0 });
-    Ok(out)
-}
-
-fn check_slot(node: NodeId, slot: usize, slot_count: usize) -> Result<(), CompileError> {
-    if slot >= slot_count {
-        return Err(CompileError::BadSlot { node, slot });
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Mark {
     New,
@@ -593,7 +285,10 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{MathOp, Waveform};
+    use crate::ir::{MAX_REGISTERS, MathOp, Op, Operand, Reg, Waveform};
+    use crate::nodes::{
+        AudioIn, Constant, DelayRead, DelayWrite, Lfo, Math, NodeKind, Rate, SlotIn, SlotOut,
+    };
 
     const SLOTS: usize = 32;
 

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ir::MathOp;
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::{Op, Operand};
 use crate::port::Port;
 
 /// Two inputs and an operator. Input 1 falls back to `b` when unconnected,
@@ -23,5 +25,24 @@ impl Math {
 
     pub fn title(&self) -> String {
         self.op.label().into()
+    }
+}
+
+impl Math {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let a = cx.input_or_zero(0)?;
+        let b = match cx.input(1) {
+            Some(reg) => Operand::Reg(reg),
+            None => Operand::Value(self.b),
+        };
+        let out = cx.alloc()?;
+        cx.emit(Op::Math {
+            out,
+            a,
+            b,
+            op: self.op,
+        });
+        cx.bind_output(0, out);
+        Ok(())
     }
 }

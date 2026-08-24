@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::ParamTarget;
 use crate::port::{Port, PortType};
 
 /// One sub-plugin parameter the graph is allowed to drive.
@@ -131,5 +133,28 @@ impl Plugin {
 
     pub fn title(&self) -> String {
         format!("Plugin {}", self.instance + 1)
+    }
+}
+
+impl Plugin {
+    /// The param half of a plugin node is only its parameter sockets; the
+    /// audio pass walks the same order again and emits the rest (§14.9).
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        // A plugin node's parameter sockets sit after its audio inputs and its
+        // notes port. Only the ones with something wired to them cost anything.
+        let first = self.ports.audio_in.len() + usize::from(self.ports.accepts_notes);
+        for (index, param) in self.ports.params.iter().enumerate() {
+            let Some(reg) = cx.input((first + index) as u8) else {
+                continue;
+            };
+            cx.drive_param(
+                ParamTarget {
+                    instance: self.instance as u32,
+                    param: param.id,
+                },
+                reg,
+            )?;
+        }
+        Ok(())
     }
 }

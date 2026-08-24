@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
 use crate::port::Port;
 
 /// A fixed number.
@@ -19,5 +21,17 @@ impl Constant {
 
     pub fn title(&self) -> String {
         "Constant".into()
+    }
+}
+
+impl Constant {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let out = cx.alloc()?;
+        cx.emit(Op::Const {
+            out,
+            value: self.value,
+        });
+        cx.bind_output(0, out);
+        Ok(())
     }
 }

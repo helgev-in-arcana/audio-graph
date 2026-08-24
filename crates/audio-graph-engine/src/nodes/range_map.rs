@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
 use crate::port::Port;
 
 /// Rescale one range onto another. The 0..1 → plain-units half of §9.3 is
@@ -25,5 +27,23 @@ impl RangeMap {
 
     pub fn title(&self) -> String {
         "Range map".into()
+    }
+}
+
+impl RangeMap {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let a = cx.input_or_zero(0)?;
+        let out = cx.alloc()?;
+        cx.emit(Op::Range {
+            out,
+            a,
+            in_lo: self.in_lo,
+            in_span: self.in_hi - self.in_lo,
+            out_lo: self.out_lo,
+            out_span: self.out_hi - self.out_lo,
+            clamp: self.clamp,
+        });
+        cx.bind_output(0, out);
+        Ok(())
     }
 }
