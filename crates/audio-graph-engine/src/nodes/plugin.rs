@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::port::{Port, PortType};
+
 /// One sub-plugin parameter the graph is allowed to drive.
 ///
 /// A plugin node does not get a socket per parameter — Chroma has 2106 of them.
@@ -82,4 +84,52 @@ impl PluginPorts {
 pub struct Plugin {
     pub instance: usize,
     pub ports: PluginPorts,
+}
+
+impl Plugin {
+    /// Main audio, then aux (sidechain), then notes if it takes them, then one
+    /// socket per exposed parameter.
+    ///
+    /// The order matters more than it looks: it is what link indices mean, so
+    /// inserting a category in the middle would re-point every saved link.
+    /// Grow it only at the end.
+    pub fn input_ports(&self) -> Vec<Port> {
+        let mut out = Vec::new();
+        for (i, &channels) in self.ports.audio_in.iter().enumerate() {
+            let name = match i {
+                0 => "in".to_string(),
+                1 => "sidechain".to_string(),
+                _ => format!("aux {i}"),
+            };
+            let port = Port::new(name, PortType::Audio { channels });
+            out.push(if i == 0 { port } else { port.aux() });
+        }
+        if self.ports.accepts_notes {
+            out.push(Port::new("notes", PortType::Note));
+        }
+        for param in &self.ports.params {
+            out.push(Port::param(param.name.clone()));
+        }
+        out
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        self.ports
+            .audio_out
+            .iter()
+            .enumerate()
+            .map(|(i, &channels)| {
+                let name = if i == 0 {
+                    "out".to_string()
+                } else {
+                    format!("out {}", i + 1)
+                };
+                Port::new(name, PortType::Audio { channels })
+            })
+            .collect()
+    }
+
+    pub fn title(&self) -> String {
+        format!("Plugin {}", self.instance + 1)
+    }
 }

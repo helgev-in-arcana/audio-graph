@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::port::{Port, PortType};
+
 /// Sum several audio inputs of the same width into one, each at its own
 /// gain.
 ///
@@ -24,4 +26,38 @@ pub struct Mix {
     pub inputs: u8,
     #[serde(default)]
     pub gains: Vec<f64>,
+}
+
+impl Mix {
+    /// Each input next to its own gain, rather than all the signals followed
+    /// by all the gains: they are one row of one control on screen, and a
+    /// socket list that does not read that way makes the user count.
+    pub fn input_ports(&self) -> Vec<Port> {
+        (0..self.inputs)
+            .flat_map(|i| {
+                [
+                    Port::new(
+                        format!("in {}", i + 1),
+                        PortType::Audio {
+                            channels: self.channels,
+                        },
+                    ),
+                    Port::param(format!("gain {}", i + 1)),
+                ]
+            })
+            .collect()
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        vec![Port::new(
+            "out",
+            PortType::Audio {
+                channels: self.channels,
+            },
+        )]
+    }
+
+    pub fn title(&self) -> String {
+        "Mix".into()
+    }
 }
