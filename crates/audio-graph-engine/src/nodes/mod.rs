@@ -40,6 +40,69 @@ pub use slot::{SlotIn, SlotOut};
 
 use serde::{Deserialize, Serialize};
 
+/// What every node is, in one declaration.
+///
+/// Before this existed, the answer to "what does a node have to do" was
+/// spread over four `match` statements in three crates, and the only way to
+/// find out was to add a variant and read the compiler's complaints. Now it is
+/// here, and a new node is one file that implements this.
+///
+/// The defaults are the point of most of it. A `Constant` has no audio half, a
+/// `Math` declares nothing, and only `NoteIn` is a source of notes — so those
+/// nodes say nothing about any of it, and what is left in their files is what
+/// makes them different from each other.
+///
+/// [`NodeKind`] stays an enum and keeps delegating through `for_kind!`. That
+/// is deliberate, and ADR-14 records the trade: an enum keeps the
+/// exhaustiveness check, the derived `Serialize`/`Deserialize`/`PartialEq`,
+/// and static dispatch, at the cost of one line per node in the macro. A
+/// `Box<dyn Node>` would buy third-party nodes and cost all four — plus a
+/// public contract for the patch format, a receptacle for unknown kinds, and a
+/// validation pass over `Program`, since an outside node could emit an
+/// instruction stream the engine indexes without checking.
+///
+/// Not in here: `catalogue_defaults`, which returns `Self` and so would make
+/// the trait un-object-safe for no gain — and which is not one-per-node
+/// anyway, since `Mix` offers itself twice.
+pub(crate) trait Node {
+    fn title(&self) -> String;
+    fn input_ports(&self) -> Vec<Port>;
+    fn output_ports(&self) -> Vec<Port>;
+
+    /// Say what has to be booked before anything is emitted — today, delay
+    /// lines. Runs over the whole graph before either half compiles.
+    fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        let _ = cx;
+        Ok(())
+    }
+
+    /// Emit the parameter half (§9.2).
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let _ = cx;
+        Ok(())
+    }
+
+    /// Emit the audio half (§14.9).
+    fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        let _ = cx;
+        Ok(())
+    }
+
+    /// The note stream a plugin wired to this node's output plays from, if
+    /// this node is a source of notes at all (§14.10).
+    fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+
+    /// Draw this node's own controls, inside the frame the canvas laid out.
+    /// Returns whether anything changed.
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
+        let _ = (ui, cx);
+        false
+    }
+}
+
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::ir::NoteSource;
 use crate::port::Port;

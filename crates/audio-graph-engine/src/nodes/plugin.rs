@@ -2,8 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, NoteSource, ParamTarget};
+use crate::compile::{AudioCx, CompileError, ParamCx};
+use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, ParamTarget};
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
 use crate::port::{Port, PortType};
 
 /// One sub-plugin parameter the graph is allowed to drive.
@@ -88,14 +91,18 @@ impl PluginPorts {
     }
 }
 
-impl Plugin {
+impl Node for Plugin {
+    fn title(&self) -> String {
+        format!("Plugin {}", self.instance + 1)
+    }
+
     /// Main audio, then aux (sidechain), then notes if it takes them, then one
     /// socket per exposed parameter.
     ///
     /// The order matters more than it looks: it is what link indices mean, so
     /// inserting a category in the middle would re-point every saved link.
     /// Grow it only at the end.
-    pub fn input_ports(&self) -> Vec<Port> {
+    fn input_ports(&self) -> Vec<Port> {
         let mut out = Vec::new();
         for (i, &channels) in self.ports.audio_in.iter().enumerate() {
             let name = match i {
@@ -115,7 +122,7 @@ impl Plugin {
         out
     }
 
-    pub fn output_ports(&self) -> Vec<Port> {
+    fn output_ports(&self) -> Vec<Port> {
         self.ports
             .audio_out
             .iter()
@@ -131,13 +138,9 @@ impl Plugin {
             .collect()
     }
 
-    pub fn title(&self) -> String {
-        format!("Plugin {}", self.instance + 1)
-    }
-
     /// The param half of a plugin node is only its parameter sockets; the
     /// audio pass walks the same order again and emits the rest (§14.9).
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         // A plugin node's parameter sockets sit after its audio inputs and its
         // notes port. Only the ones with something wired to them cost anything.
         let first = self.ports.audio_in.len() + usize::from(self.ports.accepts_notes);
@@ -156,7 +159,7 @@ impl Plugin {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+    fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let out_width = cx.out_width();
         if out_width == 0 {
             // A plugin with no output bus cannot be routed through. It is still
@@ -302,27 +305,14 @@ impl Plugin {
         Ok(())
     }
 
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
-    }
-}
-
-#[cfg(feature = "ui")]
-use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
-
-#[cfg(feature = "ui")]
-impl Plugin {
     /// What is loaded in this node, and its parameter sockets.
     ///
     /// The sockets are the user's choice, not the plugin's (§14.12). A
     /// compressor has ninety parameters and a node with ninety sockets would be
     /// unusable, so they are added one at a time and each one picks what it
     /// drives from a dropdown.
-    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let mut changed = false;
         let view = cx.instances.get(self.instance).cloned().unwrap_or_default();
 
@@ -396,7 +386,10 @@ impl Plugin {
         }
         changed
     }
+}
 
+#[cfg(feature = "ui")]
+impl Plugin {
     /// Not in the plain menu: a plugin node needs an instance number and a file
     /// to load, so the editor offers it through the plugin list instead.
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Plugin)> {

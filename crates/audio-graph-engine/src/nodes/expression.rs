@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::compile::AudioCx;
-use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
 pub use crate::ir::ExprSource;
-use crate::ir::NoteSource;
 use crate::ir::Op;
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{NodeUi, combo};
 use crate::port::Port;
 
 /// A note expression, reduced to one value (see [`ExprSource`]).
@@ -14,20 +14,20 @@ pub struct Expression {
     pub source: ExprSource,
 }
 
-impl Expression {
-    pub fn input_ports(&self) -> Vec<Port> {
-        Vec::new()
-    }
-
-    pub fn output_ports(&self) -> Vec<Port> {
-        vec![Port::param("out")]
-    }
-
-    pub fn title(&self) -> String {
+impl Node for Expression {
+    fn title(&self) -> String {
         self.source.label().into()
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn input_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    fn output_ports(&self) -> Vec<Port> {
+        vec![Port::param("out")]
+    }
+
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let out = cx.alloc()?;
         cx.emit(Op::Expr {
             out,
@@ -37,25 +37,8 @@ impl Expression {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
-    }
-}
-
-#[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo};
-
-#[cfg(feature = "ui")]
-impl Expression {
-    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let changed = combo(
             ui,
             "source",
@@ -77,7 +60,10 @@ impl Expression {
         }
         changed
     }
+}
 
+#[cfg(feature = "ui")]
+impl Expression {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Expression)> {
         vec![(
             "Expression",

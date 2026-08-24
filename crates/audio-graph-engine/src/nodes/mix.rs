@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-use crate::ir::{AudioOp, Buf, MixIn, NoteSource};
+use crate::compile::{AudioCx, CompileError, ParamCx};
+use crate::ir::{AudioOp, Buf, MixIn};
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::NodeUi;
 use crate::port::{Port, PortType};
 
 /// Sum several audio inputs of the same width into one, each at its own
@@ -30,11 +33,15 @@ pub struct Mix {
     pub gains: Vec<f64>,
 }
 
-impl Mix {
+impl Node for Mix {
+    fn title(&self) -> String {
+        "Mix".into()
+    }
+
     /// Each input next to its own gain, rather than all the signals followed
     /// by all the gains: they are one row of one control on screen, and a
     /// socket list that does not read that way makes the user count.
-    pub fn input_ports(&self) -> Vec<Port> {
+    fn input_ports(&self) -> Vec<Port> {
         (0..self.inputs)
             .flat_map(|i| {
                 [
@@ -50,7 +57,7 @@ impl Mix {
             .collect()
     }
 
-    pub fn output_ports(&self) -> Vec<Port> {
+    fn output_ports(&self) -> Vec<Port> {
         vec![Port::new(
             "out",
             PortType::Audio {
@@ -59,13 +66,9 @@ impl Mix {
         )]
     }
 
-    pub fn title(&self) -> String {
-        "Mix".into()
-    }
-
     /// A mix's gains are params, so the param half is where their lanes are
     /// booked; the scaling itself is the audio half's.
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         for i in 0..self.inputs {
             // Signal, gain, signal, gain: the gain for input `i` is the socket
             // right after it.
@@ -77,7 +80,7 @@ impl Mix {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+    fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         // §14.6, the merge point: every branch waits for the latest one or they
         // phase-cancel.
         let arrive = cx
@@ -120,21 +123,8 @@ impl Mix {
         Ok(())
     }
 
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
-    }
-}
-
-#[cfg(feature = "ui")]
-use crate::nodes::widgets::NodeUi;
-
-#[cfg(feature = "ui")]
-impl Mix {
-    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("inputs");
@@ -164,7 +154,10 @@ impl Mix {
         ui.weak("a gain is used only while its socket is unconnected");
         changed
     }
+}
 
+#[cfg(feature = "ui")]
+impl Mix {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Mix)> {
         vec![
             (

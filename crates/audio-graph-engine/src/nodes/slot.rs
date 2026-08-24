@@ -7,8 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-use crate::ir::{NoteSource, Op};
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{NodeUi, slot_picker};
 use crate::port::Port;
 
 /// The DAW's automation for one wrapper slot, 0..1.
@@ -23,20 +26,20 @@ pub struct SlotOut {
     pub slot: usize,
 }
 
-impl SlotIn {
-    pub fn input_ports(&self) -> Vec<Port> {
-        Vec::new()
-    }
-
-    pub fn output_ports(&self) -> Vec<Port> {
-        vec![Port::param("out")]
-    }
-
-    pub fn title(&self) -> String {
+impl Node for SlotIn {
+    fn title(&self) -> String {
         format!("Slot {} in", self.slot + 1)
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn input_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    fn output_ports(&self) -> Vec<Port> {
+        vec![Port::param("out")]
+    }
+
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         cx.check_slot(self.slot)?;
         let out = cx.alloc()?;
         cx.emit(Op::Slot {
@@ -47,47 +50,33 @@ impl SlotIn {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+        slot_picker(ui, &mut self.slot, cx)
     }
 }
 
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, slot_picker};
-
-#[cfg(feature = "ui")]
 impl SlotIn {
-    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
-        slot_picker(ui, &mut self.slot, cx)
-    }
-
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, SlotIn)> {
         vec![("Slot in", SlotIn { slot: 0 })]
     }
 }
 
-impl SlotOut {
-    pub fn input_ports(&self) -> Vec<Port> {
-        vec![Port::param("in")]
-    }
-
-    pub fn output_ports(&self) -> Vec<Port> {
-        Vec::new()
-    }
-
-    pub fn title(&self) -> String {
+impl Node for SlotOut {
+    fn title(&self) -> String {
         format!("Slot {} out", self.slot + 1)
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn input_ports(&self) -> Vec<Port> {
+        vec![Port::param("in")]
+    }
+
+    fn output_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         cx.check_slot(self.slot)?;
         cx.claim_slot(self.slot)?;
         // An output with nothing plugged in is not an error - it is a node the
@@ -99,25 +88,14 @@ impl SlotOut {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+        slot_picker(ui, &mut self.slot, cx)
     }
 }
 
 #[cfg(feature = "ui")]
 impl SlotOut {
-    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
-        slot_picker(ui, &mut self.slot, cx)
-    }
-
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, SlotOut)> {
         vec![("Slot out", SlotOut { slot: 0 })]
     }
