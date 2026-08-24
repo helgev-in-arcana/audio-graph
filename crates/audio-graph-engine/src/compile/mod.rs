@@ -13,11 +13,10 @@
 mod audio;
 mod cx;
 
-pub(crate) use cx::{AudioCx, ParamCx};
+pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
 use crate::graph::{Graph, LineId, NodeId};
-use crate::ir::{MAX_DELAY_LINES, Program};
-use crate::nodes::{DelayRead, DelayWrite, NodeKind};
+use crate::ir::Program;
 use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,60 +162,14 @@ pub(crate) struct Line {
     pub ty: PortType,
 }
 
-/// Number the delay lines and check that each one's halves agree.
-///
-/// A line with reads but no write is not an error: it reads silence, which is
-/// what a half-drawn patch should do. A line with a write and no read is not an
-/// error either — it is just unread.
+/// Ask every node what delay lines it is an end of, and number them.
 fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
-    let mut lines: Vec<(Line, PortType)> = Vec::new();
-
+    let mut cx = DeclareCx::new();
     for node in &graph.nodes {
-        let (id, ty, writer) = match node.kind {
-            NodeKind::DelayWrite(DelayWrite { line, ty }) => (line, ty, Some(node.id)),
-            NodeKind::DelayRead(DelayRead { line, ty, .. }) => (line, ty, None),
-            _ => continue,
-        };
-        // A note delay line would have to store events, not values, and the
-        // param ring stores one `f64` per sub-block. Refusing is the honest
-        // answer; compiling it would drop every note in silence.
-        if matches!(ty, PortType::Note) {
-            return Err(CompileError::NotYet {
-                what: "note delay lines",
-            });
-        }
-        match lines.iter_mut().find(|(l, _)| l.id == id) {
-            Some((existing, seen_ty)) => {
-                if *seen_ty != ty {
-                    return Err(CompileError::DelayTypeMismatch { line: id });
-                }
-                if let Some(node_id) = writer {
-                    if existing.writer != NO_WRITER {
-                        return Err(CompileError::DuplicateDelayWrite { line: id });
-                    }
-                    existing.writer = node_id;
-                }
-            }
-            None => {
-                if lines.len() >= MAX_DELAY_LINES {
-                    return Err(CompileError::TooLarge {
-                        what: "delay lines",
-                        limit: MAX_DELAY_LINES,
-                    });
-                }
-                lines.push((
-                    Line {
-                        id,
-                        writer: writer.unwrap_or(NO_WRITER),
-                        ty,
-                    },
-                    ty,
-                ));
-            }
-        }
+        cx.begin(node.id);
+        node.kind.declare(&mut cx)?;
     }
-
-    Ok(lines.into_iter().map(|(l, _)| l).collect())
+    Ok(cx.finish())
 }
 
 /// Stands in for "this line has no writer yet". Node ids are never reused, and

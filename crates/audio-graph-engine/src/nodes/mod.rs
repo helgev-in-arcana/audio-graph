@@ -37,7 +37,8 @@ pub use slot::{SlotIn, SlotOut};
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, CompileError, ParamCx};
+use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
+use crate::ir::NoteSource;
 use crate::port::Port;
 
 /// One node's identity and settings.
@@ -117,6 +118,17 @@ impl NodeKind {
 
     pub fn title(&self) -> String {
         for_kind!(self, node => node.title())
+    }
+
+    /// Say what this node needs booked before anything is emitted.
+    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        for_kind!(self, node => node.declare(cx))
+    }
+
+    /// The note stream a plugin wired to this node's output plays from, if it
+    /// is a source of notes at all (§14.10).
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        for_kind!(self, node => node.note_identity())
     }
 
     /// Emit this node's parameter-half instructions (§9.2).

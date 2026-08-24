@@ -9,10 +9,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::AudioCx;
+use crate::compile::{AudioCx, DeclareCx};
 use crate::compile::{CompileError, ParamCx};
 use crate::graph::LineId;
 use crate::ir::AudioOp;
+use crate::ir::NoteSource;
 use crate::ir::Op;
 use crate::port::{Port, PortType};
 
@@ -156,5 +157,29 @@ impl DelayWrite {
             cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
         }
         Ok(())
+    }
+}
+
+impl DelayWrite {
+    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        cx.declare_line(self.line, self.ty, true)
+    }
+}
+
+impl DelayRead {
+    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        cx.declare_line(self.line, self.ty, false)
+    }
+}
+
+impl DelayWrite {
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+}
+
+impl DelayRead {
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
     }
 }
