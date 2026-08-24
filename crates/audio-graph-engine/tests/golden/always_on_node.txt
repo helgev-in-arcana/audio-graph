@@ -1,0 +1,31 @@
+Program {
+    ops: [
+        Lfo {
+            out: 0,
+            state: 0,
+            waveform: Sine,
+            rate: Hz(
+                1.0,
+            ),
+            offset_phase: 0.0,
+            depth: 0.5,
+            centre: 0.5,
+        },
+    ],
+    registers: 1,
+    outputs: [],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [],
+    param_targets: [],
+    instances: [],
+    buffers: [],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [
+        0,
+    ],
+}

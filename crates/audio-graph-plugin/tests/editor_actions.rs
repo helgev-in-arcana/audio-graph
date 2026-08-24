@@ -185,7 +185,9 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 /// format-agnostic, which is the point of §9.
 #[test]
 fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
-    use audio_graph_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
+    use audio_graph_engine::{
+        BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform,
+    };
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
@@ -194,23 +196,25 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
     {
         let mut state = shared.main();
         let lfo = state.graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
                 rate: Rate::Hz(2.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
         let half = state.graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 0.5,
-            },
+            }),
             [200.0, 0.0],
         );
-        let out = state.graph.add(NodeKind::SlotOut { slot: 4 }, [400.0, 0.0]);
+        let out = state
+            .graph
+            .add(NodeKind::SlotOut(SlotOut { slot: 4 }), [400.0, 0.0]);
         state.graph.connect(lfo, 0, half, 0);
         state.graph.connect(half, 0, out, 0);
     }
@@ -258,20 +262,22 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
     {
         let mut state = shared.main();
         let a = state.graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 200.0],
         );
         let b = state.graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 300.0],
         );
-        let out = state.graph.add(NodeKind::SlotOut { slot: 6 }, [0.0, 400.0]);
+        let out = state
+            .graph
+            .add(NodeKind::SlotOut(SlotOut { slot: 6 }), [0.0, 400.0]);
         state.graph.connect(a, 0, b, 0);
         state.graph.connect(b, 0, a, 0);
         state.graph.connect(b, 0, out, 0);
@@ -295,7 +301,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
 /// making sound: what it was implicitly getting is drawn for it on open.
 #[test]
 fn a_patch_saved_without_a_graph_gets_the_default_one() {
-    use audio_graph_engine::{Graph, NodeKind};
+    use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeKind};
 
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
     shared.main().graph = Graph::new();
@@ -305,11 +311,11 @@ fn a_patch_saved_without_a_graph_gets_the_default_one() {
     assert_eq!(state.graph.nodes.len(), 2);
     assert!(matches!(
         state.graph.nodes[0].kind,
-        NodeKind::AudioIn { bus: 0, .. }
+        NodeKind::AudioIn(AudioIn { bus: 0, .. })
     ));
     assert!(matches!(
         state.graph.nodes[1].kind,
-        NodeKind::AudioOut { bus: 0, .. }
+        NodeKind::AudioOut(AudioOut { bus: 0, .. })
     ));
     assert_eq!(state.graph.links.len(), 1, "and it is wired");
 }
@@ -319,14 +325,14 @@ fn a_patch_saved_without_a_graph_gets_the_default_one() {
 /// graph with no nodes at all, and never touches one the user built.
 #[test]
 fn adoption_leaves_an_existing_graph_alone() {
-    use audio_graph_engine::NodeKind;
+    use audio_graph_engine::{Constant, NodeKind};
 
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
     let before = {
         let mut state = shared.main();
         state
             .graph
-            .add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
+            .add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
         state.graph.clone()
     };
     shared.adopt_default_patch();
@@ -337,7 +343,7 @@ fn adoption_leaves_an_existing_graph_alone() {
 /// sub-plugin it was built against is not there (§8.3).
 #[test]
 fn a_graph_survives_the_state_round_trip() {
-    use audio_graph_engine::{Graph, NodeKind};
+    use audio_graph_engine::{Constant, Graph, NodeKind, SlotOut};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params.clone());
@@ -347,10 +353,10 @@ fn a_graph_survives_the_state_round_trip() {
         state.graph = Graph::default_patch();
         let c = state
             .graph
-            .add(NodeKind::Constant { value: 0.25 }, [10.0, 20.0]);
+            .add(NodeKind::Constant(Constant { value: 0.25 }), [10.0, 20.0]);
         let out = state
             .graph
-            .add(NodeKind::SlotOut { slot: 2 }, [210.0, 20.0]);
+            .add(NodeKind::SlotOut(SlotOut { slot: 2 }), [210.0, 20.0]);
         state.graph.connect(c, 0, out, 0);
     }
     shared.store_state();
@@ -364,7 +370,7 @@ fn a_graph_survives_the_state_round_trip() {
     let constant = restored
         .nodes
         .iter()
-        .find(|n| matches!(n.kind, NodeKind::Constant { .. }))
+        .find(|n| matches!(n.kind, NodeKind::Constant(Constant { .. })))
         .expect("the constant was saved");
     assert_eq!(
         constant.pos,
@@ -385,7 +391,7 @@ fn a_graph_survives_the_state_round_trip() {
 /// parameters rather than only in the compiler's own tests.
 #[test]
 fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
-    use audio_graph_engine::{NodeKind, PluginPorts};
+    use audio_graph_engine::{AudioOut, Constant, NodeKind, Plugin, PluginPorts};
 
     let Some((path, shared)) = a_plugin_with_parameters() else {
         eprintln!("no installed plugin with parameters; skipping");
@@ -408,10 +414,10 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     let node = {
         let mut state = shared.main();
         state.graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 1,
                 ports: PluginPorts::default(),
-            },
+            }),
             [0.0, 0.0],
         )
     };
@@ -425,7 +431,8 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
 
     let ports = {
         let state = shared.main();
-        let Some(NodeKind::Plugin { ports, .. }) = state.graph.node(node).map(|n| n.kind.clone())
+        let Some(NodeKind::Plugin(Plugin { ports, .. })) =
+            state.graph.node(node).map(|n| n.kind.clone())
         else {
             panic!("the node should still be a plugin node");
         };
@@ -449,7 +456,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
         let Some(node_mut) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
             panic!("node vanished")
         };
-        if let NodeKind::Plugin { ports, .. } = &mut node_mut.kind {
+        if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node_mut.kind {
             ports.params.push(audio_graph_engine::ParamPort {
                 id: first.id.0,
                 name: first.name.clone(),
@@ -457,15 +464,15 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
         }
         let constant = state
             .graph
-            .add(NodeKind::Constant { value: 1.0 }, [-200.0, 0.0]);
+            .add(NodeKind::Constant(Constant { value: 1.0 }), [-200.0, 0.0]);
         state.graph.connect(constant, 0, node, socket);
         // Something has to consume the plugin's audio or the node is not a
         // sink and never reaches the compiler.
         let out = state.graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [200.0, 0.0],
         );
         state.graph.connect(node, 0, out, 0);

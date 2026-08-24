@@ -754,7 +754,9 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_graph_engine::{Graph, MathOp, NodeKind, Rate, Waveform, compile};
+    use audio_graph_engine::{
+        Graph, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform, compile,
+    };
     use subhost_adapter::LANES;
 
     /// A schedule carries more than the DAW's slots (§14.12), and `run_graph`
@@ -795,23 +797,23 @@ mod tests {
         // With one: same width, and the driven slot has moved.
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
                 rate: Rate::Hz(4.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
         let scale = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 1.0,
-            },
+            }),
             [100.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 7 }, [200.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 7 }), [200.0, 0.0]);
         graph.connect(lfo, 0, scale, 0);
         graph.connect(scale, 0, out, 0);
 

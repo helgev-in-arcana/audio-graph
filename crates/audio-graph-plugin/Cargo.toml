@@ -10,7 +10,7 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 plugin-host.workspace = true
 subhost-adapter.workspace = true
-audio-graph-engine.workspace = true
+audio-graph-engine = { workspace = true, features = ["ui"] }
 nice-plug = "0.3"
 nice-log = "0.3"
 log.workspace = true
