@@ -13,83 +13,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{ExprSource, MathOp, Waveform};
-use crate::port::{Port, PortType};
+use crate::nodes::{AudioIn, AudioOut, DelayRead, DelayWrite, NodeKind};
+use crate::port::PortType;
 
 pub use crate::ir::NodeId;
 
 /// Identifies one delay line. See [`NodeKind::DelayWrite`].
 pub type LineId = u32;
-
-/// One sub-plugin parameter the graph is allowed to drive.
-///
-/// A plugin node does not get a socket per parameter — Chroma has 2106 of them.
-/// The user picks which ones to expose, exactly as they pick slot bindings
-/// today (§8.3), and each pick becomes a port.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ParamPort {
-    /// The sub-plugin's own id for the parameter. A plain `u32` because the
-    /// common data model is CLAP-shaped (ADR-4) — nothing here is VST3.
-    pub id: u32,
-    pub name: String,
-}
-
-/// A sub-plugin's port layout, as discovered after loading (§14.2).
-///
-/// Cached in the graph rather than asked for on demand. A patch has to reopen
-/// with the right shape *before* its plugins have finished loading, and a node
-/// whose plugin has gone missing still has to draw with the links it had.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct PluginPorts {
-    /// Channel count of each input bus. Bus 0 is main; the rest are aux
-    /// (sidechain). Discovered from what the plugin *accepted*, not from what
-    /// was asked for.
-    #[serde(default)]
-    pub audio_in: Vec<u16>,
-    #[serde(default)]
-    pub audio_out: Vec<u16>,
-    #[serde(default)]
-    pub accepts_notes: bool,
-    #[serde(default)]
-    pub params: Vec<ParamPort>,
-    /// The plugin's reported latency, in samples.
-    ///
-    /// Discovered after loading like everything else here, and re-read when the
-    /// plugin says `kLatencyChanged`. The compiler needs it to line up parallel
-    /// paths (§14.6) and to work out how short a feedback loop may be (§14.4),
-    /// so a change to it means a recompile.
-    #[serde(default)]
-    pub latency: u32,
-}
-
-impl PluginPorts {
-    /// Build a node's ports from what a loaded plugin reported (§14.2).
-    ///
-    /// `params` is deliberately left empty. The parameter sockets are the
-    /// user's choice, not the plugin's: a compressor with 90 parameters would
-    /// otherwise arrive as a node with 90 sockets. The editor adds them one at
-    /// a time.
-    ///
-    /// Widths are clamped to [`MAX_CHANNELS`][crate::MAX_CHANNELS]. M8 is
-    /// stereo throughout (§14.8), and a node drawn with a socket the compiler
-    /// will refuse is worse than one drawn narrow.
-    pub fn from_layout(layout: &plugin_host_api::IoLayout, latency: u32) -> PluginPorts {
-        let widths = |buses: &[plugin_host_api::BusInfo]| -> Vec<u16> {
-            buses
-                .iter()
-                .map(|b| b.channels.min(crate::MAX_CHANNELS as u16))
-                .filter(|&c| c > 0)
-                .collect()
-        };
-        PluginPorts {
-            audio_in: widths(&layout.inputs),
-            audio_out: widths(&layout.outputs),
-            accepts_notes: layout.accepts_notes,
-            params: Vec::new(),
-            latency,
-        }
-    }
-}
 
 /// One node's identity, position and settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,264 +58,6 @@ pub struct Link {
     pub to_port: u8,
 }
 
-/// The node set (§9.3 for the v1 core, §14 for the M8 additions).
-///
-/// Adding a variant here should require touching the compiler's `match` and
-/// nothing else — that property is the thing §9.3 asks to be checked early, so
-/// it is worth noticing if a new node ever wants more.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum NodeKind {
-    /// A fixed number.
-    Constant { value: f64 },
-    /// The DAW's automation for one wrapper slot, 0..1.
-    SlotIn { slot: usize },
-    /// A free-running or tempo-synced oscillator.
-    Lfo {
-        waveform: Waveform,
-        rate: Rate,
-        /// Starting phase, 0..1.
-        phase: f64,
-        /// Half the peak-to-peak swing.
-        depth: f64,
-        /// Centre of the swing. `depth 0.5 / offset 0.5` fills 0..1.
-        offset: f64,
-    },
-    /// A note expression, reduced to one value (see [`ExprSource`]).
-    Expression { source: ExprSource },
-    /// Two inputs and an operator. Input 1 falls back to `b` when unconnected,
-    /// so a "multiply by 0.5" node needs no second node feeding it.
-    Math { op: MathOp, b: f64 },
-    /// Rescale one range onto another. The 0..1 → plain-units half of §9.3 is
-    /// the slot table's job (`ResolvedTarget::to_plain`); this is the shaping
-    /// that happens before it.
-    RangeMap {
-        in_lo: f64,
-        in_hi: f64,
-        out_lo: f64,
-        out_hi: f64,
-        clamp: bool,
-    },
-    /// Drive a wrapper slot, replacing the DAW's automation for it.
-    SlotOut { slot: usize },
-
-    // --- M8 (§14) ---
-    /// Audio arriving from the DAW on one of the wrapper's own input buses.
-    AudioIn { bus: usize, channels: u16 },
-    /// Audio leaving for the DAW on one of the wrapper's own output buses.
-    AudioOut { bus: usize, channels: u16 },
-    /// Notes arriving from the DAW.
-    NoteIn,
-    /// One hosted sub-plugin.
-    ///
-    /// `instance` indexes the wrapper's table of loaded sub-plugins, the same
-    /// way `slot` indexes the slot table: which file that is, and how it was
-    /// bound, stays outside the graph (§8.3). `ports` is the layout that was
-    /// discovered after loading (§14.2), cached here.
-    Plugin { instance: usize, ports: PluginPorts },
-    /// The writing half of a delay line (§14.4).
-    ///
-    /// Has an input and no output, so a graph that goes through a delay has no
-    /// cycle for the topological sort to find. That is the whole mechanism: the
-    /// two halves are paired by `line`, never by an edge.
-    DelayWrite { line: LineId, ty: PortType },
-    /// Sum several audio inputs of the same width into one, each at its own
-    /// gain.
-    ///
-    /// The only way two audio sources reach one destination. An input takes one
-    /// link everywhere in this graph, so mixing is a node rather than a rule —
-    /// and being a node is what lets the compiler see the merge and line the
-    /// paths up (§14.6).
-    ///
-    /// The gains are here rather than in a node of their own because a mix with
-    /// one input *is* a gain, and the audio half needed a multiply anyway: a
-    /// feedback delay whose loop gain is one never decays, and `Math` is the
-    /// param half's multiply and cannot touch a buffer. Two nodes that share
-    /// every line of their implementation are one node.
-    ///
-    /// Each gain has a socket of its own, after the audio inputs; the number
-    /// here is what is used while that socket is unconnected, the same rule
-    /// `Math`'s `b` follows. Missing entries are 1.0, which is what makes a
-    /// patch saved before the gains existed still mix the way it did.
-    Mix {
-        channels: u16,
-        inputs: u8,
-        #[serde(default)]
-        gains: Vec<f64>,
-    },
-    /// The reading half of a delay line (§14.4).
-    ///
-    /// Has an output and no input. Several reads may share one line — that is a
-    /// multi-tap delay, and it falls out for free.
-    ///
-    /// `time` is in seconds and is clamped at run time to the floor of §14.4;
-    /// the compiler cannot do the clamping itself because the floor depends on
-    /// the sample rate and the sub-block size, neither of which it knows.
-    DelayRead {
-        line: LineId,
-        ty: PortType,
-        /// Longest delay this line will ever be asked for. Not automatable: the
-        /// ring is allocated for it at activate, and §9.1 forbids allocating in
-        /// `process`.
-        max_time: f64,
-        time: f64,
-    },
-}
-
-/// How fast an LFO runs.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum Rate {
-    Hz(f64),
-    /// One cycle per this many beats, following the host's tempo.
-    Beats(f64),
-}
-
-impl NodeKind {
-    /// This kind's input sockets, in order. Empty for a source node.
-    ///
-    /// Returns owned ports because a plugin node's sockets depend on what the
-    /// plugin turned out to have (§14.2) and so cannot be a static slice. Every
-    /// caller is on the main thread — the audio thread sees only a `Program`.
-    pub fn input_ports(&self) -> Vec<Port> {
-        match self {
-            NodeKind::Constant { .. }
-            | NodeKind::SlotIn { .. }
-            | NodeKind::Lfo { .. }
-            | NodeKind::Expression { .. }
-            | NodeKind::AudioIn { .. }
-            | NodeKind::NoteIn => Vec::new(),
-            // The one input a `DelayRead` has is its own delay time (§14.5).
-            // It is a param, never audio, so it cannot close a loop through
-            // the line it belongs to — the type check in `check_links` is what
-            // makes that true rather than a convention.
-            NodeKind::DelayRead { .. } => vec![Port::param("time")],
-            NodeKind::Math { .. } => vec![Port::param("a"), Port::param("b")],
-            NodeKind::RangeMap { .. } | NodeKind::SlotOut { .. } => vec![Port::param("in")],
-            NodeKind::AudioOut { bus, channels } => {
-                let port = Port::new(
-                    "in",
-                    PortType::Audio {
-                        channels: *channels,
-                    },
-                );
-                vec![if *bus == 0 { port } else { port.aux() }]
-            }
-            NodeKind::DelayWrite { ty, .. } => vec![Port::new("in", *ty)],
-            // Each input next to its own gain, rather than all the signals
-            // followed by all the gains: they are one row of one control on
-            // screen, and a socket list that does not read that way makes the
-            // user count.
-            NodeKind::Mix {
-                channels, inputs, ..
-            } => (0..*inputs)
-                .flat_map(|i| {
-                    [
-                        Port::new(
-                            format!("in {}", i + 1),
-                            PortType::Audio {
-                                channels: *channels,
-                            },
-                        ),
-                        Port::param(format!("gain {}", i + 1)),
-                    ]
-                })
-                .collect(),
-            NodeKind::Plugin { ports, .. } => plugin_input_ports(ports),
-        }
-    }
-
-    /// This kind's output sockets, in order. Empty for a sink node.
-    pub fn output_ports(&self) -> Vec<Port> {
-        match self {
-            NodeKind::SlotOut { .. } | NodeKind::AudioOut { .. } | NodeKind::DelayWrite { .. } => {
-                Vec::new()
-            }
-            NodeKind::Constant { .. }
-            | NodeKind::SlotIn { .. }
-            | NodeKind::Lfo { .. }
-            | NodeKind::Expression { .. }
-            | NodeKind::Math { .. }
-            | NodeKind::RangeMap { .. } => vec![Port::param("out")],
-            NodeKind::AudioIn { bus, channels } => {
-                let port = Port::new(
-                    "out",
-                    PortType::Audio {
-                        channels: *channels,
-                    },
-                );
-                vec![if *bus == 0 { port } else { port.aux() }]
-            }
-            NodeKind::NoteIn => vec![Port::new("out", PortType::Note)],
-            NodeKind::DelayRead { ty, .. } => vec![Port::new("out", *ty)],
-            NodeKind::Mix { channels, .. } => {
-                vec![Port::new(
-                    "out",
-                    PortType::Audio {
-                        channels: *channels,
-                    },
-                )]
-            }
-            NodeKind::Plugin { ports, .. } => ports
-                .audio_out
-                .iter()
-                .enumerate()
-                .map(|(i, &channels)| {
-                    let name = if i == 0 {
-                        "out".to_string()
-                    } else {
-                        format!("out {}", i + 1)
-                    };
-                    Port::new(name, PortType::Audio { channels })
-                })
-                .collect(),
-        }
-    }
-
-    pub fn title(&self) -> String {
-        match self {
-            NodeKind::Constant { .. } => "Constant".into(),
-            NodeKind::SlotIn { slot } => format!("Slot {} in", slot + 1),
-            NodeKind::Lfo { .. } => "LFO".into(),
-            NodeKind::Expression { source } => source.label().into(),
-            NodeKind::Math { op, .. } => op.label().into(),
-            NodeKind::RangeMap { .. } => "Range map".into(),
-            NodeKind::SlotOut { slot } => format!("Slot {} out", slot + 1),
-            NodeKind::AudioIn { bus, .. } => format!("Audio in {}", bus + 1),
-            NodeKind::AudioOut { bus, .. } => format!("Audio out {}", bus + 1),
-            NodeKind::NoteIn => "Note in".into(),
-            NodeKind::Plugin { instance, .. } => format!("Plugin {}", instance + 1),
-            NodeKind::DelayWrite { line, .. } => format!("Delay {} write", line + 1),
-            NodeKind::DelayRead { line, .. } => format!("Delay {} read", line + 1),
-            NodeKind::Mix { .. } => "Mix".into(),
-        }
-    }
-}
-
-/// A plugin node's inputs: main audio, then aux (sidechain), then notes if it
-/// takes them, then one socket per exposed parameter.
-///
-/// The order matters more than it looks: it is what link indices mean, so
-/// inserting a category in the middle would re-point every saved link. Grow it
-/// only at the end.
-fn plugin_input_ports(ports: &PluginPorts) -> Vec<Port> {
-    let mut out = Vec::new();
-    for (i, &channels) in ports.audio_in.iter().enumerate() {
-        let name = match i {
-            0 => "in".to_string(),
-            1 => "sidechain".to_string(),
-            _ => format!("aux {i}"),
-        };
-        let port = Port::new(name, PortType::Audio { channels });
-        out.push(if i == 0 { port } else { port.aux() });
-    }
-    if ports.accepts_notes {
-        out.push(Port::new("notes", PortType::Note));
-    }
-    for param in &ports.params {
-        out.push(Port::param(param.name.clone()));
-    }
-    out
-}
-
 /// The whole patch.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
@@ -412,17 +84,17 @@ impl Graph {
     pub fn default_patch() -> Graph {
         let mut graph = Graph::new();
         let input = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [60.0, 80.0],
         );
         let output = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [360.0, 80.0],
         );
         graph.connect(input, 0, output, 0);
@@ -456,16 +128,16 @@ impl Graph {
     /// Returns `(write, read)`.
     pub fn add_delay(&mut self, ty: PortType, pos: [f32; 2]) -> (NodeId, NodeId) {
         let line = self.free_line();
-        let write = self.add(NodeKind::DelayWrite { line, ty }, pos);
+        let write = self.add(NodeKind::DelayWrite(DelayWrite { line, ty }), pos);
         let read = self.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line,
                 ty,
                 // Long enough for an echo, short enough that the control is
                 // usable without zooming in on it.
                 max_time: 2.0,
                 time: 0.25,
-            },
+            }),
             [pos[0] + 170.0, pos[1]],
         );
         (write, read)
@@ -475,7 +147,8 @@ impl Graph {
     pub fn free_line(&self) -> LineId {
         let mut line = 0;
         while self.nodes.iter().any(|n| match n.kind {
-            NodeKind::DelayWrite { line: l, .. } | NodeKind::DelayRead { line: l, .. } => l == line,
+            NodeKind::DelayWrite(DelayWrite { line: l, .. })
+            | NodeKind::DelayRead(DelayRead { line: l, .. }) => l == line,
             _ => false,
         }) {
             line += 1;
@@ -596,13 +269,17 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::{MathOp, Waveform};
+    use crate::nodes::{
+        Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotOut,
+    };
 
     #[test]
     fn an_input_only_ever_has_one_source() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 1.0 }, [0.0, 0.0]);
-        let b = graph.add(NodeKind::Constant { value: 2.0 }, [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
+        let b = graph.add(NodeKind::Constant(Constant { value: 2.0 }), [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
 
         graph.connect(a, 0, out, 0);
         graph.connect(b, 0, out, 0);
@@ -614,8 +291,8 @@ mod tests {
     #[test]
     fn removing_a_node_takes_its_links_with_it() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 1.0 }, [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut { slot: 3 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
         graph.connect(a, 0, out, 0);
 
         graph.remove(a);
@@ -626,34 +303,34 @@ mod tests {
     #[test]
     fn ids_are_not_reused_after_a_delete() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 1.0 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         graph.remove(a);
-        let b = graph.add(NodeKind::Constant { value: 1.0 }, [0.0, 0.0]);
+        let b = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         assert_ne!(a, b);
     }
 
     #[test]
     fn prune_drops_links_that_no_longer_make_sense() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 1.0 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         let math = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(a, 0, math, 1);
 
         // Something the user could do in the editor: turn a two-input node into
         // a one-input one. The link to input 1 is now meaningless.
-        graph.node_mut(math).unwrap().kind = NodeKind::RangeMap {
+        graph.node_mut(math).unwrap().kind = NodeKind::RangeMap(RangeMap {
             in_lo: 0.0,
             in_hi: 1.0,
             out_lo: 0.0,
             out_hi: 1.0,
             clamp: true,
-        };
+        });
         graph.prune();
         assert!(graph.links.is_empty());
     }
@@ -662,18 +339,18 @@ mod tests {
     fn ports_only_join_ports_of_the_same_type() {
         let mut graph = Graph::new();
         let audio = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         let speaker = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
 
@@ -695,17 +372,17 @@ mod tests {
     fn audio_of_different_widths_still_connects() {
         let mut graph = Graph::new();
         let mono = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 1,
-            },
+            }),
             [0.0, 0.0],
         );
         let stereo = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(mono, 0, stereo, 0);
@@ -717,13 +394,13 @@ mod tests {
     fn audio_still_does_not_connect_to_a_parameter() {
         let mut graph = Graph::new();
         let audio = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(audio, 0, slot, 0);
         assert!(graph.links.is_empty());
     }
@@ -732,16 +409,16 @@ mod tests {
     /// neither has a socket facing the other.
     #[test]
     fn a_delay_has_no_edge_between_its_halves() {
-        let write = NodeKind::DelayWrite {
+        let write = NodeKind::DelayWrite(DelayWrite {
             line: 0,
             ty: PortType::Param,
-        };
-        let read = NodeKind::DelayRead {
+        });
+        let read = NodeKind::DelayRead(DelayRead {
             line: 0,
             ty: PortType::Param,
             max_time: 1.0,
             time: 0.5,
-        };
+        });
         assert!(write.output_ports().is_empty());
         // The read has one input, but it is the delay time (§14.5) and it is a
         // param — never the line's own signal, which is what would make an edge
@@ -762,7 +439,7 @@ mod tests {
             }],
             latency: 0,
         };
-        let node = NodeKind::Plugin { instance: 0, ports };
+        let node = NodeKind::Plugin(Plugin { instance: 0, ports });
         let inputs = node.input_ports();
         let names: Vec<&str> = inputs.iter().map(|p| p.name.as_ref()).collect();
         assert_eq!(names, ["in", "sidechain", "notes", "Cutoff"]);
@@ -778,21 +455,21 @@ mod tests {
     fn swapping_a_plugin_drops_only_the_links_that_stopped_making_sense() {
         let mut graph = Graph::new();
         let source = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         let plugin = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2, 2],
                     audio_out: vec![2],
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(source, 0, plugin, 0);
@@ -800,14 +477,14 @@ mod tests {
         assert_eq!(graph.links.len(), 2);
 
         // The replacement has no sidechain.
-        graph.node_mut(plugin).unwrap().kind = NodeKind::Plugin {
+        graph.node_mut(plugin).unwrap().kind = NodeKind::Plugin(Plugin {
             instance: 0,
             ports: PluginPorts {
                 audio_in: vec![2],
                 audio_out: vec![2],
                 ..PluginPorts::default()
             },
-        };
+        });
         graph.prune();
         assert_eq!(graph.links.len(), 1, "the main input link survives");
         assert_eq!(graph.source_of(plugin, 0), Some((source, 0)));
@@ -833,16 +510,16 @@ mod tests {
     fn a_graph_survives_a_json_round_trip() {
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Triangle,
                 rate: Rate::Beats(2.0),
                 phase: 0.25,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [12.0, 34.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 5 }, [200.0, 34.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 5 }), [200.0, 34.0]);
         graph.connect(lfo, 0, out, 0);
 
         let json = serde_json::to_string(&graph).unwrap();

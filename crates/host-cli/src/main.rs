@@ -12,6 +12,7 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Mix, NodeKind, SlotIn};
 use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
 
@@ -341,7 +342,8 @@ fn cmd_buses(args: &[String]) -> Result<(), String> {
     // The same thing again, as the graph will show it.
     println!("\nas a plugin node:");
     let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
-    let node = audio_graph_engine::NodeKind::Plugin { instance: 0, ports };
+    let node =
+        audio_graph_engine::NodeKind::Plugin(audio_graph_engine::Plugin { instance: 0, ports });
     for port in node.input_ports() {
         println!("  in  {} ({})", port.name, port.ty.label());
     }
@@ -1674,7 +1676,7 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
 fn cmd_outbus(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
-    use audio_graph_engine::{Graph, NodeKind, PluginPorts};
+    use audio_graph_engine::{Graph, PluginPorts};
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let plugin = args
@@ -1766,25 +1768,25 @@ fn cmd_outbus(args: &[String]) -> Result<(), String> {
             if ports.accepts_notes {
                 NodeKind::NoteIn
             } else {
-                NodeKind::AudioIn {
+                NodeKind::AudioIn(AudioIn {
                     bus: 0,
                     channels: 2,
-                }
+                })
             },
             [40.0, 60.0],
         );
         let node = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(audio_graph_engine::Plugin {
                 instance: 0,
                 ports: ports.clone(),
-            },
+            }),
             [300.0, 60.0],
         );
         let out = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [560.0, 60.0],
         );
         // Input sockets are the audio buses first and the notes port after
@@ -2313,34 +2315,34 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
 
     let mut graph = audio_graph_engine::Graph::new();
     let input = graph.add(
-        audio_graph_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn(AudioIn {
             bus: 0,
             channels: 2,
-        },
+        }),
         [40.0, 40.0],
     );
     let output = graph.add(
-        audio_graph_engine::NodeKind::AudioOut {
+        audio_graph_engine::NodeKind::AudioOut(AudioOut {
             bus: 0,
             channels: 2,
-        },
+        }),
         [600.0, 40.0],
     );
     let mix = graph.add(
-        audio_graph_engine::NodeKind::Mix {
+        audio_graph_engine::NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
             // The dry signal at unity, the loop below it, so the repeats fade
             // rather than running for ever. Checking that they fade *by this
             // much* is what puts the mix's gains under test too.
             gains: vec![1.0, FEEDBACK],
-        },
+        }),
         [320.0, 40.0],
     );
     let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [320.0, 240.0]);
-    if let Some(audio_graph_engine::NodeKind::DelayRead {
+    if let Some(audio_graph_engine::NodeKind::DelayRead(DelayRead {
         time: t, max_time, ..
-    }) = graph.node_mut(read).map(|n| &mut n.kind)
+    })) = graph.node_mut(read).map(|n| &mut n.kind)
     {
         *t = time;
         *max_time = time * 2.0;
@@ -2574,44 +2576,44 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
     // with only one type in it is a patch that cannot show whether it works.
     let mut graph = audio_graph_engine::Graph::new();
     let input = graph.add(
-        audio_graph_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn(AudioIn {
             bus: 0,
             channels: 2,
-        },
+        }),
         [40.0, 60.0],
     );
     let sidechain = graph.add(
-        audio_graph_engine::NodeKind::AudioIn {
+        audio_graph_engine::NodeKind::AudioIn(AudioIn {
             bus: 1,
             channels: 2,
-        },
+        }),
         [40.0, 200.0],
     );
     let node = graph.add(
-        audio_graph_engine::NodeKind::Plugin {
+        audio_graph_engine::NodeKind::Plugin(audio_graph_engine::Plugin {
             instance: 0,
             ports: ports.clone(),
-        },
+        }),
         [300.0, 60.0],
     );
     let mix = graph.add(
-        audio_graph_engine::NodeKind::Mix {
+        audio_graph_engine::NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
             gains: vec![1.0, 0.5],
-        },
+        }),
         [560.0, 60.0],
     );
     let output = graph.add(
-        audio_graph_engine::NodeKind::AudioOut {
+        audio_graph_engine::NodeKind::AudioOut(AudioOut {
             bus: 0,
             channels: 2,
-        },
+        }),
         [800.0, 60.0],
     );
     let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [300.0, 340.0]);
     let slot = graph.add(
-        audio_graph_engine::NodeKind::SlotIn { slot: 0 },
+        audio_graph_engine::NodeKind::SlotIn(SlotIn { slot: 0 }),
         [40.0, 400.0],
     );
 

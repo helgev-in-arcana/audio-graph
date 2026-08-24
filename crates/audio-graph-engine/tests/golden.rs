@@ -19,7 +19,8 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
+    AudioIn, AudioOut, Constant, ExprSource, Expression, Graph, Lfo, Math, MathOp, Mix, NodeId,
+    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, SlotOut, Waveform,
     compile,
 };
 
@@ -58,17 +59,17 @@ fn check(name: &str, graph: &Graph) {
 // --- patch builders -------------------------------------------------------
 
 fn lfo(rate: Rate) -> NodeKind {
-    NodeKind::Lfo {
+    NodeKind::Lfo(Lfo {
         waveform: Waveform::Sine,
         rate,
         phase: 0.0,
         depth: 0.5,
         offset: 0.5,
-    }
+    })
 }
 
 fn stereo_plugin(instance: usize, latency: u32) -> NodeKind {
-    NodeKind::Plugin {
+    NodeKind::Plugin(Plugin {
         instance,
         ports: PluginPorts {
             audio_in: vec![2],
@@ -80,15 +81,15 @@ fn stereo_plugin(instance: usize, latency: u32) -> NodeKind {
             }],
             latency,
         },
-    }
+    })
 }
 
 fn audio_in(graph: &mut Graph, bus: usize, channels: u16) -> NodeId {
-    graph.add(NodeKind::AudioIn { bus, channels }, [0.0, 0.0])
+    graph.add(NodeKind::AudioIn(AudioIn { bus, channels }), [0.0, 0.0])
 }
 
 fn audio_out(graph: &mut Graph, bus: usize, channels: u16) -> NodeId {
-    graph.add(NodeKind::AudioOut { bus, channels }, [0.0, 0.0])
+    graph.add(NodeKind::AudioOut(AudioOut { bus, channels }), [0.0, 0.0])
 }
 
 // --- the shapes -----------------------------------------------------------
@@ -102,7 +103,7 @@ fn default_patch() {
 fn lfo_into_slot_out() {
     let mut graph = Graph::new();
     let osc = graph.add(lfo(Rate::Beats(4.0)), [0.0, 0.0]);
-    let out = graph.add(NodeKind::SlotOut { slot: 3 }, [0.0, 0.0]);
+    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
     graph.connect(osc, 0, out, 0);
     check("lfo_into_slot_out", &graph);
 }
@@ -112,44 +113,44 @@ fn lfo_into_slot_out() {
 #[test]
 fn math_chain() {
     let mut graph = Graph::new();
-    let slot = graph.add(NodeKind::SlotIn { slot: 0 }, [0.0, 0.0]);
+    let slot = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
     let expr = graph.add(
-        NodeKind::Expression {
+        NodeKind::Expression(Expression {
             source: ExprSource::Velocity,
-        },
+        }),
         [0.0, 0.0],
     );
     // Two inputs wired: `b` is ignored.
     let both = graph.add(
-        NodeKind::Math {
+        NodeKind::Math(Math {
             op: MathOp::Multiply,
             b: 0.25,
-        },
+        }),
         [0.0, 0.0],
     );
     graph.connect(slot, 0, both, 0);
     graph.connect(expr, 0, both, 1);
     // One input wired: `b` is the constant.
     let fallback = graph.add(
-        NodeKind::Math {
+        NodeKind::Math(Math {
             op: MathOp::Curve,
             b: 2.0,
-        },
+        }),
         [0.0, 0.0],
     );
     graph.connect(both, 0, fallback, 0);
     let shaped = graph.add(
-        NodeKind::RangeMap {
+        NodeKind::RangeMap(RangeMap {
             in_lo: 0.0,
             in_hi: 1.0,
             out_lo: -1.0,
             out_hi: 1.0,
             clamp: true,
-        },
+        }),
         [0.0, 0.0],
     );
     graph.connect(fallback, 0, shaped, 0);
-    let out = graph.add(NodeKind::SlotOut { slot: 1 }, [0.0, 0.0]);
+    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 1 }), [0.0, 0.0]);
     graph.connect(shaped, 0, out, 0);
     check("math_chain", &graph);
 }
@@ -162,7 +163,7 @@ fn plugin_with_sidechain() {
     let main = audio_in(&mut graph, 0, 2);
     let side = audio_in(&mut graph, 1, 1);
     let plugin = graph.add(
-        NodeKind::Plugin {
+        NodeKind::Plugin(Plugin {
             instance: 0,
             ports: PluginPorts {
                 audio_in: vec![2, 2],
@@ -174,7 +175,7 @@ fn plugin_with_sidechain() {
                 }],
                 latency: 0,
             },
-        },
+        }),
         [0.0, 0.0],
     );
     let out = audio_out(&mut graph, 0, 2);
@@ -183,7 +184,7 @@ fn plugin_with_sidechain() {
     graph.connect(side, 0, plugin, 1);
     graph.connect(plugin, 0, out, 0);
 
-    let param = graph.add(NodeKind::Constant { value: 0.75 }, [0.0, 0.0]);
+    let param = graph.add(NodeKind::Constant(Constant { value: 0.75 }), [0.0, 0.0]);
     let param_port = plugin_param_port(&graph, plugin);
     graph.connect(param, 0, plugin, param_port);
 
@@ -196,7 +197,7 @@ fn plugin_with_two_outputs() {
     let mut graph = Graph::new();
     let src = audio_in(&mut graph, 0, 2);
     let plugin = graph.add(
-        NodeKind::Plugin {
+        NodeKind::Plugin(Plugin {
             instance: 1,
             ports: PluginPorts {
                 audio_in: vec![2],
@@ -205,7 +206,7 @@ fn plugin_with_two_outputs() {
                 params: Vec::new(),
                 latency: 0,
             },
-        },
+        }),
         [0.0, 0.0],
     );
     let main = audio_out(&mut graph, 0, 2);
@@ -222,7 +223,7 @@ fn instrument_with_notes() {
     let mut graph = Graph::new();
     let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
     let plugin = graph.add(
-        NodeKind::Plugin {
+        NodeKind::Plugin(Plugin {
             instance: 0,
             ports: PluginPorts {
                 audio_in: Vec::new(),
@@ -231,7 +232,7 @@ fn instrument_with_notes() {
                 params: Vec::new(),
                 latency: 0,
             },
-        },
+        }),
         [0.0, 0.0],
     );
     let out = audio_out(&mut graph, 0, 2);
@@ -250,11 +251,11 @@ fn mix_with_a_driven_gain() {
     let b = audio_in(&mut graph, 1, 2);
     let c = audio_in(&mut graph, 2, 2);
     let mix = graph.add(
-        NodeKind::Mix {
+        NodeKind::Mix(Mix {
             channels: 2,
             inputs: 3,
             gains: vec![1.0, 0.5, 0.25],
-        },
+        }),
         [0.0, 0.0],
     );
     let out = audio_out(&mut graph, 0, 2);
@@ -276,11 +277,11 @@ fn audio_feedback_delay() {
     let src = audio_in(&mut graph, 0, 2);
     let (write, read) = graph.add_delay(PortType::STEREO, [0.0, 0.0]);
     let mix = graph.add(
-        NodeKind::Mix {
+        NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
             gains: vec![1.0, 0.5],
-        },
+        }),
         [0.0, 0.0],
     );
     let out = audio_out(&mut graph, 0, 2);
@@ -296,11 +297,11 @@ fn audio_feedback_delay() {
 fn param_delay() {
     let mut graph = Graph::new();
     let (write, read) = graph.add_delay(PortType::Param, [0.0, 0.0]);
-    let src = graph.add(NodeKind::SlotIn { slot: 2 }, [0.0, 0.0]);
+    let src = graph.add(NodeKind::SlotIn(SlotIn { slot: 2 }), [0.0, 0.0]);
     graph.connect(src, 0, write, 0);
-    let time = graph.add(NodeKind::Constant { value: 0.1 }, [0.0, 0.0]);
+    let time = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
     graph.connect(time, 0, read, 0);
-    let out = graph.add(NodeKind::SlotOut { slot: 5 }, [0.0, 0.0]);
+    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 5 }), [0.0, 0.0]);
     graph.connect(read, 0, out, 0);
     check("param_delay", &graph);
 }
@@ -313,11 +314,11 @@ fn latency_compensation() {
     let src = audio_in(&mut graph, 0, 2);
     let slow = graph.add(stereo_plugin(0, 512), [0.0, 0.0]);
     let mix = graph.add(
-        NodeKind::Mix {
+        NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
             gains: vec![0.5, 0.5],
-        },
+        }),
         [0.0, 0.0],
     );
     let out = audio_out(&mut graph, 0, 2);

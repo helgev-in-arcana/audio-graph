@@ -14,7 +14,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use audio_graph_engine::{BlockContext, Engine, MathOp, NodeKind, Rate, Waveform};
+use audio_graph_engine::{
+    BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform,
+};
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};
 use subhost_adapter::{SLOT_COUNT, SubHost};
@@ -38,16 +40,18 @@ fn lfo_into(shared: &Arc<Shared>, slot: usize, rate: f64) {
     let mut state = shared.main();
     state.graph = audio_graph_engine::Graph::new();
     let lfo = state.graph.add(
-        NodeKind::Lfo {
+        NodeKind::Lfo(Lfo {
             waveform: Waveform::Saw,
             rate: Rate::Hz(rate),
             phase: 0.0,
             depth: 0.5,
             offset: 0.5,
-        },
+        }),
         [0.0, 0.0],
     );
-    let out = state.graph.add(NodeKind::SlotOut { slot }, [200.0, 0.0]);
+    let out = state
+        .graph
+        .add(NodeKind::SlotOut(SlotOut { slot }), [200.0, 0.0]);
     state.graph.connect(lfo, 0, out, 0);
 }
 
@@ -237,15 +241,15 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     {
         let mut state = shared.main();
         let a = state.graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 100.0],
         );
         let one = state
             .graph
-            .add(NodeKind::SlotOut { slot: 1 }, [200.0, 100.0]);
+            .add(NodeKind::SlotOut(SlotOut { slot: 1 }), [200.0, 100.0]);
         state.graph.connect(a, 0, one, 0);
     }
     shared.publish_graph();
