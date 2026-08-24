@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
+use crate::ir::AudioOp;
 use crate::port::{Port, PortType};
 
 /// Audio arriving from the DAW on one of the wrapper's own input buses.
@@ -63,6 +65,32 @@ impl AudioIn {
 
 impl AudioOut {
     pub(crate) fn compile(&self, _cx: &mut ParamCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+}
+
+impl AudioIn {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        let out = cx.alloc(self.channels, cx.readers())?;
+        cx.emit(AudioOp::Input {
+            out,
+            bus: self.bus as u16,
+        });
+        cx.produce(0, out, 0);
+        Ok(())
+    }
+}
+
+impl AudioOut {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        if let Some((buf, late)) = cx.source(0) {
+            cx.report_latency(late);
+            cx.consume(buf);
+            cx.emit(AudioOp::Output {
+                a: buf,
+                bus: self.bus as u16,
+            });
+        }
         Ok(())
     }
 }

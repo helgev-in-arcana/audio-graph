@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
+use crate::ir::{AudioOp, Buf, MixIn};
 use crate::port::{Port, PortType};
 
 /// Sum several audio inputs of the same width into one, each at its own
@@ -75,6 +77,51 @@ impl Mix {
                 cx.drive_audio(port, reg)?;
             }
         }
+        Ok(())
+    }
+}
+
+impl Mix {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        // §14.6, the merge point: every branch waits for the latest one or they
+        // phase-cancel.
+        let arrive = cx
+            .sources()
+            .iter()
+            .filter_map(|s| s.map(|(_, late)| late))
+            .max()
+            .unwrap_or(0);
+        let wired: Vec<(usize, Buf, u32)> = cx
+            .sources()
+            .iter()
+            .enumerate()
+            .filter_map(|(port, s)| s.map(|(buf, late)| (port, buf, late)))
+            .collect();
+
+        let mut inputs = Vec::new();
+        for (port, buf, late) in wired {
+            if arrive > late {
+                cx.compensate(buf, arrive - late)?;
+            }
+            inputs.push(MixIn {
+                buf,
+                // Signal, gain, signal, gain: the gain for input `port` is the
+                // socket right after it.
+                lane: cx.lane((2 * port + 1) as u8),
+                gain: self.gains.get(port).copied().unwrap_or(1.0),
+            });
+        }
+        for input in &inputs {
+            cx.consume(input.buf);
+        }
+        // The first input may be reused as the destination — that is what makes
+        // the mix an accumulate rather than a copy — but the rest may not, or
+        // the sum would be built out of a buffer that has already been written
+        // over.
+        let avoid: Vec<Buf> = inputs.iter().skip(1).map(|i| i.buf).collect();
+        let out = cx.alloc_avoiding(self.channels, cx.readers(), &avoid)?;
+        cx.emit(AudioOp::Mix { out, inputs });
+        cx.produce(0, out, arrive);
         Ok(())
     }
 }

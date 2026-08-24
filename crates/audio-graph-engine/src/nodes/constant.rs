@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::Op;
 use crate::port::Port;
@@ -32,6 +33,12 @@ impl Constant {
             value: self.value,
         });
         cx.bind_output(0, out);
+        Ok(())
+    }
+}
+
+impl Constant {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

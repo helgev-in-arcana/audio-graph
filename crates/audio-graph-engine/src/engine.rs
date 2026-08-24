@@ -17,12 +17,11 @@
 
 use plugin_host_api::{NoteEvent, NoteExpression};
 
-use crate::audio::MAX_BUFFERS;
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_CHANNELS,
-    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS,
-    MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
+    AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
+    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS,
+    MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
 };
 
 /// How many `DelayRead` taps one program may have.

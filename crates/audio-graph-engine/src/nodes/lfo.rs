@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ir::Waveform;
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::{Op, RateSpec};
 use crate::port::Port;
@@ -61,6 +62,12 @@ impl Lfo {
             centre: self.offset,
         });
         cx.bind_output(0, out);
+        Ok(())
+    }
+}
+
+impl Lfo {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

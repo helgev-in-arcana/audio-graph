@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::Op;
 use crate::port::Port;
@@ -74,6 +75,18 @@ impl SlotOut {
         if let Some(reg) = cx.input(0) {
             cx.drive_slot(self.slot, reg);
         }
+        Ok(())
+    }
+}
+
+impl SlotIn {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+}
+
+impl SlotOut {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

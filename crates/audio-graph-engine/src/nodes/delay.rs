@@ -9,8 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::graph::LineId;
+use crate::ir::AudioOp;
 use crate::ir::Op;
 use crate::port::{Port, PortType};
 
@@ -115,6 +117,43 @@ impl DelayWrite {
         // simply does not take its slot over.
         if let Some(reg) = cx.input(0) {
             cx.emit_deferred(Op::DelayWrite { line, a: reg });
+        }
+        Ok(())
+    }
+}
+
+impl DelayRead {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        let PortType::Audio { channels } = self.ty else {
+            return Ok(());
+        };
+        let line = cx.audio_line(self.line)?;
+        cx.want_ring(line, self.max_time);
+        let out = cx.alloc(channels, cx.readers())?;
+        cx.emit(AudioOp::DelayRead {
+            out,
+            line,
+            lane: cx.lane(0),
+            time: self.time.max(0.0),
+            max_time: self.max_time.max(0.0),
+        });
+        // A line is a cut, not an edge: what comes out of it did not travel
+        // here through the paths §14.6 is lining up, so it arrives with no
+        // latency of its own to compensate for.
+        cx.produce(0, out, 0);
+        Ok(())
+    }
+}
+
+impl DelayWrite {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        if !matches!(self.ty, PortType::Audio { .. }) {
+            return Ok(());
+        }
+        let line = cx.audio_line(self.line)?;
+        if let Some((buf, _)) = cx.source(0) {
+            cx.consume(buf);
+            cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
         }
         Ok(())
     }

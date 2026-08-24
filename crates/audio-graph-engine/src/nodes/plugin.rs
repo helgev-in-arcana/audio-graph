@@ -2,8 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::ParamTarget;
+use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES};
 use crate::port::{Port, PortType};
 
 /// One sub-plugin parameter the graph is allowed to drive.
@@ -155,6 +157,154 @@ impl Plugin {
                 reg,
             )?;
         }
+        Ok(())
+    }
+}
+
+impl Plugin {
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        let out_width = cx.out_width();
+        if out_width == 0 {
+            // A plugin with no output bus cannot be routed through. It is still
+            // legal to place — an analyser is one — but there is nothing
+            // downstream of it to compile.
+            return Ok(());
+        }
+
+        // Which input buses the graph actually feeds (§14.11). A sidechain
+        // nobody wired is left off entirely rather than activated and fed
+        // silence: a compressor with an active, silent sidechain ducks to
+        // nothing.
+        let mut wired = self.ports.audio_in.len();
+        while wired > 1 && cx.source(wired - 1).is_none() {
+            wired -= 1;
+        }
+        if wired > 1 + MAX_AUX_BUSES {
+            return Err(CompileError::TooLarge {
+                what: "aux input buses on one plugin",
+                limit: 1 + MAX_AUX_BUSES,
+            });
+        }
+        let buses: Vec<u16> = self.ports.audio_in[..wired].to_vec();
+
+        // One buffer per bus, at the width the plugin wants. An unwired bus
+        // before a wired one still needs something to read.
+        let mut in_latency = 0u32;
+        let mut parts: Vec<(Buf, u16)> = Vec::with_capacity(buses.len());
+        for (index, &width) in buses.iter().enumerate() {
+            match cx.source(index) {
+                Some((buf, late)) => {
+                    in_latency = in_latency.max(late);
+                    parts.push((buf, width));
+                }
+                None => {
+                    let silent = cx.alloc(width, 1)?;
+                    cx.emit(AudioOp::Silence { out: silent });
+                    parts.push((silent, width));
+                }
+            }
+        }
+
+        // One bus at the right width already is the plugin's input region;
+        // anything else has to be assembled. Skipping the copy in the common
+        // case matters — most plugins are one stereo bus.
+        let total: u16 = buses.iter().sum();
+        let input = match parts.as_slice() {
+            [] => {
+                // An instrument. It is still handed a buffer, because the
+                // caller's slice has to point somewhere.
+                let silent = cx.alloc(out_width, 1)?;
+                cx.emit(AudioOp::Silence { out: silent });
+                silent
+            }
+            [(buf, width)] if cx.width_of(*buf) == *width => *buf,
+            _ => {
+                let avoid: Vec<Buf> = parts.iter().map(|&(b, _)| b).collect();
+                let out = cx.alloc_avoiding(total, 1, &avoid)?;
+                cx.emit(AudioOp::Gather {
+                    out,
+                    buses: parts.clone(),
+                });
+                out
+            }
+        };
+        for (buf, _) in &parts {
+            cx.consume(*buf);
+        }
+        if !parts.iter().any(|&(b, _)| b == input) {
+            cx.consume(input);
+        }
+
+        // The same question on the way out (§14.2): a plugin's extra output
+        // buses are handed over only as far as the graph reads them, so Surge
+        // XT's `Scene B` costs nothing in a patch that ignores it.
+        let out_wired = cx.outputs_read();
+        if out_wired > self.ports.audio_out.len() {
+            // A socket the node does not have. `connect` cannot make this link,
+            // so the patch was hand-edited or written by a later version.
+            return Err(CompileError::TypeMismatch {
+                node: cx.node(),
+                port: (out_wired - 1) as u8,
+            });
+        }
+        if out_wired > 1 + MAX_AUX_BUSES {
+            return Err(CompileError::TooLarge {
+                what: "output buses read from one plugin",
+                limit: 1 + MAX_AUX_BUSES,
+            });
+        }
+        // At least the main bus, even when nothing reads it: a plugin still has
+        // to be given somewhere to write.
+        let out_buses: Vec<u16> = self.ports.audio_out[..out_wired.max(1)].to_vec();
+        let out_total: u16 = out_buses.iter().sum();
+
+        // One bus is the overwhelmingly common case and stays exactly as it
+        // was: the plugin writes straight into the buffer the next node reads.
+        // Only a patch that reads a second bus pays for the split.
+        let single = out_buses.len() == 1;
+        let readers = cx.readers();
+        let output = cx.alloc_avoiding(out_total, if single { readers } else { 1 }, &[input])?;
+        let notes = cx.note_source(self.ports.audio_in.len() as u8);
+        cx.emit(AudioOp::Plugin {
+            instance: self.instance as u32,
+            input,
+            input_buses: buses.clone(),
+            output,
+            output_buses: out_buses.clone(),
+            notes,
+        });
+        cx.declare_instance(InstanceIo {
+            instance: self.instance as u32,
+            input_channels: buses.first().copied().unwrap_or(0),
+            aux_inputs: buses.get(1..).unwrap_or(&[]).to_vec(),
+            output_channels: out_buses[0],
+            aux_outputs: out_buses.get(1..).unwrap_or(&[]).to_vec(),
+        });
+
+        let latency = in_latency + self.ports.latency;
+        if single {
+            cx.produce(0, output, latency);
+            return Ok(());
+        }
+        let mut channel = 0u16;
+        for (port, &width) in out_buses.iter().enumerate() {
+            let readers = cx.readers_of(port as u8);
+            // A bus in the middle that nobody reads still occupies its channels
+            // in the plugin's output region; it just never gets copied out of
+            // it.
+            if readers > 0 {
+                let buf = cx.alloc_avoiding(width, readers, &[input, output])?;
+                cx.emit(AudioOp::Split {
+                    from: output,
+                    out: buf,
+                    channel,
+                    width,
+                });
+                cx.produce(port as u8, buf, latency);
+            }
+            channel += width;
+        }
+        cx.consume(output);
         Ok(())
     }
 }
