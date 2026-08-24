@@ -1,0 +1,70 @@
+Program {
+    ops: [],
+    registers: 0,
+    outputs: [],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Plugin {
+            instance: 1,
+            input: 0,
+            input_buses: [
+                2,
+            ],
+            output: 1,
+            output_buses: [
+                2,
+                2,
+            ],
+            notes: None,
+        },
+        Split {
+            from: 1,
+            out: 2,
+            channel: 0,
+            width: 2,
+        },
+        Split {
+            from: 1,
+            out: 3,
+            channel: 2,
+            width: 2,
+        },
+        Output {
+            a: 2,
+            bus: 0,
+        },
+        Output {
+            a: 3,
+            bus: 1,
+        },
+    ],
+    param_targets: [],
+    instances: [
+        InstanceIo {
+            instance: 1,
+            input_channels: 2,
+            aux_inputs: [],
+            output_channels: 2,
+            aux_outputs: [
+                2,
+            ],
+        },
+    ],
+    buffers: [
+        2,
+        4,
+        2,
+        2,
+    ],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [],
+}

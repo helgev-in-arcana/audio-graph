@@ -109,6 +109,7 @@ checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 name = "audio-graph-engine"
 version = "0.1.1"
 dependencies = [
+ "egui",
  "plugin-host-api",
  "serde",
  "serde_json",

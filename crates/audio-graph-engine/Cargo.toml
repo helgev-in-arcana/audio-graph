@@ -4,9 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The editor half of a node: its controls, and what the add-node menu offers.
+# Only the wrapper turns this on -- the CLI and the adapter link this crate with
+# no egui in the tree at all, which `cargo tree -p host-cli` checks.
+ui = ["dep:egui"]
+
 [dependencies]
 plugin-host-api.workspace = true
 serde.workspace = true
+# Pinned to what nice-plug-egui resolves, so the wrapper links one egui.
+egui = { version = "0.36", optional = true, default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true

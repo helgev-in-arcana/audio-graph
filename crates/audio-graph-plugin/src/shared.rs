@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use audio_graph_engine::{Graph, Handoff, Program, compile};
-use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, PluginPorts};
+use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, Plugin, PluginPorts};
 use parking_lot::Mutex;
 use plugin_host::AudioConfig;
 use subhost_adapter::{
@@ -329,10 +329,10 @@ impl Shared {
         // A single loaded sub-plugin was the pre-M8 patch: put it in the middle.
         if self.main().host.is_loaded(0) {
             let node = self.main().graph.add(
-                NodeKind::Plugin {
+                NodeKind::Plugin(Plugin {
                     instance: 0,
                     ports: PluginPorts::default(),
-                },
+                }),
                 [210.0, 80.0],
             );
             // Sockets before links: `discover_ports` prunes, and a link into a
@@ -358,7 +358,7 @@ impl Shared {
     pub fn discover_ports(&self, node: NodeId) {
         let mut state = self.main();
         let Some(instance) = state.graph.node(node).and_then(|n| match n.kind {
-            NodeKind::Plugin { instance, .. } => Some(instance),
+            NodeKind::Plugin(Plugin { instance, .. }) => Some(instance),
             _ => None,
         }) else {
             return;
@@ -369,7 +369,7 @@ impl Shared {
         let Some(node) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
             return;
         };
-        if let NodeKind::Plugin { ports, .. } = &mut node.kind {
+        if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
             // The parameter sockets are the user's, not the plugin's (§14.12):
             // discovery replaces the buses and leaves the sockets alone.
             let params = std::mem::take(&mut ports.params);

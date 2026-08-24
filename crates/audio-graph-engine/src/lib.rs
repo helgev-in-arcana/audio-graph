@@ -15,23 +15,31 @@
 //!   back up, without a lock in either direction.
 //! - [`Engine`] runs it, allocating nothing and freeing nothing.
 
-mod audio;
 mod compile;
 mod engine;
 mod graph;
 mod handoff;
-mod program;
+mod ir;
+mod nodes;
+mod port;
 
-pub use audio::MAX_BUFFERS;
 pub use compile::{CompileError, compile};
 pub use engine::{AudioChunk, AudioContext, AudioNodes, BlockContext, Engine, NoNodes};
-pub use graph::{
-    ExprSource, Graph, LineId, Link, MathOp, Node, NodeId, NodeKind, ParamPort, PluginPorts, Port,
-    PortType, Rate, Waveform,
-};
+pub use graph::{Graph, LineId, Link, Node, NodeId};
 pub use handoff::Handoff;
-pub use program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
-    MAX_AUDIO_LANES, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS, MAX_LFOS,
-    MAX_REGISTERS, NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
+pub use ir::{
+    AudioOp, Buf, Chunking, ExprSource, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
+    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
+    Waveform,
 };
+pub use nodes::{
+    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
+    NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, SlotOut,
+};
+#[cfg(feature = "ui")]
+pub use nodes::{
+    catalogue,
+    widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
+};
+pub use port::{Port, PortType};

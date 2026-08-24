@@ -7,16 +7,10 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType};
-use crate::program::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
-    MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS, MixIn, NoteSource,
-};
+use crate::graph::{Graph, NodeId};
+use crate::ir::{AudioOp, Chunking, InstanceIo};
 
-use crate::compile::{CompileError, Line, NO_WRITER};
-
-/// Ceiling on the buffer pool, so `activate` can size it once and never grow.
-pub const MAX_BUFFERS: usize = 64;
+use crate::compile::{AudioCx, CompileError, Line};
 
 /// The audio half of a `Program`.
 pub(crate) struct Audio {
@@ -33,536 +27,25 @@ pub(crate) struct Audio {
     pub instances: Vec<InstanceIo>,
 }
 
-/// One node's audio output, once it has been emitted.
-struct Produced {
-    node: NodeId,
-    /// Which of the node's output sockets this is. Only a plugin node has
-    /// more than one (§14.2); everything else produces port 0.
-    port: u8,
-    buf: Buf,
-    /// Samples of delay accumulated on the way here. Two of these arriving at
-    /// one `Mix` with different values is what §14.6 exists to fix.
-    latency: u32,
-}
-
-/// Hands out audio buffers and takes them back (§14.7).
+/// Walk the order a second time and emit the audio half.
 ///
-/// A linear-scan register allocator, with the one wrinkle that buffers have a
-/// width: a stereo buffer cannot stand in for a mono one, so the free list is
-/// searched by width rather than popped.
-struct Pool {
-    widths: Vec<u16>,
-    /// How many reads of each buffer are still to come. Zero means free.
-    pending: Vec<usize>,
-}
-
-impl Pool {
-    fn new() -> Pool {
-        Pool {
-            widths: Vec::new(),
-            pending: Vec::new(),
-        }
-    }
-
-    fn alloc(&mut self, channels: u16, readers: usize) -> Result<Buf, CompileError> {
-        if let Some(i) =
-            (0..self.widths.len()).find(|&i| self.pending[i] == 0 && self.widths[i] == channels)
-        {
-            self.pending[i] = readers;
-            return Ok(i as Buf);
-        }
-        if self.widths.len() >= MAX_BUFFERS {
-            return Err(CompileError::TooLarge {
-                what: "audio buffers",
-                limit: MAX_BUFFERS,
-            });
-        }
-        self.widths.push(channels);
-        self.pending.push(readers);
-        Ok((self.widths.len() - 1) as Buf)
-    }
-
-    /// Like `alloc`, but never returns one of `avoid`.
-    ///
-    /// Two callers need this and for different reasons. A plugin reads its
-    /// input and writes its output, and whether those may be the same memory is
-    /// a question about the plugin's internals that a host has no way to ask,
-    /// so it is never asked. A `Mix` may accumulate into its first input, but
-    /// the moment it does, that buffer stops holding what the *other* inputs
-    /// expect to be summed with — so all but the first are off limits.
-    ///
-    /// Implemented by parking the buffers rather than by filtering, so there is
-    /// exactly one place that knows how a free buffer is chosen.
-    fn alloc_avoiding(
-        &mut self,
-        channels: u16,
-        readers: usize,
-        avoid: &[Buf],
-    ) -> Result<Buf, CompileError> {
-        let saved: Vec<usize> = avoid
-            .iter()
-            .map(|&b| std::mem::replace(&mut self.pending[b as usize], usize::MAX))
-            .collect();
-        let got = self.alloc(channels, readers);
-        for (&b, was) in avoid.iter().zip(saved) {
-            self.pending[b as usize] = was;
-        }
-        got
-    }
-
-    fn width_of(&self, buf: Buf) -> u16 {
-        self.widths[buf as usize]
-    }
-
-    /// One of `buf`'s readers has run.
-    fn consume(&mut self, buf: Buf) {
-        let slot = &mut self.pending[buf as usize];
-        *slot = slot.saturating_sub(1);
-    }
-}
-
-/// The lane the param half booked for one socket, if it booked one.
-fn lane_of(lanes: &[((NodeId, u8), u16)], node: NodeId, port: u8) -> Option<u16> {
-    lanes
-        .iter()
-        .find(|&&(socket, _)| socket == (node, port))
-        .map(|&(_, lane)| lane)
-}
-
-/// The audio index of `line`, assigning one if this is its first mention.
-///
-/// `delay_nodes` grows alongside, so index `i` always names the writer of the
-/// line at `audio_lines[i]` — that pairing is what lets a program swap keep the
-/// ring contents (§14.5).
-fn audio_line(
-    audio_lines: &mut Vec<LineId>,
-    delay_nodes: &mut Vec<NodeId>,
-    ring_seconds: &mut Vec<f64>,
-    lines: &[Line],
-    line: LineId,
-) -> Result<u16, CompileError> {
-    if let Some(index) = audio_lines.iter().position(|&l| l == line) {
-        return Ok(index as u16);
-    }
-    if audio_lines.len() >= MAX_AUDIO_DELAY_LINES {
-        return Err(CompileError::TooLarge {
-            what: "audio delay lines",
-            limit: MAX_AUDIO_DELAY_LINES,
-        });
-    }
-    audio_lines.push(line);
-    ring_seconds.push(0.0);
-    delay_nodes.push(
-        lines
-            .iter()
-            .find(|l| l.id == line)
-            .map(|l| l.writer)
-            .unwrap_or(NO_WRITER),
-    );
-    Ok((audio_lines.len() - 1) as u16)
-}
-
-/// Which note stream a plugin node is wired to (§14.10).
-///
-/// `None` when nothing is connected, which is the answer that makes an
-/// unwired instrument silent rather than making it play whatever the DAW
-/// happened to send. Only `NoteIn` produces notes today; a plugin's own note
-/// output would need the engine to carry event buffers, and that is M9.
-fn note_source(graph: &Graph, id: NodeId, ports: &crate::graph::PluginPorts) -> NoteSource {
-    if !ports.accepts_notes {
-        return NoteSource::None;
-    }
-    // The notes port sits after the audio inputs and before the parameters —
-    // see `plugin_input_ports`, which is the one place that order is decided.
-    let port = ports.audio_in.len() as u8;
-    match graph.source_of(id, port) {
-        Some((from, _)) if matches!(graph.node(from).map(|n| &n.kind), Some(NodeKind::NoteIn)) => {
-            NoteSource::Daw { bus: 0 }
-        }
-        _ => NoteSource::None,
-    }
-}
-
+/// The same order as the param half, and for the same reason: a node may only
+/// read what is already in a buffer. What differs is what a node is handed —
+/// see [`AudioCx`], which owns the buffer pool, the latency bookkeeping and the
+/// audio line numbering.
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
 ) -> Result<Audio, CompileError> {
-    let mut ops: Vec<AudioOp> = Vec::new();
-    let mut pool = Pool::new();
-    let mut produced: Vec<Produced> = Vec::new();
-    let mut latency = 0u32;
-    let mut compensators = 0u16;
-    let mut instances: Vec<InstanceIo> = Vec::new();
-    // Audio lines are numbered among themselves: their rings are a scarcer
-    // resource than a param line's, so they get their own ceiling and their own
-    // index space.
-    let mut audio_lines: Vec<LineId> = Vec::new();
-    let mut delay_nodes: Vec<NodeId> = Vec::new();
-    let mut ring_seconds: Vec<f64> = Vec::new();
-    // Held back and appended last, for the reason the param half holds its
-    // writes back (`compile`): within one chunk every read must see the line as
-    // it stood before this chunk was written, or a delay of exactly one chunk
-    // would read back what it had just written.
-    let mut writes: Vec<AudioOp> = Vec::new();
-
+    let mut cx = AudioCx::new(graph, lines, audio_lanes);
     for &id in order {
         let node = graph.node(id).expect("ordering only contains real nodes");
-
-        // Where each audio input's signal came from, in port order. `None` for
-        // an input nobody wired, which is silence rather than an error — the
-        // same rule the param half uses.
-        let sources: Vec<Option<(Buf, u32)>> = node
-            .kind
-            .input_ports()
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| matches!(p.ty, PortType::Audio { .. }))
-            .map(|(port, _)| {
-                graph
-                    .source_of(id, port as u8)
-                    .and_then(|(from, from_port)| {
-                        produced
-                            .iter()
-                            .find(|p| p.node == from && p.port == from_port)
-                    })
-                    .map(|p| (p.buf, p.latency))
-            })
-            .collect();
-
-        let readers = graph.links.iter().filter(|l| l.from == id).count();
-        let out_width = match node.kind.output_ports().first().map(|p| p.ty) {
-            Some(PortType::Audio { channels }) => channels,
-            _ => 0,
-        };
-
-        match &node.kind {
-            NodeKind::AudioIn { bus, channels } => {
-                let out = pool.alloc(*channels, readers)?;
-                ops.push(AudioOp::Input {
-                    out,
-                    bus: *bus as u16,
-                });
-                produced.push(Produced {
-                    node: id,
-                    port: 0,
-                    buf: out,
-                    latency: 0,
-                });
-            }
-            NodeKind::AudioOut { bus, .. } => {
-                if let Some((buf, late)) = sources[0] {
-                    latency = latency.max(late);
-                    pool.consume(buf);
-                    ops.push(AudioOp::Output {
-                        a: buf,
-                        bus: *bus as u16,
-                    });
-                }
-            }
-            NodeKind::Plugin { instance, ports } => {
-                if out_width == 0 {
-                    // A plugin with no output bus cannot be routed through. It
-                    // is still legal to place — an analyser is one — but there
-                    // is nothing downstream of it to compile.
-                    continue;
-                }
-
-                // Which input buses the graph actually feeds (§14.11). A
-                // sidechain nobody wired is left off entirely rather than
-                // activated and fed silence: a compressor with an active,
-                // silent sidechain ducks to nothing.
-                let mut wired = ports.audio_in.len();
-                while wired > 1 && sources.get(wired - 1).copied().flatten().is_none() {
-                    wired -= 1;
-                }
-                if wired > 1 + MAX_AUX_BUSES {
-                    return Err(CompileError::TooLarge {
-                        what: "aux input buses on one plugin",
-                        limit: 1 + MAX_AUX_BUSES,
-                    });
-                }
-                let buses: Vec<u16> = ports.audio_in[..wired].to_vec();
-
-                // One buffer per bus, at the width the plugin wants. An unwired
-                // bus before a wired one still needs something to read.
-                let mut in_latency = 0u32;
-                let mut parts: Vec<(Buf, u16)> = Vec::with_capacity(buses.len());
-                for (index, &width) in buses.iter().enumerate() {
-                    match sources.get(index).copied().flatten() {
-                        Some((buf, late)) => {
-                            in_latency = in_latency.max(late);
-                            parts.push((buf, width));
-                        }
-                        None => {
-                            let silent = pool.alloc(width, 1)?;
-                            ops.push(AudioOp::Silence { out: silent });
-                            parts.push((silent, width));
-                        }
-                    }
-                }
-
-                // One bus at the right width already is the plugin's input
-                // region; anything else has to be assembled. Skipping the copy
-                // in the common case matters — most plugins are one stereo bus.
-                let total: u16 = buses.iter().sum();
-                let input = match parts.as_slice() {
-                    [] => {
-                        // An instrument. It is still handed a buffer, because
-                        // the caller's slice has to point somewhere.
-                        let silent = pool.alloc(out_width, 1)?;
-                        ops.push(AudioOp::Silence { out: silent });
-                        silent
-                    }
-                    [(buf, width)] if pool.width_of(*buf) == *width => *buf,
-                    _ => {
-                        let avoid: Vec<Buf> = parts.iter().map(|&(b, _)| b).collect();
-                        let out = pool.alloc_avoiding(total, 1, &avoid)?;
-                        ops.push(AudioOp::Gather {
-                            out,
-                            buses: parts.clone(),
-                        });
-                        out
-                    }
-                };
-                for (buf, _) in &parts {
-                    pool.consume(*buf);
-                }
-                if !parts.iter().any(|&(b, _)| b == input) {
-                    pool.consume(input);
-                }
-
-                // The same question on the way out (§14.2): a plugin's extra
-                // output buses are handed over only as far as the graph reads
-                // them, so Surge XT's `Scene B` costs nothing in a patch that
-                // ignores it.
-                let mut out_wired = 0usize;
-                for link in graph.links.iter().filter(|l| l.from == id) {
-                    out_wired = out_wired.max(link.from_port as usize + 1);
-                }
-                if out_wired > ports.audio_out.len() {
-                    // A socket the node does not have. `connect` cannot make
-                    // this link, so the patch was hand-edited or written by a
-                    // later version.
-                    return Err(CompileError::TypeMismatch {
-                        node: id,
-                        port: (out_wired - 1) as u8,
-                    });
-                }
-                if out_wired > 1 + MAX_AUX_BUSES {
-                    return Err(CompileError::TooLarge {
-                        what: "output buses read from one plugin",
-                        limit: 1 + MAX_AUX_BUSES,
-                    });
-                }
-                // At least the main bus, even when nothing reads it: a plugin
-                // still has to be given somewhere to write.
-                let out_buses: Vec<u16> = ports.audio_out[..out_wired.max(1)].to_vec();
-                let out_total: u16 = out_buses.iter().sum();
-
-                // One bus is the overwhelmingly common case and stays exactly
-                // as it was: the plugin writes straight into the buffer the
-                // next node reads. Only a patch that reads a second bus pays
-                // for the split.
-                let single = out_buses.len() == 1;
-                let output =
-                    pool.alloc_avoiding(out_total, if single { readers } else { 1 }, &[input])?;
-                ops.push(AudioOp::Plugin {
-                    instance: *instance as u32,
-                    input,
-                    input_buses: buses.clone(),
-                    output,
-                    output_buses: out_buses.clone(),
-                    notes: note_source(graph, id, ports),
-                });
-                instances.push(InstanceIo {
-                    instance: *instance as u32,
-                    input_channels: buses.first().copied().unwrap_or(0),
-                    aux_inputs: buses.get(1..).unwrap_or(&[]).to_vec(),
-                    output_channels: out_buses[0],
-                    aux_outputs: out_buses.get(1..).unwrap_or(&[]).to_vec(),
-                });
-                let latency = in_latency + ports.latency;
-                if single {
-                    produced.push(Produced {
-                        node: id,
-                        port: 0,
-                        buf: output,
-                        latency,
-                    });
-                } else {
-                    let mut channel = 0u16;
-                    for (port, &width) in out_buses.iter().enumerate() {
-                        let readers = graph
-                            .links
-                            .iter()
-                            .filter(|l| l.from == id && l.from_port == port as u8)
-                            .count();
-                        // A bus in the middle that nobody reads still occupies
-                        // its channels in the plugin's output region; it just
-                        // never gets copied out of it.
-                        if readers > 0 {
-                            let buf = pool.alloc_avoiding(width, readers, &[input, output])?;
-                            ops.push(AudioOp::Split {
-                                from: output,
-                                out: buf,
-                                channel,
-                                width,
-                            });
-                            produced.push(Produced {
-                                node: id,
-                                port: port as u8,
-                                buf,
-                                latency,
-                            });
-                        }
-                        channel += width;
-                    }
-                    pool.consume(output);
-                }
-            }
-            NodeKind::Mix {
-                channels, gains, ..
-            } => {
-                // §14.6, the merge point: every branch waits for the latest one
-                // or they phase-cancel.
-                let arrive = sources
-                    .iter()
-                    .filter_map(|s| s.map(|(_, late)| late))
-                    .max()
-                    .unwrap_or(0);
-                let mut inputs = Vec::new();
-                for (port, (buf, late)) in sources
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(port, s)| s.map(|s| (port, s)))
-                {
-                    if arrive > late {
-                        if compensators as usize >= MAX_COMPENSATORS {
-                            return Err(CompileError::TooLarge {
-                                what: "compensated paths",
-                                limit: MAX_COMPENSATORS,
-                            });
-                        }
-                        if (arrive - late) as usize >= MAX_COMPENSATION {
-                            return Err(CompileError::TooLarge {
-                                what: "samples of delay compensation",
-                                limit: MAX_COMPENSATION,
-                            });
-                        }
-                        ops.push(AudioOp::Compensate {
-                            buf,
-                            slot: compensators,
-                            samples: arrive - late,
-                        });
-                        compensators += 1;
-                    }
-                    inputs.push(MixIn {
-                        buf,
-                        // Signal, gain, signal, gain: the gain for input
-                        // `port` is the socket right after it.
-                        lane: lane_of(audio_lanes, id, (2 * port + 1) as u8),
-                        gain: gains.get(port).copied().unwrap_or(1.0),
-                    });
-                }
-                for input in &inputs {
-                    pool.consume(input.buf);
-                }
-                // The first input may be reused as the destination — that is
-                // what makes the mix an accumulate rather than a copy — but the
-                // rest may not, or the sum would be built out of a buffer that
-                // has already been written over.
-                let avoid: Vec<Buf> = inputs.iter().skip(1).map(|i| i.buf).collect();
-                let out = pool.alloc_avoiding(*channels, readers, &avoid)?;
-                ops.push(AudioOp::Mix { out, inputs });
-                produced.push(Produced {
-                    node: id,
-                    port: 0,
-                    buf: out,
-                    latency: arrive,
-                });
-            }
-            NodeKind::DelayRead {
-                line,
-                ty: PortType::Audio { channels },
-                max_time,
-                time,
-            } => {
-                let index = audio_line(
-                    &mut audio_lines,
-                    &mut delay_nodes,
-                    &mut ring_seconds,
-                    lines,
-                    *line,
-                )?;
-                // Several reads may share a line — that is a multi-tap delay —
-                // and the ring has to be long enough for the furthest of them.
-                let want = max_time.clamp(0.0, MAX_AUDIO_DELAY_SECONDS);
-                ring_seconds[index as usize] = ring_seconds[index as usize].max(want);
-                let out = pool.alloc(*channels, readers)?;
-                ops.push(AudioOp::DelayRead {
-                    out,
-                    line: index,
-                    lane: lane_of(audio_lanes, id, 0),
-                    time: time.max(0.0),
-                    max_time: max_time.max(0.0),
-                });
-                produced.push(Produced {
-                    node: id,
-                    port: 0,
-                    buf: out,
-                    // A line is a cut, not an edge: what comes out of it did not
-                    // travel here through the paths §14.6 is lining up, so it
-                    // arrives with no latency of its own to compensate for.
-                    latency: 0,
-                });
-            }
-            NodeKind::DelayWrite {
-                line,
-                ty: PortType::Audio { .. },
-            } => {
-                let index = audio_line(
-                    &mut audio_lines,
-                    &mut delay_nodes,
-                    &mut ring_seconds,
-                    lines,
-                    *line,
-                )?;
-                if let Some((buf, _)) = sources[0] {
-                    pool.consume(buf);
-                    writes.push(AudioOp::DelayWrite {
-                        line: index,
-                        a: buf,
-                    });
-                }
-            }
-            _ => {}
-        }
+        cx.begin(id, &node.kind);
+        node.kind.compile_audio(&mut cx)?;
     }
-
-    ops.append(&mut writes);
-
-    // §14.9. An audio line with both halves present closes a loop, and then
-    // every plugin in the program has to run at sub-block granularity.
-    let looped = lines
-        .iter()
-        .any(|line| matches!(line.ty, PortType::Audio { .. }) && line.writer != NO_WRITER);
-
-    instances.sort_unstable_by_key(|i| i.instance);
-    Ok(Audio {
-        instances,
-        ops,
-        delay_nodes,
-        ring_seconds,
-        buffers: pool.widths,
-        chunking: if looped {
-            Chunking::SubBlock
-        } else {
-            Chunking::WholeBlock
-        },
-        latency,
-    })
+    Ok(cx.finish())
 }
 
 #[cfg(test)]
@@ -583,14 +66,17 @@ mod tests {
     use super::*;
     use crate::compile::compile;
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
-    use crate::graph::PluginPorts;
-    use crate::program::AudioOp;
+    use crate::ir::{AudioOp, NoteSource};
+    use crate::nodes::{
+        AudioIn, AudioOut, DelayRead, DelayWrite, Mix, NodeKind, Plugin, PluginPorts,
+    };
+    use crate::port::PortType;
 
     const SLOTS: usize = 32;
 
     fn plugin(graph: &mut Graph, instance: usize, latency: u32) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -598,7 +84,7 @@ mod tests {
                     latency,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -606,34 +92,34 @@ mod tests {
     /// A plugin with a main stereo bus and one aux bus of `aux` channels.
     fn with_sidechain(graph: &mut Graph, instance: usize, aux: u16) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![2, aux],
                     audio_out: vec![2],
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
     fn stereo_in(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
     fn stereo_out(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -721,7 +207,7 @@ mod tests {
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let node = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -729,7 +215,7 @@ mod tests {
                     audio_out: vec![2, 2, 2],
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, node, 0);
@@ -815,12 +301,12 @@ mod tests {
         let input = stereo_in(&mut graph);
         let slow = plugin(&mut graph, 0, 128);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -850,12 +336,12 @@ mod tests {
         let a = plugin(&mut graph, 0, 64);
         let b = plugin(&mut graph, 1, 64);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -891,28 +377,28 @@ mod tests {
 
         // Feed the plugin from its own output, through a delay line.
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::STEREO,
                 max_time: 1.0,
                 time: 0.01,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::STEREO,
-            },
+            }),
             [0.0, 0.0],
         );
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, mix, 0);
@@ -935,19 +421,19 @@ mod tests {
         graph.connect(node, 0, output, 0);
 
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::Param,
                 max_time: 1.0,
                 time: 0.01,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(read, 0, write, 0);
@@ -961,7 +447,7 @@ mod tests {
     /// A synth node with an instrument's ports.
     fn synth(graph: &mut Graph, instance: usize) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![],
@@ -969,12 +455,12 @@ mod tests {
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
-    fn note_sources(program: &crate::program::Program) -> Vec<(u32, NoteSource)> {
+    fn note_sources(program: &crate::ir::Program) -> Vec<(u32, NoteSource)> {
         program
             .audio_ops
             .iter()
@@ -1047,12 +533,12 @@ mod tests {
         let wired = synth(&mut graph, 0);
         let idle = synth(&mut graph, 1);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -1078,7 +564,7 @@ mod tests {
         let input = stereo_in(&mut graph);
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let node = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -1086,7 +572,7 @@ mod tests {
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);

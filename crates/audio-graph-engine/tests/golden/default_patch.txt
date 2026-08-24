@@ -1,0 +1,28 @@
+Program {
+    ops: [],
+    registers: 0,
+    outputs: [],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Output {
+            a: 0,
+            bus: 0,
+        },
+    ],
+    param_targets: [],
+    instances: [],
+    buffers: [
+        2,
+    ],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [],
+}
