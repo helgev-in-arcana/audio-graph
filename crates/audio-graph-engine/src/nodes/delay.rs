@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::graph::LineId;
-use crate::ir::{AudioOp, NoteSource, Op};
+use crate::ir::{AudioOp, Op};
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{NodeUi, line_control};
 use crate::port::{Port, PortType};
 
 /// The writing half of a delay line (§14.4).
@@ -44,20 +47,24 @@ pub struct DelayRead {
     pub time: f64,
 }
 
-impl DelayWrite {
-    pub fn input_ports(&self) -> Vec<Port> {
-        vec![Port::new("in", self.ty)]
-    }
-
-    pub fn output_ports(&self) -> Vec<Port> {
-        Vec::new()
-    }
-
-    pub fn title(&self) -> String {
+impl Node for DelayWrite {
+    fn title(&self) -> String {
         format!("Delay {} write", self.line + 1)
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn input_ports(&self) -> Vec<Port> {
+        vec![Port::new("in", self.ty)]
+    }
+
+    fn output_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        cx.declare_line(self.line, self.ty, true)
+    }
+
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         if matches!(self.ty, PortType::Audio { .. }) {
             return Ok(());
         }
@@ -70,7 +77,7 @@ impl DelayWrite {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+    fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         if !matches!(self.ty, PortType::Audio { .. }) {
             return Ok(());
         }
@@ -82,24 +89,14 @@ impl DelayWrite {
         Ok(())
     }
 
-    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
-        cx.declare_line(self.line, self.ty, true)
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+        line_control(ui, &mut self.line)
     }
 }
 
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, line_control};
-
-#[cfg(feature = "ui")]
 impl DelayWrite {
-    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        line_control(ui, &mut self.line)
-    }
-
     /// Not in the menu: both halves arrive together, through `Graph::add_delay`
     /// (ADR-8). A `DelayWrite` on its own is a line nothing reads.
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, DelayWrite)> {
@@ -107,24 +104,28 @@ impl DelayWrite {
     }
 }
 
-impl DelayRead {
+impl Node for DelayRead {
+    fn title(&self) -> String {
+        format!("Delay {} read", self.line + 1)
+    }
+
     /// The one input a `DelayRead` has is its own delay time (§14.5). It is a
     /// param, never audio, so it cannot close a loop through the line it
     /// belongs to — the type check in `check_links` is what makes that true
     /// rather than a convention.
-    pub fn input_ports(&self) -> Vec<Port> {
+    fn input_ports(&self) -> Vec<Port> {
         vec![Port::param("time")]
     }
 
-    pub fn output_ports(&self) -> Vec<Port> {
+    fn output_ports(&self) -> Vec<Port> {
         vec![Port::new("out", self.ty)]
     }
 
-    pub fn title(&self) -> String {
-        format!("Delay {} read", self.line + 1)
+    fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        cx.declare_line(self.line, self.ty, false)
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let line = cx.line_index(self.line);
         let time_reg = cx.input(0);
         if matches!(self.ty, PortType::Audio { .. }) {
@@ -151,7 +152,7 @@ impl DelayRead {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+    fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let PortType::Audio { channels } = self.ty else {
             return Ok(());
         };
@@ -172,18 +173,8 @@ impl DelayRead {
         Ok(())
     }
 
-    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
-        cx.declare_line(self.line, self.ty, false)
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
-    }
-}
-
-#[cfg(feature = "ui")]
-impl DelayRead {
-    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let mut changed = line_control(ui, &mut self.line);
         // The floor of §14.4, in the units the control is in. It is the
         // sub-block size, which the user chose, so it moves when they change
@@ -224,7 +215,10 @@ impl DelayRead {
         }
         changed
     }
+}
 
+#[cfg(feature = "ui")]
+impl DelayRead {
     /// See [`DelayWrite::catalogue_defaults`].
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, DelayRead)> {
         Vec::new()

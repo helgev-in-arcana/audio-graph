@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-use crate::ir::{NoteSource, Op};
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
+use crate::nodes::Node;
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::NodeUi;
 use crate::port::Port;
 
 /// Rescale one range onto another. The 0..1 → plain-units half of §9.3 is
@@ -16,20 +19,20 @@ pub struct RangeMap {
     pub clamp: bool,
 }
 
-impl RangeMap {
-    pub fn input_ports(&self) -> Vec<Port> {
-        vec![Port::param("in")]
-    }
-
-    pub fn output_ports(&self) -> Vec<Port> {
-        vec![Port::param("out")]
-    }
-
-    pub fn title(&self) -> String {
+impl Node for RangeMap {
+    fn title(&self) -> String {
         "Range map".into()
     }
 
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+    fn input_ports(&self) -> Vec<Port> {
+        vec![Port::param("in")]
+    }
+
+    fn output_ports(&self) -> Vec<Port> {
+        vec![Port::param("out")]
+    }
+
+    fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let a = cx.input_or_zero(0)?;
         let out = cx.alloc()?;
         cx.emit(Op::Range {
@@ -45,25 +48,8 @@ impl RangeMap {
         Ok(())
     }
 
-    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
-        Ok(())
-    }
-
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
-    }
-}
-
-#[cfg(feature = "ui")]
-use crate::nodes::widgets::NodeUi;
-
-#[cfg(feature = "ui")]
-impl RangeMap {
-    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+    #[cfg(feature = "ui")]
+    fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("in");
@@ -86,7 +72,10 @@ impl RangeMap {
         changed |= ui.checkbox(&mut self.clamp, "clamp").changed();
         changed
     }
+}
 
+#[cfg(feature = "ui")]
+impl RangeMap {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, RangeMap)> {
         vec![(
             "Range map",
