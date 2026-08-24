@@ -2,12 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::AudioCx;
-use crate::compile::DeclareCx;
-use crate::compile::{CompileError, ParamCx};
-use crate::ir::NoteSource;
-use crate::ir::ParamTarget;
-use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES};
+use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
+use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, NoteSource, ParamTarget};
 use crate::port::{Port, PortType};
 
 /// One sub-plugin parameter the graph is allowed to drive.
@@ -51,6 +47,18 @@ pub struct PluginPorts {
     pub latency: u32,
 }
 
+/// One hosted sub-plugin.
+///
+/// `instance` indexes the wrapper's table of loaded sub-plugins, the same
+/// way `slot` indexes the slot table: which file that is, and how it was
+/// bound, stays outside the graph (§8.3). `ports` is the layout that was
+/// discovered after loading (§14.2), cached here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Plugin {
+    pub instance: usize,
+    pub ports: PluginPorts,
+}
+
 impl PluginPorts {
     /// Build a node's ports from what a loaded plugin reported (§14.2).
     ///
@@ -78,18 +86,6 @@ impl PluginPorts {
             latency,
         }
     }
-}
-
-/// One hosted sub-plugin.
-///
-/// `instance` indexes the wrapper's table of loaded sub-plugins, the same
-/// way `slot` indexes the slot table: which file that is, and how it was
-/// bound, stays outside the graph (§8.3). `ports` is the layout that was
-/// discovered after loading (§14.2), cached here.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Plugin {
-    pub instance: usize,
-    pub ports: PluginPorts,
 }
 
 impl Plugin {
@@ -138,9 +134,7 @@ impl Plugin {
     pub fn title(&self) -> String {
         format!("Plugin {}", self.instance + 1)
     }
-}
 
-impl Plugin {
     /// The param half of a plugin node is only its parameter sockets; the
     /// audio pass walks the same order again and emits the rest (§14.9).
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
@@ -161,9 +155,7 @@ impl Plugin {
         }
         Ok(())
     }
-}
 
-impl Plugin {
     pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let out_width = cx.out_width();
         if out_width == 0 {
@@ -309,14 +301,105 @@ impl Plugin {
         cx.consume(output);
         Ok(())
     }
-}
 
-impl Plugin {
     pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
         Ok(())
     }
 
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         None
+    }
+}
+
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
+
+#[cfg(feature = "ui")]
+impl Plugin {
+    /// What is loaded in this node, and its parameter sockets.
+    ///
+    /// The sockets are the user's choice, not the plugin's (§14.12). A
+    /// compressor has ninety parameters and a node with ninety sockets would be
+    /// unusable, so they are added one at a time and each one picks what it
+    /// drives from a dropdown.
+    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+        let mut changed = false;
+        let view = cx.instances.get(self.instance).cloned().unwrap_or_default();
+
+        if view.loaded {
+            ui.label(egui::RichText::new(&view.name).strong());
+        } else {
+            ui.colored_label(CAUTION, "not loaded").on_hover_text(
+                "the plugin could not be found, or is still loading. Its links and \
+                 parameter sockets are kept either way (§8.3).",
+            );
+        }
+
+        let instance = self.instance;
+        let ports = &mut self.ports;
+        ui.horizontal(|ui| {
+            if view.loaded {
+                if view.editor_open {
+                    if ui.small_button("close GUI").clicked() {
+                        cx.act(NodeAction::CloseSubEditor(instance));
+                    }
+                } else if ui.small_button("GUI").clicked() {
+                    cx.act(NodeAction::OpenSubEditor(instance));
+                }
+            }
+            if ui.small_button("+ param").clicked() {
+                // The first parameter it has, so a freshly added socket points
+                // at something real rather than at nothing.
+                let (id, name) = view
+                    .params
+                    .first()
+                    .cloned()
+                    .unwrap_or((0, "parameter".to_string()));
+                ports.params.push(ParamPort { id, name });
+                changed = true;
+            }
+        });
+
+        let mut remove: Option<usize> = None;
+        for (index, param) in ports.params.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let label = if param.name.is_empty() {
+                    format!("#{}", param.id)
+                } else {
+                    param.name.clone()
+                };
+                egui::ComboBox::from_id_salt(("param", index))
+                    .selected_text(shorten(&label))
+                    .width(112.0)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &view.params {
+                            if ui.selectable_label(*id == param.id, name).clicked()
+                                && *id != param.id
+                            {
+                                param.id = *id;
+                                param.name = name.clone();
+                                changed = true;
+                            }
+                        }
+                        if view.params.is_empty() {
+                            ui.weak("load a plugin to choose");
+                        }
+                    });
+                if ui.small_button("x").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove {
+            ports.params.remove(index);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Not in the plain menu: a plugin node needs an instance number and a file
+    /// to load, so the editor offers it through the plugin list instead.
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Plugin)> {
+        Vec::new()
     }
 }

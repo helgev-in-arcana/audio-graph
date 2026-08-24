@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::compile::AudioCx;
-use crate::compile::DeclareCx;
-use crate::compile::{CompileError, ParamCx};
-use crate::ir::NoteSource;
-use crate::ir::Op;
+use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
+use crate::ir::{NoteSource, Op};
 use crate::port::Port;
 
 /// A fixed number.
@@ -25,9 +22,7 @@ impl Constant {
     pub fn title(&self) -> String {
         "Constant".into()
     }
-}
 
-impl Constant {
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let out = cx.alloc()?;
         cx.emit(Op::Const {
@@ -37,20 +32,31 @@ impl Constant {
         cx.bind_output(0, out);
         Ok(())
     }
-}
 
-impl Constant {
     pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
-}
 
-impl Constant {
     pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
         Ok(())
     }
 
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         None
+    }
+}
+
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::NodeUi;
+
+#[cfg(feature = "ui")]
+impl Constant {
+    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+        ui.add(egui::Slider::new(&mut self.value, 0.0..=1.0))
+            .changed()
+    }
+
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Constant)> {
+        vec![("Constant", Constant { value: 0.5 })]
     }
 }

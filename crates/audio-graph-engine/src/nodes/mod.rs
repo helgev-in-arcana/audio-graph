@@ -11,6 +11,9 @@
 //! not a `Box<dyn …>` here, it is a variant carrying its own struct. The arms
 //! below are the whole cost of that, and they are one line each.
 
+#[cfg(feature = "ui")]
+pub mod widgets;
+
 mod audio_io;
 mod constant;
 mod delay;
@@ -140,4 +143,60 @@ impl NodeKind {
     pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         for_kind!(self, node => node.compile_audio(cx))
     }
+
+    /// Draw this node's own controls, inside the frame the canvas has already
+    /// laid out. Returns whether anything changed.
+    #[cfg(feature = "ui")]
+    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
+        for_kind!(self, node => node.controls(ui, cx))
+    }
+}
+
+/// What the editor's "add a node" menu offers, in the order it offers it.
+///
+/// A free function rather than a method, because two entries can be the same
+/// node: `Mix` and `Gain` differ only in their starting shape, and the menu is
+/// the right place to say so. The delay pair is absent for the opposite
+/// reason — both halves arrive together, through `Graph::add_delay`.
+#[cfg(feature = "ui")]
+pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
+    let mut out = Vec::new();
+    fn take<T>(
+        out: &mut Vec<(&'static str, NodeKind)>,
+        entries: Vec<(&'static str, T)>,
+        wrap: fn(T) -> NodeKind,
+    ) {
+        out.extend(entries.into_iter().map(|(name, node)| (name, wrap(node))));
+    }
+    take(&mut out, Constant::catalogue_defaults(), NodeKind::Constant);
+    take(&mut out, SlotIn::catalogue_defaults(), NodeKind::SlotIn);
+    take(&mut out, Lfo::catalogue_defaults(), NodeKind::Lfo);
+    take(
+        &mut out,
+        Expression::catalogue_defaults(),
+        NodeKind::Expression,
+    );
+    take(&mut out, Math::catalogue_defaults(), NodeKind::Math);
+    take(&mut out, RangeMap::catalogue_defaults(), NodeKind::RangeMap);
+    take(&mut out, SlotOut::catalogue_defaults(), NodeKind::SlotOut);
+    take(&mut out, AudioIn::catalogue_defaults(), NodeKind::AudioIn);
+    take(&mut out, AudioOut::catalogue_defaults(), NodeKind::AudioOut);
+    out.extend(
+        NoteIn::catalogue_defaults()
+            .into_iter()
+            .map(|(name, _)| (name, NodeKind::NoteIn)),
+    );
+    take(&mut out, Plugin::catalogue_defaults(), NodeKind::Plugin);
+    take(
+        &mut out,
+        DelayWrite::catalogue_defaults(),
+        NodeKind::DelayWrite,
+    );
+    take(&mut out, Mix::catalogue_defaults(), NodeKind::Mix);
+    take(
+        &mut out,
+        DelayRead::catalogue_defaults(),
+        NodeKind::DelayRead,
+    );
+    out
 }

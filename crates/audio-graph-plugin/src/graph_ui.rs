@@ -18,10 +18,13 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, ExprSource, Expression, Graph, Lfo, Math,
-    MathOp, Mix, NodeId, NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate,
-    SlotIn, SlotOut, Waveform,
+    Graph, NODE_WIDTH, NodeAction, NodeId, NodeKind, NodeUi, Plugin, PluginPorts, PortType,
+    catalogue,
 };
+
+/// Re-exported so the wrapper fills one in without naming two crates. It is
+/// the engine's type: what a plugin node draws is the engine's business now.
+pub use audio_graph_engine::InstanceView;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use subhost_adapter::SLOT_COUNT;
 
@@ -50,7 +53,6 @@ fn socket_colour(port: &audio_graph_engine::Port) -> Color32 {
     }
 }
 
-const NODE_WIDTH: f32 = 186.0;
 /// Vertical space between a node's top edge and its first port.
 const PORT_TOP: f32 = 26.0;
 const PORT_SPACING: f32 = 18.0;
@@ -64,16 +66,6 @@ pub struct PluginEntry {
     pub name: String,
     pub format: plugin_host::Format,
     pub path: PathBuf,
-}
-
-/// One sub-plugin instance, as the canvas needs to draw the node holding it.
-#[derive(Default, Clone)]
-pub struct InstanceView {
-    pub loaded: bool,
-    pub name: String,
-    pub editor_open: bool,
-    /// `(id, name)` for every parameter, to fill a socket's dropdown.
-    pub params: Vec<(u32, String)>,
 }
 
 /// Something the canvas cannot do itself, because it loads a plugin or touches
@@ -513,7 +505,7 @@ impl GraphEditor {
             if !inputs.is_empty() || !outputs.is_empty() {
                 ui.separator();
             }
-            outcome.changed |= self.controls(ui, &mut graph.nodes[index].kind, ctx);
+            outcome.changed |= self.node_controls(ui, &mut graph.nodes[index].kind, ctx);
         });
 
         let rect = response.response.rect;
@@ -639,261 +631,33 @@ impl GraphEditor {
         response.clicked()
     }
 
-    /// The per-kind controls inside a node. Returns whether anything changed.
-    fn controls(&mut self, ui: &mut egui::Ui, kind: &mut NodeKind, ctx: &GraphContext<'_>) -> bool {
-        let mut changed = false;
-        match kind {
-            NodeKind::Constant(Constant { value }) => {
-                changed |= ui.add(egui::Slider::new(value, 0.0..=1.0)).changed();
-            }
-            NodeKind::SlotIn(SlotIn { slot }) | NodeKind::SlotOut(SlotOut { slot }) => {
-                changed |= slot_picker(ui, slot, ctx);
-            }
-            NodeKind::Lfo(Lfo {
-                waveform,
-                rate,
-                phase,
-                depth,
-                offset,
-            }) => {
-                changed |= combo(ui, "wave", waveform, &Waveform::ALL, Waveform::label);
-                changed |= rate_control(ui, rate);
-                ui.horizontal(|ui| {
-                    ui.label("phase");
-                    changed |= ui
-                        .add(egui::DragValue::new(phase).speed(0.01).range(0.0..=1.0))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("depth");
-                    changed |= ui
-                        .add(egui::DragValue::new(depth).speed(0.01).range(-1.0..=1.0))
-                        .changed();
-                    ui.label("centre");
-                    changed |= ui
-                        .add(egui::DragValue::new(offset).speed(0.01).range(-1.0..=1.0))
-                        .changed();
-                });
-            }
-            NodeKind::Expression(Expression { source }) => {
-                changed |= combo(ui, "source", source, &ExprSource::ALL, ExprSource::label);
-                if source.is_per_note() && !ctx.poly_modulation {
-                    // §3.3 asks for per-voice sources to be greyed out when the
-                    // sub-plugin cannot take per-voice modulation. In v1 the
-                    // graph is monophonic, so these still do something useful —
-                    // they are just flattened. Saying so is more use than
-                    // disabling a control that works.
-                    ui.colored_label(Color32::from_rgb(200, 160, 70), "newest note only")
-                        .on_hover_text(
-                            "the sub-plugin cannot take per-voice modulation, so every \
-                             held note contributes to one value",
-                        );
-                }
-            }
-            NodeKind::Math(Math { op, b }) => {
-                changed |= combo(ui, "op", op, &MathOp::ALL, MathOp::label);
-                ui.horizontal(|ui| {
-                    ui.label("b");
-                    changed |= ui.add(egui::DragValue::new(b).speed(0.01)).changed();
-                });
-                ui.weak("b is used only while its input is unconnected");
-            }
-            NodeKind::RangeMap(RangeMap {
-                in_lo,
-                in_hi,
-                out_lo,
-                out_hi,
-                clamp,
-            }) => {
-                ui.horizontal(|ui| {
-                    ui.label("in");
-                    changed |= ui.add(egui::DragValue::new(in_lo).speed(0.01)).changed();
-                    changed |= ui.add(egui::DragValue::new(in_hi).speed(0.01)).changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("out");
-                    changed |= ui.add(egui::DragValue::new(out_lo).speed(0.01)).changed();
-                    changed |= ui.add(egui::DragValue::new(out_hi).speed(0.01)).changed();
-                });
-                changed |= ui.checkbox(clamp, "clamp").changed();
-            }
-            NodeKind::DelayRead(DelayRead {
-                line,
-                ty,
-                max_time,
-                time,
-            }) => {
-                changed |= line_control(ui, line);
-                // The floor of §14.4, in the units the control is in. It is
-                // the sub-block size, which the user chose, so it moves when
-                // they change that setting — and the value is raised with
-                // it rather than the delay quietly running longer than it says.
-                let floor = ctx.quantum as f64 / ctx.sample_rate.max(1.0);
-                if *time < floor {
-                    *time = floor;
-                    changed = true;
-                }
-                ui.horizontal(|ui| {
-                    ui.label("time (s)");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(time)
-                                .speed(0.001)
-                                .range(floor..=*max_time),
-                        )
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("max (s)");
-                    changed |= ui
-                        .add(egui::DragValue::new(max_time).speed(0.01).range(0.01..=2.0))
-                        .changed();
-                });
-                if matches!(ty, PortType::Audio { .. }) {
-                    ui.weak(format!(
-                        "at least {:.1} ms — one sub-block (§14.4)",
-                        floor * 1000.0
-                    ));
-                    ui.weak("wire the time socket to sweep it — the pitch moves with it");
-                }
-            }
-            NodeKind::Plugin(Plugin { instance, ports }) => {
-                changed |= self.plugin_controls(ui, *instance, ports, ctx);
-            }
-            NodeKind::Mix(Mix { inputs, gains, .. }) => {
-                ui.horizontal(|ui| {
-                    ui.label("inputs");
-                    let mut count = *inputs as u32;
-                    // One is allowed, and useful: a mix of one input *is* a
-                    // gain, which is what turns a feedback delay's loop down
-                    // below unity so it decays.
-                    if ui
-                        .add(egui::DragValue::new(&mut count).range(1..=8))
-                        .changed()
-                    {
-                        *inputs = count as u8;
-                        changed = true;
-                    }
-                });
-                // Grown here rather than at load: a patch saved before the
-                // gains existed has none, and every missing one is unity.
-                gains.resize(*inputs as usize, 1.0);
-                for (i, gain) in gains.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("gain {}", i + 1));
-                        changed |= ui
-                            .add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
-                            .changed();
-                    });
-                }
-                ui.weak("a gain is used only while its socket is unconnected");
-            }
-            NodeKind::AudioIn(AudioIn { bus, .. }) | NodeKind::AudioOut(AudioOut { bus, .. }) => {
-                ui.horizontal(|ui| {
-                    ui.label("bus");
-                    // One-based on screen: the DAW calls them "Main" and
-                    // "Sidechain", not "0" and "1".
-                    let mut shown = *bus as u32 + 1;
-                    if ui
-                        .add(egui::DragValue::new(&mut shown).range(1..=2))
-                        .changed()
-                    {
-                        *bus = (shown - 1) as usize;
-                        changed = true;
-                    }
-                    ui.weak(if *bus == 0 { "main" } else { "sidechain" });
-                });
-            }
-            NodeKind::DelayWrite(DelayWrite { line, .. }) => {
-                changed |= line_control(ui, line);
-            }
-            // A source with nothing to set.
-            NodeKind::NoteIn => {}
-        }
-        changed
-    }
-
-    /// A plugin node: what is loaded in it, and its parameter sockets.
-    ///
-    /// The sockets are the user's choice, not the plugin's (§14.12). A
-    /// compressor has ninety parameters and a node with ninety sockets would be
-    /// unusable, so they are added one at a time and each one picks what it
-    /// drives from a dropdown.
-    fn plugin_controls(
+    /// A node's own controls, which live with the node (`nodes/` in the
+    /// engine). All the canvas does is hand over the facts a node may need and
+    /// carry out whatever it asked for afterwards — opening a sub-plugin's
+    /// window may not happen inside a draw callback, which is why the request
+    /// comes back as a value rather than happening on the spot.
+    fn node_controls(
         &mut self,
         ui: &mut egui::Ui,
-        instance: usize,
-        ports: &mut PluginPorts,
+        kind: &mut NodeKind,
         ctx: &GraphContext<'_>,
     ) -> bool {
-        let mut changed = false;
-        let view = ctx.instances.get(instance).cloned().unwrap_or_default();
-
-        if view.loaded {
-            ui.label(egui::RichText::new(&view.name).strong());
-        } else {
-            ui.colored_label(Color32::from_rgb(200, 140, 60), "not loaded")
-                .on_hover_text(
-                    "the plugin could not be found, or is still loading. Its links and                      parameter sockets are kept either way (§8.3).",
-                );
-        }
-
-        ui.horizontal(|ui| {
-            if view.loaded {
-                if view.editor_open {
-                    if ui.small_button("close GUI").clicked() {
-                        self.actions.push(GraphAction::CloseSubEditor(instance));
-                    }
-                } else if ui.small_button("GUI").clicked() {
-                    self.actions.push(GraphAction::OpenSubEditor(instance));
-                }
-            }
-            if ui.small_button("+ param").clicked() {
-                // The first parameter it has, so a freshly added socket points
-                // at something real rather than at nothing.
-                let (id, name) = view
-                    .params
-                    .first()
-                    .cloned()
-                    .unwrap_or((0, "parameter".to_string()));
-                ports.params.push(ParamPort { id, name });
-                changed = true;
-            }
-        });
-
-        let mut remove: Option<usize> = None;
-        for (index, param) in ports.params.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                let label = if param.name.is_empty() {
-                    format!("#{}", param.id)
-                } else {
-                    param.name.clone()
-                };
-                egui::ComboBox::from_id_salt(("param", index))
-                    .selected_text(shorten(&label))
-                    .width(112.0)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &view.params {
-                            if ui.selectable_label(*id == param.id, name).clicked()
-                                && *id != param.id
-                            {
-                                param.id = *id;
-                                param.name = name.clone();
-                                changed = true;
-                            }
-                        }
-                        if view.params.is_empty() {
-                            ui.weak("load a plugin to choose");
-                        }
-                    });
-                if ui.small_button("x").clicked() {
-                    remove = Some(index);
-                }
+        let mut cx = NodeUi {
+            slot_count: SLOT_COUNT,
+            bindings: ctx.bindings,
+            live: &ctx.live,
+            poly_modulation: ctx.poly_modulation,
+            quantum: ctx.quantum,
+            sample_rate: ctx.sample_rate,
+            instances: ctx.instances,
+            actions: Vec::new(),
+        };
+        let changed = kind.controls(ui, &mut cx);
+        for action in cx.actions {
+            self.actions.push(match action {
+                NodeAction::OpenSubEditor(instance) => GraphAction::OpenSubEditor(instance),
+                NodeAction::CloseSubEditor(instance) => GraphAction::CloseSubEditor(instance),
             });
-        }
-        if let Some(index) = remove {
-            ports.params.remove(index);
-            changed = true;
         }
         changed
     }
@@ -1051,86 +815,6 @@ struct NodeOutcome {
     input_ports: Vec<Pos2>,
 }
 
-fn catalogue() -> Vec<(&'static str, NodeKind)> {
-    vec![
-        ("Constant", NodeKind::Constant(Constant { value: 0.5 })),
-        ("Slot in", NodeKind::SlotIn(SlotIn { slot: 0 })),
-        (
-            "LFO",
-            NodeKind::Lfo(Lfo {
-                waveform: Waveform::Sine,
-                rate: Rate::Hz(1.0),
-                phase: 0.0,
-                // Centred on 0.5 with a half swing fills 0..1 exactly, which is
-                // the range a slot wants; anything else needs a Range map and
-                // would make a freshly dropped LFO look broken.
-                depth: 0.5,
-                offset: 0.5,
-            }),
-        ),
-        (
-            "Expression",
-            NodeKind::Expression(Expression {
-                source: ExprSource::Pressure,
-            }),
-        ),
-        (
-            "Math",
-            NodeKind::Math(Math {
-                op: MathOp::Multiply,
-                b: 1.0,
-            }),
-        ),
-        (
-            "Range map",
-            NodeKind::RangeMap(RangeMap {
-                in_lo: 0.0,
-                in_hi: 1.0,
-                out_lo: 0.0,
-                out_hi: 1.0,
-                clamp: true,
-            }),
-        ),
-        ("Slot out", NodeKind::SlotOut(SlotOut { slot: 0 })),
-        (
-            "Audio in",
-            NodeKind::AudioIn(AudioIn {
-                bus: 0,
-                channels: 2,
-            }),
-        ),
-        (
-            "Audio out",
-            NodeKind::AudioOut(AudioOut {
-                bus: 0,
-                channels: 2,
-            }),
-        ),
-        ("Note in", NodeKind::NoteIn),
-        (
-            "Mix",
-            NodeKind::Mix(Mix {
-                channels: 2,
-                inputs: 2,
-                gains: vec![1.0, 1.0],
-            }),
-        ),
-        (
-            "Gain",
-            NodeKind::Mix(Mix {
-                channels: 2,
-                inputs: 1,
-                // Half back round is a delay that decays over a few repeats,
-                // which is what a one-input mix is nearly always dropped in to
-                // do. It is the same node as the one above — only the starting
-                // shape differs, and having both in the menu is cheaper than
-                // making the user work that out.
-                gains: vec![0.5],
-            }),
-        ),
-    ]
-}
-
 /// `base` with every size in it multiplied by `zoom`.
 ///
 /// egui has a zoom of its own, but it is global: it would scale the panels and
@@ -1155,132 +839,6 @@ fn zoomed_style(base: &egui::Style, zoom: f32) -> egui::Style {
     s.icon_width_inner *= zoom;
     s.icon_spacing *= zoom;
     style
-}
-
-/// Combo boxes are only so wide, and a parameter name can be long.
-fn shorten(text: &str) -> String {
-    if text.chars().count() <= 16 {
-        return text.to_string();
-    }
-    text.chars().take(15).collect::<String>() + "\u{2026}"
-}
-
-/// Which delay line a half belongs to.
-///
-/// One-based on screen for the same reason a slot is: the two halves are paired
-/// by this number and nothing else, so it has to be readable at a glance.
-fn line_control(ui: &mut egui::Ui, line: &mut u32) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label("line");
-        let mut shown = *line + 1;
-        if ui
-            .add(egui::DragValue::new(&mut shown).range(1..=16))
-            .changed()
-        {
-            *line = shown.max(1) - 1;
-            changed = true;
-        }
-    });
-    changed
-}
-
-fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, ctx: &GraphContext<'_>) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        // One-based on screen, zero-based in the data: the DAW's automation
-        // lanes are called "Slot 1".."Slot 32", and disagreeing with them is
-        // how a user binds the wrong control.
-        let mut shown = *slot + 1;
-        if ui
-            .add(egui::DragValue::new(&mut shown).range(1..=SLOT_COUNT))
-            .changed()
-        {
-            *slot = shown.clamp(1, SLOT_COUNT) - 1;
-            changed = true;
-        }
-        ui.label(format!(
-            "{:.3}",
-            ctx.live.get(*slot).copied().unwrap_or(0.0)
-        ));
-    });
-    match ctx.bindings.iter().find(|(i, _, _)| i == slot) {
-        Some((_, name, true)) => {
-            ui.weak(name);
-        }
-        Some((_, name, false)) => {
-            ui.colored_label(Color32::from_rgb(200, 140, 60), name)
-                .on_hover_text("not resolved against the loaded sub-plugin");
-        }
-        None => {
-            ui.weak("not bound to a parameter");
-        }
-    }
-    changed
-}
-
-fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        let synced = matches!(rate, Rate::Beats(_));
-        if ui.selectable_label(!synced, "Hz").clicked() && synced {
-            *rate = Rate::Hz(1.0);
-            changed = true;
-        }
-        if ui.selectable_label(synced, "beats").clicked() && !synced {
-            *rate = Rate::Beats(1.0);
-            changed = true;
-        }
-        match rate {
-            Rate::Hz(hz) => {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(hz)
-                            .speed(0.05)
-                            .range(0.0..=40.0)
-                            .suffix(" Hz"),
-                    )
-                    .changed();
-            }
-            Rate::Beats(beats) => {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(beats)
-                            .speed(0.05)
-                            .range(0.03125..=64.0),
-                    )
-                    .on_hover_text("beats per cycle")
-                    .changed();
-            }
-        }
-    });
-    changed
-}
-
-/// A labelled drop-down over a fixed set of values.
-fn combo<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    label: &str,
-    current: &mut T,
-    all: &[T],
-    name: fn(T) -> &'static str,
-) -> bool {
-    let mut changed = false;
-    egui::ComboBox::from_id_salt(ui.id().with(label))
-        .selected_text(name(*current))
-        .width(NODE_WIDTH - 40.0)
-        .show_ui(ui, |ui| {
-            for &option in all {
-                if ui
-                    .selectable_label(*current == option, name(option))
-                    .clicked()
-                {
-                    *current = option;
-                    changed = true;
-                }
-            }
-        });
-    changed
 }
 
 /// A cubic curve between two ports, leaving and arriving horizontally.

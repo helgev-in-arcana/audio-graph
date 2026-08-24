@@ -9,12 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{AudioCx, DeclareCx};
-use crate::compile::{CompileError, ParamCx};
+use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::graph::LineId;
-use crate::ir::AudioOp;
-use crate::ir::NoteSource;
-use crate::ir::Op;
+use crate::ir::{AudioOp, NoteSource, Op};
 use crate::port::{Port, PortType};
 
 /// The writing half of a delay line (§14.4).
@@ -59,6 +56,55 @@ impl DelayWrite {
     pub fn title(&self) -> String {
         format!("Delay {} write", self.line + 1)
     }
+
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        if matches!(self.ty, PortType::Audio { .. }) {
+            return Ok(());
+        }
+        let line = cx.line_index(self.line);
+        // Nothing plugged in writes silence, the same way an unwired SlotOut
+        // simply does not take its slot over.
+        if let Some(reg) = cx.input(0) {
+            cx.emit_deferred(Op::DelayWrite { line, a: reg });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
+        if !matches!(self.ty, PortType::Audio { .. }) {
+            return Ok(());
+        }
+        let line = cx.audio_line(self.line)?;
+        if let Some((buf, _)) = cx.source(0) {
+            cx.consume(buf);
+            cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
+        cx.declare_line(self.line, self.ty, true)
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+}
+
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{NodeUi, line_control};
+
+#[cfg(feature = "ui")]
+impl DelayWrite {
+    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+        line_control(ui, &mut self.line)
+    }
+
+    /// Not in the menu: both halves arrive together, through `Graph::add_delay`
+    /// (ADR-8). A `DelayWrite` on its own is a line nothing reads.
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, DelayWrite)> {
+        Vec::new()
+    }
 }
 
 impl DelayRead {
@@ -77,9 +123,7 @@ impl DelayRead {
     pub fn title(&self) -> String {
         format!("Delay {} read", self.line + 1)
     }
-}
 
-impl DelayRead {
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let line = cx.line_index(self.line);
         let time_reg = cx.input(0);
@@ -106,24 +150,7 @@ impl DelayRead {
         cx.bind_output(0, out);
         Ok(())
     }
-}
 
-impl DelayWrite {
-    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
-        if matches!(self.ty, PortType::Audio { .. }) {
-            return Ok(());
-        }
-        let line = cx.line_index(self.line);
-        // Nothing plugged in writes silence, the same way an unwired SlotOut
-        // simply does not take its slot over.
-        if let Some(reg) = cx.input(0) {
-            cx.emit_deferred(Op::DelayWrite { line, a: reg });
-        }
-        Ok(())
-    }
-}
-
-impl DelayRead {
     pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let PortType::Audio { channels } = self.ty else {
             return Ok(());
@@ -144,42 +171,62 @@ impl DelayRead {
         cx.produce(0, out, 0);
         Ok(())
     }
-}
 
-impl DelayWrite {
-    pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
-        if !matches!(self.ty, PortType::Audio { .. }) {
-            return Ok(());
-        }
-        let line = cx.audio_line(self.line)?;
-        if let Some((buf, _)) = cx.source(0) {
-            cx.consume(buf);
-            cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
-        }
-        Ok(())
-    }
-}
-
-impl DelayWrite {
-    pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
-        cx.declare_line(self.line, self.ty, true)
-    }
-}
-
-impl DelayRead {
     pub(crate) fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
         cx.declare_line(self.line, self.ty, false)
     }
-}
 
-impl DelayWrite {
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         None
     }
 }
 
+#[cfg(feature = "ui")]
 impl DelayRead {
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        None
+    pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+        let mut changed = line_control(ui, &mut self.line);
+        // The floor of §14.4, in the units the control is in. It is the
+        // sub-block size, which the user chose, so it moves when they change
+        // that setting — and the value is raised with it rather than the delay
+        // quietly running longer than it says.
+        let floor = cx.quantum as f64 / cx.sample_rate.max(1.0);
+        if self.time < floor {
+            self.time = floor;
+            changed = true;
+        }
+        let max_time = self.max_time;
+        ui.horizontal(|ui| {
+            ui.label("time (s)");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.time)
+                        .speed(0.001)
+                        .range(floor..=max_time),
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("max (s)");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.max_time)
+                        .speed(0.01)
+                        .range(0.01..=2.0),
+                )
+                .changed();
+        });
+        if matches!(self.ty, PortType::Audio { .. }) {
+            ui.weak(format!(
+                "at least {:.1} ms — one sub-block (§14.4)",
+                floor * 1000.0
+            ));
+            ui.weak("wire the time socket to sweep it — the pitch moves with it");
+        }
+        changed
+    }
+
+    /// See [`DelayWrite::catalogue_defaults`].
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, DelayRead)> {
+        Vec::new()
     }
 }
