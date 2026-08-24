@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ir::ExprSource;
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
 use crate::port::Port;
 
 /// A note expression, reduced to one value (see [`ExprSource`]).
@@ -21,5 +23,17 @@ impl Expression {
 
     pub fn title(&self) -> String {
         self.source.label().into()
+    }
+}
+
+impl Expression {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let out = cx.alloc()?;
+        cx.emit(Op::Expr {
+            out,
+            source: self.source,
+        });
+        cx.bind_output(0, out);
+        Ok(())
     }
 }

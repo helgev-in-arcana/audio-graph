@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
 use crate::port::{Port, PortType};
 
 /// Sum several audio inputs of the same width into one, each at its own
@@ -59,5 +60,21 @@ impl Mix {
 
     pub fn title(&self) -> String {
         "Mix".into()
+    }
+}
+
+impl Mix {
+    /// A mix's gains are params, so the param half is where their lanes are
+    /// booked; the scaling itself is the audio half's.
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        for i in 0..self.inputs {
+            // Signal, gain, signal, gain: the gain for input `i` is the socket
+            // right after it.
+            let port = 2 * i + 1;
+            if let Some(reg) = cx.input(port) {
+                cx.drive_audio(port, reg)?;
+            }
+        }
+        Ok(())
     }
 }

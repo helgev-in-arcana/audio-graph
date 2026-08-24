@@ -37,6 +37,7 @@ pub use slot::{SlotIn, SlotOut};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
 use crate::port::Port;
 
 /// One node's identity and settings.
@@ -116,5 +117,10 @@ impl NodeKind {
 
     pub fn title(&self) -> String {
         for_kind!(self, node => node.title())
+    }
+
+    /// Emit this node's parameter-half instructions (§9.2).
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        for_kind!(self, node => node.compile(cx))
     }
 }

@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::Op;
 use crate::port::Port;
 
 /// The DAW's automation for one wrapper slot, 0..1.
@@ -46,5 +48,32 @@ impl SlotOut {
 
     pub fn title(&self) -> String {
         format!("Slot {} out", self.slot + 1)
+    }
+}
+
+impl SlotIn {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        cx.check_slot(self.slot)?;
+        let out = cx.alloc()?;
+        cx.emit(Op::Slot {
+            out,
+            slot: self.slot as u16,
+        });
+        cx.bind_output(0, out);
+        Ok(())
+    }
+}
+
+impl SlotOut {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        cx.check_slot(self.slot)?;
+        cx.claim_slot(self.slot)?;
+        // An output with nothing plugged in is not an error - it is a node the
+        // user has placed and not yet wired. It just does not take the slot
+        // over from the DAW.
+        if let Some(reg) = cx.input(0) {
+            cx.drive_slot(self.slot, reg);
+        }
+        Ok(())
     }
 }

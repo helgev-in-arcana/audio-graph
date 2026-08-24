@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::{CompileError, ParamCx};
 use crate::port::{Port, PortType};
 
 /// Audio arriving from the DAW on one of the wrapper's own input buses.
@@ -50,4 +51,18 @@ impl AudioOut {
 fn bus_port(name: &'static str, bus: usize, channels: u16) -> Port {
     let port = Port::new(name, PortType::Audio { channels });
     if bus == 0 { port } else { port.aux() }
+}
+
+// Audio nodes carry no param register at all. The audio pass walks the same
+// order again and emits their half (§14.9).
+impl AudioIn {
+    pub(crate) fn compile(&self, _cx: &mut ParamCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+}
+
+impl AudioOut {
+    pub(crate) fn compile(&self, _cx: &mut ParamCx) -> Result<(), CompileError> {
+        Ok(())
+    }
 }

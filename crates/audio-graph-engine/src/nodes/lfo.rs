@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ir::Waveform;
 
+use crate::compile::{CompileError, ParamCx};
+use crate::ir::{Op, RateSpec};
 use crate::port::Port;
 
 /// A free-running or tempo-synced oscillator.
@@ -36,5 +38,29 @@ impl Lfo {
 
     pub fn title(&self) -> String {
         "LFO".into()
+    }
+}
+
+impl Lfo {
+    pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        let state = cx.lfo_state()?;
+        let out = cx.alloc()?;
+        cx.emit(Op::Lfo {
+            out,
+            state,
+            waveform: self.waveform,
+            rate: match self.rate {
+                Rate::Hz(hz) => RateSpec::Hz(hz.max(0.0)),
+                // Zero beats per cycle would be an infinitely fast LFO; treat
+                // it as "does not move" rather than as NaN.
+                Rate::Beats(beats) if beats > 0.0 => RateSpec::CyclesPerBeat(1.0 / beats),
+                Rate::Beats(_) => RateSpec::CyclesPerBeat(0.0),
+            },
+            offset_phase: self.phase.rem_euclid(1.0),
+            depth: self.depth,
+            centre: self.offset,
+        });
+        cx.bind_output(0, out);
+        Ok(())
     }
 }

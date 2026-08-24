@@ -1,3 +1,4 @@
+use crate::compile::{CompileError, ParamCx};
 /// Notes arriving from the DAW.
 use crate::port::{Port, PortType};
 ///
@@ -19,5 +20,11 @@ impl NoteIn {
 
     pub fn title(&self) -> String {
         "Note in".into()
+    }
+}
+
+impl NoteIn {
+    pub(crate) fn compile(&self, _cx: &mut ParamCx) -> Result<(), CompileError> {
+        Ok(())
     }
 }
