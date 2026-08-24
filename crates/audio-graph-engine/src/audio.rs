@@ -7,11 +7,12 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType};
-use crate::program::{
+use crate::graph::{Graph, LineId, NodeId, NodeKind};
+use crate::ir::{
     AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS, MixIn, NoteSource,
 };
+use crate::port::PortType;
 
 use crate::compile::{CompileError, Line, NO_WRITER};
 
@@ -584,7 +585,7 @@ mod tests {
     use crate::compile::compile;
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
     use crate::graph::PluginPorts;
-    use crate::program::AudioOp;
+    use crate::ir::AudioOp;
 
     const SLOTS: usize = 32;
 
@@ -974,7 +975,7 @@ mod tests {
         )
     }
 
-    fn note_sources(program: &crate::program::Program) -> Vec<(u32, NoteSource)> {
+    fn note_sources(program: &crate::ir::Program) -> Vec<(u32, NoteSource)> {
         program
             .audio_ops
             .iter()

@@ -9,16 +9,20 @@
 //! current note expression values. Recompiling happens on every drag of every
 //! control, and an oscillator that restarted each time would make the editor
 //! unusable for exactly the thing an LFO is for.
+//!
+//! Outside of its own tests, nothing here mentions `graph` or a node kind, and
+//! that is the thread boundary rather than an accident: what reaches this side
+//! is a `Program` and nothing else. A `use crate::graph::…` appearing above
+//! the `#[cfg(test)]` line is the signal that something has leaked across.
 
 use plugin_host_api::{NoteEvent, NoteExpression};
 
 use crate::audio::MAX_BUFFERS;
-use crate::graph::{ExprSource, MathOp, Waveform};
 use crate::handoff::Handoff;
-use crate::program::{
-    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_CHANNELS,
+use crate::ir::{
+    AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_CHANNELS,
     MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS, MAX_REGISTERS,
-    NoteSource, Op, Operand, Program, RateSpec,
+    MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
 };
 
 /// How many `DelayRead` taps one program may have.
@@ -1188,7 +1192,9 @@ fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
 mod tests {
     use super::*;
     use crate::compile::compile;
-    use crate::graph::{Graph, MathOp, NodeId, NodeKind, PortType, Rate};
+    use crate::graph::{Graph, NodeId, NodeKind, Rate};
+    use crate::ir::MathOp;
+    use crate::port::PortType;
 
     const SLOTS: usize = 32;
 

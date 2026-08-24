@@ -10,11 +10,12 @@
 //! state for a graph someone is halfway through drawing; the editor shows the
 //! message and keeps running the last program that compiled.
 
-use crate::graph::{Graph, LineId, NodeId, NodeKind, PortType, Rate};
-use crate::program::{
+use crate::graph::{Graph, LineId, NodeId, NodeKind, Rate};
+use crate::ir::{
     MAX_AUDIO_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
     ParamTarget, Program, RateSpec, Reg,
 };
+use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
@@ -586,7 +587,8 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{MathOp, NodeKind, Waveform};
+    use crate::graph::NodeKind;
+    use crate::ir::{MathOp, Waveform};
 
     const SLOTS: usize = 32;
 

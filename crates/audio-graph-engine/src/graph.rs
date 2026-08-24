@@ -11,76 +11,15 @@
 //! Nothing here knows what a VST3 is. A node reads a slot and a node writes a
 //! slot; what a slot is bound to is the outer layer's business (§8).
 
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 
-pub type NodeId = u32;
+use crate::ir::{ExprSource, MathOp, Waveform};
+use crate::port::{Port, PortType};
+
+pub use crate::ir::NodeId;
 
 /// Identifies one delay line. See [`NodeKind::DelayWrite`].
 pub type LineId = u32;
-
-/// What a port carries (§14.3).
-///
-/// Ports only connect to ports of the same type. Mono-to-stereo is deliberately
-/// not implicit: a hidden widening rule is the same kind of thing as a hidden
-/// mixing rule, and the graph already says no to those.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PortType {
-    /// A scalar. One value per sub-block (§9.2).
-    Param,
-    /// Audio, `channels` wide.
-    Audio { channels: u16 },
-    /// Note events.
-    Note,
-}
-
-impl PortType {
-    pub const STEREO: PortType = PortType::Audio { channels: 2 };
-
-    pub fn label(self) -> String {
-        match self {
-            PortType::Param => "param".into(),
-            PortType::Audio { channels: 1 } => "mono".into(),
-            PortType::Audio { channels: 2 } => "stereo".into(),
-            PortType::Audio { channels } => format!("{channels} ch"),
-            PortType::Note => "notes".into(),
-        }
-    }
-}
-
-/// One socket on a node.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Port {
-    pub name: Cow<'static, str>,
-    pub ty: PortType,
-    /// Whether this is a *side* input rather than the signal path proper: a
-    /// sidechain or another aux bus (§14.11).
-    ///
-    /// The compiler does not care — an aux bus is the bus at that index and
-    /// nothing else. It is here because the editor does: a sidechain socket
-    /// that looks exactly like the main input is one a user wires into by
-    /// mistake, and the mistake is silent.
-    pub aux: bool,
-}
-
-impl Port {
-    fn new(name: impl Into<Cow<'static, str>>, ty: PortType) -> Port {
-        Port {
-            name: name.into(),
-            ty,
-            aux: false,
-        }
-    }
-
-    fn param(name: impl Into<Cow<'static, str>>) -> Port {
-        Port::new(name, PortType::Param)
-    }
-
-    fn aux(self) -> Port {
-        Port { aux: true, ..self }
-    }
-}
 
 /// One sub-plugin parameter the graph is allowed to drive.
 ///
@@ -292,139 +231,12 @@ pub enum NodeKind {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Waveform {
-    Sine,
-    Triangle,
-    Saw,
-    Square,
-    /// Sample and hold: a new random value at each cycle boundary.
-    Random,
-}
-
-impl Waveform {
-    pub const ALL: [Waveform; 5] = [
-        Waveform::Sine,
-        Waveform::Triangle,
-        Waveform::Saw,
-        Waveform::Square,
-        Waveform::Random,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Waveform::Sine => "Sine",
-            Waveform::Triangle => "Triangle",
-            Waveform::Saw => "Saw",
-            Waveform::Square => "Square",
-            Waveform::Random => "Random",
-        }
-    }
-}
-
 /// How fast an LFO runs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Rate {
     Hz(f64),
     /// One cycle per this many beats, following the host's tempo.
     Beats(f64),
-}
-
-/// Which per-note controller a node reads.
-///
-/// v1 reduces polyphony away: each source keeps the most recent value from any
-/// note. The graph is monophonic, so a per-voice value would have nowhere to
-/// go. `Capabilities.poly_modulation` is what will decide whether the *voice*
-/// level ever becomes reachable, and the editor already greys these out when
-/// the sub-plugin cannot accept per-note modulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExprSource {
-    Pressure,
-    Tuning,
-    Brightness,
-    Expression,
-    Vibrato,
-    Volume,
-    Pan,
-    /// Velocity of the most recent note-on, 0..1.
-    Velocity,
-    /// 1 while any note is held, 0 otherwise.
-    Gate,
-    /// The most recent note's key, scaled to 0..1 across the MIDI range.
-    KeyTrack,
-}
-
-impl ExprSource {
-    pub const ALL: [ExprSource; 10] = [
-        ExprSource::Pressure,
-        ExprSource::Tuning,
-        ExprSource::Brightness,
-        ExprSource::Expression,
-        ExprSource::Vibrato,
-        ExprSource::Volume,
-        ExprSource::Pan,
-        ExprSource::Velocity,
-        ExprSource::Gate,
-        ExprSource::KeyTrack,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ExprSource::Pressure => "Pressure",
-            ExprSource::Tuning => "Tuning",
-            ExprSource::Brightness => "Brightness",
-            ExprSource::Expression => "Expression",
-            ExprSource::Vibrato => "Vibrato",
-            ExprSource::Volume => "Volume",
-            ExprSource::Pan => "Pan",
-            ExprSource::Velocity => "Velocity",
-            ExprSource::Gate => "Gate",
-            ExprSource::KeyTrack => "Key track",
-        }
-    }
-
-    /// Whether this source comes from a per-note controller rather than from
-    /// the note itself. These are the ones a sub-plugin without per-note
-    /// modulation cannot meaningfully receive.
-    pub fn is_per_note(self) -> bool {
-        !matches!(
-            self,
-            ExprSource::Velocity | ExprSource::Gate | ExprSource::KeyTrack
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MathOp {
-    Add,
-    Subtract,
-    Multiply,
-    Min,
-    Max,
-    /// `a^b` on a 0..1 input — the curve control of §9.3.
-    Curve,
-}
-
-impl MathOp {
-    pub const ALL: [MathOp; 6] = [
-        MathOp::Add,
-        MathOp::Subtract,
-        MathOp::Multiply,
-        MathOp::Min,
-        MathOp::Max,
-        MathOp::Curve,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            MathOp::Add => "Add",
-            MathOp::Subtract => "Subtract",
-            MathOp::Multiply => "Multiply",
-            MathOp::Min => "Min",
-            MathOp::Max => "Max",
-            MathOp::Curve => "Curve",
-        }
-    }
 }
 
 impl NodeKind {
