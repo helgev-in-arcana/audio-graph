@@ -1,0 +1,4 @@
+# CI の Windows ランナーは core.autocrlf=true で checkout する。それだと
+# tests/golden の期待値だけが CRLF になり、コンパイラが吐く LF と食い違って
+# golden テストが全滅する。作業ツリーでも LF のままにしておく。
+* text=auto eol=lf
