@@ -37,4 +37,9 @@ pub use nodes::{
     AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
     NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, SlotOut,
 };
+#[cfg(feature = "ui")]
+pub use nodes::{
+    catalogue,
+    widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
+};
 pub use port::{Port, PortType};

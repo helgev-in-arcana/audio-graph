@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-pub use crate::ir::MathOp;
-
 use crate::compile::AudioCx;
 use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
+pub use crate::ir::MathOp;
 use crate::ir::NoteSource;
 use crate::ir::{Op, Operand};
 use crate::port::Port;
@@ -29,9 +28,7 @@ impl Math {
     pub fn title(&self) -> String {
         self.op.label().into()
     }
-}
 
-impl Math {
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let a = cx.input_or_zero(0)?;
         let b = match cx.input(1) {
@@ -48,20 +45,44 @@ impl Math {
         cx.bind_output(0, out);
         Ok(())
     }
-}
 
-impl Math {
     pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
-}
 
-impl Math {
     pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
         Ok(())
     }
 
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         None
+    }
+}
+
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::{NodeUi, combo};
+
+#[cfg(feature = "ui")]
+impl Math {
+    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+        let mut changed = combo(ui, "op", &mut self.op, &MathOp::ALL, MathOp::label);
+        ui.horizontal(|ui| {
+            ui.label("b");
+            changed |= ui
+                .add(egui::DragValue::new(&mut self.b).speed(0.01))
+                .changed();
+        });
+        ui.weak("b is used only while its input is unconnected");
+        changed
+    }
+
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Math)> {
+        vec![(
+            "Math",
+            Math {
+                op: MathOp::Multiply,
+                b: 1.0,
+            },
+        )]
     }
 }

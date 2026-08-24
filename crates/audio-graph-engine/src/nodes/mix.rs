@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::compile::AudioCx;
-use crate::compile::DeclareCx;
-use crate::compile::{CompileError, ParamCx};
-use crate::ir::NoteSource;
-use crate::ir::{AudioOp, Buf, MixIn};
+use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
+use crate::ir::{AudioOp, Buf, MixIn, NoteSource};
 use crate::port::{Port, PortType};
 
 /// Sum several audio inputs of the same width into one, each at its own
@@ -65,9 +62,7 @@ impl Mix {
     pub fn title(&self) -> String {
         "Mix".into()
     }
-}
 
-impl Mix {
     /// A mix's gains are params, so the param half is where their lanes are
     /// booked; the scaling itself is the audio half's.
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
@@ -81,9 +76,7 @@ impl Mix {
         }
         Ok(())
     }
-}
 
-impl Mix {
     pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         // §14.6, the merge point: every branch waits for the latest one or they
         // phase-cancel.
@@ -126,14 +119,75 @@ impl Mix {
         cx.produce(0, out, arrive);
         Ok(())
     }
-}
 
-impl Mix {
     pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
         Ok(())
     }
 
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         None
+    }
+}
+
+#[cfg(feature = "ui")]
+use crate::nodes::widgets::NodeUi;
+
+#[cfg(feature = "ui")]
+impl Mix {
+    pub fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("inputs");
+            let mut count = self.inputs as u32;
+            // One is allowed, and useful: a mix of one input *is* a gain, which
+            // is what turns a feedback delay's loop down below unity so it
+            // decays.
+            if ui
+                .add(egui::DragValue::new(&mut count).range(1..=8))
+                .changed()
+            {
+                self.inputs = count as u8;
+                changed = true;
+            }
+        });
+        // Grown here rather than at load: a patch saved before the gains
+        // existed has none, and every missing one is unity.
+        self.gains.resize(self.inputs as usize, 1.0);
+        for (i, gain) in self.gains.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("gain {}", i + 1));
+                changed |= ui
+                    .add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
+                    .changed();
+            });
+        }
+        ui.weak("a gain is used only while its socket is unconnected");
+        changed
+    }
+
+    pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Mix)> {
+        vec![
+            (
+                "Mix",
+                Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: vec![1.0, 1.0],
+                },
+            ),
+            (
+                "Gain",
+                Mix {
+                    channels: 2,
+                    inputs: 1,
+                    // Half back round is a delay that decays over a few
+                    // repeats, which is what a one-input mix is nearly always
+                    // dropped in to do. It is the same node as the one above —
+                    // only the starting shape differs, and having both in the
+                    // menu is cheaper than making the user work that out.
+                    gains: vec![0.5],
+                },
+            ),
+        ]
     }
 }
