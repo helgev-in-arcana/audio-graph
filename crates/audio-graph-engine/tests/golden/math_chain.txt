@@ -1,0 +1,56 @@
+Program {
+    ops: [
+        Slot {
+            out: 0,
+            slot: 0,
+        },
+        Expr {
+            out: 1,
+            source: Velocity,
+        },
+        Math {
+            out: 2,
+            a: 0,
+            b: Reg(
+                1,
+            ),
+            op: Multiply,
+        },
+        Math {
+            out: 3,
+            a: 2,
+            b: Value(
+                2.0,
+            ),
+            op: Curve,
+        },
+        Range {
+            out: 4,
+            a: 3,
+            in_lo: 0.0,
+            in_span: 1.0,
+            out_lo: -1.0,
+            out_span: 2.0,
+            clamp: true,
+        },
+    ],
+    registers: 5,
+    outputs: [
+        (
+            1,
+            4,
+        ),
+    ],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [],
+    param_targets: [],
+    instances: [],
+    buffers: [],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [],
+}

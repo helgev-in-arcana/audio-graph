@@ -1,0 +1,69 @@
+Program {
+    ops: [],
+    registers: 0,
+    outputs: [],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Plugin {
+            instance: 0,
+            input: 0,
+            input_buses: [
+                2,
+            ],
+            output: 1,
+            output_buses: [
+                2,
+            ],
+            notes: None,
+        },
+        Compensate {
+            buf: 0,
+            slot: 0,
+            samples: 512,
+        },
+        Mix {
+            out: 1,
+            inputs: [
+                MixIn {
+                    buf: 1,
+                    lane: None,
+                    gain: 0.5,
+                },
+                MixIn {
+                    buf: 0,
+                    lane: None,
+                    gain: 0.5,
+                },
+            ],
+        },
+        Output {
+            a: 1,
+            bus: 0,
+        },
+    ],
+    param_targets: [],
+    instances: [
+        InstanceIo {
+            instance: 0,
+            input_channels: 2,
+            aux_inputs: [],
+            output_channels: 2,
+            aux_outputs: [],
+        },
+    ],
+    buffers: [
+        2,
+        2,
+    ],
+    chunking: WholeBlock,
+    latency: 512,
+    lfo_nodes: [],
+}

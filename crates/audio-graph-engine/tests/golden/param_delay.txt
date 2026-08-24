@@ -1,0 +1,45 @@
+Program {
+    ops: [
+        Slot {
+            out: 0,
+            slot: 2,
+        },
+        Const {
+            out: 1,
+            value: 0.1,
+        },
+        DelayRead {
+            out: 2,
+            line: 0,
+            time: 0.25,
+            time_reg: Some(
+                1,
+            ),
+        },
+        DelayWrite {
+            line: 0,
+            a: 0,
+        },
+    ],
+    registers: 3,
+    outputs: [
+        (
+            5,
+            2,
+        ),
+    ],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [
+        0,
+    ],
+    audio_ops: [],
+    param_targets: [],
+    instances: [],
+    buffers: [],
+    chunking: WholeBlock,
+    latency: 0,
+    lfo_nodes: [],
+}
