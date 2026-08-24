@@ -18,7 +18,9 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    ExprSource, Graph, MathOp, NodeId, NodeKind, ParamPort, PluginPorts, PortType, Rate, Waveform,
+    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, ExprSource, Expression, Graph, Lfo, Math,
+    MathOp, Mix, NodeId, NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate,
+    SlotIn, SlotOut, Waveform,
 };
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use subhost_adapter::SLOT_COUNT;
@@ -286,7 +288,8 @@ impl GraphEditor {
             // Deleting the node is what unloads the plugin. There is no
             // separate "unload" anywhere, because a node with no plugin in it
             // is not a thing the user asked for.
-            if let Some(NodeKind::Plugin { instance, .. }) = graph.node(id).map(|n| &n.kind) {
+            if let Some(NodeKind::Plugin(Plugin { instance, .. })) = graph.node(id).map(|n| &n.kind)
+            {
                 self.actions.push(GraphAction::UnloadInstance(*instance));
             }
             graph.remove(id);
@@ -640,19 +643,19 @@ impl GraphEditor {
     fn controls(&mut self, ui: &mut egui::Ui, kind: &mut NodeKind, ctx: &GraphContext<'_>) -> bool {
         let mut changed = false;
         match kind {
-            NodeKind::Constant { value } => {
+            NodeKind::Constant(Constant { value }) => {
                 changed |= ui.add(egui::Slider::new(value, 0.0..=1.0)).changed();
             }
-            NodeKind::SlotIn { slot } | NodeKind::SlotOut { slot } => {
+            NodeKind::SlotIn(SlotIn { slot }) | NodeKind::SlotOut(SlotOut { slot }) => {
                 changed |= slot_picker(ui, slot, ctx);
             }
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform,
                 rate,
                 phase,
                 depth,
                 offset,
-            } => {
+            }) => {
                 changed |= combo(ui, "wave", waveform, &Waveform::ALL, Waveform::label);
                 changed |= rate_control(ui, rate);
                 ui.horizontal(|ui| {
@@ -672,7 +675,7 @@ impl GraphEditor {
                         .changed();
                 });
             }
-            NodeKind::Expression { source } => {
+            NodeKind::Expression(Expression { source }) => {
                 changed |= combo(ui, "source", source, &ExprSource::ALL, ExprSource::label);
                 if source.is_per_note() && !ctx.poly_modulation {
                     // §3.3 asks for per-voice sources to be greyed out when the
@@ -687,7 +690,7 @@ impl GraphEditor {
                         );
                 }
             }
-            NodeKind::Math { op, b } => {
+            NodeKind::Math(Math { op, b }) => {
                 changed |= combo(ui, "op", op, &MathOp::ALL, MathOp::label);
                 ui.horizontal(|ui| {
                     ui.label("b");
@@ -695,13 +698,13 @@ impl GraphEditor {
                 });
                 ui.weak("b is used only while its input is unconnected");
             }
-            NodeKind::RangeMap {
+            NodeKind::RangeMap(RangeMap {
                 in_lo,
                 in_hi,
                 out_lo,
                 out_hi,
                 clamp,
-            } => {
+            }) => {
                 ui.horizontal(|ui| {
                     ui.label("in");
                     changed |= ui.add(egui::DragValue::new(in_lo).speed(0.01)).changed();
@@ -714,12 +717,12 @@ impl GraphEditor {
                 });
                 changed |= ui.checkbox(clamp, "clamp").changed();
             }
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line,
                 ty,
                 max_time,
                 time,
-            } => {
+            }) => {
                 changed |= line_control(ui, line);
                 // The floor of §14.4, in the units the control is in. It is
                 // the sub-block size, which the user chose, so it moves when
@@ -754,10 +757,10 @@ impl GraphEditor {
                     ui.weak("wire the time socket to sweep it — the pitch moves with it");
                 }
             }
-            NodeKind::Plugin { instance, ports } => {
+            NodeKind::Plugin(Plugin { instance, ports }) => {
                 changed |= self.plugin_controls(ui, *instance, ports, ctx);
             }
-            NodeKind::Mix { inputs, gains, .. } => {
+            NodeKind::Mix(Mix { inputs, gains, .. }) => {
                 ui.horizontal(|ui| {
                     ui.label("inputs");
                     let mut count = *inputs as u32;
@@ -785,7 +788,7 @@ impl GraphEditor {
                 }
                 ui.weak("a gain is used only while its socket is unconnected");
             }
-            NodeKind::AudioIn { bus, .. } | NodeKind::AudioOut { bus, .. } => {
+            NodeKind::AudioIn(AudioIn { bus, .. }) | NodeKind::AudioOut(AudioOut { bus, .. }) => {
                 ui.horizontal(|ui| {
                     ui.label("bus");
                     // One-based on screen: the DAW calls them "Main" and
@@ -801,7 +804,7 @@ impl GraphEditor {
                     ui.weak(if *bus == 0 { "main" } else { "sidechain" });
                 });
             }
-            NodeKind::DelayWrite { line, .. } => {
+            NodeKind::DelayWrite(DelayWrite { line, .. }) => {
                 changed |= line_control(ui, line);
             }
             // A source with nothing to set.
@@ -950,10 +953,10 @@ impl GraphEditor {
                                 // when the plugin has finished loading, which
                                 // takes hundreds of milliseconds.
                                 let node = graph.add(
-                                    NodeKind::Plugin {
+                                    NodeKind::Plugin(Plugin {
                                         instance,
                                         ports: PluginPorts::default(),
-                                    },
+                                    }),
                                     [at.x, at.y],
                                 );
                                 self.actions.push(GraphAction::LoadPlugin {
@@ -1050,11 +1053,11 @@ struct NodeOutcome {
 
 fn catalogue() -> Vec<(&'static str, NodeKind)> {
     vec![
-        ("Constant", NodeKind::Constant { value: 0.5 }),
-        ("Slot in", NodeKind::SlotIn { slot: 0 }),
+        ("Constant", NodeKind::Constant(Constant { value: 0.5 })),
+        ("Slot in", NodeKind::SlotIn(SlotIn { slot: 0 })),
         (
             "LFO",
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Sine,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
@@ -1063,58 +1066,58 @@ fn catalogue() -> Vec<(&'static str, NodeKind)> {
                 // would make a freshly dropped LFO look broken.
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
         ),
         (
             "Expression",
-            NodeKind::Expression {
+            NodeKind::Expression(Expression {
                 source: ExprSource::Pressure,
-            },
+            }),
         ),
         (
             "Math",
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 1.0,
-            },
+            }),
         ),
         (
             "Range map",
-            NodeKind::RangeMap {
+            NodeKind::RangeMap(RangeMap {
                 in_lo: 0.0,
                 in_hi: 1.0,
                 out_lo: 0.0,
                 out_hi: 1.0,
                 clamp: true,
-            },
+            }),
         ),
-        ("Slot out", NodeKind::SlotOut { slot: 0 }),
+        ("Slot out", NodeKind::SlotOut(SlotOut { slot: 0 })),
         (
             "Audio in",
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
         ),
         (
             "Audio out",
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
         ),
         ("Note in", NodeKind::NoteIn),
         (
             "Mix",
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 gains: vec![1.0, 1.0],
-            },
+            }),
         ),
         (
             "Gain",
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 1,
                 // Half back round is a delay that decays over a few repeats,
@@ -1123,7 +1126,7 @@ fn catalogue() -> Vec<(&'static str, NodeKind)> {
                 // shape differs, and having both in the menu is cheaper than
                 // making the user work that out.
                 gains: vec![0.5],
-            },
+            }),
         ),
     ]
 }

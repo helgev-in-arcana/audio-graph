@@ -1192,8 +1192,12 @@ fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
 mod tests {
     use super::*;
     use crate::compile::compile;
-    use crate::graph::{Graph, NodeId, NodeKind, Rate};
+    use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
+    use crate::nodes::{
+        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
+        Plugin, PluginPorts, Rate, SlotIn, SlotOut,
+    };
     use crate::port::PortType;
 
     const SLOTS: usize = 32;
@@ -1240,8 +1244,8 @@ mod tests {
     #[test]
     fn a_slot_the_graph_does_not_drive_keeps_the_daws_value() {
         let mut graph = Graph::new();
-        let c = graph.add(NodeKind::Constant { value: 0.25 }, [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let c = graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(c, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1256,15 +1260,15 @@ mod tests {
     #[test]
     fn the_daws_automation_can_be_read_shaped_and_written_back() {
         let mut graph = Graph::new();
-        let input = graph.add(NodeKind::SlotIn { slot: 3 }, [0.0, 0.0]);
+        let input = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
         let half = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 4 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
         graph.connect(input, 0, half, 0);
         graph.connect(half, 0, out, 0);
 
@@ -1281,16 +1285,16 @@ mod tests {
     fn an_lfo_sweeps_and_comes_back() {
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1314,17 +1318,17 @@ mod tests {
     fn tempo_sync_follows_the_host() {
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
                 // One cycle per beat: at 120 bpm that is 2 Hz.
                 rate: Rate::Beats(1.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1359,39 +1363,39 @@ mod tests {
     /// value has to come back round, one sub-block later, scaled.
     fn feedback_graph(time: f64) -> (Graph, NodeId) {
         let mut graph = Graph::new();
-        let seed = graph.add(NodeKind::SlotIn { slot: 1 }, [0.0, 0.0]);
+        let seed = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::Param,
                 max_time: 1.0,
                 time,
-            },
+            }),
             [0.0, 0.0],
         );
         // The loop: (input + what came back) * 0.5, written back to the line.
         let mixed = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 0.0],
         );
         let decayed = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
 
         graph.connect(seed, 0, mixed, 0);
         graph.connect(read, 0, mixed, 1);
@@ -1435,7 +1439,7 @@ mod tests {
         assert!((slots[0] - 0.5).abs() < 1e-9);
 
         // An unrelated node appears, as it does on any edit.
-        graph.add(NodeKind::Constant { value: 0.0 }, [0.0, 0.0]);
+        graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         load(&mut engine, &graph);
 
         slots[1] = 1.0;
@@ -1515,15 +1519,15 @@ mod tests {
 
     fn audio_plugin(graph: &mut Graph, instance: usize, latency: u32) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
-                ports: crate::graph::PluginPorts {
+                ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
                     latency,
-                    ..crate::graph::PluginPorts::default()
+                    ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -1532,19 +1536,19 @@ mod tests {
     fn audio_runs_through_two_plugins_in_order() {
         let mut graph = Graph::new();
         let input = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         let first = audio_plugin(&mut graph, 0, 0);
         let second = audio_plugin(&mut graph, 1, 0);
         let output = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, first, 0);
@@ -1572,29 +1576,29 @@ mod tests {
     fn a_compensated_branch_arrives_with_the_late_one() {
         let mut graph = Graph::new();
         let input = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         // Latency 4, but the stand-in does not actually delay: what is being
         // tested is that the *other* branch is delayed by the same 4.
         let slow = audio_plugin(&mut graph, 0, 4);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, slow, 0);
@@ -1647,10 +1651,10 @@ mod tests {
     fn an_unconnected_output_leaves_the_daw_buffer_alone() {
         let mut graph = Graph::new();
         graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         let mut engine = Engine::new();
@@ -1670,17 +1674,17 @@ mod tests {
     fn running_audio_unprepared_does_nothing() {
         let mut graph = Graph::new();
         let input = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         let output = graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, output, 0);
@@ -1704,16 +1708,16 @@ mod tests {
     fn recompiling_does_not_restart_a_running_lfo() {
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1728,7 +1732,7 @@ mod tests {
 
         // Something unrelated changes — a new node appears — and the graph is
         // recompiled, as it is on every edit.
-        graph.add(NodeKind::Constant { value: 0.0 }, [0.0, 0.0]);
+        graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         load(&mut engine, &graph);
         engine.run(&ctx(1), &mut slots);
 
@@ -1743,12 +1747,12 @@ mod tests {
     fn note_expression_reaches_the_graph() {
         let mut graph = Graph::new();
         let expr = graph.add(
-            NodeKind::Expression {
+            NodeKind::Expression(Expression {
                 source: ExprSource::Pressure,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 7 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 7 }), [0.0, 0.0]);
         graph.connect(expr, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1772,12 +1776,12 @@ mod tests {
     fn the_gate_follows_held_notes() {
         let mut graph = Graph::new();
         let gate = graph.add(
-            NodeKind::Expression {
+            NodeKind::Expression(Expression {
                 source: ExprSource::Gate,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(gate, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -1822,15 +1826,15 @@ mod tests {
     #[test]
     fn a_degenerate_graph_cannot_hand_a_nan_to_the_sub_plugin() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 0.0 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         let div = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Curve,
                 b: 0.0,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(a, 0, div, 0);
         graph.connect(div, 0, out, 0);
 
@@ -1853,20 +1857,20 @@ mod tests {
 
     fn stereo_in(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
     fn stereo_out(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -1874,20 +1878,20 @@ mod tests {
     /// The two halves of an audio delay line, on line 0, `samples` back.
     fn audio_delay(graph: &mut Graph, samples: f64) -> (NodeId, NodeId) {
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::STEREO,
-            },
+            }),
             [0.0, 0.0],
         );
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::STEREO,
                 // Room for the sweeps, without asking for a megabyte of ring.
                 max_time: 0.05,
                 time: seconds(samples),
-            },
+            }),
             [0.0, 0.0],
         );
         (write, read)
@@ -1984,12 +1988,12 @@ mod tests {
         let output = stereo_out(&mut graph);
         let (write, read) = audio_delay(&mut graph, 64.0);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, mix, 0);
@@ -2059,7 +2063,7 @@ mod tests {
         let output = stereo_out(&mut graph);
         let plugin = audio_plugin(&mut graph, 0, 0);
         let (write, read) = audio_delay(&mut graph, 64.0);
-        let time = graph.add(NodeKind::SlotIn { slot: 0 }, [0.0, 0.0]);
+        let time = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
         graph.connect(input, 0, plugin, 0);
         graph.connect(plugin, 0, write, 0);
         graph.connect(read, 0, output, 0);
@@ -2120,7 +2124,7 @@ mod tests {
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let (write, read) = audio_delay(&mut graph, 200.0);
-        let time = graph.add(NodeKind::SlotIn { slot: 0 }, [0.0, 0.0]);
+        let time = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
         graph.connect(input, 0, write, 0);
         graph.connect(read, 0, output, 0);
         graph.connect(time, 0, read, 0);
@@ -2195,11 +2199,11 @@ mod tests {
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let gain = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 1,
                 gains: vec![0.25],
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, gain, 0);
@@ -2224,11 +2228,11 @@ mod tests {
         let a = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 gains: vec![0.5, 0.25],
-            },
+            }),
             [0.0, 0.0],
         );
         // The same source into both inputs: 0.5 + 0.25 of it should come out.
@@ -2287,7 +2291,7 @@ mod tests {
 
         // Now ask for four times the range. The ring has to be reallocated on
         // the main thread, and the impulse still in it has to survive.
-        if let Some(NodeKind::DelayRead { max_time, .. }) =
+        if let Some(NodeKind::DelayRead(DelayRead { max_time, .. })) =
             graph.node_mut(read).map(|n| &mut n.kind)
         {
             *max_time = 0.2;
@@ -2341,8 +2345,8 @@ mod tests {
         engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
 
         // An edit somewhere else entirely, between the write and the read.
-        let constant = graph.add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
-        let slot = graph.add(NodeKind::SlotOut { slot: 3 }, [0.0, 0.0]);
+        let constant = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
         graph.connect(constant, 0, slot, 0);
         load(&mut engine, &graph);
 

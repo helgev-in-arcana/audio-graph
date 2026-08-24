@@ -7,11 +7,12 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::graph::{Graph, LineId, NodeId, NodeKind};
+use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUX_BUSES, MAX_COMPENSATION, MAX_COMPENSATORS, MixIn, NoteSource,
 };
+use crate::nodes::{AudioIn, AudioOut, DelayRead, DelayWrite, Mix, NodeKind, Plugin, PluginPorts};
 use crate::port::PortType;
 
 use crate::compile::{CompileError, Line, NO_WRITER};
@@ -169,7 +170,7 @@ fn audio_line(
 /// unwired instrument silent rather than making it play whatever the DAW
 /// happened to send. Only `NoteIn` produces notes today; a plugin's own note
 /// output would need the engine to carry event buffers, and that is M9.
-fn note_source(graph: &Graph, id: NodeId, ports: &crate::graph::PluginPorts) -> NoteSource {
+fn note_source(graph: &Graph, id: NodeId, ports: &PluginPorts) -> NoteSource {
     if !ports.accepts_notes {
         return NoteSource::None;
     }
@@ -239,7 +240,7 @@ pub(crate) fn compile_audio(
         };
 
         match &node.kind {
-            NodeKind::AudioIn { bus, channels } => {
+            NodeKind::AudioIn(AudioIn { bus, channels }) => {
                 let out = pool.alloc(*channels, readers)?;
                 ops.push(AudioOp::Input {
                     out,
@@ -252,7 +253,7 @@ pub(crate) fn compile_audio(
                     latency: 0,
                 });
             }
-            NodeKind::AudioOut { bus, .. } => {
+            NodeKind::AudioOut(AudioOut { bus, .. }) => {
                 if let Some((buf, late)) = sources[0] {
                     latency = latency.max(late);
                     pool.consume(buf);
@@ -262,7 +263,7 @@ pub(crate) fn compile_audio(
                     });
                 }
             }
-            NodeKind::Plugin { instance, ports } => {
+            NodeKind::Plugin(Plugin { instance, ports }) => {
                 if out_width == 0 {
                     // A plugin with no output bus cannot be routed through. It
                     // is still legal to place — an analyser is one — but there
@@ -423,9 +424,9 @@ pub(crate) fn compile_audio(
                     pool.consume(output);
                 }
             }
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels, gains, ..
-            } => {
+            }) => {
                 // §14.6, the merge point: every branch waits for the latest one
                 // or they phase-cancel.
                 let arrive = sources
@@ -484,12 +485,12 @@ pub(crate) fn compile_audio(
                     latency: arrive,
                 });
             }
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line,
                 ty: PortType::Audio { channels },
                 max_time,
                 time,
-            } => {
+            }) => {
                 let index = audio_line(
                     &mut audio_lines,
                     &mut delay_nodes,
@@ -519,10 +520,10 @@ pub(crate) fn compile_audio(
                     latency: 0,
                 });
             }
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line,
                 ty: PortType::Audio { .. },
-            } => {
+            }) => {
                 let index = audio_line(
                     &mut audio_lines,
                     &mut delay_nodes,
@@ -584,14 +585,14 @@ mod tests {
     use super::*;
     use crate::compile::compile;
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
-    use crate::graph::PluginPorts;
     use crate::ir::AudioOp;
+    use crate::nodes::PluginPorts;
 
     const SLOTS: usize = 32;
 
     fn plugin(graph: &mut Graph, instance: usize, latency: u32) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -599,7 +600,7 @@ mod tests {
                     latency,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -607,34 +608,34 @@ mod tests {
     /// A plugin with a main stereo bus and one aux bus of `aux` channels.
     fn with_sidechain(graph: &mut Graph, instance: usize, aux: u16) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![2, aux],
                     audio_out: vec![2],
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
     fn stereo_in(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
 
     fn stereo_out(graph: &mut Graph) -> NodeId {
         graph.add(
-            NodeKind::AudioOut {
+            NodeKind::AudioOut(AudioOut {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -722,7 +723,7 @@ mod tests {
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let node = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -730,7 +731,7 @@ mod tests {
                     audio_out: vec![2, 2, 2],
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, node, 0);
@@ -816,12 +817,12 @@ mod tests {
         let input = stereo_in(&mut graph);
         let slow = plugin(&mut graph, 0, 128);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -851,12 +852,12 @@ mod tests {
         let a = plugin(&mut graph, 0, 64);
         let b = plugin(&mut graph, 1, 64);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -892,28 +893,28 @@ mod tests {
 
         // Feed the plugin from its own output, through a delay line.
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::STEREO,
                 max_time: 1.0,
                 time: 0.01,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::STEREO,
-            },
+            }),
             [0.0, 0.0],
         );
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(input, 0, mix, 0);
@@ -936,19 +937,19 @@ mod tests {
         graph.connect(node, 0, output, 0);
 
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::Param,
                 max_time: 1.0,
                 time: 0.01,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(read, 0, write, 0);
@@ -962,7 +963,7 @@ mod tests {
     /// A synth node with an instrument's ports.
     fn synth(graph: &mut Graph, instance: usize) -> NodeId {
         graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance,
                 ports: PluginPorts {
                     audio_in: vec![],
@@ -970,7 +971,7 @@ mod tests {
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         )
     }
@@ -1048,12 +1049,12 @@ mod tests {
         let wired = synth(&mut graph, 0);
         let idle = synth(&mut graph, 1);
         let mix = graph.add(
-            NodeKind::Mix {
+            NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
                 // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);
@@ -1079,7 +1080,7 @@ mod tests {
         let input = stereo_in(&mut graph);
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let node = graph.add(
-            NodeKind::Plugin {
+            NodeKind::Plugin(Plugin {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
@@ -1087,7 +1088,7 @@ mod tests {
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
-            },
+            }),
             [0.0, 0.0],
         );
         let output = stereo_out(&mut graph);

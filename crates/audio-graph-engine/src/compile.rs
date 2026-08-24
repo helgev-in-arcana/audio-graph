@@ -10,10 +10,14 @@
 //! state for a graph someone is halfway through drawing; the editor shows the
 //! message and keeps running the last program that compiled.
 
-use crate::graph::{Graph, LineId, NodeId, NodeKind, Rate};
+use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     MAX_AUDIO_LANES, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, Op, Operand,
     ParamTarget, Program, RateSpec, Reg,
+};
+use crate::nodes::{
+    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
+    Plugin, RangeMap, Rate, SlotIn, SlotOut,
 };
 use crate::port::PortType;
 
@@ -165,12 +169,12 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         };
 
         match node.kind {
-            NodeKind::Constant { value } => {
+            NodeKind::Constant(Constant { value }) => {
                 let out = alloc()?;
                 ops.push(Op::Const { out, value });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::SlotIn { slot } => {
+            NodeKind::SlotIn(SlotIn { slot }) => {
                 check_slot(id, slot, slot_count)?;
                 let out = alloc()?;
                 ops.push(Op::Slot {
@@ -179,13 +183,13 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                 });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform,
                 rate,
                 phase,
                 depth,
                 offset,
-            } => {
+            }) => {
                 if lfo_nodes.len() >= MAX_LFOS {
                     return Err(CompileError::TooLarge {
                         what: "LFOs",
@@ -212,12 +216,12 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                 });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::Expression { source } => {
+            NodeKind::Expression(Expression { source }) => {
                 let out = alloc()?;
                 ops.push(Op::Expr { out, source });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::Math { op, b } => {
+            NodeKind::Math(Math { op, b }) => {
                 // An unconnected `a` contributes nothing. The identity element
                 // for each operator would be a slightly nicer answer, but
                 // "nothing plugged in reads as zero" is one rule instead of six.
@@ -233,13 +237,13 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                 ops.push(Op::Math { out, a, b, op });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::RangeMap {
+            NodeKind::RangeMap(RangeMap {
                 in_lo,
                 in_hi,
                 out_lo,
                 out_hi,
                 clamp,
-            } => {
+            }) => {
                 let a = match input(0) {
                     Some(reg) => reg,
                     None => zero(&mut ops, &mut alloc)?,
@@ -256,7 +260,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                 });
                 reg_of.push(((id, 0), out));
             }
-            NodeKind::SlotOut { slot } => {
+            NodeKind::SlotOut(SlotOut { slot }) => {
                 check_slot(id, slot, slot_count)?;
                 if outputs.iter().any(|&(s, _)| s as usize == slot) {
                     return Err(CompileError::DuplicateOutput { slot });
@@ -268,7 +272,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     outputs.push((slot as u16, reg));
                 }
             }
-            NodeKind::DelayRead { line, ty, time, .. } => {
+            NodeKind::DelayRead(DelayRead { line, ty, time, .. }) => {
                 let index = lines
                     .iter()
                     .position(|l| l.id == line)
@@ -302,7 +306,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     }
                 }
             }
-            NodeKind::DelayWrite { line, ty } => {
+            NodeKind::DelayWrite(DelayWrite { line, ty }) => {
                 let index = lines
                     .iter()
                     .position(|l| l.id == line)
@@ -321,11 +325,11 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             }
             // Audio nodes carry no param register. The audio pass walks the
             // same order again and emits their half (§14.9).
-            NodeKind::Plugin { instance, .. } => {
+            NodeKind::Plugin(Plugin { instance, .. }) => {
                 // A plugin node's parameter sockets sit after its audio inputs
                 // and its notes port. Only the ones with something wired to
                 // them cost anything.
-                let NodeKind::Plugin { ports, .. } = &node.kind else {
+                let NodeKind::Plugin(Plugin { ports, .. }) = &node.kind else {
                     unreachable!()
                 };
                 let first = ports.audio_in.len() + usize::from(ports.accepts_notes);
@@ -361,7 +365,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             // A mix's gains are params, so the param half is where their lanes
             // are booked; the scaling itself is the audio half's. The gain
             // sockets sit after the audio inputs.
-            NodeKind::Mix { inputs, .. } => {
+            NodeKind::Mix(Mix { inputs, .. }) => {
                 for i in 0..inputs {
                     // Signal, gain, signal, gain: the gain for input `i` is the
                     // socket right after it.
@@ -373,7 +377,9 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     outputs.push((lane, reg));
                 }
             }
-            NodeKind::AudioIn { .. } | NodeKind::AudioOut { .. } | NodeKind::NoteIn => {}
+            NodeKind::AudioIn(AudioIn { .. })
+            | NodeKind::AudioOut(AudioOut { .. })
+            | NodeKind::NoteIn => {}
         }
     }
 
@@ -449,8 +455,8 @@ fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
 
     for node in &graph.nodes {
         let (id, ty, writer) = match node.kind {
-            NodeKind::DelayWrite { line, ty } => (line, ty, Some(node.id)),
-            NodeKind::DelayRead { line, ty, .. } => (line, ty, None),
+            NodeKind::DelayWrite(DelayWrite { line, ty }) => (line, ty, Some(node.id)),
+            NodeKind::DelayRead(DelayRead { line, ty, .. }) => (line, ty, None),
             _ => continue,
         };
         // A note delay line would have to store events, not values, and the
@@ -587,7 +593,6 @@ fn visit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::NodeKind;
     use crate::ir::{MathOp, Waveform};
 
     const SLOTS: usize = 32;
@@ -602,19 +607,19 @@ mod tests {
     #[test]
     fn only_what_feeds_an_output_is_compiled() {
         let mut graph = Graph::new();
-        let used = graph.add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let used = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(used, 0, out, 0);
         // Dropped on the canvas and wired to nothing.
-        graph.add(NodeKind::Constant { value: 0.25 }, [0.0, 0.0]);
+        graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
         graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Sine,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
 
@@ -633,13 +638,13 @@ mod tests {
     fn an_always_on_node_is_compiled_with_nothing_downstream() {
         let mut graph = Graph::new();
         let lfo = graph.add(
-            NodeKind::Lfo {
+            NodeKind::Lfo(Lfo {
                 waveform: Waveform::Sine,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
                 depth: 0.5,
                 offset: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
         assert!(
@@ -657,12 +662,12 @@ mod tests {
     #[test]
     fn an_always_on_node_pulls_its_inputs_in_with_it() {
         let mut graph = Graph::new();
-        let source = graph.add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
+        let source = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
         let sink = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 2.0,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.connect(source, 0, sink, 0);
@@ -675,16 +680,16 @@ mod tests {
     #[test]
     fn every_op_reads_only_registers_already_written() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 0.5 }, [0.0, 0.0]);
-        let b = graph.add(NodeKind::SlotIn { slot: 2 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+        let b = graph.add(NodeKind::SlotIn(SlotIn { slot: 2 }), [0.0, 0.0]);
         let sum = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 0.0,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 1 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 1 }), [0.0, 0.0]);
         // Wired back to front on purpose: creation order must not matter.
         graph.connect(sum, 0, out, 0);
         graph.connect(b, 0, sum, 1);
@@ -709,20 +714,20 @@ mod tests {
     fn a_cycle_is_reported_rather_than_hung_on() {
         let mut graph = Graph::new();
         let x = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 1.0,
-            },
+            }),
             [0.0, 0.0],
         );
         let y = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Add,
                 b: 1.0,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(x, 0, y, 0);
         graph.connect(y, 0, x, 0);
         graph.connect(y, 0, out, 0);
@@ -736,9 +741,9 @@ mod tests {
     #[test]
     fn two_nodes_driving_one_slot_is_an_error_not_a_coin_toss() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 0.1 }, [0.0, 0.0]);
-        let one = graph.add(NodeKind::SlotOut { slot: 4 }, [0.0, 0.0]);
-        let two = graph.add(NodeKind::SlotOut { slot: 4 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
+        let one = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
+        let two = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
         graph.connect(a, 0, one, 0);
         graph.connect(a, 0, two, 0);
 
@@ -751,8 +756,8 @@ mod tests {
     #[test]
     fn a_slot_outside_the_table_is_refused() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant { value: 0.1 }, [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut { slot: 99 }, [0.0, 0.0]);
+        let a = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 99 }), [0.0, 0.0]);
         graph.connect(a, 0, out, 0);
         assert!(matches!(
             compile(&graph, SLOTS),
@@ -763,7 +768,7 @@ mod tests {
     #[test]
     fn an_output_with_nothing_plugged_in_leaves_the_slot_to_the_daw() {
         let mut graph = Graph::new();
-        graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         let program = compile(&graph, SLOTS).unwrap();
         assert!(!program.drives(0));
     }
@@ -771,14 +776,14 @@ mod tests {
     #[test]
     fn a_graph_bigger_than_the_audio_thread_can_hold_is_refused() {
         let mut graph = Graph::new();
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
-        let mut last = graph.add(NodeKind::Constant { value: 0.0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let mut last = graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         for _ in 0..MAX_REGISTERS + 8 {
             let next = graph.add(
-                NodeKind::Math {
+                NodeKind::Math(Math {
                     op: MathOp::Add,
                     b: 1.0,
-                },
+                }),
                 [0.0, 0.0],
             );
             graph.connect(last, 0, next, 0);
@@ -799,29 +804,29 @@ mod tests {
     fn a_loop_closed_through_a_delay_is_not_a_cycle() {
         let mut graph = Graph::new();
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 0,
                 ty: PortType::Param,
                 max_time: 1.0,
                 time: 0.25,
-            },
+            }),
             [0.0, 0.0],
         );
         let scale = graph.add(
-            NodeKind::Math {
+            NodeKind::Math(Math {
                 op: MathOp::Multiply,
                 b: 0.5,
-            },
+            }),
             [0.0, 0.0],
         );
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 0,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
 
         graph.connect(read, 0, scale, 0);
         graph.connect(scale, 0, write, 0);
@@ -850,23 +855,23 @@ mod tests {
     fn delay_writes_are_emitted_after_everything_else() {
         let mut graph = Graph::new();
         let read = graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 7,
                 ty: PortType::Param,
                 max_time: 1.0,
                 time: 0.1,
-            },
+            }),
             [0.0, 0.0],
         );
-        let source = graph.add(NodeKind::Constant { value: 0.25 }, [0.0, 0.0]);
+        let source = graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
         let write = graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 7,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.connect(source, 0, write, 0);
         graph.connect(read, 0, out, 0);
 
@@ -880,10 +885,10 @@ mod tests {
         let mut graph = Graph::new();
         for _ in 0..2 {
             graph.add(
-                NodeKind::DelayWrite {
+                NodeKind::DelayWrite(DelayWrite {
                     line: 3,
                     ty: PortType::Param,
-                },
+                }),
                 [0.0, 0.0],
             );
         }
@@ -897,19 +902,19 @@ mod tests {
     fn the_two_halves_of_a_line_must_agree_on_what_it_carries() {
         let mut graph = Graph::new();
         graph.add(
-            NodeKind::DelayWrite {
+            NodeKind::DelayWrite(DelayWrite {
                 line: 1,
                 ty: PortType::Param,
-            },
+            }),
             [0.0, 0.0],
         );
         graph.add(
-            NodeKind::DelayRead {
+            NodeKind::DelayRead(DelayRead {
                 line: 1,
                 ty: PortType::STEREO,
                 max_time: 1.0,
                 time: 0.1,
-            },
+            }),
             [0.0, 0.0],
         );
         assert!(matches!(
@@ -925,13 +930,13 @@ mod tests {
     fn a_hand_written_link_between_two_types_is_refused() {
         let mut graph = Graph::new();
         let audio = graph.add(
-            NodeKind::AudioIn {
+            NodeKind::AudioIn(AudioIn {
                 bus: 0,
                 channels: 2,
-            },
+            }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut { slot: 0 }, [0.0, 0.0]);
+        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
         graph.links.push(crate::graph::Link {
             from: audio,
             from_port: 0,
