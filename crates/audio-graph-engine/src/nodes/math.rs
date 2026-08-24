@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::ir::MathOp;
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::{Op, Operand};
 use crate::port::Port;
@@ -43,6 +44,12 @@ impl Math {
             op: self.op,
         });
         cx.bind_output(0, out);
+        Ok(())
+    }
+}
+
+impl Math {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

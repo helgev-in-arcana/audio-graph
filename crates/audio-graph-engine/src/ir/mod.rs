@@ -87,6 +87,10 @@ pub const MAX_AUDIO_LANES: usize = 16;
 pub const MAX_COMPENSATORS: usize = 8;
 pub const MAX_COMPENSATION: usize = 32_768;
 
+/// Ceiling on the audio buffer pool, so `activate` can size it once and never
+/// grow.
+pub const MAX_BUFFERS: usize = 64;
+
 /// Widest single bus the engine moves around. Stereo throughout (§14.8).
 pub const MAX_CHANNELS: usize = 2;
 

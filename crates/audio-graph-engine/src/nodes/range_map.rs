@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::Op;
 use crate::port::Port;
@@ -44,6 +45,12 @@ impl RangeMap {
             clamp: self.clamp,
         });
         cx.bind_output(0, out);
+        Ok(())
+    }
+}
+
+impl RangeMap {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

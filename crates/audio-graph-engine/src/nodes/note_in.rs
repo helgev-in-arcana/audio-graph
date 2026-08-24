@@ -1,3 +1,4 @@
+use crate::compile::AudioCx;
 use crate::compile::{CompileError, ParamCx};
 /// Notes arriving from the DAW.
 use crate::port::{Port, PortType};
@@ -25,6 +26,12 @@ impl NoteIn {
 
 impl NoteIn {
     pub(crate) fn compile(&self, _cx: &mut ParamCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+}
+
+impl NoteIn {
+    pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
     }
 }

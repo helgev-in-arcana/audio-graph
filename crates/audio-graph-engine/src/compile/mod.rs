@@ -10,9 +10,10 @@
 //! state for a graph someone is halfway through drawing; the editor shows the
 //! message and keeps running the last program that compiled.
 
+mod audio;
 mod cx;
 
-pub(crate) use cx::ParamCx;
+pub(crate) use cx::{AudioCx, ParamCx};
 
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{MAX_DELAY_LINES, Program};
@@ -128,7 +129,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     }
     let param = cx.finish();
 
-    let audio = crate::audio::compile_audio(graph, &order, &lines, &param.audio_lanes)?;
+    let audio = audio::compile_audio(graph, &order, &lines, &param.audio_lanes)?;
 
     Ok(Program {
         ops: param.ops,
