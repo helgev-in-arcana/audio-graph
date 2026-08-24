@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::port::Port;
+
 /// The DAW's automation for one wrapper slot, 0..1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotIn {
@@ -17,4 +19,32 @@ pub struct SlotIn {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotOut {
     pub slot: usize,
+}
+
+impl SlotIn {
+    pub fn input_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        vec![Port::param("out")]
+    }
+
+    pub fn title(&self) -> String {
+        format!("Slot {} in", self.slot + 1)
+    }
+}
+
+impl SlotOut {
+    pub fn input_ports(&self) -> Vec<Port> {
+        vec![Port::param("in")]
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    pub fn title(&self) -> String {
+        format!("Slot {} out", self.slot + 1)
+    }
 }

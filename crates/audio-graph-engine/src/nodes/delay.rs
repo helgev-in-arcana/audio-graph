@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::graph::LineId;
-use crate::port::PortType;
+use crate::port::{Port, PortType};
 
 /// The writing half of a delay line (§14.4).
 ///
@@ -40,4 +40,36 @@ pub struct DelayRead {
     /// `process`.
     pub max_time: f64,
     pub time: f64,
+}
+
+impl DelayWrite {
+    pub fn input_ports(&self) -> Vec<Port> {
+        vec![Port::new("in", self.ty)]
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        Vec::new()
+    }
+
+    pub fn title(&self) -> String {
+        format!("Delay {} write", self.line + 1)
+    }
+}
+
+impl DelayRead {
+    /// The one input a `DelayRead` has is its own delay time (§14.5). It is a
+    /// param, never audio, so it cannot close a loop through the line it
+    /// belongs to — the type check in `check_links` is what makes that true
+    /// rather than a convention.
+    pub fn input_ports(&self) -> Vec<Port> {
+        vec![Port::param("time")]
+    }
+
+    pub fn output_ports(&self) -> Vec<Port> {
+        vec![Port::new("out", self.ty)]
+    }
+
+    pub fn title(&self) -> String {
+        format!("Delay {} read", self.line + 1)
+    }
 }
