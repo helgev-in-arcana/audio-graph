@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 pub use crate::ir::Waveform;
 
 use crate::compile::AudioCx;
+use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
+use crate::ir::NoteSource;
 use crate::ir::{Op, RateSpec};
 use crate::port::Port;
 
@@ -69,5 +71,15 @@ impl Lfo {
 impl Lfo {
     pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
+    }
+}
+
+impl Lfo {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
     }
 }

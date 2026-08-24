@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::AudioCx;
+use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
+use crate::ir::NoteSource;
 use crate::ir::{AudioOp, Buf, MixIn};
 use crate::port::{Port, PortType};
 
@@ -123,5 +125,15 @@ impl Mix {
         cx.emit(AudioOp::Mix { out, inputs });
         cx.produce(0, out, arrive);
         Ok(())
+    }
+}
+
+impl Mix {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
     }
 }

@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::AudioCx;
+use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
+use crate::ir::NoteSource;
 use crate::ir::Op;
 use crate::port::Port;
 
@@ -88,5 +90,25 @@ impl SlotIn {
 impl SlotOut {
     pub(crate) fn compile_audio(&self, _cx: &mut AudioCx) -> Result<(), CompileError> {
         Ok(())
+    }
+}
+
+impl SlotIn {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+}
+
+impl SlotOut {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
     }
 }

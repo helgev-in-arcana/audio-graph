@@ -17,8 +17,8 @@ use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
-    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_GRAPH_PARAMS, MAX_LFOS,
-    MAX_REGISTERS, NoteSource, Op, ParamTarget, Reg,
+    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, ParamTarget, Reg,
 };
 use crate::nodes::NodeKind;
 use crate::port::PortType;
@@ -549,17 +549,11 @@ impl<'a> AudioCx<'a> {
     /// note output would need the engine to carry event buffers, and that is
     /// M9.
     pub(crate) fn note_source(&self, port: u8) -> NoteSource {
-        match self.graph.source_of(self.id, port) {
-            Some((from, _))
-                if matches!(
-                    self.graph.node(from).map(|n| &n.kind),
-                    Some(NodeKind::NoteIn)
-                ) =>
-            {
-                NoteSource::Daw { bus: 0 }
-            }
-            _ => NoteSource::None,
-        }
+        self.graph
+            .source_of(self.id, port)
+            .and_then(|(from, _)| self.graph.node(from))
+            .and_then(|node| node.kind.note_identity())
+            .unwrap_or(NoteSource::None)
     }
 
     // --- buffers ----------------------------------------------------------
@@ -684,5 +678,91 @@ impl<'a> AudioCx<'a> {
     pub(crate) fn want_ring(&mut self, index: u16, seconds: f64) {
         let slot = &mut self.ring_seconds[index as usize];
         *slot = slot.max(seconds.clamp(0.0, MAX_AUDIO_DELAY_SECONDS));
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+/// What a node is handed before either half is compiled.
+///
+/// One pass over the graph, in which a node says what it needs that the
+/// compiler has to know about *before* it starts emitting: today that is delay
+/// lines, and nothing else. The pass exists so the compiler can stop
+/// recognising node kinds — it used to find the two halves of a delay line by
+/// matching on `DelayWrite` and `DelayRead` itself, which is exactly the kind
+/// of knowledge this refactoring is moving out of it.
+///
+/// Deliberately in graph order rather than topological order: line numbering
+/// comes from where the writers sit in the patch, and a `DelayRead` compiled
+/// early has to already know its line index.
+pub(crate) struct DeclareCx {
+    id: NodeId,
+    lines: Vec<Line>,
+}
+
+impl DeclareCx {
+    pub(crate) fn new() -> DeclareCx {
+        DeclareCx {
+            id: NodeId::MAX,
+            lines: Vec::new(),
+        }
+    }
+
+    pub(crate) fn begin(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    pub(crate) fn finish(self) -> Vec<Line> {
+        self.lines
+    }
+
+    /// Say that this node is one end of delay line `line`, carrying `ty`.
+    ///
+    /// A line with reads but no write is not an error: it reads silence, which
+    /// is what a half-drawn patch should do. A line with a write and no read is
+    /// not an error either — it is just unread. Two writers is an error, for
+    /// the same reason two outputs on one slot are: which one wins would
+    /// otherwise depend on node creation order.
+    pub(crate) fn declare_line(
+        &mut self,
+        line: LineId,
+        ty: PortType,
+        writes: bool,
+    ) -> Result<(), CompileError> {
+        // A note delay line would have to store events, not values, and the
+        // param ring stores one `f64` per sub-block. Refusing is the honest
+        // answer; compiling it would drop every note in silence.
+        if matches!(ty, PortType::Note) {
+            return Err(CompileError::NotYet {
+                what: "note delay lines",
+            });
+        }
+        match self.lines.iter_mut().find(|l| l.id == line) {
+            Some(existing) => {
+                if existing.ty != ty {
+                    return Err(CompileError::DelayTypeMismatch { line });
+                }
+                if writes {
+                    if existing.writer != NO_WRITER {
+                        return Err(CompileError::DuplicateDelayWrite { line });
+                    }
+                    existing.writer = self.id;
+                }
+            }
+            None => {
+                if self.lines.len() >= MAX_DELAY_LINES {
+                    return Err(CompileError::TooLarge {
+                        what: "delay lines",
+                        limit: MAX_DELAY_LINES,
+                    });
+                }
+                self.lines.push(Line {
+                    id: line,
+                    writer: if writes { self.id } else { NO_WRITER },
+                    ty,
+                });
+            }
+        }
+        Ok(())
     }
 }

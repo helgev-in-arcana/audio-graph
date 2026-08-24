@@ -3,8 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::AudioCx;
+use crate::compile::DeclareCx;
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::AudioOp;
+use crate::ir::NoteSource;
 use crate::port::{Port, PortType};
 
 /// Audio arriving from the DAW on one of the wrapper's own input buses.
@@ -92,5 +94,25 @@ impl AudioOut {
             });
         }
         Ok(())
+    }
+}
+
+impl AudioIn {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+}
+
+impl AudioOut {
+    pub(crate) fn declare(&self, _cx: &mut DeclareCx) -> Result<(), CompileError> {
+        Ok(())
+    }
+
+    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
+        None
     }
 }
