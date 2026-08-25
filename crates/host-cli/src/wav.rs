@@ -89,29 +89,39 @@ pub fn read(path: &Path) -> Result<Audio, String> {
 
     let interleaved: Vec<f32> = match (format, bits) {
         (1, 16) => data
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| i16::from_le_bytes(c) as f32 / 32768.0)
             .collect(),
         (1, 24) => data
-            .chunks_exact(3)
-            .map(|c| {
-                let v = i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8;
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[a, b, c]| {
+                let v = i32::from_le_bytes([0, a, b, c]) >> 8;
                 v as f32 / 8_388_608.0
             })
             .collect(),
         (3, 32) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect(),
         // 0xFFFE is WAVE_FORMAT_EXTENSIBLE; the sub-format lives in the fmt
         // extension, but bit depth alone disambiguates the cases we accept.
         (0xFFFE, 16) => data
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| i16::from_le_bytes(c) as f32 / 32768.0)
             .collect(),
         (0xFFFE, 32) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
             .collect(),
         _ => {
             return Err(format!(
