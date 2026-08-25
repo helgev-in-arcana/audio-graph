@@ -231,6 +231,31 @@ impl Graph {
         self.links.retain(|l| !(l.to == to && l.to_port == to_port));
     }
 
+    /// A node has lost `count` input sockets starting at `first`: cut what was
+    /// plugged into them, and slide every later socket's link down.
+    ///
+    /// The sliding is the whole point. A link names its socket by index, so
+    /// taking a socket out from the middle — one of a `Mix`'s inputs, one of a
+    /// plugin node's parameter sockets — silently re-points every link after
+    /// it unless they are moved with it. `prune` cannot repair that: the links
+    /// still land on sockets of the right type, just the wrong ones.
+    ///
+    /// The node itself has already shrunk by the time this is called; all that
+    /// is left here is the graph's half of it.
+    pub fn drop_inputs(&mut self, node: NodeId, first: u8, count: u8) {
+        if count == 0 {
+            return;
+        }
+        let end = first.saturating_add(count);
+        self.links
+            .retain(|l| !(l.to == node && (first..end).contains(&l.to_port)));
+        for link in &mut self.links {
+            if link.to == node && link.to_port >= end {
+                link.to_port -= count;
+            }
+        }
+    }
+
     /// What feeds one of a node's inputs: the source node and its output port.
     pub fn source_of(&self, to: NodeId, to_port: u8) -> Option<(NodeId, u8)> {
         self.links
@@ -273,6 +298,10 @@ mod tests {
     use crate::nodes::{
         Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotOut,
     };
+    // `remove_input` is the editor's half of the node set, so the two tests
+    // that exercise it are compiled with it.
+    #[cfg(feature = "ui")]
+    use crate::nodes::{Mix, Node};
 
     #[test]
     fn an_input_only_ever_has_one_source() {
@@ -488,6 +517,117 @@ mod tests {
         graph.prune();
         assert_eq!(graph.links.len(), 1, "the main input link survives");
         assert_eq!(graph.source_of(plugin, 0), Some((source, 0)));
+    }
+
+    /// Taking one of a `Mix`'s inputs away is two sockets going out of the
+    /// middle of the list, and every link after them means a socket one lower
+    /// than it did. Nothing else notices: `prune` would leave these links
+    /// where they were, still pointing at sockets of the right type and the
+    /// wrong index, and the patch would quietly mix the wrong things.
+    #[test]
+    #[cfg(feature = "ui")]
+    fn removing_an_input_slides_the_links_after_it_down() {
+        let mut graph = Graph::new();
+        let a = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        let b = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 1,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 3,
+                gains: vec![1.0, 1.0, 1.0],
+            }),
+            [0.0, 0.0],
+        );
+        // Signal, gain, signal, gain: input 2 is socket 2, input 3 is socket 4.
+        graph.connect(a, 0, mix, 2);
+        graph.connect(b, 0, mix, 4);
+
+        // The user takes input 2 away — the pair at sockets 2 and 3.
+        let NodeKind::Mix(node) = &mut graph.node_mut(mix).unwrap().kind else {
+            unreachable!()
+        };
+        let count = node.remove_input(2);
+        assert_eq!(count, 2, "an input is a signal and its gain");
+        graph.drop_inputs(mix, 2, count);
+
+        assert_eq!(
+            graph.source_of(mix, 2),
+            Some((b, 0)),
+            "input 3 became input 2"
+        );
+        assert_eq!(graph.links.len(), 1, "what fed the removed input is cut");
+        assert_eq!(graph.node(mix).unwrap().kind.input_ports().len(), 4);
+    }
+
+    /// The same for a plugin node's parameter sockets, which are one socket
+    /// each rather than a pair — and which sit after the audio and note ones,
+    /// so the sockets before them must not move.
+    #[test]
+    #[cfg(feature = "ui")]
+    fn removing_a_parameter_socket_leaves_the_audio_ones_alone() {
+        let mut graph = Graph::new();
+        let audio = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        let value = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+        let plugin = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2],
+                    params: vec![
+                        ParamPort {
+                            id: 1,
+                            name: "Cutoff".into(),
+                        },
+                        ParamPort {
+                            id: 2,
+                            name: "Resonance".into(),
+                        },
+                    ],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(audio, 0, plugin, 0);
+        graph.connect(value, 0, plugin, 2);
+
+        // Cutoff, the first of the two parameter sockets, is socket 1.
+        let NodeKind::Plugin(node) = &mut graph.node_mut(plugin).unwrap().kind else {
+            unreachable!()
+        };
+        let count = node.remove_input(1);
+        assert_eq!(count, 1);
+        graph.drop_inputs(plugin, 1, count);
+
+        assert_eq!(
+            graph.source_of(plugin, 0),
+            Some((audio, 0)),
+            "audio is untouched"
+        );
+        assert_eq!(
+            graph.source_of(plugin, 1),
+            Some((value, 0)),
+            "Resonance moved into Cutoff's place, and its link with it"
+        );
     }
 
     /// Patches written before M8 name the destination socket `input` and have

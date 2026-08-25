@@ -5,7 +5,7 @@ pub use crate::ir::MathOp;
 use crate::ir::{Op, Operand};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo};
+use crate::nodes::widgets::{NodeUi, combo, fallback};
 use crate::port::Port;
 
 /// Two inputs and an operator. Input 1 falls back to `b` when unconnected,
@@ -48,15 +48,27 @@ impl Node for Math {
 
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        let mut changed = combo(ui, "op", &mut self.op, &MathOp::ALL, MathOp::label);
-        ui.horizontal(|ui| {
-            ui.label("b");
-            changed |= ui
-                .add(egui::DragValue::new(&mut self.b).speed(0.01))
-                .changed();
-        });
-        ui.weak("b is used only while its input is unconnected");
-        changed
+        combo(ui, "op", &mut self.op, &MathOp::ALL, MathOp::label)
+    }
+
+    /// `b` sits on the row of the socket it stands in for, and greys out when
+    /// that socket is fed — which is the whole of what the line of prose under
+    /// this node used to say.
+    #[cfg(feature = "ui")]
+    fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        connected: bool,
+        _cx: &mut NodeUi<'_>,
+    ) -> bool {
+        if port != 1 {
+            return false;
+        }
+        let b = &mut self.b;
+        fallback(ui, connected, |ui| {
+            ui.add(egui::DragValue::new(b).speed(0.01)).changed()
+        })
     }
 }
 
