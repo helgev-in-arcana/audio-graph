@@ -354,8 +354,17 @@ impl Node for Plugin {
         } else {
             "open the plugin's window"
         };
+        // Framed whether the window is open or not. A `selectable_label`
+        // that is not selected draws as bare text, and bare text in a title
+        // bar does not read as something to press.
         if ui
-            .selectable_label(view.editor_open, "GUI")
+            .add(
+                egui::Button::new("GUI")
+                    .small()
+                    .selected(view.editor_open)
+                    .frame(true)
+                    .frame_when_inactive(true),
+            )
             .on_hover_text(hint)
             .clicked()
         {
@@ -418,9 +427,12 @@ impl Node for Plugin {
         } else {
             param.name.clone()
         };
+        // The width the row has left, not a number of pixels: an absolute
+        // width does not move when the canvas is zoomed, so the dropdown was
+        // the one thing on a zoomed-out node still drawn at full size.
         egui::ComboBox::from_id_salt(("param", index))
             .selected_text(shorten(&label))
-            .width(112.0)
+            .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for (id, name) in &available {
                     if ui.selectable_label(*id == param.id, name).clicked() && *id != param.id {
