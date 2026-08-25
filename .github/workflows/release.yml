@@ -109,9 +109,23 @@ jobs:
         run: cargo build --workspace --release
 
       # DAW が期待するのは素の共有ライブラリではなくバンドル。xtask が
-      # cargo build と梱包をまとめて面倒を見る。出力は target/bundled/。
-      - name: Bundle the VST3
+      # cargo build と梱包をまとめて面倒を見る。出力は target/bundled/ で、
+      # どの形式が出るかはバイナリがエクスポートしている記号で決まる。
+      # audio-graph-plugin は VST3 と CLAP の両方を出す。
+      - name: Bundle the VST3 and the CLAP
         run: cargo xtask bundle audio-graph-plugin --release
+
+      # 片方しか出ていなければ、リリースまで進む前にここで気付きたい。
+      # CLAP は Windows / Linux では単一ファイル、macOS ではバンドルディレクトリ。
+      - name: Verify both bundles exist
+        shell: bash
+        run: |
+          for f in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
+            if [ ! -e "$f" ]; then
+              echo "::error::$f が生成されていません。"
+              exit 1
+            fi
+          done
 
       # Windows のランナーには zip が入っていないので pwsh で固める。
       # ライセンスと著作権表示はバイナリと一緒に配る。
@@ -120,7 +134,7 @@ jobs:
         shell: pwsh
         run: |
           $name = "AudioGraph-${{ github.ref_name }}-${{ matrix.name }}"
-          Compress-Archive -Path target/bundled/AudioGraph.vst3, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY-NOTICES.md, README.md -DestinationPath "$name.zip"
+          Compress-Archive -Path target/bundled/AudioGraph.vst3, target/bundled/AudioGraph.clap, LICENSE-MIT, LICENSE-APACHE, THIRD-PARTY-NOTICES.md, README.md -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
             Out-File -Encoding ascii "$name.zip.sha256"
 
@@ -131,7 +145,7 @@ jobs:
         shell: bash
         run: |
           name="AudioGraph-${GITHUB_REF_NAME}-${{ matrix.name }}"
-          (cd target/bundled && zip -qry "../../$name.zip" AudioGraph.vst3)
+          (cd target/bundled && zip -qry "../../$name.zip" AudioGraph.vst3 AudioGraph.clap)
           zip -qj "$name.zip" LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md README.md
           if command -v sha256sum >/dev/null; then
             sha256sum "$name.zip" > "$name.zip.sha256"
@@ -141,7 +155,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: vst3-${{ matrix.name }}
+          name: bundles-${{ matrix.name }}
           path: |
             *.zip
             *.zip.sha256
