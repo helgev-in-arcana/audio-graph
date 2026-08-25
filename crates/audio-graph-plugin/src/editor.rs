@@ -127,6 +127,11 @@ pub struct WrapperEditor {
     entries: Vec<crate::graph_ui::PluginEntry>,
     scanned: bool,
 
+    /// Whether the plugin-folders window is showing.
+    folders_open: bool,
+    /// What the user has typed into that window's path field, not yet added.
+    folder_input: String,
+
     status: Status,
 
     /// Filled while drawing, drained at the end of the same `ui` call.
@@ -146,6 +151,8 @@ impl WrapperEditor {
             deferred: None,
             entries: Vec::new(),
             scanned: false,
+            folders_open: false,
+            folder_input: String::new(),
             status: Status::default(),
             commands: Vec::new(),
             view: View::default(),
@@ -281,6 +288,155 @@ impl WrapperEditor {
         }
     }
 
+    /// Where sub-plugins are looked for, and the user's say in it.
+    ///
+    /// Its own window rather than a row in the settings strip: the list is as
+    /// long as the user's folders, and the strip has one line.
+    ///
+    /// Nothing here is deferred. Reading and writing the config file touches no
+    /// window and dispatches no messages, so the reentrancy the rest of this
+    /// module is built around does not apply — and the rescan it leads to is
+    /// already done inline, from `refresh`.
+    fn folders_window(&mut self, ctx: &egui::Context) {
+        if !self.folders_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Plugin folders")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Every folder scanned for sub-plugins, and one level below each. \
+                     This list is the whole of it: nothing is scanned that is not \
+                     here. The usual folders for this machine were filled in to \
+                     start with, and are yours to remove like any other.",
+                );
+
+                // The list scrolls and the controls below it do not: a machine
+                // with a lot of plugin folders can outgrow the screen, and an
+                // Add button pushed off the bottom is an Add button that does
+                // not exist.
+                let mut remove = None;
+                let directories = plugin_host::config::directories();
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        if directories.is_empty() {
+                            // Reachable, and deliberately not undone on its own:
+                            // a user who removed every folder asked for exactly
+                            // this, and only the button below puts them back.
+                            ui.weak("No folders. Nothing will be scanned.");
+                            return;
+                        }
+                        // `remove` is decided here and acted on after the scroll
+                        // area closes: removing inside the loop would edit the
+                        // list being drawn from, and `self` is not reachable
+                        // from in here anyway.
+                        for dir in &directories {
+                            ui.horizontal(|ui| {
+                                if ui.button("Remove").clicked() {
+                                    remove = Some(dir.clone());
+                                }
+                                let label = ui.label(dir.display().to_string());
+                                // A folder on a drive that is not plugged in
+                                // stays in the list — it is still what the user
+                                // asked for — but saying so beats an empty
+                                // plugin menu and no reason for it.
+                                if !dir.is_dir() {
+                                    label.on_hover_text("this folder is not there right now");
+                                    ui.weak("(missing)");
+                                }
+                            });
+                        }
+                    });
+
+                if let Some(dir) = remove {
+                    match plugin_host::config::remove_directory(&dir) {
+                        Ok(()) => {
+                            self.status.set(format!("removed {}", dir.display()));
+                            self.scanned = false;
+                        }
+                        Err(e) => self.status.set(format!("settings not saved: {e}")),
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.folder_input)
+                            .hint_text("path to a folder of plugins")
+                            .desired_width(300.0),
+                    );
+                    let entered =
+                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button("Add").clicked() || entered)
+                        && !self.folder_input.trim().is_empty()
+                    {
+                        let dir = PathBuf::from(self.folder_input.trim());
+                        // Refused rather than saved: a typo that silently
+                        // scans nothing is worse than being told.
+                        if !dir.is_dir() {
+                            self.status
+                                .set(format!("{} is not a folder", dir.display()));
+                        } else {
+                            match plugin_host::config::add_directory(dir.clone()) {
+                                Ok(()) => {
+                                    self.status.set(format!("added {}", dir.display()));
+                                    self.folder_input.clear();
+                                    self.scanned = false;
+                                }
+                                Err(e) => self.status.set(format!("settings not saved: {e}")),
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Rescan").clicked() {
+                        self.scanned = false;
+                        self.status.set("rescanned");
+                    }
+                    // Adds, never replaces: the user's own folders are not what
+                    // they asked to undo. Also how a folder that appeared after
+                    // the list was first filled in — a format installed since,
+                    // a CLAP_PATH set since — gets picked up.
+                    if ui
+                        .button("Add the usual folders")
+                        .on_hover_text(
+                            "put back any of this machine's conventional plugin folders \
+                             that are not on the list",
+                        )
+                        .clicked()
+                    {
+                        match plugin_host::config::restore_defaults() {
+                            Ok(()) => {
+                                self.status.set("the usual folders are on the list");
+                                self.scanned = false;
+                            }
+                            Err(e) => self.status.set(format!("settings not saved: {e}")),
+                        }
+                    }
+                    ui.weak(format!("{} modules found", self.entries.len()));
+                });
+
+                // The settings are shared by every instance in this process and
+                // outlive all of them, which is surprising enough to say out
+                // loud, and the path is what a user needs to back it up.
+                if let Some(path) = plugin_host::config::config_path() {
+                    ui.add_space(4.0);
+                    ui.weak(format!(
+                        "Shared by every Audio Graph instance. Saved in {}",
+                        path.display()
+                    ));
+                }
+            });
+        self.folders_open = open;
+    }
+
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         ui.label("Modulation rate").on_hover_text(
             "how often the graph's outputs reach the sub-plugin, in samples. \
@@ -295,6 +451,15 @@ impl WrapperEditor {
             {
                 self.commands.push(Command::SetQuantum(choice));
             }
+        }
+
+        ui.separator();
+        if ui
+            .selectable_label(self.folders_open, "Plugin folders")
+            .on_hover_text("where sub-plugins are looked for")
+            .clicked()
+        {
+            self.folders_open = !self.folders_open;
         }
     }
 
@@ -474,6 +639,9 @@ impl NiceEguiApp for WrapperEditor {
         });
         ui.separator();
         self.graph_panel(ui);
+        // After the panels, so that a folder added this frame is scanned on the
+        // next one rather than half-applied to this one's plugin menus.
+        self.folders_window(ui.ctx());
         self.dispatch();
     }
 

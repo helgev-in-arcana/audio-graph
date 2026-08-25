@@ -28,6 +28,7 @@
 //! `subhost-adapter`'s job (ARCHITECTURE.md §7), and the test is unchanged:
 //! would an offline renderer or a plugin scanner still need it?
 
+pub mod config;
 mod format;
 mod plugin;
 mod scan;
@@ -36,7 +37,7 @@ pub use format::{FORMATS, Format};
 pub use plugin::Plugin;
 pub use scan::{
     ClassInfo, PluginRef, default_plugin_directories, find_modules, installed_modules,
-    resolve_reference, scan_module, scan_module_as,
+    plugin_directories, resolve_reference, scan_module, scan_module_as,
 };
 
 // The shared data model, re-exported wholesale. Callers depend on this crate
