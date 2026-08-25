@@ -228,12 +228,11 @@ mod imp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use std::rc::Rc;
 
-    #[cfg(windows)]
     #[test]
     fn posted_work_waits_for_the_message_loop() {
         let deferred = new().expect("create");
@@ -249,7 +248,6 @@ mod tests {
         assert!(ran.get());
     }
 
-    #[cfg(windows)]
     #[test]
     fn work_queued_from_inside_a_task_still_runs() {
         let deferred = new().expect("create");

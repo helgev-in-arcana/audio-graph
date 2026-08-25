@@ -239,8 +239,7 @@ impl WrapperEditor {
         // By name, not by format: a user looking for "Raum" should not have to
         // know which format it was installed as, and the tag on the row says
         // which one they are about to load.
-        self.entries
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.entries.sort_by_key(|e| e.name.to_lowercase());
         self.scanned = true;
     }
 

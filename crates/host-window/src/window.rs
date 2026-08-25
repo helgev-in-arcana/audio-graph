@@ -293,7 +293,7 @@ mod imp {
         }
 
         pub fn handle(&self) -> *mut c_void {
-            self.hwnd.get() as *mut c_void
+            self.hwnd.get()
         }
 
         pub fn set_client_size(&self, size: Size) {
@@ -400,7 +400,7 @@ mod imp {
         }
         // GA_ROOT walks up parents but stops at the first top-level window,
         // which is the DAW's own frame rather than the desktop.
-        unsafe { GetAncestor(handle as HWND, GA_ROOT) as *mut c_void }
+        unsafe { GetAncestor(handle, GA_ROOT) }
     }
 
     pub fn pump_events() {
@@ -455,11 +455,10 @@ mod imp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn a_window_can_be_created_and_dropped() {
         let window = ContainerWindow::new("test", Size::new(320, 240), std::ptr::null_mut())
@@ -470,7 +469,6 @@ mod tests {
         drop(window);
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_can_be_created_repeatedly() {
         // The window class is registered once per process; a second

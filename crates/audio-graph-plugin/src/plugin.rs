@@ -357,10 +357,10 @@ impl Wrapper {
         // single ordered event stream.
         self.events.clear();
         while let Some(event) = context.next_event() {
-            if let Some(converted) = convert_note(&event) {
-                if self.events.len() < self.events.capacity() {
-                    self.events.push(Event::Note(converted));
-                }
+            if let Some(converted) = convert_note(&event)
+                && self.events.len() < self.events.capacity()
+            {
+                self.events.push(Event::Note(converted));
             }
         }
 
@@ -414,9 +414,9 @@ impl Wrapper {
         let mut at = 0usize;
         {
             let slices = buffer.as_slice_immutable();
-            for ch in 0..input_channels as usize {
+            for src in slices.iter().take(input_channels as usize) {
                 let dst = &mut self.input_scratch[at..at + frame_len];
-                dst.copy_from_slice(&slices[ch][..frame_len]);
+                dst.copy_from_slice(&src[..frame_len]);
                 at += frame_len;
             }
         }
@@ -509,13 +509,13 @@ impl Wrapper {
         }
 
         let output = buffer.as_slice();
-        for ch in 0..out_channels as usize {
-            output[ch][..frame_len]
+        for (ch, out) in output.iter_mut().take(out_channels as usize).enumerate() {
+            out[..frame_len]
                 .copy_from_slice(&self.output_scratch[ch * frame_len..(ch + 1) * frame_len]);
         }
         // Channels the sub-plugin did not write must not keep the input.
-        for ch in out_channels as usize..channels as usize {
-            output[ch][..frame_len].fill(0.0);
+        for out in &mut output[out_channels as usize..channels as usize] {
+            out[..frame_len].fill(0.0);
         }
 
         match status {

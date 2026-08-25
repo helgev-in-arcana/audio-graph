@@ -271,10 +271,8 @@ impl Shared {
                 state.graph_params = program.param_targets.clone();
                 self.programs.send(Box::new(program));
                 drop(state);
-                if changed {
-                    if let Err(e) = self.rebind() {
-                        log::warn!("audio-graph: re-activating for new buses: {e}");
-                    }
+                if changed && let Err(e) = self.rebind() {
+                    log::warn!("audio-graph: re-activating for new buses: {e}");
                 }
             }
             Err(e) => state.compile_error = Some(e.to_string()),
