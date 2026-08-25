@@ -37,9 +37,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       # 警告ゼロを維持する。新しい警告は PR の時点で落とす。
-      # ここは ubuntu なので、Windows 限定のコードは lint されない
-      # （host-window と vst3-host の大半）。それらは test ジョブの
-      # 各 OS で走る Clippy が見る。
+      # clippy はこのジョブにしか置かない。test ジョブにも置くと、
+      # ビルドが壊れたのか lint に引っかかっただけなのかがログから
+      # 読み取りにくくなる。
+      #
+      # 代償として、ここは ubuntu なので Windows 限定のコードは lint
+      # されない。そこは各 OS の build/test が拾う。
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -60,12 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # clippy はこのジョブでも走らせる（Windows 限定のコードを lint できるのは
-      # ここだけ）。dtolnay のアクションは既定で minimal プロファイルなので、
-      # 明示的に足さないと clippy が入らない。
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -83,9 +81,6 @@ jobs:
       # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
       - name: Build the test fixtures
         run: cargo build --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
