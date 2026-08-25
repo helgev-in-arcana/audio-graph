@@ -1,0 +1,4 @@
+[alias]
+# `build` is a builtin and cannot be aliased, so bundling gets its own verb.
+# See README.md for what it does.
+xtask = "run --package xtask --release --"
