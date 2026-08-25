@@ -53,7 +53,6 @@ fn main() -> ExitCode {
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
         "automate" => cmd_automate(rest),
-        "bundle" => cmd_bundle(rest),
         _ => {
             usage();
             return ExitCode::FAILURE;
@@ -135,96 +134,9 @@ fn usage() {
   host-cli state <PLUGIN> [ID]      save/restore a parameter across instances
   host-cli automate <PLUGIN> <IN.wav> [ID [PARAM_ID]]
                                     check a mid-block parameter change lands
-  host-cli bundle <DLL> <OUT.vst3>  wrap a built cdylib as a VST3 bundle"
+
+Bundling moved to `cargo xtask bundle audio-graph-plugin --release`."
     );
-}
-
-/// Package a built cdylib as a VST3 bundle.
-///
-/// A bare `.dll` renamed to `.vst3` loads in some hosts and not others; the
-/// bundle layout is what the format actually specifies, so the wrapper is
-/// tested in the shape a DAW will meet it in. This exists here rather than in a
-/// build script because it is only ever wanted deliberately.
-fn cmd_bundle(args: &[String]) -> Result<(), String> {
-    let dll = args.first().ok_or("usage: bundle <DLL> <OUT.vst3>")?;
-    let out = args.get(1).ok_or("usage: bundle <DLL> <OUT.vst3>")?;
-    let out = Path::new(out);
-
-    let stem = out
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("the output needs a name ending in .vst3")?;
-    // The bundle layout is per-OS: Windows and Linux put the binary under an
-    // architecture-named directory, macOS under `MacOS` with an Info.plist
-    // beside it. Getting this wrong is invisible until a host silently skips
-    // the bundle, so each platform is spelled out rather than guessed at.
-    let contents = out.join("Contents");
-    let (subdir, ext) = if cfg!(target_os = "windows") {
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64-win"
-        } else {
-            "arm64-win"
-        };
-        (arch, "vst3")
-    } else if cfg!(target_os = "macos") {
-        ("MacOS", "")
-    } else {
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64-linux"
-        } else {
-            "aarch64-linux"
-        };
-        (arch, "so")
-    };
-    let contents = contents.join(subdir);
-
-    // Replaced wholesale: a stale binary next to a fresh one is the kind of
-    // thing that costs an hour to notice.
-    if out.exists() {
-        std::fs::remove_dir_all(out).map_err(|e| format!("clearing {}: {e}", out.display()))?;
-    }
-    std::fs::create_dir_all(&contents).map_err(|e| e.to_string())?;
-    let name = if ext.is_empty() {
-        stem.to_string()
-    } else {
-        format!("{stem}.{ext}")
-    };
-    let target = contents.join(&name);
-    std::fs::copy(dll, &target).map_err(|e| format!("copying {dll}: {e}"))?;
-
-    // macOS identifies a bundle by its Info.plist; without one the loader
-    // treats the directory as an ordinary folder.
-    if cfg!(target_os = "macos") {
-        let plist = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\"              \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-             <plist version=\"1.0\">
-<dict>
-             	<key>CFBundleExecutable</key>
-	<string>{stem}</string>
-             	<key>CFBundleIdentifier</key>
-	<string>com.audio-graph.{stem}</string>
-             	<key>CFBundleName</key>
-	<string>{stem}</string>
-             	<key>CFBundlePackageType</key>
-	<string>BNDL</string>
-             	<key>CFBundleSignature</key>
-	<string>????</string>
-             	<key>CFBundleVersion</key>
-	<string>1.0</string>
-             </dict>
-</plist>
-"
-        );
-        let dir = out.join("Contents");
-        std::fs::write(dir.join("Info.plist"), plist)
-            .map_err(|e| format!("writing Info.plist: {e}"))?;
-        std::fs::write(dir.join("PkgInfo"), "BNDL????")
-            .map_err(|e| format!("writing PkgInfo: {e}"))?;
-    }
-
-    println!("{}", out.display());
-    Ok(())
 }
 
 /// The directories a scan actually covers, and the file they come from.
