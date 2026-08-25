@@ -207,9 +207,12 @@ pub(crate) fn combo<T: PartialEq + Copy>(
     name: fn(T) -> &'static str,
 ) -> bool {
     let mut changed = false;
+    // Whatever the row has left rather than a fixed width: `NODE_WIDTH` is
+    // in canvas units and the `Ui` here is already zoomed, so a constant made
+    // the dropdown the one control that did not scale with the rest.
     egui::ComboBox::from_id_salt(ui.id().with(label))
         .selected_text(name(*current))
-        .width(NODE_WIDTH - 40.0)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for &option in all {
                 if ui

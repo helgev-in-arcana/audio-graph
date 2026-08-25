@@ -441,7 +441,14 @@ impl GraphEditor {
             child.set_style(zoomed_style(ui.style(), zoom));
         }
 
+        // A socket's circle is painted on the node's edge, centred on it, so
+        // the outer half of it lies over the node's own contents. Anything
+        // narrower than the whole circle leaves a socket name with a hole
+        // punched through it. `Frame::group` hardcodes 6 and does not scale
+        // with the zoom, which is the other half of the same problem.
+        let margin = PORT_RADIUS * 2.0 * zoom;
         let frame = egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(margin.round().clamp(1.0, 127.0) as i8))
             .fill(ui.visuals().panel_fill)
             .stroke(Stroke::new(
                 1.0,
@@ -470,7 +477,7 @@ impl GraphEditor {
         let mut dropped: Option<u8> = None;
 
         let response = frame.show(&mut child, |ui| {
-            ui.set_width(width - 16.0 * zoom);
+            ui.set_width(width - 2.0 * margin);
             // The whole bar is laid out right to left, so it reads name ·
             // GUI · always on · x on screen. The buttons are placed first and
             // the name takes what is left, because the other way round a
@@ -492,14 +499,25 @@ impl GraphEditor {
                     // with no output is already compiled.
                     if !outputs.is_empty() {
                         let on = &mut graph.nodes[index].always_on;
+                        // Framed in both states. A `toggle_value` that is off
+                        // draws as bare text, which in a title bar beside a
+                        // node's name is not something anybody reads as a
+                        // control until they happen to hover it.
                         if ui
-                            .toggle_value(on, "always on")
+                            .add(
+                                egui::Button::new("always on")
+                                    .small()
+                                    .selected(*on)
+                                    .frame(true)
+                                    .frame_when_inactive(true),
+                            )
                             .on_hover_text(
                                 "run this node even with nothing wired to its output \
                                  — for analysers",
                             )
-                            .changed()
+                            .clicked()
                         {
+                            *on = !*on;
                             outcome.changed = true;
                         }
                     }
@@ -539,7 +557,7 @@ impl GraphEditor {
                 let row = ui
                     .horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(port.name.as_ref()).small())
+                            ui.label(port.name.as_ref())
                         });
                     })
                     .response
@@ -570,30 +588,41 @@ impl GraphEditor {
                 let wired = connected.get(i).copied().unwrap_or(false);
                 let row = ui
                     .horizontal(|ui| {
-                        ui.label(egui::RichText::new(port.name.as_ref()).small());
-                        let mut cx = node_ui(ctx);
-                        outcome.changed |= graph.nodes[index]
-                            .kind
-                            .input_control(ui, i as u8, wired, &mut cx);
-                        actions.append(&mut cx.actions);
-                        if port.removable {
-                            // Outside whatever `input_control` disabled, on
-                            // purpose: a socket with a link in it is still one
-                            // you may want gone, and taking it away is exactly
-                            // what cuts the link.
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
+                        // Right to left, like the title bar and for the same
+                        // reason: the remove button takes its width first, and
+                        // what is left is what the control may have. A control
+                        // that asks `available_width` then gets an honest
+                        // answer, rather than one that ignores the button and
+                        // runs under it.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if port.removable {
+                                // Outside whatever `input_control` disabled,
+                                // on purpose: a socket with a link in it is
+                                // still one you may want gone, and taking it
+                                // away is exactly what cuts the link.
+                                if ui
+                                    .small_button("x")
+                                    .on_hover_text("remove this input")
+                                    .clicked()
+                                {
+                                    dropped = Some(i as u8);
+                                }
+                            }
+                            let rest =
+                                egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                            ui.allocate_ui_with_layout(
+                                rest,
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    if ui
-                                        .small_button("x")
-                                        .on_hover_text("remove this input")
-                                        .clicked()
-                                    {
-                                        dropped = Some(i as u8);
-                                    }
+                                    ui.label(port.name.as_ref());
+                                    let mut cx = node_ui(ctx);
+                                    outcome.changed |= graph.nodes[index]
+                                        .kind
+                                        .input_control(ui, i as u8, wired, &mut cx);
+                                    actions.append(&mut cx.actions);
                                 },
                             );
-                        }
+                        });
                     })
                     .response
                     .rect;
