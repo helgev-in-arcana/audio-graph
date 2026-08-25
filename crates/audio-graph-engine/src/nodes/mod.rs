@@ -336,10 +336,10 @@ impl NodeKind {
 
 /// What the editor's "add a node" menu offers, in the order it offers it.
 ///
-/// A free function rather than a method, because two entries can be the same
-/// node: `Mix` and `Gain` differ only in their starting shape, and the menu is
-/// the right place to say so. The delay pair is absent for the opposite
-/// reason — both halves arrive together, through `Graph::add_delay`.
+/// A free function rather than a method: `catalogue_defaults` returns `Self`,
+/// which would make [`Node`] un-object-safe, and it is not one entry per node
+/// anyway — both halves of a delay arrive together through `Graph::add_delay`
+/// and so are offered here not at all.
 #[cfg(feature = "ui")]
 pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
     let mut out = Vec::new();
