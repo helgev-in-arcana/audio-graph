@@ -104,6 +104,22 @@ DAW を再スキャンすると、`Audio Graph FX` と `Audio Graph Instrument` 
 4. **LFO ノード**を置き、その出力を Plugin ノードのパラメータソケットへ繋ぐ
 5. LFO の rate を拍同期にすると、テンポに追従して揺れます
 
+### プラグインが一覧に出てこないとき
+
+VST3 にも CLAP にも「DAW がどこを探しているか」を訊く手段がないので、慣例的な
+設置場所以外はこちらからは分かりません。
+
+エディタ上部の **Plugin folders** を開いてフォルダを追加してください。初回起動時に
+その OS の慣例的な設置場所が書き込まれており、以降はそこに並ぶフォルダが探索対象の
+すべてです。慣例由来の行も含めて自由に削除できます（重い・壊れているフォルダを
+外せます）。消しすぎたときは **Add the usual folders** で慣例パスが戻ります。
+
+設定はプラグインの隣ではなくユーザーごとの領域（Windows は
+`%LOCALAPPDATA%\AudioGraph\config.json`、macOS は
+`~/Library/Application Support/AudioGraph/`、Linux は `$XDG_CONFIG_HOME/audio-graph/`）
+に保存され、同じマシンの全インスタンスで共有されます。
+`cargo run -p host-cli -- dirs` で、実際に探索しているフォルダを確認できます。
+
 ## ノードグラフの考え方
 
 ### ポートには型がある
@@ -302,7 +318,7 @@ cargo run -p host-cli -- <コマンド>
 
 | コマンド | 内容 |
 |---|---|
-| `dirs` | VST3 / CLAP の慣例的な設置場所を列挙 |
+| `dirs` | 実際に探索する設置場所と、その設定ファイルの位置を列挙（設定が無ければ慣例パスで作成する） |
 | `scan [DIR...]` | 見つかったモジュールを全部ロードして中身を列挙 |
 | `info <PLUGIN>` | 1 モジュールの詳細 |
 | `params <PLUGIN>` | インスタンス化してパラメータを列挙 |

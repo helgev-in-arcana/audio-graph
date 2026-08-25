@@ -1702,6 +1702,8 @@ dependencies = [
  "host-window",
  "log",
  "plugin-host-api",
+ "serde",
+ "serde_json",
  "vst3-host",
  "vst3-host-view",
 ]

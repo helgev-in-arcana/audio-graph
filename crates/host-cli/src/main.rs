@@ -75,7 +75,10 @@ fn usage() {
   backend. ID is that format's own plugin id -- a VST3 class id in hex, or a
   CLAP reverse-DNS name -- as printed by `scan` and `info`.
 
-  host-cli dirs                     list the conventional plugin directories
+  host-cli dirs                     list the directories a scan covers, and the
+                                    config file they come from -- seeded on a
+                                    first run from this OS's conventions, and
+                                    editable from the wrapper's editor
   host-cli scan [DIR...]            load every module found and list its plugins
   host-cli info <PLUGIN> [ID]       detail one module, and list the CLAP
                                     extensions or VST3 interfaces one of its
@@ -136,9 +139,28 @@ Bundling moved to `cargo xtask bundle audio-graph-plugin --release`."
     );
 }
 
+/// The directories a scan actually covers, and the file they come from.
+///
+/// Running this on a machine with no config file writes one, seeded from the
+/// conventions — which is the same thing opening the wrapper's editor would do,
+/// and is why the list looks conventional the first time.
 fn cmd_dirs() -> Result<(), String> {
-    for (format, d) in plugin_host::default_plugin_directories() {
-        println!("{format:<5} {}", d.display());
+    // One line per folder, not one per folder and format. Every folder is
+    // searched for every format now, so printing the pairs would say the same
+    // thing twice and imply a distinction that no longer exists.
+    let dirs = plugin_host::config::directories();
+    if dirs.is_empty() {
+        println!("(no folders; nothing will be scanned)");
+    }
+    for d in &dirs {
+        // A folder can be on a drive that is not plugged in. It stays on the
+        // list — it is what the user asked for — and a scan passes over it.
+        let note = if d.is_dir() { "" } else { "  (missing)" };
+        println!("{}{note}", d.display());
+    }
+    match plugin_host::config::config_path() {
+        Some(path) => println!("\nconfig {}", path.display()),
+        None => println!("\nconfig (nowhere to keep one on this platform)"),
     }
     Ok(())
 }
