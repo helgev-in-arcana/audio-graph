@@ -142,12 +142,12 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
 /// to control — so it is dropped until the mapping is read properly.
 fn expression_type_id(expression: NoteExpression) -> Option<u32> {
     Some(match expression {
-        NoteExpression::Volume => NoteExpressionTypeIDs_::kVolumeTypeID,
-        NoteExpression::Pan => NoteExpressionTypeIDs_::kPanTypeID,
-        NoteExpression::Tuning => NoteExpressionTypeIDs_::kTuningTypeID,
-        NoteExpression::Vibrato => NoteExpressionTypeIDs_::kVibratoTypeID,
-        NoteExpression::Expression => NoteExpressionTypeIDs_::kExpressionTypeID,
-        NoteExpression::Brightness => NoteExpressionTypeIDs_::kBrightnessTypeID,
+        NoteExpression::Volume => NoteExpressionTypeIDs_::kVolumeTypeID as u32,
+        NoteExpression::Pan => NoteExpressionTypeIDs_::kPanTypeID as u32,
+        NoteExpression::Tuning => NoteExpressionTypeIDs_::kTuningTypeID as u32,
+        NoteExpression::Vibrato => NoteExpressionTypeIDs_::kVibratoTypeID as u32,
+        NoteExpression::Expression => NoteExpressionTypeIDs_::kExpressionTypeID as u32,
+        NoteExpression::Brightness => NoteExpressionTypeIDs_::kBrightnessTypeID as u32,
         NoteExpression::Pressure => return None,
     })
 }
