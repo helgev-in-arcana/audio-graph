@@ -11,6 +11,9 @@ vst3-host-view.workspace = true
 clap-host.workspace = true
 host-window.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 clap-test-plugin = { path = "../clap-test-plugin" }
+serde_json.workspace = true
