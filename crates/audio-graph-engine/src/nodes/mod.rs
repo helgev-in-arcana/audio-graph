@@ -96,10 +96,78 @@ pub(crate) trait Node {
 
     /// Draw this node's own controls, inside the frame the canvas laid out.
     /// Returns whether anything changed.
+    ///
+    /// What is left here is what belongs to the *node*: an LFO's waveform, a
+    /// slot picker, a bus number. Anything that stands in for one socket
+    /// belongs on that socket's row instead — see [`Node::input_control`].
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         let _ = (ui, cx);
         false
+    }
+
+    /// The title as the canvas shows it.
+    ///
+    /// Separate from [`Node::title`] because a plugin node's name is the name
+    /// of what is loaded in it, and this crate has no idea what that is until
+    /// the wrapper hands it over.
+    #[cfg(feature = "ui")]
+    fn ui_title(&self, cx: &widgets::NodeUi<'_>) -> String {
+        let _ = cx;
+        self.title()
+    }
+
+    /// The controls that belong in this node's title bar, drawn to the left of
+    /// the always-on toggle.
+    ///
+    /// Only for what is about the node as a whole rather than about one of its
+    /// sockets: opening a sub-plugin's window is the only one so far.
+    #[cfg(feature = "ui")]
+    fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
+        let _ = (ui, cx);
+        false
+    }
+
+    /// The control that stands in for input socket `port`, drawn on that
+    /// socket's own row.
+    ///
+    /// A socket and the number it falls back to are one thing to the user —
+    /// `Math`'s `b`, a `Mix`'s gain, a delay's time — and were two rows apart
+    /// until they were drawn together. `connected` says whether anything is
+    /// wired in; a fallback wraps itself in [`widgets::fallback`] to grey out
+    /// when it is, while a control that still applies with a link in place
+    /// (a plugin's choice of *which* parameter) ignores it.
+    #[cfg(feature = "ui")]
+    fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        connected: bool,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        let _ = (ui, port, connected, cx);
+        false
+    }
+
+    /// The label for the button that gives this node another input, or `None`
+    /// where the sockets are fixed. Drawn on the node's last row.
+    #[cfg(feature = "ui")]
+    fn add_input_label(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Give this node another input group. Only called when
+    /// [`Node::add_input_label`] offered one.
+    #[cfg(feature = "ui")]
+    fn add_input(&mut self) {}
+
+    /// Take away the input group beginning at `port`, and say how many sockets
+    /// went with it — the canvas needs the count to slide the links into the
+    /// sockets after it down by that much.
+    #[cfg(feature = "ui")]
+    fn remove_input(&mut self, port: u8) -> u8 {
+        let _ = port;
+        0
     }
 }
 
@@ -212,6 +280,57 @@ impl NodeKind {
     #[cfg(feature = "ui")]
     pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         for_kind!(self, node => node.controls(ui, cx))
+    }
+
+    /// The title as the canvas shows it — see [`Node::ui_title`].
+    #[cfg(feature = "ui")]
+    pub fn ui_title(&self, cx: &widgets::NodeUi<'_>) -> String {
+        // `for_kind!` binds mutably, and this takes `&self`. One arm of its
+        // own is cheaper than a second macro.
+        match self {
+            NodeKind::Plugin(node) => node.ui_title(cx),
+            other => other.title(),
+        }
+    }
+
+    /// This node's title-bar controls — see [`Node::title_controls`].
+    #[cfg(feature = "ui")]
+    pub fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
+        for_kind!(self, node => node.title_controls(ui, cx))
+    }
+
+    /// The control on one input socket's row — see [`Node::input_control`].
+    #[cfg(feature = "ui")]
+    pub fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        connected: bool,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        for_kind!(self, node => node.input_control(ui, port, connected, cx))
+    }
+
+    /// The label of this node's "another input" button, if it has one.
+    #[cfg(feature = "ui")]
+    pub fn add_input_label(&self) -> Option<&'static str> {
+        match self {
+            NodeKind::Mix(node) => node.add_input_label(),
+            NodeKind::Plugin(node) => node.add_input_label(),
+            _ => None,
+        }
+    }
+
+    /// Give this node another input group.
+    #[cfg(feature = "ui")]
+    pub fn add_input(&mut self) {
+        for_kind!(self, node => node.add_input())
+    }
+
+    /// Take away the input group at `port`, returning how many sockets went.
+    #[cfg(feature = "ui")]
+    pub fn remove_input(&mut self, port: u8) -> u8 {
+        for_kind!(self, node => node.remove_input(port))
     }
 }
 

@@ -407,7 +407,9 @@ impl GraphEditor {
 
         let inputs = graph.nodes[index].kind.input_ports();
         let outputs = graph.nodes[index].kind.output_ports();
-        let title = graph.nodes[index].kind.title();
+        // Not `title()`: a plugin node is named for what is loaded in it,
+        // and only the wrapper knows what that is.
+        let title = graph.nodes[index].kind.ui_title(&node_ui(ctx));
 
         let zoom = self.zoom;
         let width = NODE_WIDTH * zoom;
@@ -447,16 +449,43 @@ impl GraphEditor {
             ));
 
         // Where each socket's row ended up, so the circles can be painted on
-        // the node's edge at exactly the height of the name beside them.
+        // the node's edge at exactly the height of the row beside them. A row
+        // is now a socket *and* the control that stands in for it, so this is
+        // also what keeps the circle centred on a two-line control.
         let mut input_rows: Vec<f32> = Vec::with_capacity(inputs.len());
         let mut output_rows: Vec<f32> = Vec::with_capacity(outputs.len());
 
+        // Which inputs already have a link, worked out before the closure
+        // borrows the graph mutably. A fed socket is one whose fallback
+        // control has nothing left to say, and greying it out where it sits
+        // says so better than a line of prose under the node.
+        let connected: Vec<bool> = (0..inputs.len())
+            .map(|i| graph.source_of(id, i as u8).is_some())
+            .collect();
+
+        // What the node's own controls asked the wrapper for, and which socket
+        // the user asked to take away. Both are carried out after the closure
+        // has given the graph back.
+        let mut actions: Vec<NodeAction> = Vec::new();
+        let mut dropped: Option<u8> = None;
+
         let response = frame.show(&mut child, |ui| {
             ui.set_width(width - 16.0 * zoom);
+            // The whole bar is laid out right to left, so it reads name ·
+            // GUI · always on · x on screen. The buttons are placed first and
+            // the name takes what is left, because the other way round a
+            // plugin called "audio-graph CLAP test plugin" pushed every button
+            // off the node.
             ui.horizontal(|ui| {
-                ui.strong(&title);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("x").clicked() {
+                    // Delete sits on the outside because it is the one that
+                    // cannot be taken back, and because that is where every
+                    // window has put it for thirty years.
+                    if ui
+                        .small_button("x")
+                        .on_hover_text("delete this node")
+                        .clicked()
+                    {
                         outcome.remove = true;
                     }
                     // Only worth offering where it changes anything: a node
@@ -464,15 +493,40 @@ impl GraphEditor {
                     if !outputs.is_empty() {
                         let on = &mut graph.nodes[index].always_on;
                         if ui
-                            .toggle_value(on, "on")
+                            .toggle_value(on, "always on")
                             .on_hover_text(
-                                "run this node even with nothing wired to its output                                  — for analysers",
+                                "run this node even with nothing wired to its output \
+                                 — for analysers",
                             )
                             .changed()
                         {
                             outcome.changed = true;
                         }
                     }
+                    let mut cx = node_ui(ctx);
+                    outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
+                    actions.append(&mut cx.actions);
+                    // The name fills what the buttons left, laid out the
+                    // other way round again so it starts at the node's left
+                    // edge instead of hugging them.
+                    //
+                    // Truncated rather than wrapped: a plugin name that grew
+                    // the title bar to two lines would move every socket on
+                    // the node down with it, and the full name is a hover
+                    // away.
+                    let rest = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    ui.allocate_ui_with_layout(
+                        rest,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&title).strong())
+                                    .truncate()
+                                    .selectable(false),
+                            )
+                            .on_hover_text(&title);
+                        },
+                    );
                 });
             });
             ui.separator();
@@ -484,29 +538,94 @@ impl GraphEditor {
             for port in &outputs {
                 let row = ui
                     .horizontal(|ui| {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| ui.label(egui::RichText::new(port.name.as_ref()).small()),
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(port.name.as_ref()).small())
+                        });
                     })
                     .response
                     .rect;
                 output_rows.push(row.center().y);
             }
-            for port in &inputs {
+
+            // The node's own settings sit between the two halves: everything
+            // that belongs to a socket has moved onto that socket's row, so
+            // what is left here is about the node itself.
+            let body = ui.scope(|ui| {
+                let mut cx = node_ui(ctx);
+                let changed = graph.nodes[index].kind.controls(ui, &mut cx);
+                actions.append(&mut cx.actions);
+                changed
+            });
+            outcome.changed |= body.inner;
+            // Measured rather than asked, because only the node knows whether
+            // it drew anything and a separator over nothing is a line across
+            // an empty node.
+            let drew_body = body.response.rect.height() > 1.0;
+            let add_label = graph.nodes[index].kind.add_input_label();
+            if (!outputs.is_empty() || drew_body) && (!inputs.is_empty() || add_label.is_some()) {
+                ui.separator();
+            }
+
+            for (i, port) in inputs.iter().enumerate() {
+                let wired = connected.get(i).copied().unwrap_or(false);
                 let row = ui
                     .horizontal(|ui| {
                         ui.label(egui::RichText::new(port.name.as_ref()).small());
+                        let mut cx = node_ui(ctx);
+                        outcome.changed |= graph.nodes[index]
+                            .kind
+                            .input_control(ui, i as u8, wired, &mut cx);
+                        actions.append(&mut cx.actions);
+                        if port.removable {
+                            // Outside whatever `input_control` disabled, on
+                            // purpose: a socket with a link in it is still one
+                            // you may want gone, and taking it away is exactly
+                            // what cuts the link.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text("remove this input")
+                                        .clicked()
+                                    {
+                                        dropped = Some(i as u8);
+                                    }
+                                },
+                            );
+                        }
                     })
                     .response
                     .rect;
                 input_rows.push(row.center().y);
             }
-            if !inputs.is_empty() || !outputs.is_empty() {
-                ui.separator();
+
+            // The last row, under the sockets it makes more of.
+            if let Some(label) = add_label
+                && ui.small_button(label).clicked()
+            {
+                graph.nodes[index].kind.add_input();
+                outcome.changed = true;
             }
-            outcome.changed |= self.node_controls(ui, &mut graph.nodes[index].kind, ctx);
         });
+
+        // A socket the user took away. The node has already shrunk itself; all
+        // that is left is the graph's half — cutting what was plugged in, and
+        // sliding every later socket's link down so it still means the socket
+        // it meant before.
+        if let Some(port) = dropped {
+            let count = graph.nodes[index].kind.remove_input(port);
+            if count > 0 {
+                graph.drop_inputs(id, port, count);
+                outcome.changed = true;
+            }
+        }
+        for action in actions {
+            self.actions.push(match action {
+                NodeAction::OpenSubEditor(instance) => GraphAction::OpenSubEditor(instance),
+                NodeAction::CloseSubEditor(instance) => GraphAction::CloseSubEditor(instance),
+            });
+        }
 
         let rect = response.response.rect;
 
@@ -631,37 +750,6 @@ impl GraphEditor {
         response.clicked()
     }
 
-    /// A node's own controls, which live with the node (`nodes/` in the
-    /// engine). All the canvas does is hand over the facts a node may need and
-    /// carry out whatever it asked for afterwards — opening a sub-plugin's
-    /// window may not happen inside a draw callback, which is why the request
-    /// comes back as a value rather than happening on the spot.
-    fn node_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        kind: &mut NodeKind,
-        ctx: &GraphContext<'_>,
-    ) -> bool {
-        let mut cx = NodeUi {
-            slot_count: SLOT_COUNT,
-            bindings: ctx.bindings,
-            live: &ctx.live,
-            poly_modulation: ctx.poly_modulation,
-            quantum: ctx.quantum,
-            sample_rate: ctx.sample_rate,
-            instances: ctx.instances,
-            actions: Vec::new(),
-        };
-        let changed = kind.controls(ui, &mut cx);
-        for action in cx.actions {
-            self.actions.push(match action {
-                NodeAction::OpenSubEditor(instance) => GraphAction::OpenSubEditor(instance),
-                NodeAction::CloseSubEditor(instance) => GraphAction::CloseSubEditor(instance),
-            });
-        }
-        changed
-    }
-
     /// The "add a node" menu, shown wherever the user asked for it.
     fn add_menu(
         &mut self,
@@ -740,30 +828,38 @@ impl GraphEditor {
                     ui.separator();
                     ui.strong("Delay");
                     ui.weak("two nodes on one line: a write and a read (§14.4)");
-                    for (label, ty) in [
-                        ("Audio delay", PortType::STEREO),
-                        ("Param delay", PortType::Param),
-                    ] {
-                        if ui.button(label).clicked() {
-                            graph.add_delay(ty, [at.x, at.y]);
-                            added = true;
-                            close = true;
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, ty) in [
+                            ("Audio delay", PortType::STEREO),
+                            ("Param delay", PortType::Param),
+                        ] {
+                            if ui.button(label).clicked() {
+                                graph.add_delay(ty, [at.x, at.y]);
+                                added = true;
+                                close = true;
+                            }
                         }
-                    }
+                    });
 
                     ui.separator();
                     ui.strong("Node");
+                    // Wrapped rather than one per row. There are fourteen of
+                    // them and none has a name longer than "Range map", so a
+                    // column made the menu twice as tall as the list needed
+                    // and put half of it behind a scrollbar.
                     egui::ScrollArea::vertical()
                         .id_salt("add-kind")
                         .max_height(240.0)
                         .show(ui, |ui| {
-                            for (label, kind) in catalogue() {
-                                if ui.button(label).clicked() {
-                                    graph.add(kind, [at.x, at.y]);
-                                    added = true;
-                                    close = true;
+                            ui.horizontal_wrapped(|ui| {
+                                for (label, kind) in catalogue() {
+                                    if ui.button(label).clicked() {
+                                        graph.add(kind, [at.x, at.y]);
+                                        added = true;
+                                        close = true;
+                                    }
                                 }
-                            }
+                            });
                         });
                     ui.separator();
                     if ui.button("cancel").clicked() {
@@ -782,6 +878,25 @@ impl GraphEditor {
     /// Actions the caller has to carry out after the frame.
     pub fn take_actions(&mut self) -> Vec<GraphAction> {
         std::mem::take(&mut self.actions)
+    }
+}
+
+/// The facts a node's own controls are handed.
+///
+/// Built fresh at each call rather than once per node, because it also carries
+/// what those controls asked the wrapper to do and every caller drains its own
+/// — a node's title bar, its body and each of its socket rows are three
+/// separate asks.
+fn node_ui<'a>(ctx: &'a GraphContext<'a>) -> NodeUi<'a> {
+    NodeUi {
+        slot_count: SLOT_COUNT,
+        bindings: ctx.bindings,
+        live: &ctx.live,
+        poly_modulation: ctx.poly_modulation,
+        quantum: ctx.quantum,
+        sample_rate: ctx.sample_rate,
+        instances: ctx.instances,
+        actions: Vec::new(),
     }
 }
 

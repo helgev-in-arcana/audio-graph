@@ -2507,6 +2507,24 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
     sub.load(0, Path::new(wrapper), Some(&class.id))?;
     sub.load_sub_state(0, &state)?;
+    // The wrapper reads its own state at activate, not when the blob arrives:
+    // nice-plug restores persisted fields first, and the sub-plugins have to be
+    // loaded at the sample rate they are about to be given. Without this the
+    // editor opens on the default patch and the whole point of the injection —
+    // one node of every kind on screen — is lost.
+    let processors = sub.activate(
+        plugin_host::AudioConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 512,
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+            offline: false,
+        },
+        &[],
+        &[],
+    )?;
     sub.open_editor(0, std::ptr::null_mut())?;
     println!("opened the wrapper's editor with a {} node", short(plugin));
     match hold {
@@ -2516,6 +2534,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
 
     let (open, elapsed) = hold_editor_open(&mut sub, hold);
     sub.close_editor(0);
+    sub.deactivate(processors);
     sub.unload_all();
     println!(
         "{} after {:.1}s",

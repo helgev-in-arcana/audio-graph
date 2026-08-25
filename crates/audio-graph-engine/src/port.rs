@@ -50,6 +50,14 @@ pub struct Port {
     /// that looks exactly like the main input is one a user wires into by
     /// mistake, and the mistake is silent.
     pub aux: bool,
+    /// Whether this socket is the first of a group the user may take away —
+    /// one of a `Mix`'s inputs, one of a plugin node's parameter sockets.
+    ///
+    /// Marked on the port rather than answered by a method so the canvas can
+    /// draw the button beside the socket it removes without knowing which
+    /// node it is looking at. How many sockets go with it is the node's
+    /// answer, not this flag's: see [`Node::remove_input`][crate::NodeKind].
+    pub removable: bool,
 }
 
 impl Port {
@@ -58,6 +66,7 @@ impl Port {
             name: name.into(),
             ty,
             aux: false,
+            removable: false,
         }
     }
 
@@ -67,5 +76,14 @@ impl Port {
 
     pub(crate) fn aux(self) -> Port {
         Port { aux: true, ..self }
+    }
+
+    /// Mark this port as the first socket of a group the user may remove.
+    #[cfg(feature = "ui")]
+    pub(crate) fn removable(self) -> Port {
+        Port {
+            removable: true,
+            ..self
+        }
     }
 }

@@ -14,7 +14,7 @@ use crate::graph::LineId;
 use crate::ir::{AudioOp, Op};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, line_control};
+use crate::nodes::widgets::{NodeUi, fallback, line_control};
 use crate::port::{Port, PortType};
 
 /// The writing half of a delay line (§14.4).
@@ -185,17 +185,6 @@ impl Node for DelayRead {
             self.time = floor;
             changed = true;
         }
-        let max_time = self.max_time;
-        ui.horizontal(|ui| {
-            ui.label("time (s)");
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut self.time)
-                        .speed(0.001)
-                        .range(floor..=max_time),
-                )
-                .changed();
-        });
         ui.horizontal(|ui| {
             ui.label("max (s)");
             changed |= ui
@@ -211,9 +200,45 @@ impl Node for DelayRead {
                 "at least {:.1} ms — one sub-block (§14.4)",
                 floor * 1000.0
             ));
-            ui.weak("wire the time socket to sweep it — the pitch moves with it");
         }
         changed
+    }
+
+    /// The delay time, on the row of the socket that sweeps it.
+    ///
+    /// The floor is re-applied here as well as in `controls`, because this is
+    /// where the number is now set and the sub-block size can move under it
+    /// while the patch is open (§14.4).
+    #[cfg(feature = "ui")]
+    fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        connected: bool,
+        cx: &mut NodeUi<'_>,
+    ) -> bool {
+        if port != 0 {
+            return false;
+        }
+        let floor = cx.quantum as f64 / cx.sample_rate.max(1.0);
+        let max_time = self.max_time;
+        let time = &mut self.time;
+        let mut changed = false;
+        if *time < floor {
+            *time = floor;
+            changed = true;
+        }
+        changed
+            | fallback(ui, connected, |ui| {
+                ui.add(
+                    egui::DragValue::new(time)
+                        .speed(0.001)
+                        .range(floor..=max_time)
+                        .suffix(" s"),
+                )
+                .on_hover_text("wire this socket to sweep it — the pitch moves with it")
+                .changed()
+            })
     }
 }
 
