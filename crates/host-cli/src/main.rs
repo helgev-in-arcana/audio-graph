@@ -76,7 +76,9 @@ fn usage() {
   backend. ID is that format's own plugin id -- a VST3 class id in hex, or a
   CLAP reverse-DNS name -- as printed by `scan` and `info`.
 
-  host-cli dirs                     list the conventional plugin directories
+  host-cli dirs                     list the directories a scan covers -- the
+                                    conventional ones plus the user's own --
+                                    and the config file the latter come from
   host-cli scan [DIR...]            load every module found and list its plugins
   host-cli info <PLUGIN> [ID]       detail one module, and list the CLAP
                                     extensions or VST3 interfaces one of its
@@ -224,9 +226,19 @@ fn cmd_bundle(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The directories a scan actually covers, and the file the user's own
+/// additions come from.
+///
+/// The effective set rather than the conventional one: someone asking where
+/// their plugin folder went is asking about what is scanned, and the config
+/// path is the next thing they need.
 fn cmd_dirs() -> Result<(), String> {
-    for (format, d) in plugin_host::default_plugin_directories() {
+    for (format, d) in plugin_host::plugin_directories() {
         println!("{format:<5} {}", d.display());
+    }
+    match plugin_host::config::config_path() {
+        Some(path) => println!("\nconfig {}", path.display()),
+        None => println!("\nconfig (nowhere to keep one on this platform)"),
     }
     Ok(())
 }

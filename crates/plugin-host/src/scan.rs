@@ -69,6 +69,33 @@ pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
     out
 }
 
+/// Every directory a scan should look in: the conventional ones, plus whatever
+/// the user added ([`crate::config`]).
+///
+/// A user's directory is paired with every format rather than one, because the
+/// user pointed at a folder of plugins and not at a folder of VST3s — the same
+/// rule the CLI applies to a directory given on the command line.
+///
+/// Directories that do not exist are dropped: a folder can be on a drive that
+/// is not plugged in today, and a scan should be quiet about that rather than
+/// fail.
+pub fn plugin_directories() -> Vec<(Format, PathBuf)> {
+    let mut out = default_plugin_directories();
+    for dir in crate::config::extra_directories() {
+        if !dir.is_dir() {
+            continue;
+        }
+        for format in FORMATS {
+            out.push((format, dir.clone()));
+        }
+    }
+    // A user who added a folder the OS already scans should not have every
+    // plugin in it listed twice.
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Modules of `format` in `dir` and one level below it.
 pub fn find_modules(format: Format, dir: &Path) -> Vec<PathBuf> {
     match format {
@@ -77,13 +104,13 @@ pub fn find_modules(format: Format, dir: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// Every module of every format in the conventional directories.
+/// Every module of every format in every directory a scan covers.
 ///
 /// Paths only: enumerating the classes inside means loading third-party code,
 /// which is a decision the caller should make deliberately.
 pub fn installed_modules() -> Vec<(Format, PathBuf)> {
     let mut out = Vec::new();
-    for (format, dir) in default_plugin_directories() {
+    for (format, dir) in plugin_directories() {
         for path in find_modules(format, &dir) {
             out.push((format, path));
         }
