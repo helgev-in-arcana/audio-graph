@@ -36,10 +36,15 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # 既存の警告が残っているので、まだ `-D warnings` では落とさない。
-      # 掃除が済んだら deny に切り替える。
+      # 警告ゼロを維持する。新しい警告は PR の時点で落とす。
+      # clippy はこのジョブにしか置かない。test ジョブにも置くと、
+      # ビルドが壊れたのか lint に引っかかっただけなのかがログから
+      # 読み取りにくくなる。
+      #
+      # 代償として、ここは ubuntu なので Windows 限定のコードは lint
+      # されない。そこは各 OS の build/test が拾う。
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # リリースと同じ6ターゲット。ここが緑なら、タグを打った時に
   # 初めて知るコンパイルエラーは残っていない。
@@ -83,3 +88,20 @@ jobs:
       # リリースで実際に配るのは release ビルドなので、そこまで確かめる。
       - name: Build release
         run: cargo build --workspace --release
+
+      # 配るのは素の共有ライブラリではなくバンドルなので、梱包まで CI で通す。
+      # バンドラが壊れているのをタグを打ってから知るのは遅い。
+      - name: Bundle
+        run: cargo xtask bundle audio-graph-plugin --release
+
+      # 出る形式はバイナリのエクスポート記号で決まる。片方だけ消えるのは
+      # ここでしか気付けないので、両方あることを確かめる。
+      - name: Verify both bundles exist
+        shell: bash
+        run: |
+          for f in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
+            if [ ! -e "$f" ]; then
+              echo "::error::$f が生成されていません。"
+              exit 1
+            fi
+          done
