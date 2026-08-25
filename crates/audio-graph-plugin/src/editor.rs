@@ -308,43 +308,83 @@ impl WrapperEditor {
             .default_width(460.0)
             .show(ctx, |ui| {
                 ui.label(
-                    "Folders scanned for sub-plugins. The conventional ones are always \
-                     scanned; a DAW never says which folders it scans itself, so anything \
-                     else has to be added here.",
+                    "Every folder scanned for sub-plugins, and one level below each. \
+                     A DAW never says which folders it scans itself, so anything the \
+                     conventions miss has to be added here.",
                 );
-                ui.add_space(6.0);
 
-                let extra = plugin_host::config::extra_directories();
-                if extra.is_empty() {
-                    ui.weak("No folders added.");
-                } else {
-                    // Collected first: removing inside the loop would edit the
-                    // list being drawn from.
-                    let mut remove = None;
-                    for dir in &extra {
-                        ui.horizontal(|ui| {
-                            if ui.button("Remove").clicked() {
-                                remove = Some(dir.clone());
-                            }
-                            let label = ui.label(dir.display().to_string());
-                            // A folder on a drive that is not plugged in stays
-                            // in the list — it is still what the user asked for
-                            // — but saying so beats an empty plugin menu and no
-                            // reason for it.
-                            if !dir.is_dir() {
-                                label.on_hover_text("this folder is not there right now");
-                                ui.weak("(missing)");
-                            }
-                        });
-                    }
-                    if let Some(dir) = remove {
-                        match plugin_host::config::remove_directory(&dir) {
-                            Ok(()) => {
-                                self.status.set(format!("removed {}", dir.display()));
-                                self.scanned = false;
-                            }
-                            Err(e) => self.status.set(format!("settings not saved: {e}")),
+                // Both lists scroll together, and the controls below them do
+                // not: on a machine with a long CLAP_PATH the folders alone can
+                // outgrow the screen, and an Add button that has been pushed
+                // off the bottom is an Add button that does not exist.
+                let mut remove = None;
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        // The conventional half, listed rather than alluded to. A user
+                        // whose plugin is not in the menu is trying to work out whether
+                        // the folder it sits in gets looked at, and a window that says
+                        // "the usual places" and leaves them to guess which those are
+                        // is no help — it is the same guessing the DAW already forces.
+                        ui.add_space(8.0);
+                        ui.strong("Always scanned");
+                        ui.weak(
+                            "This OS's conventions, and CLAP_PATH. A conventional folder that \
+                     does not exist on this machine is left out.",
+                        );
+                        let defaults = plugin_host::default_plugin_directories();
+                        if defaults.is_empty() {
+                            ui.weak("None of them exist on this machine.");
+                        } else {
+                            egui::Grid::new("conventional folders")
+                                .num_columns(2)
+                                .spacing([12.0, 2.0])
+                                .show(ui, |ui| {
+                                    for (format, dir) in &defaults {
+                                        ui.weak(format.to_string());
+                                        ui.label(dir.display().to_string());
+                                        ui.end_row();
+                                    }
+                                });
                         }
+
+                        ui.add_space(8.0);
+                        ui.strong("Added by you");
+                        ui.weak("Scanned for every format, whatever the folder is named.");
+                        let extra = plugin_host::config::extra_directories();
+                        if extra.is_empty() {
+                            ui.weak("No folders added.");
+                        } else {
+                            // `remove` is decided here and acted on after the scroll
+                            // area closes: removing inside the loop would edit the list
+                            // being drawn from, and `self` is not reachable from in
+                            // here anyway.
+                            for dir in &extra {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Remove").clicked() {
+                                        remove = Some(dir.clone());
+                                    }
+                                    let label = ui.label(dir.display().to_string());
+                                    // A folder on a drive that is not plugged in stays
+                                    // in the list — it is still what the user asked for
+                                    // — but saying so beats an empty plugin menu and no
+                                    // reason for it.
+                                    if !dir.is_dir() {
+                                        label.on_hover_text("this folder is not there right now");
+                                        ui.weak("(missing)");
+                                    }
+                                });
+                            }
+                        }
+                    });
+
+                if let Some(dir) = remove {
+                    match plugin_host::config::remove_directory(&dir) {
+                        Ok(()) => {
+                            self.status.set(format!("removed {}", dir.display()));
+                            self.scanned = false;
+                        }
+                        Err(e) => self.status.set(format!("settings not saved: {e}")),
                     }
                 }
 
