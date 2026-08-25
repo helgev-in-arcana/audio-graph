@@ -36,10 +36,12 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # 既存の警告が残っているので、まだ `-D warnings` では落とさない。
-      # 掃除が済んだら deny に切り替える。
+      # 警告ゼロを維持する。新しい警告は PR の時点で落とす。
+      # ここは ubuntu なので、Windows 限定のコードは lint されない
+      # （host-window と vst3-host の大半）。それらは test ジョブの
+      # 各 OS で走る Clippy が見る。
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # リリースと同じ6ターゲット。ここが緑なら、タグを打った時に
   # 初めて知るコンパイルエラーは残っていない。
@@ -58,7 +60,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # clippy はこのジョブでも走らせる（Windows 限定のコードを lint できるのは
+      # ここだけ）。dtolnay のアクションは既定で minimal プロファイルなので、
+      # 明示的に足さないと clippy が入らない。
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -77,9 +84,29 @@ jobs:
       - name: Build the test fixtures
         run: cargo build --workspace
 
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 
       # リリースで実際に配るのは release ビルドなので、そこまで確かめる。
       - name: Build release
         run: cargo build --workspace --release
+
+      # 配るのは素の共有ライブラリではなくバンドルなので、梱包まで CI で通す。
+      # バンドラが壊れているのをタグを打ってから知るのは遅い。
+      - name: Bundle
+        run: cargo xtask bundle audio-graph-plugin --release
+
+      # 出る形式はバイナリのエクスポート記号で決まる。片方だけ消えるのは
+      # ここでしか気付けないので、両方あることを確かめる。
+      - name: Verify both bundles exist
+        shell: bash
+        run: |
+          for f in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
+            if [ ! -e "$f" ]; then
+              echo "::error::$f が生成されていません。"
+              exit 1
+            fi
+          done
