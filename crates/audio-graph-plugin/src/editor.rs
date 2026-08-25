@@ -309,72 +309,47 @@ impl WrapperEditor {
             .show(ctx, |ui| {
                 ui.label(
                     "Every folder scanned for sub-plugins, and one level below each. \
-                     A DAW never says which folders it scans itself, so anything the \
-                     conventions miss has to be added here.",
+                     This list is the whole of it: nothing is scanned that is not \
+                     here. The usual folders for this machine were filled in to \
+                     start with, and are yours to remove like any other.",
                 );
 
-                // Both lists scroll together, and the controls below them do
-                // not: on a machine with a long CLAP_PATH the folders alone can
-                // outgrow the screen, and an Add button that has been pushed
-                // off the bottom is an Add button that does not exist.
+                // The list scrolls and the controls below it do not: a machine
+                // with a lot of plugin folders can outgrow the screen, and an
+                // Add button pushed off the bottom is an Add button that does
+                // not exist.
                 let mut remove = None;
+                let directories = plugin_host::config::directories();
+                ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        // The conventional half, listed rather than alluded to. A user
-                        // whose plugin is not in the menu is trying to work out whether
-                        // the folder it sits in gets looked at, and a window that says
-                        // "the usual places" and leaves them to guess which those are
-                        // is no help — it is the same guessing the DAW already forces.
-                        ui.add_space(8.0);
-                        ui.strong("Always scanned");
-                        ui.weak(
-                            "This OS's conventions, and CLAP_PATH. A conventional folder that \
-                     does not exist on this machine is left out.",
-                        );
-                        let defaults = plugin_host::default_plugin_directories();
-                        if defaults.is_empty() {
-                            ui.weak("None of them exist on this machine.");
-                        } else {
-                            egui::Grid::new("conventional folders")
-                                .num_columns(2)
-                                .spacing([12.0, 2.0])
-                                .show(ui, |ui| {
-                                    for (format, dir) in &defaults {
-                                        ui.weak(format.to_string());
-                                        ui.label(dir.display().to_string());
-                                        ui.end_row();
-                                    }
-                                });
+                        if directories.is_empty() {
+                            // Reachable, and deliberately not undone on its own:
+                            // a user who removed every folder asked for exactly
+                            // this, and only the button below puts them back.
+                            ui.weak("No folders. Nothing will be scanned.");
+                            return;
                         }
-
-                        ui.add_space(8.0);
-                        ui.strong("Added by you");
-                        ui.weak("Scanned for every format, whatever the folder is named.");
-                        let extra = plugin_host::config::extra_directories();
-                        if extra.is_empty() {
-                            ui.weak("No folders added.");
-                        } else {
-                            // `remove` is decided here and acted on after the scroll
-                            // area closes: removing inside the loop would edit the list
-                            // being drawn from, and `self` is not reachable from in
-                            // here anyway.
-                            for dir in &extra {
-                                ui.horizontal(|ui| {
-                                    if ui.button("Remove").clicked() {
-                                        remove = Some(dir.clone());
-                                    }
-                                    let label = ui.label(dir.display().to_string());
-                                    // A folder on a drive that is not plugged in stays
-                                    // in the list — it is still what the user asked for
-                                    // — but saying so beats an empty plugin menu and no
-                                    // reason for it.
-                                    if !dir.is_dir() {
-                                        label.on_hover_text("this folder is not there right now");
-                                        ui.weak("(missing)");
-                                    }
-                                });
-                            }
+                        // `remove` is decided here and acted on after the scroll
+                        // area closes: removing inside the loop would edit the
+                        // list being drawn from, and `self` is not reachable
+                        // from in here anyway.
+                        for dir in &directories {
+                            ui.horizontal(|ui| {
+                                if ui.button("Remove").clicked() {
+                                    remove = Some(dir.clone());
+                                }
+                                let label = ui.label(dir.display().to_string());
+                                // A folder on a drive that is not plugged in
+                                // stays in the list — it is still what the user
+                                // asked for — but saying so beats an empty
+                                // plugin menu and no reason for it.
+                                if !dir.is_dir() {
+                                    label.on_hover_text("this folder is not there right now");
+                                    ui.weak("(missing)");
+                                }
+                            });
                         }
                     });
 
@@ -424,6 +399,26 @@ impl WrapperEditor {
                     if ui.button("Rescan").clicked() {
                         self.scanned = false;
                         self.status.set("rescanned");
+                    }
+                    // Adds, never replaces: the user's own folders are not what
+                    // they asked to undo. Also how a folder that appeared after
+                    // the list was first filled in — a format installed since,
+                    // a CLAP_PATH set since — gets picked up.
+                    if ui
+                        .button("Add the usual folders")
+                        .on_hover_text(
+                            "put back any of this machine's conventional plugin folders \
+                             that are not on the list",
+                        )
+                        .clicked()
+                    {
+                        match plugin_host::config::restore_defaults() {
+                            Ok(()) => {
+                                self.status.set("the usual folders are on the list");
+                                self.scanned = false;
+                            }
+                            Err(e) => self.status.set(format!("settings not saved: {e}")),
+                        }
                     }
                     ui.weak(format!("{} modules found", self.entries.len()));
                 });

@@ -58,6 +58,10 @@ impl ClassInfo {
 }
 
 /// Directories the OS conventionally keeps plugins in, every format together.
+///
+/// Not what gets scanned — [`plugin_directories`] is. This is what a first run
+/// seeds the user's settings with, and what "put the usual folders back" means
+/// afterwards.
 pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
     let mut out = Vec::new();
     for dir in vst3_host::default_plugin_directories() {
@@ -69,19 +73,23 @@ pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
     out
 }
 
-/// Every directory a scan should look in: the conventional ones, plus whatever
-/// the user added ([`crate::config`]).
+/// Every directory a scan should look in, as the user's settings have it.
 ///
-/// A user's directory is paired with every format rather than one, because the
-/// user pointed at a folder of plugins and not at a folder of VST3s — the same
-/// rule the CLI applies to a directory given on the command line.
+/// [`crate::config`] is the whole answer, not an addition to
+/// [`default_plugin_directories`] — the conventional folders are written into
+/// the settings the first time they are read, and are the user's to keep or
+/// remove from then on.
+///
+/// Each directory is paired with every format, because the user pointed at a
+/// folder of plugins and not at a folder of VST3s — the same rule the CLI
+/// applies to a directory given on the command line.
 ///
 /// Directories that do not exist are dropped: a folder can be on a drive that
 /// is not plugged in today, and a scan should be quiet about that rather than
 /// fail.
 pub fn plugin_directories() -> Vec<(Format, PathBuf)> {
-    let mut out = default_plugin_directories();
-    for dir in crate::config::extra_directories() {
+    let mut out = Vec::new();
+    for dir in crate::config::directories() {
         if !dir.is_dir() {
             continue;
         }
@@ -89,8 +97,8 @@ pub fn plugin_directories() -> Vec<(Format, PathBuf)> {
             out.push((format, dir.clone()));
         }
     }
-    // A user who added a folder the OS already scans should not have every
-    // plugin in it listed twice.
+    // A list that names the same folder twice should not list every plugin in
+    // it twice.
     out.sort();
     out.dedup();
     out

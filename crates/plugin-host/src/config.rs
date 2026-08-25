@@ -1,12 +1,27 @@
-//! The user's own plugin folders, and where that list is kept.
+//! The folders sub-plugins are looked for in, and where that list is kept.
 //!
-//! A host asks the OS-conventional directories on its own (see
-//! [`crate::default_plugin_directories`]), and for most installs that is the
-//! whole answer. It stops being the whole answer the moment someone keeps
-//! plugins somewhere else — which is common enough, and which nothing in either
-//! format lets us discover: neither VST3 nor CLAP has a way to ask the DAW what
-//! *it* scans. So the user says so, from the editor, and this is where it is
-//! remembered.
+//! Nothing in either format lets a plugin discover where the DAW looks: neither
+//! VST3 nor CLAP has a way to ask. So the list is the user's, and this is where
+//! it lives.
+//!
+//! # One list, seeded once
+//!
+//! The first time anything asks, there is no file, and one is written holding
+//! the OS-conventional directories — the ones a plugin would have been found in
+//! anyway. From then on the file is the whole answer: a folder the user adds and
+//! a folder that came from the conventions are the same kind of thing, and
+//! either can be removed.
+//!
+//! That is deliberate, and it is what every DAW's own plugin-paths dialog does.
+//! The alternative — conventions always scanned, user folders on top — means a
+//! folder the user can see in the list but cannot remove, and no way to stop
+//! scanning somewhere slow or broken. Seeding costs one file write and makes
+//! the file say the truth: this, and only this, is what gets scanned.
+//!
+//! A list that is empty because the user emptied it stays empty. Re-seeding
+//! keys off the file being absent, never off the list being short, so "scan
+//! nothing" remains something a user can ask for. [`restore_defaults`] is how
+//! they get the conventions back, and it adds rather than replaces.
 //!
 //! # Where
 //!
@@ -43,12 +58,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Directories to scan on top of the conventional ones.
+    /// Every folder to scan, in the order they appear to the user.
     ///
-    /// Searched for every format, the same way a directory given to the CLI is:
-    /// a user pointing at their plugin folder should not have to say which
-    /// kinds of plugin are in it.
-    pub extra_directories: Vec<PathBuf>,
+    /// Each is searched for every format, whatever it is called: a user
+    /// pointing at their plugin folder should not have to say which kinds of
+    /// plugin are in it, and a conventional `VST3` folder with a stray `.clap`
+    /// in it is the user's business rather than ours.
+    ///
+    /// The alias is for files written by the first build of this feature, which
+    /// called the field `extra_directories` back when the conventions were
+    /// scanned separately.
+    #[serde(alias = "extra_directories")]
+    pub directories: Vec<PathBuf>,
 }
 
 /// The process-wide copy, and what it was read from.
@@ -118,41 +139,75 @@ fn stamp_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// The config as it stands, re-reading the file if it changed underneath us.
+/// The conventional directories, as plain paths.
+///
+/// The format each is conventionally for is dropped on the way in, because past
+/// this point a folder is a folder — see [`Config::directories`].
+fn conventional() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for (_, dir) in crate::scan::default_plugin_directories() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// The config exactly as the file has it, with no seeding.
 ///
 /// A file that cannot be read or does not parse gives the default rather than
 /// an error: the alternative is a wrapper that lists no plugins at all because
-/// one line of JSON is malformed.
-pub fn load() -> Config {
-    let Some(path) = config_path() else {
-        return Config::default();
-    };
+/// one line of JSON is malformed. `None` means there is no file yet, which is
+/// what [`load`] acts on and what a parse failure deliberately does *not* look
+/// like — re-seeding over a file we merely failed to understand would throw the
+/// user's list away.
+fn read_file() -> Option<Config> {
+    let path = config_path()?;
     let stamp = stamp_of(&path);
 
     {
         let cache = cache().read().unwrap();
         if cache.read && cache.stamp == stamp {
-            return cache.config.clone();
+            return Some(cache.config.clone());
         }
     }
 
-    let config = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            log::warn!(
-                "audio-graph: {} is not readable config: {e}",
-                path.display()
-            );
-            Config::default()
-        }),
-        // Not an error. Nobody has opened the settings yet.
-        Err(_) => Config::default(),
-    };
+    let bytes = std::fs::read(&path).ok()?;
+    let config = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        log::warn!(
+            "audio-graph: {} is not readable config: {e}",
+            path.display()
+        );
+        Config::default()
+    });
 
     let mut cache = cache().write().unwrap();
     cache.config = config.clone();
     cache.stamp = stamp;
     cache.read = true;
-    config
+    Some(config)
+}
+
+/// The config as it stands, writing one out first if there is none.
+///
+/// Re-reads the file when it changed underneath us, so a second DAW's edits are
+/// picked up.
+pub fn load() -> Config {
+    if let Some(config) = read_file() {
+        return config;
+    }
+    // No file: first run. Write down the folders a plugin would have been found
+    // in anyway, so that the list the user is shown is complete from the start
+    // and every line of it is theirs to remove.
+    let seeded = Config {
+        directories: conventional(),
+    };
+    if let Err(e) = store(&seeded) {
+        // Not fatal. The list is right for this session; it just will not
+        // survive, and the editor says so when the user changes something.
+        log::warn!("audio-graph: the plugin folders could not be saved: {e}");
+    }
+    seeded
 }
 
 /// Replace the config, in this process and on disk.
@@ -191,34 +246,58 @@ pub fn store(config: &Config) -> Result<(), String> {
     })?;
 
     // The file just written is the newest one; record its stamp so the next
-    // `load` does not read it back for nothing.
+    // read does not fetch it back for nothing.
     let mut cache = cache().write().unwrap();
     cache.stamp = stamp_of(&path);
     Ok(())
 }
 
-/// The user's extra directories, in the order they added them.
-pub fn extra_directories() -> Vec<PathBuf> {
-    load().extra_directories
+/// Every folder to scan, in the order the user sees them.
+pub fn directories() -> Vec<PathBuf> {
+    load().directories
 }
 
-/// Add `dir` to the user's directories and save.
+/// Add `dir` to the list and save.
 ///
 /// A duplicate is neither an error nor a second entry: the user asked for that
 /// folder to be scanned, and after this call it is.
 pub fn add_directory(dir: impl Into<PathBuf>) -> Result<(), String> {
     let dir = dir.into();
     let mut config = load();
-    if config.extra_directories.contains(&dir) {
+    if config.directories.contains(&dir) {
         return Ok(());
     }
-    config.extra_directories.push(dir);
+    config.directories.push(dir);
     store(&config)
 }
 
-/// Drop `dir` from the user's directories and save.
+/// Drop `dir` from the list and save.
+///
+/// Removing a folder that came from the conventions is allowed, and is the
+/// point of seeding them in: a folder full of plugins that crash the scanner is
+/// something the user must be able to stop looking at.
 pub fn remove_directory(dir: &Path) -> Result<(), String> {
     let mut config = load();
-    config.extra_directories.retain(|d| d != dir);
+    config.directories.retain(|d| d != dir);
+    store(&config)
+}
+
+/// Put back any conventional folder that is not in the list, and save.
+///
+/// Adds rather than replaces: the user's own folders are not what they asked to
+/// undo. Also the way a folder that appeared after the list was seeded — a
+/// plugin format installed later, a `CLAP_PATH` set since — gets picked up.
+pub fn restore_defaults() -> Result<(), String> {
+    let mut config = load();
+    let mut added = false;
+    for dir in conventional() {
+        if !config.directories.contains(&dir) {
+            config.directories.push(dir);
+            added = true;
+        }
+    }
+    if !added {
+        return Ok(());
+    }
     store(&config)
 }
