@@ -187,29 +187,21 @@ impl Node for Mix {
 
 #[cfg(feature = "ui")]
 impl Mix {
+    /// One entry, called what it is.
+    ///
+    /// There was a second, "Gain", which was this node starting with one
+    /// input — true to how the node works, and no help at all: picking Gain
+    /// and watching a node called Mix appear reads as the menu having handed
+    /// over the wrong thing. Taking an input off a Mix is how you get a gain,
+    /// and the node says so on the row where it happens.
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Mix)> {
-        vec![
-            (
-                "Mix",
-                Mix {
-                    channels: 2,
-                    inputs: 2,
-                    gains: vec![1.0, 1.0],
-                },
-            ),
-            (
-                "Gain",
-                Mix {
-                    channels: 2,
-                    inputs: 1,
-                    // Half back round is a delay that decays over a few
-                    // repeats, which is what a one-input mix is nearly always
-                    // dropped in to do. It is the same node as the one above —
-                    // only the starting shape differs, and having both in the
-                    // menu is cheaper than making the user work that out.
-                    gains: vec![0.5],
-                },
-            ),
-        ]
+        vec![(
+            "Mix",
+            Mix {
+                channels: 2,
+                inputs: 2,
+                gains: vec![1.0, 1.0],
+            },
+        )]
     }
 }
