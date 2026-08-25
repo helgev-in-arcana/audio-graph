@@ -77,7 +77,7 @@ impl IHostApplicationTrait for HostApplication {
         if name.is_null() {
             return kInvalidArgument;
         }
-        let dst = unsafe { &mut *(name as *mut [TChar; 128]) };
+        let dst = unsafe { &mut *name };
         to_char16(self.context.host_name(), dst);
         kResultOk
     }

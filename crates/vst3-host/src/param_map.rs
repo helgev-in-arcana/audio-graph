@@ -73,12 +73,6 @@ impl ParamMap {
             Curve::Sampled(table) => invert_table(table, plain),
         })
     }
-
-    /// How many parameters the map covers.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 fn build_curve(param: &ParamInfo, sample: &mut impl FnMut(ParamId, f64) -> f64) -> Curve {

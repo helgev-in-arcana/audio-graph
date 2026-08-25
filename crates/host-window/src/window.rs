@@ -293,7 +293,7 @@ mod imp {
         }
 
         pub fn handle(&self) -> *mut c_void {
-            self.hwnd.get() as *mut c_void
+            self.hwnd.get()
         }
 
         pub fn set_client_size(&self, size: Size) {
@@ -400,7 +400,7 @@ mod imp {
         }
         // GA_ROOT walks up parents but stops at the first top-level window,
         // which is the DAW's own frame rather than the desktop.
-        unsafe { GetAncestor(handle as HWND, GA_ROOT) as *mut c_void }
+        unsafe { GetAncestor(handle, GA_ROOT) }
     }
 
     pub fn pump_events() {
