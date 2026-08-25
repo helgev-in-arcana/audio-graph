@@ -117,7 +117,13 @@ impl Node for Plugin {
             out.push(Port::new("notes", PortType::Note));
         }
         for param in &self.ports.params {
-            out.push(Port::param(param.name.clone()));
+            let port = Port::param(param.name.clone());
+            // A parameter socket is the user's own, so it is theirs to take
+            // away again; the audio and note sockets are the plugin's and are
+            // not.
+            #[cfg(feature = "ui")]
+            let port = port.removable();
+            out.push(port);
         }
         out
     }
@@ -311,80 +317,165 @@ impl Node for Plugin {
     /// compressor has ninety parameters and a node with ninety sockets would be
     /// unusable, so they are added one at a time and each one picks what it
     /// drives from a dropdown.
+    /// The name of what is loaded, not "Plugin 3".
+    ///
+    /// The instance number stays on the front of it: two copies of the same
+    /// compressor are two nodes that would otherwise be titled identically,
+    /// and the number is also what the slot bindings outside the graph are
+    /// keyed on.
+    #[cfg(feature = "ui")]
+    fn ui_title(&self, cx: &NodeUi<'_>) -> String {
+        match cx.instances.get(self.instance) {
+            Some(view) if view.loaded && !view.name.is_empty() => {
+                format!("{}: {}", self.instance + 1, view.name)
+            }
+            _ => self.title(),
+        }
+    }
+
+    /// The sub-plugin's own window, opened from the title bar.
+    ///
+    /// A request rather than the thing itself: opening a window may not happen
+    /// inside a draw callback (see the wrapper's `editor` module). Nothing
+    /// here changes the patch, so it always reports `false`.
+    #[cfg(feature = "ui")]
+    fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
+        let Some(view) = cx.instances.get(self.instance).cloned() else {
+            return false;
+        };
+        if !view.loaded {
+            return false;
+        }
+        // One button either way, and it stays in one place: a control that
+        // moves between "GUI" and "close GUI" is a control the hand has to
+        // find again every time it is used.
+        let hint = if view.editor_open {
+            "close the plugin's window"
+        } else {
+            "open the plugin's window"
+        };
+        // Framed whether the window is open or not. A `selectable_label`
+        // that is not selected draws as bare text, and bare text in a title
+        // bar does not read as something to press.
+        if ui
+            .add(
+                egui::Button::new("GUI")
+                    .small()
+                    .selected(view.editor_open)
+                    .frame(true)
+                    .frame_when_inactive(true),
+            )
+            .on_hover_text(hint)
+            .clicked()
+        {
+            cx.act(if view.editor_open {
+                NodeAction::CloseSubEditor(self.instance)
+            } else {
+                NodeAction::OpenSubEditor(self.instance)
+            });
+        }
+        false
+    }
+
+    /// Why the node is drawn with sockets it cannot currently use.
+    ///
+    /// All that is left in the body: the name moved to the title, the GUI
+    /// button to the title bar, and every parameter to the row of the socket
+    /// it drives.
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
-        let mut changed = false;
-        let view = cx.instances.get(self.instance).cloned().unwrap_or_default();
-
-        if view.loaded {
-            ui.label(egui::RichText::new(&view.name).strong());
-        } else {
+        let loaded = cx.instances.get(self.instance).is_some_and(|v| v.loaded);
+        if !loaded {
             ui.colored_label(CAUTION, "not loaded").on_hover_text(
                 "the plugin could not be found, or is still loading. Its links and \
                  parameter sockets are kept either way (§8.3).",
             );
         }
+        false
+    }
 
-        let instance = self.instance;
-        let ports = &mut self.ports;
-        ui.horizontal(|ui| {
-            if view.loaded {
-                if view.editor_open {
-                    if ui.small_button("close GUI").clicked() {
-                        cx.act(NodeAction::CloseSubEditor(instance));
+    /// Which parameter a parameter socket drives.
+    ///
+    /// Not wrapped in `fallback`: this is not a value the socket overrides, it
+    /// is *where the socket goes*, and a wired socket is exactly when the user
+    /// is most likely to want to re-point it.
+    #[cfg(feature = "ui")]
+    fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        _connected: bool,
+        cx: &mut NodeUi<'_>,
+    ) -> bool {
+        let first = self.ports.audio_in.len() + usize::from(self.ports.accepts_notes);
+        let Some(index) = (port as usize).checked_sub(first) else {
+            return false;
+        };
+        let Some(param) = self.ports.params.get_mut(index) else {
+            return false;
+        };
+        // Cloned because the combo's contents borrow `cx` while `param`
+        // borrows `self`, and the two would otherwise overlap.
+        let available = cx
+            .instances
+            .get(self.instance)
+            .map(|view| view.params.clone())
+            .unwrap_or_default();
+        let mut changed = false;
+        let label = if param.name.is_empty() {
+            format!("#{}", param.id)
+        } else {
+            param.name.clone()
+        };
+        // The width the row has left, not a number of pixels: an absolute
+        // width does not move when the canvas is zoomed, so the dropdown was
+        // the one thing on a zoomed-out node still drawn at full size.
+        egui::ComboBox::from_id_salt(("param", index))
+            .selected_text(shorten(&label))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for (id, name) in &available {
+                    if ui.selectable_label(*id == param.id, name).clicked() && *id != param.id {
+                        param.id = *id;
+                        param.name = name.clone();
+                        changed = true;
                     }
-                } else if ui.small_button("GUI").clicked() {
-                    cx.act(NodeAction::OpenSubEditor(instance));
                 }
-            }
-            if ui.small_button("+ param").clicked() {
-                // The first parameter it has, so a freshly added socket points
-                // at something real rather than at nothing.
-                let (id, name) = view
-                    .params
-                    .first()
-                    .cloned()
-                    .unwrap_or((0, "parameter".to_string()));
-                ports.params.push(ParamPort { id, name });
-                changed = true;
-            }
-        });
-
-        let mut remove: Option<usize> = None;
-        for (index, param) in ports.params.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                let label = if param.name.is_empty() {
-                    format!("#{}", param.id)
-                } else {
-                    param.name.clone()
-                };
-                egui::ComboBox::from_id_salt(("param", index))
-                    .selected_text(shorten(&label))
-                    .width(112.0)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &view.params {
-                            if ui.selectable_label(*id == param.id, name).clicked()
-                                && *id != param.id
-                            {
-                                param.id = *id;
-                                param.name = name.clone();
-                                changed = true;
-                            }
-                        }
-                        if view.params.is_empty() {
-                            ui.weak("load a plugin to choose");
-                        }
-                    });
-                if ui.small_button("x").clicked() {
-                    remove = Some(index);
+                if available.is_empty() {
+                    ui.weak("load a plugin to choose");
                 }
             });
-        }
-        if let Some(index) = remove {
-            ports.params.remove(index);
-            changed = true;
-        }
         changed
+    }
+
+    /// A plugin node does not get a socket per parameter — Chroma has 2106 of
+    /// them — so they are added one at a time, on the node's last row.
+    #[cfg(feature = "ui")]
+    fn add_input_label(&self) -> Option<&'static str> {
+        Some("+ param")
+    }
+
+    /// Named for nothing in particular: the dropdown on its row is where it is
+    /// pointed at something, and it says "#0" until it has been.
+    #[cfg(feature = "ui")]
+    fn add_input(&mut self) {
+        self.ports.params.push(ParamPort {
+            id: 0,
+            name: String::new(),
+        });
+    }
+
+    #[cfg(feature = "ui")]
+    fn remove_input(&mut self, port: u8) -> u8 {
+        let first = self.ports.audio_in.len() + usize::from(self.ports.accepts_notes);
+        let Some(index) = (port as usize).checked_sub(first) else {
+            return 0;
+        };
+        if index >= self.ports.params.len() {
+            return 0;
+        }
+        self.ports.params.remove(index);
+        1
     }
 }
 

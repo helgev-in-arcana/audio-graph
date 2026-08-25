@@ -22,7 +22,7 @@ use crate::nodes::Rate;
 /// Here rather than in the editor because a node's controls are laid out
 /// against it — a combo box that is wider than the node it sits in is the kind
 /// of thing that only shows up once somebody adds a node.
-pub const NODE_WIDTH: f32 = 186.0;
+pub const NODE_WIDTH: f32 = 232.0;
 
 /// One sub-plugin instance, as the node holding it needs to draw it.
 ///
@@ -86,6 +86,25 @@ impl NodeUi<'_> {
 /// Colour for a warning that is not an error: a control that still works, but
 /// not the way the patch implies.
 pub(crate) const CAUTION: egui::Color32 = egui::Color32::from_rgb(200, 140, 60);
+
+/// A control that is only in effect while its socket is empty.
+///
+/// The rule used to be a line of prose under the node — "b is used only while
+/// its input is unconnected" — which is a thing to read rather than a thing to
+/// see. Greying the control out says it in the place it applies, and the
+/// hover says why.
+pub(crate) fn fallback<R>(
+    ui: &mut egui::Ui,
+    connected: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let out = ui.add_enabled_ui(!connected, add);
+    if connected {
+        out.response
+            .on_hover_text("driven by what is wired into this socket");
+    }
+    out.inner
+}
 
 /// Which delay line a half belongs to.
 ///
@@ -188,9 +207,12 @@ pub(crate) fn combo<T: PartialEq + Copy>(
     name: fn(T) -> &'static str,
 ) -> bool {
     let mut changed = false;
+    // Whatever the row has left rather than a fixed width: `NODE_WIDTH` is
+    // in canvas units and the `Ui` here is already zoomed, so a constant made
+    // the dropdown the one control that did not scale with the rest.
     egui::ComboBox::from_id_salt(ui.id().with(label))
         .selected_text(name(*current))
-        .width(NODE_WIDTH - 40.0)
+        .width(ui.available_width())
         .show_ui(ui, |ui| {
             for &option in all {
                 if ui

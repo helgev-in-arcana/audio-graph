@@ -4,7 +4,7 @@ use crate::compile::{AudioCx, CompileError, ParamCx};
 use crate::ir::{AudioOp, Buf, MixIn};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::NodeUi;
+use crate::nodes::widgets::{NodeUi, fallback};
 use crate::port::{Port, PortType};
 
 /// Sum several audio inputs of the same width into one, each at its own
@@ -44,15 +44,22 @@ impl Node for Mix {
     fn input_ports(&self) -> Vec<Port> {
         (0..self.inputs)
             .flat_map(|i| {
-                [
-                    Port::new(
-                        format!("in {}", i + 1),
-                        PortType::Audio {
-                            channels: self.channels,
-                        },
-                    ),
-                    Port::param(format!("gain {}", i + 1)),
-                ]
+                let signal = Port::new(
+                    format!("in {}", i + 1),
+                    PortType::Audio {
+                        channels: self.channels,
+                    },
+                );
+                // The signal socket carries the pair's remove button. The last
+                // input is not offered one: a mix of none is not a mix, and a
+                // mix of one is a gain, which is a thing people want.
+                #[cfg(feature = "ui")]
+                let signal = if self.inputs > 1 {
+                    signal.removable()
+                } else {
+                    signal
+                };
+                [signal, Port::param(format!("gain {}", i + 1))]
             })
             .collect()
     }
@@ -123,64 +130,78 @@ impl Node for Mix {
         Ok(())
     }
 
+    /// The gain for input `i` sits on the row of its own socket, which is the
+    /// odd port of each pair. The even one — the signal — has nothing to set:
+    /// what it carries is whatever is wired to it.
     #[cfg(feature = "ui")]
-    fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        let mut changed = false;
-        ui.horizontal(|ui| {
-            ui.label("inputs");
-            let mut count = self.inputs as u32;
-            // One is allowed, and useful: a mix of one input *is* a gain, which
-            // is what turns a feedback delay's loop down below unity so it
-            // decays.
-            if ui
-                .add(egui::DragValue::new(&mut count).range(1..=8))
-                .changed()
-            {
-                self.inputs = count as u8;
-                changed = true;
-            }
-        });
+    fn input_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        connected: bool,
+        _cx: &mut NodeUi<'_>,
+    ) -> bool {
+        if port.is_multiple_of(2) {
+            return false;
+        }
         // Grown here rather than at load: a patch saved before the gains
         // existed has none, and every missing one is unity.
         self.gains.resize(self.inputs as usize, 1.0);
-        for (i, gain) in self.gains.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(format!("gain {}", i + 1));
-                changed |= ui
-                    .add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
-                    .changed();
-            });
+        let Some(gain) = self.gains.get_mut(port as usize / 2) else {
+            return false;
+        };
+        fallback(ui, connected, |ui| {
+            ui.add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
+                .changed()
+        })
+    }
+
+    /// Eight is the ceiling the old spinner had, and nothing below it has
+    /// changed: past that a mix is a wall of sockets and a second Mix reads
+    /// better than a taller one.
+    #[cfg(feature = "ui")]
+    fn add_input_label(&self) -> Option<&'static str> {
+        (self.inputs < 8).then_some("+ input")
+    }
+
+    #[cfg(feature = "ui")]
+    fn add_input(&mut self) {
+        self.inputs += 1;
+        self.gains.resize(self.inputs as usize, 1.0);
+    }
+
+    /// One input is two sockets, and they go together: a signal with no gain
+    /// beside it would leave every later gain a socket out of step.
+    #[cfg(feature = "ui")]
+    fn remove_input(&mut self, port: u8) -> u8 {
+        let index = port as usize / 2;
+        if self.inputs <= 1 || index >= self.inputs as usize {
+            return 0;
         }
-        ui.weak("a gain is used only while its socket is unconnected");
-        changed
+        self.inputs -= 1;
+        self.gains.resize((self.inputs + 1) as usize, 1.0);
+        self.gains.remove(index);
+        2
     }
 }
 
 #[cfg(feature = "ui")]
 impl Mix {
+    /// One entry, called what it is.
+    ///
+    /// There was a second, "Gain", which was this node starting with one
+    /// input — true to how the node works, and no help at all: picking Gain
+    /// and watching a node called Mix appear reads as the menu having handed
+    /// over the wrong thing. Taking an input off a Mix is how you get a gain,
+    /// and the node says so on the row where it happens.
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Mix)> {
-        vec![
-            (
-                "Mix",
-                Mix {
-                    channels: 2,
-                    inputs: 2,
-                    gains: vec![1.0, 1.0],
-                },
-            ),
-            (
-                "Gain",
-                Mix {
-                    channels: 2,
-                    inputs: 1,
-                    // Half back round is a delay that decays over a few
-                    // repeats, which is what a one-input mix is nearly always
-                    // dropped in to do. It is the same node as the one above —
-                    // only the starting shape differs, and having both in the
-                    // menu is cheaper than making the user work that out.
-                    gains: vec![0.5],
-                },
-            ),
-        ]
+        vec![(
+            "Mix",
+            Mix {
+                channels: 2,
+                inputs: 2,
+                gains: vec![1.0, 1.0],
+            },
+        )]
     }
 }
