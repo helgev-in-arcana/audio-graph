@@ -1,0 +1,5 @@
+# The bundle is named for the product, not for the crate: a DAW shows the user
+# whatever the `.vst3` directory is called, and `audio-graph-plugin` is an
+# implementation detail.
+[audio-graph-plugin]
+name = "AudioGraph"

@@ -78,18 +78,21 @@ and other countries. 本プロジェクトは Steinberg Media Technologies GmbH 
 Rust（edition 2024 が通る版）が必要です。
 
 ```sh
-# 1. ビルド
-cargo build --release -p audio-graph-plugin
+# 1. ビルドしてバンドルに包む
+#    target/bundled/ に AudioGraph.vst3 と AudioGraph.clap ができます。
+cargo xtask bundle audio-graph-plugin --release
 
-# 2. VST3 バンドルに包む
-#    Linux は libaudio_graph_plugin.so、macOS は libaudio_graph_plugin.dylib を渡します。
-cargo run -p host-cli -- bundle target/release/audio_graph_plugin.dll target/AudioGraph.vst3
-
-# 3. DAW の VST3 フォルダへ配置
+# 2. DAW の VST3 フォルダへ配置
 #    Windows: C:\Program Files\Common Files\VST3\
 #    Linux:   ~/.vst3/
 #    macOS:   ~/Library/Audio/Plug-Ins/VST3/
 ```
+
+CLAP として使う場合は `AudioGraph.clap` を CLAP フォルダ（Windows は
+`C:\Program Files\Common Files\CLAP\`、Linux は `~/.clap/`、macOS は
+`~/Library/Audio/Plug-Ins/CLAP/`）へ置きます。どちらを出すかは xtask が決めるの
+ではなく、組み上がったバイナリがどのエントリポイントをエクスポートしているかで
+決まります。
 
 DAW を再スキャンすると、`Audio Graph FX` と `Audio Graph Instrument` の 2 つが現れます。
 

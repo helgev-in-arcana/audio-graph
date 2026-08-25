@@ -12,6 +12,7 @@ members = [
     "crates/audio-graph-engine",
     "crates/audio-graph-plugin",
     "crates/host-cli",
+    "xtask",
 ]
 
 [workspace.package]

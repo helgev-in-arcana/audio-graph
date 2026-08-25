@@ -28,9 +28,8 @@ raw-window-handle = "0.6"
 # Abort if anything allocates inside `process` (M5's DoD). Not on by default —
 # the check costs time on every block — so it is a deliberate run:
 #
-#   cargo build -p audio-graph-plugin --release --features assert_process_allocs
-#   cargo run -p host-cli -- bundle target/release/audio_graph_plugin.dll target/AudioGraph.vst3
-#   cargo run -p host-cli -- nest target/AudioGraph.vst3 <a sub-plugin>.vst3
+#   cargo xtask bundle audio-graph-plugin --release --features assert_process_allocs
+#   cargo run -p host-cli -- nest target/bundled/AudioGraph.vst3 <a sub-plugin>.vst3
 #
 # An allocation on the audio thread aborts the process rather than being
 # reported, which is the right severity: it is a bug that only shows up as an
