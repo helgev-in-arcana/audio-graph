@@ -10,6 +10,14 @@
 //! Consequently the crate never constructs an `IHostApplication` of its own;
 //! host services are injected through [`plugin_host_api::HostContext`].
 
+// The `vst3` crate's constants are bindgen output, and bindgen picks the
+// integer type from the platform's C++ ABI: `i32` on MSVC, `u32` elsewhere.
+// So `MediaTypes_::kAudio as i32` is redundant on Windows — where clippy sees
+// it — and load-bearing everywhere else. Taking clippy's advice on a Windows
+// machine breaks the Linux and macOS builds outright, which is exactly what
+// happened once. The casts stay; the lint goes.
+#![allow(clippy::unnecessary_cast)]
+
 mod cid;
 mod com;
 mod host_app;

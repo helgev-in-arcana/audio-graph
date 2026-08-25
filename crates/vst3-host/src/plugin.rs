@@ -264,16 +264,16 @@ impl Vst3Plugin {
                     Some(plugin_host_api::BusInfo {
                         name: crate::util::from_char16(&info.name),
                         channels: info.channelCount.max(0) as u16,
-                        is_aux: info.busType == BusTypes_::kAux,
+                        is_aux: info.busType == BusTypes_::kAux as i32,
                     })
                 })
                 .collect()
         };
 
-        let audio = MediaTypes_::kAudio;
-        let event = MediaTypes_::kEvent;
-        let input = BusDirections_::kInput;
-        let output = BusDirections_::kOutput;
+        let audio = MediaTypes_::kAudio as i32;
+        let event = MediaTypes_::kEvent as i32;
+        let input = BusDirections_::kInput as i32;
+        let output = BusDirections_::kOutput as i32;
         plugin_host_api::IoLayout {
             inputs: buses(audio, input),
             outputs: buses(audio, output),
@@ -286,14 +286,14 @@ impl Vst3Plugin {
     pub fn bus_channel_counts(&self) -> (u32, u32) {
         use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_};
         let count = |dir: i32| -> u32 {
-            let n = unsafe { self.component.getBusCount(MediaTypes_::kAudio, dir) };
+            let n = unsafe { self.component.getBusCount(MediaTypes_::kAudio as i32, dir) };
             if n <= 0 {
                 return 0;
             }
             let mut info: vst3::Steinberg::Vst::BusInfo = unsafe { std::mem::zeroed() };
             if unsafe {
                 self.component
-                    .getBusInfo(MediaTypes_::kAudio, dir, 0, &mut info)
+                    .getBusInfo(MediaTypes_::kAudio as i32, dir, 0, &mut info)
             } == kResultOk
             {
                 info.channelCount.max(0) as u32
@@ -302,8 +302,8 @@ impl Vst3Plugin {
             }
         };
         (
-            count(BusDirections_::kInput),
-            count(BusDirections_::kOutput),
+            count(BusDirections_::kInput as i32),
+            count(BusDirections_::kOutput as i32),
         )
     }
 
@@ -561,11 +561,11 @@ impl SubPluginMain for Vst3Plugin {
 
         let mut setup = ProcessSetup {
             processMode: if config.offline {
-                vst3::Steinberg::Vst::ProcessModes_::kOffline
+                vst3::Steinberg::Vst::ProcessModes_::kOffline as i32
             } else {
-                vst3::Steinberg::Vst::ProcessModes_::kRealtime
+                vst3::Steinberg::Vst::ProcessModes_::kRealtime as i32
             },
-            symbolicSampleSize: vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32,
+            symbolicSampleSize: vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32,
             maxSamplesPerBlock: config.max_block_size as i32,
             sampleRate: config.sample_rate,
         };
@@ -799,11 +799,11 @@ impl SubPluginProcessor for Vst3Processor {
 
         let mut data = ProcessData {
             processMode: if self.config.offline {
-                vst3::Steinberg::Vst::ProcessModes_::kOffline
+                vst3::Steinberg::Vst::ProcessModes_::kOffline as i32
             } else {
-                vst3::Steinberg::Vst::ProcessModes_::kRealtime
+                vst3::Steinberg::Vst::ProcessModes_::kRealtime as i32
             },
-            symbolicSampleSize: vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32,
+            symbolicSampleSize: vst3::Steinberg::Vst::SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: self.input_buses.len() as i32,
             numOutputs: self.output_buses.len() as i32,
@@ -930,7 +930,11 @@ fn setup_buses(
         for (index, wanted) in outputs.iter().enumerate() {
             let mut actual: SpeakerArrangement = 0;
             if unsafe {
-                processor.getBusArrangement(BusDirections_::kOutput, index as i32, &mut actual)
+                processor.getBusArrangement(
+                    BusDirections_::kOutput as i32,
+                    index as i32,
+                    &mut actual,
+                )
             } == kResultOk
                 && actual != *wanted
             {
@@ -945,7 +949,11 @@ fn setup_buses(
         for (index, wanted) in inputs.iter().enumerate() {
             let mut actual: SpeakerArrangement = 0;
             if unsafe {
-                processor.getBusArrangement(BusDirections_::kInput, index as i32, &mut actual)
+                processor.getBusArrangement(
+                    BusDirections_::kInput as i32,
+                    index as i32,
+                    &mut actual,
+                )
             } == kResultOk
                 && actual != *wanted
             {
@@ -974,14 +982,14 @@ fn setup_buses(
         (MediaTypes_::kEvent, BusDirections_::kInput, 1),
         (MediaTypes_::kEvent, BusDirections_::kOutput, 0),
     ] {
-        let count = unsafe { component.getBusCount(media, dir) };
+        let count = unsafe { component.getBusCount(media as i32, dir as i32) };
         for index in 0..count {
             let on = (index as usize) < active;
-            unsafe { component.activateBus(media, dir, index, u8::from(on)) };
-            if media != MediaTypes_::kAudio {
+            unsafe { component.activateBus(media as i32, dir as i32, index, u8::from(on)) };
+            if media as i32 != MediaTypes_::kAudio as i32 {
                 continue;
             }
-            let width = if dir == BusDirections_::kInput {
+            let width = if dir as i32 == BusDirections_::kInput as i32 {
                 inputs.get(index as usize).copied()
             } else {
                 outputs.get(index as usize).copied()
@@ -993,7 +1001,7 @@ fn setup_buses(
                     0
                 },
             };
-            if dir == BusDirections_::kInput {
+            if dir as i32 == BusDirections_::kInput as i32 {
                 declared.inputs.push(bus);
             } else {
                 declared.outputs.push(bus);

@@ -455,11 +455,10 @@ mod imp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn a_window_can_be_created_and_dropped() {
         let window = ContainerWindow::new("test", Size::new(320, 240), std::ptr::null_mut())
@@ -470,7 +469,6 @@ mod tests {
         drop(window);
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_can_be_created_repeatedly() {
         // The window class is registered once per process; a second
