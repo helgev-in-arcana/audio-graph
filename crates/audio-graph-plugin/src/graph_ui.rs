@@ -75,6 +75,15 @@ pub struct PluginEntry {
     pub kind: plugin_host::catalogue::Kind,
 }
 
+/// The add-node menu's width, and the height each of its two lists gets.
+///
+/// Fixed rather than fitted to the content, and the lists are given the height
+/// whether or not they fill it: a menu that changed shape as the user switched
+/// tabs, typed into the filter, or plugged in a plugin was a menu whose buttons
+/// moved under the pointer.
+const POPUP_WIDTH: f32 = 540.0;
+const LIST_HEIGHT: f32 = 360.0;
+
 /// Whether the plugin list is split into FX and Instrument tabs.
 ///
 /// Provisional, and there are two ways to take it back out:
@@ -928,68 +937,63 @@ impl GraphEditor {
                     // nodes are a fixed list one learns by heart, the plugins
                     // are however many are installed, and scrolling one to the
                     // bottom should not push the other out of reach.
-                    ui.set_width(540.0);
+                    ui.set_width(POPUP_WIDTH);
                     let mut chosen: Option<PathBuf> = None;
                     let mut pin: Option<(PathBuf, bool)> = None;
 
                     ui.columns(2, |cols| {
                         let ui = &mut cols[0];
                         ui.strong("Node");
-                        egui::ScrollArea::vertical()
-                            .id_salt("add-kind")
-                            .max_height(360.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.weak("Delay");
+                        list_area(ui, "add-kind", |ui| {
+                            ui.weak("Delay");
+                            ui.horizontal_wrapped(|ui| {
+                                // A wrapped row leaves no gap between lines
+                                // unless asked: square it with the gap
+                                // between buttons.
+                                ui.spacing_mut().item_spacing.y = ui.spacing().item_spacing.x;
+                                for (label, ty) in [
+                                    ("Audio delay", PortType::STEREO),
+                                    ("Param delay", PortType::Param),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        graph.add_delay(ty, [at.x, at.y]);
+                                        added = true;
+                                        close = true;
+                                    }
+                                }
+                            });
+
+                            // Wrapped rather than one per row, and under a
+                            // heading per kind of wire: the flat list had
+                            // grown past the point where a reader could
+                            // find anything in it without reading all of
+                            // it, and "which sort of thing is this" is the
+                            // question being asked while the menu is open.
+                            let entries = catalogue();
+                            for group in NodeGroup::ALL {
+                                // A group with nothing in it — as `Plugin`
+                                // and the delays are, being added elsewhere
+                                // — gets no heading rather than an empty
+                                // one.
+                                if !entries.iter().any(|(g, _, _)| *g == group) {
+                                    continue;
+                                }
+                                ui.weak(group.label());
                                 ui.horizontal_wrapped(|ui| {
-                                    // A wrapped row leaves no gap between lines
-                                    // unless asked: square it with the gap
-                                    // between buttons.
                                     ui.spacing_mut().item_spacing.y = ui.spacing().item_spacing.x;
-                                    for (label, ty) in [
-                                        ("Audio delay", PortType::STEREO),
-                                        ("Param delay", PortType::Param),
-                                    ] {
-                                        if ui.button(label).clicked() {
-                                            graph.add_delay(ty, [at.x, at.y]);
+                                    for (g, label, kind) in &entries {
+                                        if *g != group {
+                                            continue;
+                                        }
+                                        if ui.button(*label).clicked() {
+                                            graph.add(kind.clone(), [at.x, at.y]);
                                             added = true;
                                             close = true;
                                         }
                                     }
                                 });
-
-                                // Wrapped rather than one per row, and under a
-                                // heading per kind of wire: the flat list had
-                                // grown past the point where a reader could
-                                // find anything in it without reading all of
-                                // it, and "which sort of thing is this" is the
-                                // question being asked while the menu is open.
-                                let entries = catalogue();
-                                for group in NodeGroup::ALL {
-                                    // A group with nothing in it — as `Plugin`
-                                    // and the delays are, being added elsewhere
-                                    // — gets no heading rather than an empty
-                                    // one.
-                                    if !entries.iter().any(|(g, _, _)| *g == group) {
-                                        continue;
-                                    }
-                                    ui.weak(group.label());
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.y =
-                                            ui.spacing().item_spacing.x;
-                                        for (g, label, kind) in &entries {
-                                            if *g != group {
-                                                continue;
-                                            }
-                                            if ui.button(*label).clicked() {
-                                                graph.add(kind.clone(), [at.x, at.y]);
-                                                added = true;
-                                                close = true;
-                                            }
-                                        }
-                                    });
-                                }
-                            });
+                            }
+                        });
 
                         let ui = &mut cols[1];
                         ui.strong("Plugin");
@@ -1017,62 +1021,51 @@ impl GraphEditor {
                                 }
                                 let needle = self.plugin_filter.to_lowercase();
                                 let tab = self.plugin_tab;
-                                egui::ScrollArea::vertical()
-                                    .id_salt("add-plugin")
-                                    .max_height(360.0)
-                                    // The list fills the column: left to shrink
-                                    // to its content, the scrollbar sat mid-way
-                                    // across the popup instead of at its edge.
-                                    .auto_shrink([false, true])
-                                    .show(ui, |ui| {
-                                        // Padded so a long name never runs
-                                        // under the scrollbar.
-                                        egui::Frame::new()
-                                            .inner_margin(egui::Margin::symmetric(10, 0))
-                                            .show(ui, |ui| {
-                                                let mut shown = 0usize;
-                                                for entry in ctx.plugins {
-                                                    if !tab.shows(entry.kind) {
-                                                        continue;
-                                                    }
-                                                    // The format is searchable too, so
-                                                    // typing "clap" narrows the list to
-                                                    // one format without a separate
-                                                    // control.
-                                                    if !needle.is_empty()
-                                                        && !entry
-                                                            .name
-                                                            .to_lowercase()
-                                                            .contains(&needle)
-                                                        && !entry
-                                                            .format
-                                                            .tag()
-                                                            .contains(needle.as_str())
-                                                    {
-                                                        continue;
-                                                    }
-                                                    match plugin_row(ui, entry) {
-                                                        RowHit::Load => {
-                                                            chosen = Some(entry.path.clone());
-                                                        }
-                                                        RowHit::TogglePin => {
-                                                            pin = Some((
-                                                                entry.path.clone(),
-                                                                !entry.pinned,
-                                                            ));
-                                                        }
-                                                        RowHit::Nothing => {}
-                                                    }
-                                                    shown += 1;
+                                list_area(ui, "add-plugin", |ui| {
+                                    // Padded so a long name never runs
+                                    // under the scrollbar.
+                                    egui::Frame::new()
+                                        .inner_margin(egui::Margin::symmetric(10, 0))
+                                        .show(ui, |ui| {
+                                            let mut shown = 0usize;
+                                            for entry in ctx.plugins {
+                                                if !tab.shows(entry.kind) {
+                                                    continue;
                                                 }
-                                                if shown == 0 {
-                                                    ui.weak("nothing here");
+                                                // The format is searchable too, so
+                                                // typing "clap" narrows the list to
+                                                // one format without a separate
+                                                // control.
+                                                if !needle.is_empty()
+                                                    && !entry.name.to_lowercase().contains(&needle)
+                                                    && !entry.format.tag().contains(needle.as_str())
+                                                {
+                                                    continue;
                                                 }
-                                            });
-                                    });
+                                                match plugin_row(ui, entry) {
+                                                    RowHit::Load => {
+                                                        chosen = Some(entry.path.clone());
+                                                    }
+                                                    RowHit::TogglePin => {
+                                                        pin = Some((
+                                                            entry.path.clone(),
+                                                            !entry.pinned,
+                                                        ));
+                                                    }
+                                                    RowHit::Nothing => {}
+                                                }
+                                                shown += 1;
+                                            }
+                                            if shown == 0 {
+                                                ui.weak("nothing here");
+                                            }
+                                        });
+                                });
                             }
                             None => {
                                 ui.weak("no free instance — the wrapper is full");
+                                // Nothing to list, but the menu keeps its shape.
+                                ui.allocate_space(egui::vec2(0.0, LIST_HEIGHT));
                             }
                         }
                     });
@@ -1119,6 +1112,21 @@ impl GraphEditor {
     pub fn take_actions(&mut self) -> Vec<GraphAction> {
         std::mem::take(&mut self.actions)
     }
+}
+
+/// One of the menu's two lists: a scrolling area of a fixed size.
+///
+/// Fixed in both directions. Left to fit its content, the height moved with
+/// whatever was in it and the scrollbar sat wherever the widest row ended
+/// rather than at the column's edge.
+fn list_area(ui: &mut egui::Ui, salt: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let size = egui::vec2(ui.available_width(), LIST_HEIGHT);
+    ui.allocate_ui(size, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(salt)
+            .auto_shrink([false, false])
+            .show(ui, add);
+    });
 }
 
 /// What clicking somewhere in a plugin's row asked for.
