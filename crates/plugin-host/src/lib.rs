@@ -28,6 +28,7 @@
 //! `subhost-adapter`'s job (ARCHITECTURE.md §7), and the test is unchanged:
 //! would an offline renderer or a plugin scanner still need it?
 
+pub mod catalogue;
 pub mod config;
 mod format;
 mod plugin;

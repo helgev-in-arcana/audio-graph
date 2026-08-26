@@ -13,6 +13,22 @@ pub enum Format {
     Clap,
 }
 
+/// Written as its tag rather than as a variant name, because that is the form
+/// already promised to be stable — the same string a saved project holds.
+impl serde::Serialize for Format {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.tag())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Format {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Format, D::Error> {
+        let tag = <String as serde::Deserialize>::deserialize(d)?;
+        Format::from_tag(&tag)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown plugin format {tag:?}")))
+    }
+}
+
 /// Every format, in the order a browser should offer them.
 pub const FORMATS: [Format; 2] = [Format::Vst3, Format::Clap];
 
