@@ -40,7 +40,7 @@ pub use nodes::{
 };
 #[cfg(feature = "ui")]
 pub use nodes::{
-    catalogue,
+    NodeGroup, catalogue,
     widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
 };
 pub use port::{Port, PortType};
