@@ -571,7 +571,8 @@ impl Node for Plugin {
     /// so they are added the way parameter sockets are.
     #[cfg(feature = "ui")]
     fn add_output_label(&self) -> Option<&'static str> {
-        (self.ports.shown_outputs().len() < self.ports.audio_out.len()).then_some("+ out")
+        (self.ports.shown_outputs().len() < self.ports.audio_out.len())
+            .then_some("a socket for another output bus")
     }
 
     #[cfg(feature = "ui")]
@@ -599,7 +600,7 @@ impl Node for Plugin {
     /// them — so they are added one at a time, on the node's last row.
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
-        Some("+ param")
+        Some("a socket for another parameter")
     }
 
     /// Named for nothing in particular: the dropdown on its row is where it is

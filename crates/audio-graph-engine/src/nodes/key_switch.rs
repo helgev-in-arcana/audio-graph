@@ -228,7 +228,7 @@ impl Node for KeySwitch {
 
     #[cfg(feature = "ui")]
     fn add_output_label(&self) -> Option<&'static str> {
-        (self.keys.len() < MAX_WAYS).then_some("+ way")
+        (self.keys.len() < MAX_WAYS).then_some("another destination")
     }
 
     #[cfg(feature = "ui")]
