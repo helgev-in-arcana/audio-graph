@@ -546,7 +546,7 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 3,
-                gains: vec![1.0, 1.0, 1.0],
+                gains: vec![0.0, 0.0, 0.0],
             }),
             [0.0, 0.0],
         );

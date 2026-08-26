@@ -32,7 +32,7 @@ pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
-pub use mix::Mix;
+pub use mix::{Mix, db_to_linear, linear_to_db};
 pub use note_in::NoteIn;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
