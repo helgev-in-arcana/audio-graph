@@ -122,9 +122,9 @@ DAW からのオートメーションは **スロット**（32 本）を通り�
 信号の ON/OFF は `Audio Gate` と `MIDI Gate`、値の切り替えは `Param Select` です。
 MIDI キースイッチで分岐させたいときは `Key MIDI Route`（送出先の切り替え）と
 `Key Param Select`（パラメータ値の切り替え）を使います。どちらも行き先／値ごとに
-鍵を 1 つ持ち、`Mix` の入力と同じように増減できます。`Key MIDI Route` のスイッチ鍵は
+鍵を 1 つ持ち、`Mix` の入力と同じように増減できます。`Key MIDI Route` の操作に使う鍵は
 既定では下流へ流れません（鳴らすためではなく選ぶために弾く鍵なので）。流したいときは
-ノードの **let switch keys through** を入れてください。`MIDI Gate` が閉じている間は
+ノードの **mute switching keys** を外してください。`MIDI Gate` が閉じている間は
 ノートオンだけが止まり、ノートオフは通るので、鳴っている音が吊ることはありません。
 
 ノード名は `[制御] <出力型> <動詞>` の順です。型語（`Audio` / `MIDI` / `Param`）が

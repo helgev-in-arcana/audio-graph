@@ -2043,7 +2043,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24],
                 mode: KeySwitchMode::Hold,
-                pass_keys: false,
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
@@ -2141,7 +2141,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24, 25],
                 mode: KeySwitchMode::Toggle,
-                pass_keys: false,
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
