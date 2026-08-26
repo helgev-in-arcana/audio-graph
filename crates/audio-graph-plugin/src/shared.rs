@@ -355,6 +355,10 @@ impl Shared {
     /// rule a patch reopened against a newer plugin follows.
     pub fn discover_ports(&self, node: NodeId) {
         let mut state = self.main();
+        // Before anything is read off the node: a patch older than
+        // `audio_out_shown` has no picks to preserve, and settling what it
+        // meant is what turns "every bus" into the handful it wired.
+        state.graph.migrate_plugin_outputs();
         let Some(instance) = state.graph.node(node).and_then(|n| match n.kind {
             NodeKind::Plugin(Plugin { instance, .. }) => Some(instance),
             _ => None,
@@ -369,10 +373,24 @@ impl Shared {
         };
         if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
             // The parameter sockets are the user's, not the plugin's (§14.12):
-            // discovery replaces the buses and leaves the sockets alone.
+            // discovery replaces the buses and leaves the sockets alone. Which
+            // output buses have a socket is the user's too, for the same
+            // reason — but only once there is something for it to be a choice
+            // between. A node discovering its plugin for the first time takes
+            // the main bus and nothing else.
             let params = std::mem::take(&mut ports.params);
+            let shown = (!ports.audio_out_shown.is_empty()).then(|| ports.audio_out_shown.clone());
             *ports = discovered;
             ports.params = params;
+            if let Some(shown) = shown {
+                ports.audio_out_shown = shown;
+                // Every pick pointed at a bus the reloaded plugin no longer
+                // has. Silently ending up with no way out of the node would be
+                // worse than falling back to the main bus.
+                if ports.shown_outputs().is_empty() && !ports.audio_out.is_empty() {
+                    ports.audio_out_shown = vec![0];
+                }
+            }
         }
         state.graph.prune();
         drop(state);

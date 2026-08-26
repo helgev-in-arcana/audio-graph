@@ -53,6 +53,66 @@ pub enum Op {
         out: Reg,
         source: ExprSource,
     },
+    /// One of two operands, chosen by where `control` sits against
+    /// `threshold`: `high` at the threshold and above, `low` below it.
+    ///
+    /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which
+    /// a gate wired from `Expression`'s `Gate` does — switches.
+    Select {
+        out: Reg,
+        control: Reg,
+        threshold: f64,
+        low: Operand,
+        high: Operand,
+    },
+    /// 1 while `key` is held, 0 otherwise.
+    ///
+    /// The one thing the graph could not ask about a note stream: `Expression`
+    /// answers for the newest note whatever it was, and a key switch is a
+    /// question about one particular key regardless of what has been played
+    /// since.
+    KeyHeld {
+        out: Reg,
+        key: u8,
+    },
+    /// Move a latch on to the next of `count` positions each time `key` is
+    /// struck, wrapping at the end.
+    ///
+    /// One key cycling a switch, which with `count` of 2 is a plain toggle.
+    /// Writes no register: the value is read back by a [`Op::Latch`] or an
+    /// [`Op::LatchIs`], because the latch is what survives a program swap and
+    /// a register does not.
+    KeyStep {
+        state: u16,
+        key: u8,
+        count: u16,
+    },
+    /// Set a latch to `value` when `key` is struck.
+    ///
+    /// Several of these on one latch is a bank of key switches: the last key
+    /// pressed wins, which is what a bank of switches does.
+    KeyLatch {
+        state: u16,
+        key: u8,
+        value: f64,
+    },
+    /// Read a latch, or `initial` if nothing has set it yet.
+    Latch {
+        out: Reg,
+        state: u16,
+        initial: f64,
+    },
+    /// 1 when a latch holds `value`, 0 otherwise.
+    ///
+    /// What makes a bank of switches exclusive: each position asks whether it
+    /// is the one selected, and exactly one of them can be. `initial` is what
+    /// an unset latch counts as, so an untouched bank still has a position.
+    LatchIs {
+        out: Reg,
+        state: u16,
+        value: f64,
+        initial: f64,
+    },
     Math {
         out: Reg,
         a: Reg,

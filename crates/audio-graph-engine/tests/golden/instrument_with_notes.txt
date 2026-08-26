@@ -19,8 +19,12 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: Daw {
-                bus: 0,
+            notes: NoteRoute {
+                source: Daw {
+                    bus: 0,
+                },
+                gate: None,
+                mute: 0,
             },
         },
         Output {
@@ -29,6 +33,7 @@ Program {
         },
     ],
     param_targets: [],
+    audio_lane_base: 96,
     instances: [
         InstanceIo {
             instance: 0,
@@ -44,5 +49,6 @@ Program {
     ],
     chunking: WholeBlock,
     latency: 0,
+    latch_nodes: [],
     lfo_nodes: [],
 }

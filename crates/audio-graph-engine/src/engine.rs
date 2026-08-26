@@ -20,8 +20,8 @@ use plugin_host_api::{NoteEvent, NoteExpression};
 use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
-    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS,
-    MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
+    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteStream, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
 
@@ -166,12 +166,13 @@ pub trait AudioNodes {
     /// the pool held, so a plugin that produces nothing should clear it.
     ///
     /// `notes` says which note stream this instance hears (§14.10). It is a
-    /// name, not a buffer: the engine routes notes without knowing what one is,
-    /// and the implementation is what turns the name into events.
+    /// name and a key mask, not a buffer: the engine routes notes without
+    /// knowing what one is, and the implementation is what turns the name into
+    /// events and drops the keys the mask names.
     fn process(
         &mut self,
         instance: u32,
-        notes: NoteSource,
+        notes: NoteStream,
         input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
@@ -185,7 +186,7 @@ impl AudioNodes for NoNodes {
     fn process(
         &mut self,
         _instance: u32,
-        _notes: NoteSource,
+        _notes: NoteStream,
         _input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
@@ -253,6 +254,22 @@ pub struct Engine {
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
     expressions: Expressions,
+    /// Which keys are down, one bit each. 128 keys, which is the whole MIDI
+    /// range, so a `u128` is the table.
+    ///
+    /// Apart from [`Expressions`] because that is the newest note whatever it
+    /// was, and a key switch asks about one particular key regardless of what
+    /// has been played since.
+    keys_held: u128,
+    /// Which keys have been struck since the last [`Engine::run`]. Cleared at
+    /// the end of it, so an op sees each note-on exactly once.
+    keys_struck: u128,
+    /// One value per latch, or NaN for a latch nothing has set yet (§14.10).
+    latches: Vec<f64>,
+    /// Which node each latch belongs to, so a program swap can carry it over.
+    latch_nodes: Vec<u32>,
+    /// Scratch for that swap, sized once so the swap itself allocates nothing.
+    latch_carry: Vec<(u32, f64)>,
     rng: u32,
 }
 
@@ -386,15 +403,21 @@ impl Engine {
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
             expressions: Expressions::default(),
+            keys_held: 0,
+            keys_struck: 0,
+            latches: vec![f64::NAN; MAX_LATCHES],
+            latch_nodes: vec![u32::MAX; MAX_LATCHES],
+            latch_carry: vec![(u32::MAX, f64::NAN); MAX_LATCHES],
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
             rng: 0x2545_F491,
         }
     }
 
-    /// Whether the graph currently drives `slot`, and so overrides the DAW.
-    pub fn drives(&self, slot: usize) -> bool {
-        self.program.as_ref().is_some_and(|p| p.drives(slot))
+    /// Whether the graph currently drives `lane` — see
+    /// [`Program::drives_lane`].
+    pub fn drives_lane(&self, lane: usize) -> bool {
+        self.program.as_ref().is_some_and(|p| p.drives_lane(lane))
     }
 
     pub fn has_program(&self) -> bool {
@@ -439,6 +462,29 @@ impl Engine {
         }
         for i in next.lfo_nodes.len()..MAX_LFOS {
             self.phase_nodes[i] = u32::MAX;
+        }
+
+        // Latches keep their values across the swap for the same reason
+        // phases do: recompiling happens on every drag of every control, and a
+        // key switch that forgot which way it was thrown would be unusable.
+        let latched = self
+            .latch_carry
+            .len()
+            .min(self.latch_nodes.len())
+            .min(self.latches.len());
+        for i in 0..latched {
+            self.latch_carry[i] = (self.latch_nodes[i], self.latches[i]);
+        }
+        for (i, &node) in next.latch_nodes.iter().take(MAX_LATCHES).enumerate() {
+            self.latches[i] = self.latch_carry[..latched]
+                .iter()
+                .find(|&&(id, _)| id == node)
+                .map_or(f64::NAN, |&(_, value)| value);
+            self.latch_nodes[i] = node;
+        }
+        for i in next.latch_nodes.len()..MAX_LATCHES {
+            self.latch_nodes[i] = u32::MAX;
+            self.latches[i] = f64::NAN;
         }
 
         // Delay lines keep their contents across the swap (§14.5), both
@@ -510,9 +556,16 @@ impl Engine {
                 self.expressions.velocity = velocity;
                 self.expressions.key = f64::from(key).clamp(0.0, 127.0) / 127.0;
                 self.expressions.held = self.expressions.held.saturating_add(1);
+                if let Some(bit) = key_bit(key) {
+                    self.keys_held |= bit;
+                    self.keys_struck |= bit;
+                }
             }
-            NoteEvent::NoteOff { .. } | NoteEvent::NoteEnd { .. } => {
+            NoteEvent::NoteOff { key, .. } | NoteEvent::NoteEnd { key, .. } => {
                 self.expressions.held = self.expressions.held.saturating_sub(1);
+                if let Some(bit) = key_bit(key) {
+                    self.keys_held &= !bit;
+                }
             }
             NoteEvent::Expression {
                 expression, value, ..
@@ -527,6 +580,12 @@ impl Engine {
     /// transport jumped and any note-offs we were waiting for will never come.
     pub fn reset(&mut self) {
         self.expressions = Expressions::default();
+        // The transport jumped: the note-offs we were waiting for will never
+        // come, so nothing is held any more. The latches are left alone —
+        // which way a key switch is thrown is a setting the user made, not a
+        // note still sounding.
+        self.keys_held = 0;
+        self.keys_struck = 0;
         self.phases.iter_mut().for_each(|p| *p = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
@@ -786,9 +845,12 @@ impl Engine {
                     // pool; the region it owns is its own buses (§14.11).
                     let packed_in = in_width as usize * frames;
                     let packed_out = out_width as usize * frames;
+                    // The gate is a lane, so it is read here, once per chunk,
+                    // the same way a mix's gain is (§14.10).
+                    let notes = notes.resolve(notes.gate.and_then(|lane| ctx.lane(row, lane)));
                     nodes.process(
                         *instance,
-                        *notes,
+                        notes,
                         &source[..packed_in],
                         &mut dest[..packed_out],
                         AudioChunk {
@@ -1116,6 +1178,71 @@ impl Engine {
                     }
                     self.phases[i] = advanced.rem_euclid(1.0);
                 }
+                Op::Select {
+                    out,
+                    control,
+                    threshold,
+                    low,
+                    high,
+                } => {
+                    let pick = if self.registers[control as usize] >= threshold {
+                        high
+                    } else {
+                        low
+                    };
+                    self.registers[out as usize] = match pick {
+                        Operand::Reg(reg) => self.registers[reg as usize],
+                        Operand::Value(value) => value,
+                    };
+                }
+                Op::KeyHeld { out, key } => {
+                    self.registers[out as usize] = f64::from(self.held(key));
+                }
+                Op::KeyStep { state, key, count } => {
+                    if self.struck(key)
+                        && count > 0
+                        && let Some(latch) = self.latches.get_mut(state as usize)
+                    {
+                        // NaN is "never set", which counts as position 0 — so
+                        // the first strike lands on 1, the way throwing a
+                        // switch that was off turns it on.
+                        let at = if latch.is_nan() { 0.0 } else { *latch };
+                        *latch = (at + 1.0).rem_euclid(f64::from(count));
+                    }
+                }
+                Op::KeyLatch { state, key, value } => {
+                    if self.struck(key)
+                        && let Some(latch) = self.latches.get_mut(state as usize)
+                    {
+                        *latch = value;
+                    }
+                }
+                Op::LatchIs {
+                    out,
+                    state,
+                    value,
+                    initial,
+                } => {
+                    let at = self
+                        .latches
+                        .get(state as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN);
+                    let at = if at.is_nan() { initial } else { at };
+                    self.registers[out as usize] = f64::from(at == value);
+                }
+                Op::Latch {
+                    out,
+                    state,
+                    initial,
+                } => {
+                    let value = self
+                        .latches
+                        .get(state as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN);
+                    self.registers[out as usize] = if value.is_nan() { initial } else { value };
+                }
                 Op::Math { out, a, b, op } => {
                     let a = self.registers[a as usize];
                     let b = match b {
@@ -1156,22 +1283,47 @@ impl Engine {
             }
         }
 
-        for &(slot, reg) in &program.outputs {
-            if let Some(target) = slots.get_mut(slot as usize) {
-                // Slots are 0..1 by definition (§8.1); the mapping onto the
-                // sub-plugin's plain range belongs to the slot table. A NaN
-                // from a degenerate graph must not get past here.
+        for &(lane, reg) in &program.outputs {
+            if let Some(target) = slots.get_mut(lane as usize) {
+                // Slots and parameters are 0..1 by definition (§8.1); the
+                // mapping onto the sub-plugin's plain range belongs to the slot
+                // table. An audio lane is not — it carries decibels or seconds
+                // (§14.5) — so only the lanes below the audio range are
+                // clamped. A NaN from a degenerate graph must not get past
+                // here either way.
                 let value = self.registers[reg as usize];
-                *target = if value.is_finite() {
+                *target = if !value.is_finite() {
+                    0.0
+                } else if lane < program.audio_lane_base {
                     value.clamp(0.0, 1.0)
                 } else {
-                    0.0
+                    value
                 };
             }
         }
 
+        // Each note-on is seen by one evaluation and no more: an op that fired
+        // on it this sub-block must not fire on it again next.
+        self.keys_struck = 0;
+
         self.program = Some(program);
     }
+
+    /// Whether `key` is down. Out of range is never down.
+    fn held(&self, key: u8) -> bool {
+        key_bit(i16::from(key)).is_some_and(|bit| self.keys_held & bit != 0)
+    }
+
+    /// Whether `key` has been struck since the last evaluation.
+    fn struck(&self, key: u8) -> bool {
+        key_bit(i16::from(key)).is_some_and(|bit| self.keys_struck & bit != 0)
+    }
+}
+
+/// One key's bit in the held/struck tables, or `None` for a key outside the
+/// MIDI range — which a malformed event can carry and a bit shift cannot.
+fn key_bit(key: i16) -> Option<u128> {
+    (0..128).contains(&key).then(|| 1u128 << key)
 }
 
 fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
@@ -1196,12 +1348,42 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-        Plugin, PluginPorts, Rate, SlotIn, SlotOut, linear_to_db,
+        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
+        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, ParamPort, Plugin,
+        PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
     const SLOTS: usize = 32;
+
+    /// Somewhere for a parameter chain to go.
+    ///
+    /// With `SlotOut` gone, a graph reaches the outside world through a §14.12
+    /// parameter socket, and the lane that carries it is the first one past
+    /// the slot table — which is what [`SINK`] is.
+    fn param_sink(graph: &mut Graph) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    params: vec![ParamPort {
+                        id: 0,
+                        name: "p".into(),
+                    }],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
+
+    /// The lane [`param_sink`]'s parameter is driven through.
+    const SINK: usize = SLOTS;
+
+    /// A lane row: the slot table, and the sink's lane after it.
+    fn lanes() -> Vec<f64> {
+        vec![0.0; SLOTS + 1]
+    }
 
     fn ctx(frames: u32) -> BlockContext {
         BlockContext {
@@ -1243,18 +1425,18 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_the_graph_does_not_drive_keeps_the_daws_value() {
+    fn a_lane_the_graph_does_not_drive_keeps_the_daws_value() {
         let mut graph = Graph::new();
         let c = graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(c, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.9; SLOTS];
+        let mut slots = vec![0.9; SLOTS + 1];
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.25);
+        assert_eq!(slots[SINK], 0.25);
         assert_eq!(slots[1], 0.9, "an undriven slot is left alone");
     }
 
@@ -1269,17 +1451,113 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(input, 0, half, 0);
         graph.connect(half, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[3] = 0.8;
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[4] - 0.4).abs() < 1e-12);
+        assert!((slots[SINK] - 0.4).abs() < 1e-12);
+    }
+
+    /// The parameter half's switch: one value below the threshold, another at
+    /// it and above.
+    #[test]
+    fn a_switch_picks_by_threshold() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                values: vec![0.2, 0.9],
+                thresholds: vec![0.6],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        slots[1] = 0.59;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+
+        slots[1] = 0.6;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.9, "the threshold itself is on");
+    }
+
+    /// More than two rungs: the last threshold the control has passed is the
+    /// one that wins, and below all of them the first value is what is read.
+    #[test]
+    fn a_switch_climbs_a_ladder_of_thresholds() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                values: vec![0.1, 0.4, 0.7],
+                thresholds: vec![0.3, 0.8],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        for (control, expected) in [(0.0, 0.1), (0.29, 0.1), (0.3, 0.4), (0.79, 0.4), (0.8, 0.7)] {
+            slots[1] = control;
+            engine.run(&ctx(32), &mut slots);
+            assert_eq!(slots[SINK], expected, "at {control}");
+        }
+    }
+
+    /// Either side of a switch can be a signal rather than a number, which is
+    /// what makes it a router as well as a chooser.
+    #[test]
+    fn a_switch_can_pick_between_two_signals() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let a = graph.add(NodeKind::SlotIn(SlotIn { slot: 2 }), [0.0, 0.0]);
+        let b = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                values: vec![0.0, 1.0],
+                thresholds: vec![0.5],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(a, 0, switch, 1);
+        graph.connect(b, 0, switch, 2);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        slots[2] = 0.25;
+        slots[3] = 0.75;
+        slots[1] = 0.0;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+
+        slots[2] = 0.25;
+        slots[3] = 0.75;
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.75);
     }
 
     #[test]
@@ -1295,18 +1573,18 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         let mut seen: Vec<f64> = Vec::new();
         // One second at 48 kHz in 32-sample sub-blocks: a whole cycle.
         for _ in 0..1500 {
             engine.run(&ctx(32), &mut slots);
-            seen.push(slots[0]);
+            seen.push(slots[SINK]);
         }
         let lowest = seen.iter().cloned().fold(f64::INFINITY, f64::min);
         let highest = seen.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -1329,14 +1607,14 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
         // Quarter of a beat at 120 bpm = 0.125 s = 6000 samples.
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         engine.run(
             &BlockContext {
                 sample_rate: 48_000.0,
@@ -1354,9 +1632,9 @@ mod tests {
             &mut slots,
         );
         assert!(
-            (slots[0] - 0.25).abs() < 1e-3,
+            (slots[SINK] - 0.25).abs() < 1e-3,
             "expected a quarter cycle, got {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1396,7 +1674,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
 
         graph.connect(seed, 0, mixed, 0);
         graph.connect(read, 0, mixed, 1);
@@ -1414,16 +1692,24 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0) * 0.5
-        assert!((slots[0] - 0.5).abs() < 1e-9, "first pass: {}", slots[0]);
+        assert!(
+            (slots[SINK] - 0.5).abs() < 1e-9,
+            "first pass: {}",
+            slots[SINK]
+        );
 
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0.5) * 0.5 — the 0.5 came back round.
-        assert!((slots[0] - 0.75).abs() < 1e-9, "second pass: {}", slots[0]);
+        assert!(
+            (slots[SINK] - 0.75).abs() < 1e-9,
+            "second pass: {}",
+            slots[SINK]
+        );
     }
 
     /// §14.5. The line is state, like an LFO's phase, and an edit somewhere
@@ -1434,10 +1720,10 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[0] - 0.5).abs() < 1e-9);
+        assert!((slots[SINK] - 0.5).abs() < 1e-9);
 
         // An unrelated node appears, as it does on any edit.
         graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
@@ -1446,9 +1732,9 @@ mod tests {
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         assert!(
-            (slots[0] - 0.75).abs() < 1e-9,
+            (slots[SINK] - 0.75).abs() < 1e-9,
             "the line was emptied by the swap: {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1460,15 +1746,15 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         assert!(
-            (slots[0] - 0.75).abs() < 1e-9,
+            (slots[SINK] - 0.75).abs() < 1e-9,
             "a zero time should behave as one sub-block, not as zero: {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1480,12 +1766,12 @@ mod tests {
         let run = |frames: u32, passes: usize| {
             let mut engine = Engine::new();
             load(&mut engine, &graph);
-            let mut slots = vec![0.0; SLOTS];
+            let mut slots = lanes();
             for _ in 0..passes {
                 slots[1] = 1.0;
                 engine.run(&ctx(frames), &mut slots);
             }
-            slots[0]
+            slots[SINK]
         };
         // Same sub-block size, same answer, however the DAW hands us the block.
         assert!((run(32, 4) - run(32, 4)).abs() < 1e-12);
@@ -1504,7 +1790,7 @@ mod tests {
         fn process(
             &mut self,
             instance: u32,
-            _notes: NoteSource,
+            _notes: NoteStream,
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
@@ -1525,6 +1811,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     latency,
                     ..PluginPorts::default()
                 },
@@ -1718,17 +2005,17 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         for _ in 0..200 {
             engine.run(&ctx(32), &mut slots);
         }
-        let before = slots[0];
+        let before = slots[SINK];
         assert!(before > 0.05, "the LFO should have moved by now");
 
         // Something unrelated changes — a new node appears — and the graph is
@@ -1738,9 +2025,9 @@ mod tests {
         engine.run(&ctx(1), &mut slots);
 
         assert!(
-            (slots[0] - before).abs() < 0.01,
+            (slots[SINK] - before).abs() < 0.01,
             "the phase jumped across a recompile: {before} -> {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1753,13 +2040,13 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 7 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(expr, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         engine.note(&NoteEvent::Expression {
             note_id: 1,
             port: 0,
@@ -1770,7 +2057,350 @@ mod tests {
             sample_offset: 0,
         });
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[7] - 0.7).abs() < 1e-12);
+        assert!((slots[SINK] - 0.7).abs() < 1e-12);
+    }
+
+    /// A key switch watches one key, whatever has been played since — which
+    /// is exactly what `Expression`'s sources cannot answer.
+    #[test]
+    fn a_held_key_switch_follows_its_own_key() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                keys: vec![24],
+                mode: KeySwitchMode::Hold,
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let lane = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Plugin { notes, .. } => notes.gate,
+                _ => None,
+            })
+            .expect("the key switch booked a gate lane") as usize;
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut lanes = vec![0.0; width];
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "nothing is held yet");
+
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "the switch key is down");
+
+        // A different key coming and going must not move it.
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 2,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.note(&NoteEvent::NoteOff {
+            note_id: 2,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 0.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "another key came and went");
+
+        engine.note(&NoteEvent::NoteOff {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 0.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "let go");
+    }
+
+    /// A toggling switch moves on each strike and stays where it was put —
+    /// including across the recompile that every edit causes.
+    #[test]
+    fn a_toggling_key_switch_latches_and_survives_a_recompile() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                keys: vec![24, 25],
+                mode: KeySwitchMode::Toggle,
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 1, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let lane = compile(&graph, SLOTS)
+            .unwrap()
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Plugin { notes, .. } => notes.gate,
+                _ => None,
+            })
+            .expect("output b got a gate lane") as usize;
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut lanes = vec![0.0; width];
+        let strike = NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "b is shut until the switch is thrown");
+
+        engine.note(&strike);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "thrown");
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "and it stays thrown");
+
+        // An unrelated edit, and the recompile it causes.
+        graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
+        load(&mut engine, &graph);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "a recompile must not move the switch");
+
+        engine.note(&strike);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "thrown back");
+    }
+
+    /// One key stepping a parameter through its values, and staying where it
+    /// was put. With two values that is a plain toggle.
+    #[test]
+    fn a_key_parameter_toggles_between_two_values() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Toggle,
+                keys: vec![24, 25],
+                values: vec![0.2, 0.8],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        let strike = NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2, "untouched, it reads its first value");
+
+        engine.note(&strike);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.8, "one strike is one step, not one per run");
+
+        engine.note(&strike);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2, "and round again");
+    }
+
+    /// A bank of keys, one value each: the last one struck wins, which is what
+    /// a row of switches does.
+    #[test]
+    fn a_key_parameter_selects_by_the_last_key_struck() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25, 26],
+                values: vec![0.25, 0.5, 1.0],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        let strike = |key: i16| NoteEvent::NoteOn {
+            note_id: key as i32,
+            port: 0,
+            channel: 0,
+            key,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+
+        engine.note(&strike(25));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.5);
+
+        engine.note(&strike(26));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 1.0);
+
+        // A key the bank does not name changes nothing.
+        engine.note(&strike(60));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 1.0);
+    }
+
+    /// Nothing wired to the notes port means no keys are read at all. An
+    /// unwired node that quietly followed the keyboard anyway would be a node
+    /// whose links say nothing about what it does.
+    #[test]
+    fn a_key_parameter_with_no_notes_wired_stays_put() {
+        let mut graph = Graph::new();
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.25, 0.75],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 25,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+    }
+
+    /// A value socket wins over the number on its row, the same way `Math`'s
+    /// `b` gives way to its input — so a key switch can pick between two
+    /// signals, not only two numbers.
+    #[test]
+    fn a_key_parameter_value_can_be_a_signal() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.25, 0.75],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        // Socket 0 is the notes port, so value 2 is socket 2.
+        graph.connect(signal, 0, key, 2);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        slots[3] = 0.6;
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 25,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.6, "the wired socket wins over the number");
     }
 
     #[test]
@@ -1782,12 +2412,12 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(gate, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
 
         let on = |key: i16| NoteEvent::NoteOn {
             note_id: key as i32,
@@ -1807,21 +2437,21 @@ mod tests {
         };
 
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.0);
+        assert_eq!(slots[SINK], 0.0);
 
         engine.note(&on(60));
         engine.note(&on(64));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 1.0);
+        assert_eq!(slots[SINK], 1.0);
 
         // Releasing one of two held notes must not drop the gate.
         engine.note(&off(60));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 1.0);
+        assert_eq!(slots[SINK], 1.0);
 
         engine.note(&off(64));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.0);
+        assert_eq!(slots[SINK], 0.0);
     }
 
     #[test]
@@ -1835,16 +2465,16 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(a, 0, div, 0);
         graph.connect(div, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
-        let mut slots = vec![0.5; SLOTS];
+        let mut slots = vec![0.5; SLOTS + 1];
         engine.run(&ctx(32), &mut slots);
-        assert!(slots[0].is_finite());
-        assert!((0.0..=1.0).contains(&slots[0]));
+        assert!(slots[SINK].is_finite());
+        assert!((0.0..=1.0).contains(&slots[SINK]));
     }
 
     #[test]
@@ -2047,7 +2677,7 @@ mod tests {
             fn process(
                 &mut self,
                 _instance: u32,
-                _notes: NoteSource,
+                _notes: NoteStream,
                 _input: &[f32],
                 output: &mut [f32],
                 chunk: AudioChunk,
@@ -2254,6 +2884,63 @@ mod tests {
         );
     }
 
+    /// A gate is a `Mix` of one whose gain the parameter half switches, and
+    /// this is the whole round trip: the control lands in a lane, the lane
+    /// becomes a gain, the gain is unity or silence.
+    #[test]
+    fn a_gate_passes_or_silences_by_its_control() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::Gate(Gate {
+                channels: 2,
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[2]);
+        load(&mut engine, &graph);
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut render = |control: f64| -> Vec<f32> {
+            let mut lanes = vec![0.0; width];
+            lanes[0] = control;
+            engine.run(&ctx(8), &mut lanes);
+            let daw_in = vec![1.0f32; 2 * 8];
+            let mut daw_out = vec![0.0f32; 2 * 8];
+            engine.run_audio(
+                &AudioContext {
+                    frames: 8,
+                    quantum: 32,
+                    sample_rate: RATE,
+                    lanes: &lanes,
+                    lanes_per_row: width,
+                },
+                &daw_in,
+                &mut daw_out,
+                &mut Adders,
+            );
+            daw_out
+        };
+
+        assert!(
+            render(1.0).iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "an open gate is unity gain"
+        );
+        assert!(
+            render(0.0).iter().all(|&v| v.abs() < 1e-6),
+            "a shut gate is silence"
+        );
+    }
+
     /// When a gain socket is driven by a parameter source, the parameter value
     /// is interpreted as decibels and converted to a linear multiplier for audio.
     #[test]
@@ -2406,7 +3093,7 @@ mod tests {
 
         // An edit somewhere else entirely, between the write and the read.
         let constant = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
+        let slot = param_sink(&mut graph);
         graph.connect(constant, 0, slot, 0);
         load(&mut engine, &graph);
 

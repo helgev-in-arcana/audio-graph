@@ -50,6 +50,7 @@ Program {
         },
     ],
     param_targets: [],
+    audio_lane_base: 96,
     instances: [],
     buffers: [
         2,
@@ -57,5 +58,6 @@ Program {
     ],
     chunking: SubBlock,
     latency: 0,
+    latch_nodes: [],
     lfo_nodes: [],
 }

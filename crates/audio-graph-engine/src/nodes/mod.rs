@@ -18,25 +18,35 @@ mod audio_io;
 mod constant;
 mod delay;
 mod expression;
+mod gate;
+mod key_param;
+mod key_switch;
 mod lfo;
 mod math;
 mod mix;
+mod note_gate;
 mod note_in;
 mod plugin;
 mod range_map;
 mod slot;
+mod switch;
 
 pub use audio_io::{AudioIn, AudioOut};
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
+pub use gate::Gate;
+pub use key_param::{KeyParam, KeyParamMode};
+pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
+pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
-pub use slot::{SlotIn, SlotOut};
+pub use slot::SlotIn;
+pub use switch::Switch;
 
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +104,30 @@ pub(crate) trait Node {
         None
     }
 
+    /// Which of this node's inputs the notes leaving output `port` came in
+    /// through, for a node that passes notes on rather than making them.
+    ///
+    /// This is what lets a note stream be routed through several nodes and
+    /// still be found: the compiler walks up the chain socket by socket until
+    /// something answers [`Node::note_identity`]. A node that answers neither
+    /// is the end of the walk, and a plugin behind it hears nothing.
+    fn note_passthrough(&self, port: u8) -> Option<u8> {
+        let _ = port;
+        None
+    }
+
+    /// Which MIDI keys this node takes *out* of the stream leaving output
+    /// `port` — bit `k` set means key `k` does not go on.
+    ///
+    /// A key switch's own keys are the case: they are played to steer, not to
+    /// sound, and by default the thing being steered should never hear them.
+    /// The mask is collected while the compiler walks the chain, so several
+    /// switches in series each swallow their own.
+    fn note_mute(&self, port: u8) -> u128 {
+        let _ = port;
+        0
+    }
+
     /// Draw this node's own controls, inside the frame the canvas laid out.
     /// Returns whether anything changed.
     ///
@@ -149,8 +183,51 @@ pub(crate) trait Node {
         false
     }
 
+    /// The control that stands in for output socket `port`, drawn on that
+    /// socket's own row and right up against the socket.
+    ///
+    /// The mirror of [`Node::input_control`], and there for the same reason: a
+    /// key switch's key belongs to the output it steers, and a node-wide list
+    /// of keys somewhere else is a thing to match up by counting.
+    #[cfg(feature = "ui")]
+    fn output_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        let _ = (ui, port, cx);
+        false
+    }
+
+    /// The output side's [`Node::add_input_label`], and drawn the same way —
+    /// as a "+", though against the edge the output sockets are on.
+    #[cfg(feature = "ui")]
+    fn add_output_label(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Give this node another output. Only called when
+    /// [`Node::add_output_label`] offered one.
+    #[cfg(feature = "ui")]
+    fn add_output(&mut self) {}
+
+    /// Take away output `port`, and say how many sockets went with it.
+    #[cfg(feature = "ui")]
+    fn remove_output(&mut self, port: u8) -> u8 {
+        let _ = port;
+        0
+    }
+
     /// The label for the button that gives this node another input, or `None`
     /// where the sockets are fixed. Drawn on the node's last row.
+    /// What the button that grows this node's inputs should say it adds, or
+    /// `None` for a node whose inputs are fixed — or already at its ceiling.
+    ///
+    /// The button itself is drawn as "+", because it sits under the row it
+    /// makes more of and the word was the wider half of it. This is the
+    /// tooltip, so it reads as a thing rather than as a label: "another
+    /// input", not "+ input".
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         None
@@ -190,7 +267,7 @@ pub enum NodeKind {
     Expression(Expression),
     Math(Math),
     RangeMap(RangeMap),
-    SlotOut(SlotOut),
+    Switch(Switch),
 
     // --- M8 (§14) ---
     AudioIn(AudioIn),
@@ -200,11 +277,15 @@ pub enum NodeKind {
     Plugin(Plugin),
     DelayWrite(DelayWrite),
     Mix(Mix),
+    Gate(Gate),
+    NoteGate(NoteGate),
+    KeySwitch(KeySwitch),
+    KeyParam(KeyParam),
     DelayRead(DelayRead),
 }
 /// Run `$body` against whichever node the kind is carrying.
 ///
-/// The one place the fourteen variants are listed. Every delegating method
+/// The one place the eighteen variants are listed. Every delegating method
 /// below is one line through here, so adding a node means adding an arm here
 /// and nothing else in this file — and the exhaustiveness check still makes
 /// forgetting it a compile error rather than a silent no-op.
@@ -220,7 +301,7 @@ macro_rules! for_kind {
             NodeKind::Expression($node) => $body,
             NodeKind::Math($node) => $body,
             NodeKind::RangeMap($node) => $body,
-            NodeKind::SlotOut($node) => $body,
+            NodeKind::Switch($node) => $body,
             NodeKind::AudioIn($node) => $body,
             NodeKind::AudioOut($node) => $body,
             NodeKind::NoteIn => {
@@ -230,6 +311,10 @@ macro_rules! for_kind {
             NodeKind::Plugin($node) => $body,
             NodeKind::DelayWrite($node) => $body,
             NodeKind::Mix($node) => $body,
+            NodeKind::Gate($node) => $body,
+            NodeKind::NoteGate($node) => $body,
+            NodeKind::KeySwitch($node) => $body,
+            NodeKind::KeyParam($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -263,6 +348,17 @@ impl NodeKind {
     /// is a source of notes at all (§14.10).
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         for_kind!(self, node => node.note_identity())
+    }
+
+    /// Where the notes leaving output `port` came in — see
+    /// [`Node::note_passthrough`].
+    pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
+        for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// The keys this node swallows on output `port` — see [`Node::note_mute`].
+    pub(crate) fn note_mute(&self, port: u8) -> u128 {
+        for_kind!(self, node => node.note_mute(port))
     }
 
     /// Emit this node's parameter-half instructions (§9.2).
@@ -311,14 +407,43 @@ impl NodeKind {
         for_kind!(self, node => node.input_control(ui, port, connected, cx))
     }
 
+    /// The control on one output socket's row — see [`Node::output_control`].
+    #[cfg(feature = "ui")]
+    pub fn output_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        for_kind!(self, node => node.output_control(ui, port, cx))
+    }
+
+    /// The label of this node's "another output" button, if it has one.
+    #[cfg(feature = "ui")]
+    pub fn add_output_label(&self) -> Option<&'static str> {
+        for_kind!(self, node => node.add_output_label())
+    }
+
+    /// Give this node another output.
+    #[cfg(feature = "ui")]
+    pub fn add_output(&mut self) {
+        for_kind!(self, node => node.add_output())
+    }
+
+    /// Take away output `port`, returning how many sockets went.
+    #[cfg(feature = "ui")]
+    pub fn remove_output(&mut self, port: u8) -> u8 {
+        for_kind!(self, node => node.remove_output(port))
+    }
+
     /// The label of this node's "another input" button, if it has one.
     #[cfg(feature = "ui")]
     pub fn add_input_label(&self) -> Option<&'static str> {
-        match self {
-            NodeKind::Mix(node) => node.add_input_label(),
-            NodeKind::Plugin(node) => node.add_input_label(),
-            _ => None,
-        }
+        // Delegated like everything else rather than listed here. The list was
+        // two arms and a `_ => None`, which is a place to forget a node — and
+        // the fourth node to grow inputs was duly forgotten until its button
+        // did not appear.
+        for_kind!(self, node => node.add_input_label())
     }
 
     /// Give this node another input group.
@@ -334,6 +459,41 @@ impl NodeKind {
     }
 }
 
+/// Which half of the graph a node belongs to, for the "add a node" menu.
+///
+/// The menu had grown to a wall of buttons in which "Param Map" sat beside
+/// "MIDI In", and the only way to find anything was to read all of it. These
+/// three are the three kinds of wire the editor has, so they are the three
+/// piles a reader is already sorting the nodes into.
+///
+/// A node is filed by what it is *for*, not by every socket it owns: a gate
+/// takes a parameter to decide with, but it is an audio node because audio is
+/// what comes out the other side.
+#[cfg(feature = "ui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeGroup {
+    /// Sound in, sound out.
+    Audio,
+    /// Notes in, notes out.
+    Note,
+    /// Numbers: what drives the slots and the sub-plugins' parameters.
+    Param,
+}
+
+#[cfg(feature = "ui")]
+impl NodeGroup {
+    /// The three, in the order the menu lists them.
+    pub const ALL: [NodeGroup; 3] = [NodeGroup::Audio, NodeGroup::Note, NodeGroup::Param];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeGroup::Audio => "Audio",
+            NodeGroup::Note => "MIDI",
+            NodeGroup::Param => "Parameter",
+        }
+    }
+}
+
 /// What the editor's "add a node" menu offers, in the order it offers it.
 ///
 /// A free function rather than a method: `catalogue_defaults` returns `Self`,
@@ -341,44 +501,132 @@ impl NodeKind {
 /// anyway — both halves of a delay arrive together through `Graph::add_delay`
 /// and so are offered here not at all.
 #[cfg(feature = "ui")]
-pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
+pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
     let mut out = Vec::new();
     fn take<T>(
-        out: &mut Vec<(&'static str, NodeKind)>,
+        out: &mut Vec<(NodeGroup, &'static str, NodeKind)>,
+        group: NodeGroup,
         entries: Vec<(&'static str, T)>,
         wrap: fn(T) -> NodeKind,
     ) {
-        out.extend(entries.into_iter().map(|(name, node)| (name, wrap(node))));
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(name, node)| (group, name, wrap(node))),
+        );
     }
-    take(&mut out, Constant::catalogue_defaults(), NodeKind::Constant);
-    take(&mut out, SlotIn::catalogue_defaults(), NodeKind::SlotIn);
-    take(&mut out, Lfo::catalogue_defaults(), NodeKind::Lfo);
+
+    // Audio.
     take(
         &mut out,
-        Expression::catalogue_defaults(),
-        NodeKind::Expression,
+        NodeGroup::Audio,
+        AudioIn::catalogue_defaults(),
+        NodeKind::AudioIn,
     );
-    take(&mut out, Math::catalogue_defaults(), NodeKind::Math);
-    take(&mut out, RangeMap::catalogue_defaults(), NodeKind::RangeMap);
-    take(&mut out, SlotOut::catalogue_defaults(), NodeKind::SlotOut);
-    take(&mut out, AudioIn::catalogue_defaults(), NodeKind::AudioIn);
-    take(&mut out, AudioOut::catalogue_defaults(), NodeKind::AudioOut);
-    out.extend(
-        NoteIn::catalogue_defaults()
-            .into_iter()
-            .map(|(name, _)| (name, NodeKind::NoteIn)),
-    );
-    take(&mut out, Plugin::catalogue_defaults(), NodeKind::Plugin);
     take(
         &mut out,
+        NodeGroup::Audio,
+        AudioOut::catalogue_defaults(),
+        NodeKind::AudioOut,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Mix::catalogue_defaults(),
+        NodeKind::Mix,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Gate::catalogue_defaults(),
+        NodeKind::Gate,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Plugin::catalogue_defaults(),
+        NodeKind::Plugin,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
         DelayWrite::catalogue_defaults(),
         NodeKind::DelayWrite,
     );
-    take(&mut out, Mix::catalogue_defaults(), NodeKind::Mix);
     take(
         &mut out,
+        NodeGroup::Audio,
         DelayRead::catalogue_defaults(),
         NodeKind::DelayRead,
+    );
+
+    // MIDI.
+    out.extend(
+        NoteIn::catalogue_defaults()
+            .into_iter()
+            .map(|(name, _)| (NodeGroup::Note, name, NodeKind::NoteIn)),
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteGate::catalogue_defaults(),
+        NodeKind::NoteGate,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        KeySwitch::catalogue_defaults(),
+        NodeKind::KeySwitch,
+    );
+
+    // Parameter.
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Constant::catalogue_defaults(),
+        NodeKind::Constant,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        SlotIn::catalogue_defaults(),
+        NodeKind::SlotIn,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Lfo::catalogue_defaults(),
+        NodeKind::Lfo,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Expression::catalogue_defaults(),
+        NodeKind::Expression,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Math::catalogue_defaults(),
+        NodeKind::Math,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        RangeMap::catalogue_defaults(),
+        NodeKind::RangeMap,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Switch::catalogue_defaults(),
+        NodeKind::Switch,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        KeyParam::catalogue_defaults(),
+        NodeKind::KeyParam,
     );
     out
 }

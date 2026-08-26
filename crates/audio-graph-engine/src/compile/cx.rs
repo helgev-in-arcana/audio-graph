@@ -18,8 +18,53 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, NoteSource, Op, ParamTarget, Reg,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, NoteSource, Op, ParamTarget,
+    Reg,
 };
+
+/// Where a note gate's lane is filed, so it cannot collide with the lane of an
+/// input socket of the same number.
+///
+/// A lane is keyed by `(node, socket)` and every other user of one means an
+/// *input* socket by it. A gate belongs to an output, and a node has both.
+/// Adding this rather than widening the key keeps every existing lookup as it
+/// was.
+const OUTPUT_SOCKET: u8 = 128;
+
+/// Walk up a note chain from `(node, port)` to whatever makes the notes.
+///
+/// Returns the source, and the gate socket nearest the reader — nearest
+/// because each gate already folds the ones above it into its own condition,
+/// so the closest one is the whole answer.
+fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>, u128) {
+    let mut at = graph.source_of(node, port);
+    let mut gate = None;
+    // Every node on the way may take keys out; they are unioned because a
+    // stream that passed two key switches has lost both sets of keys.
+    let mut mute = 0u128;
+    // Bounded by the node count: every step moves to a node upstream of the
+    // last, and `check_links` has already refused a cycle.
+    for _ in 0..=graph.nodes.len() {
+        let Some((from, from_port)) = at else {
+            return (NoteSource::None, gate, mute);
+        };
+        let Some(node) = graph.node(from) else {
+            return (NoteSource::None, gate, mute);
+        };
+        if let Some(source) = node.kind.note_identity() {
+            return (source, gate, mute);
+        }
+        let Some(input) = node.kind.note_passthrough(from_port) else {
+            // Something with a notes output that neither makes notes nor
+            // passes them on. Nothing to route.
+            return (NoteSource::None, gate, mute);
+        };
+        mute |= node.kind.note_mute(from_port);
+        gate = gate.or(Some((from, from_port)));
+        at = graph.source_of(from, input);
+    }
+    (NoteSource::None, gate, mute)
+}
 use crate::nodes::NodeKind;
 use crate::port::PortType;
 
@@ -36,8 +81,13 @@ pub(crate) struct ParamCx<'a> {
     deferred: Vec<Op>,
     outputs: Vec<(u16, Reg)>,
     lfo_nodes: Vec<NodeId>,
+    latch_nodes: Vec<NodeId>,
     param_targets: Vec<ParamTarget>,
     audio_lanes: Vec<((NodeId, u8), u16)>,
+    /// Output socket → the register saying whether notes leaving it pass.
+    /// Read by the gate downstream of it, never by the audio half, which reads
+    /// the lane instead.
+    note_gates: Vec<((NodeId, u8), Reg)>,
 }
 
 /// What the parameter half produced.
@@ -46,6 +96,7 @@ pub(crate) struct ParamHalf {
     pub registers: usize,
     pub outputs: Vec<(u16, Reg)>,
     pub lfo_nodes: Vec<NodeId>,
+    pub latch_nodes: Vec<NodeId>,
     pub param_targets: Vec<ParamTarget>,
     pub audio_lanes: Vec<((NodeId, u8), u16)>,
 }
@@ -63,8 +114,10 @@ impl<'a> ParamCx<'a> {
             deferred: Vec::new(),
             outputs: Vec::new(),
             lfo_nodes: Vec::new(),
+            latch_nodes: Vec::new(),
             param_targets: Vec::new(),
             audio_lanes: Vec::new(),
+            note_gates: Vec::new(),
         }
     }
 
@@ -81,6 +134,7 @@ impl<'a> ParamCx<'a> {
             registers: self.next_reg,
             outputs: self.outputs,
             lfo_nodes: self.lfo_nodes,
+            latch_nodes: self.latch_nodes,
             param_targets: self.param_targets,
             audio_lanes: self.audio_lanes,
         }
@@ -113,8 +167,17 @@ impl<'a> ParamCx<'a> {
         }
     }
 
+    /// Whether anything is wired to input `port`.
+    ///
+    /// For the sockets that carry no register — a notes port — where
+    /// [`ParamCx::input`] cannot tell "nothing wired" from "wired to
+    /// something that binds no register".
+    pub(crate) fn has_input(&self, port: u8) -> bool {
+        self.graph.source_of(self.id, port).is_some()
+    }
+
     /// A register holding zero, for an input nobody has connected yet.
-    fn zero(&mut self) -> Result<Reg, CompileError> {
+    pub(crate) fn zero(&mut self) -> Result<Reg, CompileError> {
         // Reuse one if this graph already needed it. Constants are free to run
         // but not free to hold, and a wide graph can want a lot of them.
         if let Some(&Op::Const { out, .. }) = self
@@ -186,6 +249,20 @@ impl<'a> ParamCx<'a> {
         Ok(state)
     }
 
+    /// Book this node a latch, which is what survives a program swap — see
+    /// [`Op::KeyToggle`][crate::Op::KeyToggle].
+    pub(crate) fn latch(&mut self) -> Result<u16, CompileError> {
+        if self.latch_nodes.len() >= MAX_LATCHES {
+            return Err(CompileError::TooLarge {
+                what: "key switches",
+                limit: MAX_LATCHES,
+            });
+        }
+        let state = self.latch_nodes.len() as u16;
+        self.latch_nodes.push(self.id);
+        Ok(state)
+    }
+
     /// Where `line` ended up in the program's numbering.
     pub(crate) fn line_index(&self, line: LineId) -> u16 {
         self.lines
@@ -202,22 +279,6 @@ impl<'a> ParamCx<'a> {
             });
         }
         Ok(())
-    }
-
-    /// Refuse a second output on one slot.
-    ///
-    /// Silently letting one win would make the graph's behaviour depend on
-    /// node creation order.
-    pub(crate) fn claim_slot(&self, slot: usize) -> Result<(), CompileError> {
-        if self.outputs.iter().any(|&(s, _)| s as usize == slot) {
-            return Err(CompileError::DuplicateOutput { slot });
-        }
-        Ok(())
-    }
-
-    /// Drive a wrapper slot from `reg`, replacing the DAW's automation for it.
-    pub(crate) fn drive_slot(&mut self, slot: usize, reg: Reg) {
-        self.outputs.push((slot as u16, reg));
     }
 
     /// Drive one of a sub-plugin's own parameters from `reg` (§14.12).
@@ -249,6 +310,32 @@ impl<'a> ParamCx<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The gate condition on the note chain feeding this node's input `port`,
+    /// if there is one upstream.
+    ///
+    /// A gate node asks for this so it can fold the gates above it into its
+    /// own condition: two gates in series pass notes only when both are open,
+    /// and one register saying so is cheaper than the audio half carrying a
+    /// list.
+    pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
+        let (_, socket, _) = trace_notes(self.graph, self.id, port);
+        let socket = socket?;
+        self.note_gates
+            .iter()
+            .find(|&&(key, _)| key == socket)
+            .map(|&(_, reg)| reg)
+    }
+
+    /// Say that the notes leaving this node's output `port` pass only while
+    /// `reg` is 1.
+    ///
+    /// Booked as an audio lane, because the audio half is where the decision
+    /// is applied and the two halves run at different rates (§14.5).
+    pub(crate) fn bind_note_gate(&mut self, port: u8, reg: Reg) -> Result<(), CompileError> {
+        self.note_gates.push(((self.id, port), reg));
+        self.drive_audio(OUTPUT_SOCKET + port, reg)
     }
 
     /// Carry the value in `reg` across to the audio half, as this node's
@@ -541,19 +628,23 @@ impl<'a> AudioCx<'a> {
             .map(|&(_, lane)| lane)
     }
 
-    /// Which note stream this node is wired to (§14.10).
+    /// How notes reach this node's input `port` (§14.10).
     ///
     /// `None` when nothing is connected, which is the answer that makes an
     /// unwired instrument silent rather than making it play whatever the DAW
     /// happened to send. Only `NoteIn` produces notes today; a plugin's own
     /// note output would need the engine to carry event buffers, and that is
-    /// M9.
-    pub(crate) fn note_source(&self, port: u8) -> NoteSource {
-        self.graph
-            .source_of(self.id, port)
-            .and_then(|(from, _)| self.graph.node(from))
-            .and_then(|node| node.kind.note_identity())
-            .unwrap_or(NoteSource::None)
+    /// M9. What sits between the source and here — gates — comes back as a
+    /// lane number for the audio half to read each chunk.
+    pub(crate) fn note_route(&self, port: u8) -> NoteRoute {
+        let (source, socket, mute) = trace_notes(self.graph, self.id, port);
+        let gate = socket.and_then(|(node, out_port)| {
+            self.lanes
+                .iter()
+                .find(|&&(key, _)| key == (node, OUTPUT_SOCKET + out_port))
+                .map(|&(_, lane)| lane)
+        });
+        NoteRoute { source, gate, mute }
     }
 
     // --- buffers ----------------------------------------------------------

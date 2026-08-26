@@ -34,7 +34,7 @@ fn bus_port(name: &'static str, bus: usize, channels: u16) -> Port {
 
 impl Node for AudioIn {
     fn title(&self) -> String {
-        format!("Audio in {}", self.bus + 1)
+        format!("Audio In {}", self.bus + 1)
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -65,7 +65,7 @@ impl Node for AudioIn {
 impl AudioIn {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, AudioIn)> {
         vec![(
-            "Audio in",
+            "Audio In",
             AudioIn {
                 bus: 0,
                 channels: 2,
@@ -97,7 +97,7 @@ fn bus_control(ui: &mut egui::Ui, bus: &mut usize) -> bool {
 
 impl Node for AudioOut {
     fn title(&self) -> String {
-        format!("Audio out {}", self.bus + 1)
+        format!("Audio Out {}", self.bus + 1)
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -130,7 +130,7 @@ impl Node for AudioOut {
 impl AudioOut {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, AudioOut)> {
         vec![(
-            "Audio out",
+            "Audio Out",
             AudioOut {
                 bus: 0,
                 channels: 2,

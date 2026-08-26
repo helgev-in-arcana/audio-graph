@@ -140,6 +140,26 @@ pub enum NoteEvent {
 }
 
 impl NoteEvent {
+    /// The MIDI key this event is about, if it is about one.
+    ///
+    /// `None` for anything that is not per-key — a raw MIDI control change,
+    /// say — because a filter that guesses a key for those would drop them
+    /// with the notes they happen to sit next to.
+    pub fn key(&self) -> Option<i16> {
+        match *self {
+            NoteEvent::NoteOn { key, .. }
+            | NoteEvent::NoteOff { key, .. }
+            | NoteEvent::NoteEnd { key, .. }
+            | NoteEvent::Expression { key, .. } => Some(key),
+            // Note-on, note-off and polyphonic aftertouch put the key in the
+            // first data byte; nothing else in a 3-byte message is a key.
+            NoteEvent::Midi { data, .. } => match data[0] & 0xf0 {
+                0x80 | 0x90 | 0xa0 => Some(i16::from(data[1])),
+                _ => None,
+            },
+        }
+    }
+
     pub fn sample_offset(&self) -> u32 {
         match *self {
             NoteEvent::NoteOn { sample_offset, .. }

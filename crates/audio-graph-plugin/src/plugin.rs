@@ -755,9 +755,32 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
 mod tests {
     use super::*;
     use audio_graph_engine::{
-        Graph, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform, compile,
+        Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,
     };
     use subhost_adapter::LANES;
+
+    /// Somewhere for a parameter chain to go.
+    ///
+    /// `SlotOut` used to be it; a §14.12 parameter socket is, now. Its lane is
+    /// the first one past the slot table, which is what `SINK_LANE` is.
+    fn param_sink(graph: &mut Graph) -> audio_graph_engine::NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    params: vec![ParamPort {
+                        id: 0,
+                        name: "p".into(),
+                    }],
+                    ..PluginPorts::default()
+                },
+            }),
+            [200.0, 0.0],
+        )
+    }
+
+    /// The lane `param_sink`'s parameter is driven through.
+    const SINK_LANE: usize = SLOT_COUNT;
 
     /// A schedule carries more than the DAW's slots (§14.12), and `run_graph`
     /// fills the difference itself.
@@ -794,7 +817,7 @@ mod tests {
             );
         }
 
-        // With one: same width, and the driven slot has moved.
+        // With one: same width, and the graph's own lane now carries a value.
         let mut graph = Graph::new();
         let lfo = graph.add(
             NodeKind::Lfo(Lfo {
@@ -813,7 +836,7 @@ mod tests {
             }),
             [100.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 7 }), [200.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, scale, 0);
         graph.connect(scale, 0, out, 0);
 
@@ -836,8 +859,8 @@ mod tests {
             assert_eq!(block.len(), LANES);
             assert_eq!(block[0], 0.42, "an undriven slot stays the DAW's");
             assert!(
-                block[SLOT_COUNT..].iter().all(|&v| v == 0.0),
-                "no parameter socket is wired, so no lane is driven"
+                block[SINK_LANE] != 0.0 || index == 0,
+                "the graph's own lane carries what it drives"
             );
         }
     }

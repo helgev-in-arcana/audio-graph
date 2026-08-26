@@ -256,6 +256,25 @@ impl Graph {
         }
     }
 
+    /// The mirror of [`Graph::drop_inputs`], for a node that lost an output.
+    ///
+    /// Same rule from the other end: the links leaving the sockets that went
+    /// are cut, and every later socket's links slide down so they still mean
+    /// the socket they meant before.
+    pub fn drop_outputs(&mut self, node: NodeId, first: u8, count: u8) {
+        if count == 0 {
+            return;
+        }
+        let end = first.saturating_add(count);
+        self.links
+            .retain(|l| !(l.from == node && (first..end).contains(&l.from_port)));
+        for link in &mut self.links {
+            if link.from == node && link.from_port >= end {
+                link.from_port -= count;
+            }
+        }
+    }
+
     /// What feeds one of a node's inputs: the source node and its output port.
     pub fn source_of(&self, to: NodeId, to_port: u8) -> Option<(NodeId, u8)> {
         self.links
@@ -272,6 +291,7 @@ impl Graph {
     /// (§14.2). A patch that loses a few wires is better than one that refuses
     /// to make a sound until every wire is right.
     pub fn prune(&mut self) {
+        self.migrate_plugin_outputs();
         let ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
         let mut keep = Vec::with_capacity(self.links.len());
         for link in &self.links {
@@ -289,15 +309,69 @@ impl Graph {
             .next_id
             .max(ids.iter().copied().max().map_or(0, |m| m + 1));
     }
+
+    /// Give a plugin node saved before `audio_out_shown` existed the sockets
+    /// it was actually using.
+    ///
+    /// Every output bus had a socket then, which is what an empty
+    /// `audio_out_shown` still means — the alternative, reading it as "none",
+    /// would cut every link on the way in. But honouring it literally reopens
+    /// Kontakt as a node with sixty-four output sockets, which is the wall
+    /// this field exists to take down. So the patch keeps the buses it wired,
+    /// plus the main one, and loses the rest.
+    ///
+    /// The link indices move with them: the socket for bus 5 is port 1 once
+    /// buses 1 to 4 have no socket, and a link still pointing at port 5 would
+    /// be pruned two lines later.
+    pub fn migrate_plugin_outputs(&mut self) {
+        for node in &mut self.nodes {
+            let NodeKind::Plugin(plugin) = &mut node.kind else {
+                continue;
+            };
+            if !plugin.ports.audio_out_shown.is_empty() || plugin.ports.audio_out.is_empty() {
+                continue;
+            }
+            let mut keep: Vec<u16> = vec![0];
+            for link in &self.links {
+                if link.from == node.id && !keep.contains(&u16::from(link.from_port)) {
+                    keep.push(u16::from(link.from_port));
+                }
+            }
+            keep.retain(|&bus| usize::from(bus) < plugin.ports.audio_out.len());
+            keep.sort_unstable();
+            for link in &mut self.links {
+                if link.from != node.id {
+                    continue;
+                }
+                if let Some(port) = keep
+                    .iter()
+                    .position(|&bus| bus == u16::from(link.from_port))
+                {
+                    link.from_port = port as u8;
+                }
+            }
+            plugin.ports.audio_out_shown = keep;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::{MathOp, Waveform};
-    use crate::nodes::{
-        Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotOut,
-    };
+    use crate::nodes::{Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate};
+
+    /// A node with one parameter socket, for the tests that only need
+    /// something to wire *into*.
+    fn param_input(graph: &mut Graph) -> NodeId {
+        graph.add(
+            NodeKind::Math(Math {
+                op: MathOp::Add,
+                b: 0.0,
+            }),
+            [0.0, 0.0],
+        )
+    }
     // `remove_input` is the editor's half of the node set, so the two tests
     // that exercise it are compiled with it.
     #[cfg(feature = "ui")]
@@ -308,7 +382,7 @@ mod tests {
         let mut graph = Graph::new();
         let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         let b = graph.add(NodeKind::Constant(Constant { value: 2.0 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_input(&mut graph);
 
         graph.connect(a, 0, out, 0);
         graph.connect(b, 0, out, 0);
@@ -321,7 +395,7 @@ mod tests {
     fn removing_a_node_takes_its_links_with_it() {
         let mut graph = Graph::new();
         let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
+        let out = param_input(&mut graph);
         graph.connect(a, 0, out, 0);
 
         graph.remove(a);
@@ -336,6 +410,52 @@ mod tests {
         graph.remove(a);
         let b = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         assert_ne!(a, b);
+    }
+
+    /// A patch saved before `audio_out_shown` existed keeps the buses it
+    /// wired and loses the rest — which is the difference between reopening
+    /// Kontakt as a node and reopening it as a column of sixty-four sockets.
+    #[test]
+    fn an_old_patch_keeps_only_the_output_buses_it_wired() {
+        let mut graph = Graph::new();
+        let plugin = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2; 8],
+                    // No picks: the file predates the field.
+                    audio_out_shown: Vec::new(),
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let sink = graph.add(
+            NodeKind::Mix(crate::nodes::Mix {
+                channels: 2,
+                inputs: 2,
+                gains: vec![0.0, 0.0],
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(plugin, 5, sink, 0);
+
+        graph.prune();
+
+        let NodeKind::Plugin(node) = &graph.node(plugin).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            node.ports.audio_out_shown,
+            vec![0, 5],
+            "the main bus and the one that was wired"
+        );
+        let link = graph.links.iter().find(|l| l.from == plugin).unwrap();
+        assert_eq!(
+            link.from_port, 1,
+            "bus 5 is the second socket now, and the link says so"
+        );
     }
 
     #[test]
@@ -374,7 +494,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let slot = param_input(&mut graph);
         let speaker = graph.add(
             NodeKind::AudioOut(AudioOut {
                 bus: 0,
@@ -429,7 +549,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let slot = param_input(&mut graph);
         graph.connect(audio, 0, slot, 0);
         assert!(graph.links.is_empty());
     }
@@ -461,6 +581,7 @@ mod tests {
         let ports = PluginPorts {
             audio_in: vec![2, 2],
             audio_out: vec![2],
+            audio_out_shown: Vec::new(),
             accepts_notes: true,
             params: vec![ParamPort {
                 id: 7,
@@ -496,6 +617,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2, 2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     ..PluginPorts::default()
                 },
             }),
@@ -511,6 +633,7 @@ mod tests {
             ports: PluginPorts {
                 audio_in: vec![2],
                 audio_out: vec![2],
+                audio_out_shown: Vec::new(),
                 ..PluginPorts::default()
             },
         });
@@ -592,6 +715,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     params: vec![
                         ParamPort {
                             id: 1,
@@ -637,7 +761,7 @@ mod tests {
         let json = r#"{
             "nodes": [
                 {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},
-                {"id": 1, "pos": [10.0, 0.0], "kind": {"SlotOut": {"slot": 2}}}
+                {"id": 1, "pos": [10.0, 0.0], "kind": {"Math": {"op": "Add", "b": 0.0}}}
             ],
             "links": [{"from": 0, "to": 1, "input": 0}],
             "next_id": 2
@@ -659,7 +783,7 @@ mod tests {
             }),
             [12.0, 34.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 5 }), [200.0, 34.0]);
+        let out = param_input(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let json = serde_json::to_string(&graph).unwrap();
