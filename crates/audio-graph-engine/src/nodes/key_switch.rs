@@ -190,9 +190,14 @@ impl Node for KeySwitch {
             &KeySwitchMode::ALL,
             KeySwitchMode::label,
         );
+        // "let ... through" rather than "pass ... on" because it is the verb
+        // the gates already use for the same thing, and because "pass keys on"
+        // can be read as a state rather than as an action.
         changed |= ui
-            .checkbox(&mut self.pass_keys, "pass keys on")
-            .on_hover_text("Send the switch keys downstream as well as steering with them")
+            .checkbox(&mut self.pass_keys, "let switch keys through")
+            .on_hover_text(
+                "The switch keys steer either way. Off, they stop here; on, they also go                  on downstream and sound.",
+            )
             .changed();
         changed
     }
