@@ -614,9 +614,17 @@ impl GraphEditor {
             // and the word was the wider half of a button nobody needs to read
             // twice. The name it would have carried is the tooltip.
             if let Some(label) = add_output_label {
+                // Inside a `horizontal`, not a bare `with_layout`. The node's
+                // ui is given four thousand pixels of height to lay out in, and
+                // a right-to-left layout asked to centre in that takes all of
+                // it: the node grew a blank column taller than the canvas.
+                // `horizontal` is what shrinks the row back to its content.
                 let clicked = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.small_button("+").on_hover_text(label).clicked()
+                    .horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.small_button("+").on_hover_text(label).clicked()
+                        })
+                        .inner
                     })
                     .inner;
                 if clicked {
