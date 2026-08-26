@@ -224,7 +224,7 @@ impl Node for KeyParam {
 
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
-        (self.keys.len() < MAX_VALUES).then_some("+ value")
+        (self.keys.len() < MAX_VALUES).then_some("another value")
     }
 
     #[cfg(feature = "ui")]

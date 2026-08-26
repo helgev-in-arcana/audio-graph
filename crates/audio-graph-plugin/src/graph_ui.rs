@@ -607,12 +607,22 @@ impl GraphEditor {
             }
 
             // The button that makes more of them, under the sockets it adds
-            // to — the same place the inputs' one sits.
-            if let Some(label) = add_output_label
-                && ui.small_button(label).clicked()
-            {
-                graph.nodes[index].kind.add_output();
-                outcome.changed = true;
+            // to, and against the same edge: an output row runs to the right,
+            // so the button that grows the list does too.
+            //
+            // "+" rather than "+ out": what it adds is the row it sits under,
+            // and the word was the wider half of a button nobody needs to read
+            // twice. The name it would have carried is the tooltip.
+            if let Some(label) = add_output_label {
+                let clicked = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small_button("+").on_hover_text(label).clicked()
+                    })
+                    .inner;
+                if clicked {
+                    graph.nodes[index].kind.add_output();
+                    outcome.changed = true;
+                }
             }
 
             let add_label = graph.nodes[index].kind.add_input_label();
@@ -667,9 +677,10 @@ impl GraphEditor {
                 input_rows.push(row.center().y);
             }
 
-            // The last row, under the sockets it makes more of.
+            // The last row, under the sockets it makes more of, and left
+            // against the edge its sockets are on.
             if let Some(label) = add_label
-                && ui.small_button(label).clicked()
+                && ui.small_button("+").on_hover_text(label).clicked()
             {
                 graph.nodes[index].kind.add_input();
                 outcome.changed = true;

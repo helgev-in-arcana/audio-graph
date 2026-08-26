@@ -200,8 +200,8 @@ pub(crate) trait Node {
         false
     }
 
-    /// The label for the button that gives this node another *output*, or
-    /// `None` where they are fixed. Drawn under the outputs it makes more of.
+    /// The output side's [`Node::add_input_label`], and drawn the same way —
+    /// as a "+", though against the edge the output sockets are on.
     #[cfg(feature = "ui")]
     fn add_output_label(&self) -> Option<&'static str> {
         None
@@ -221,6 +221,13 @@ pub(crate) trait Node {
 
     /// The label for the button that gives this node another input, or `None`
     /// where the sockets are fixed. Drawn on the node's last row.
+    /// What the button that grows this node's inputs should say it adds, or
+    /// `None` for a node whose inputs are fixed — or already at its ceiling.
+    ///
+    /// The button itself is drawn as "+", because it sits under the row it
+    /// makes more of and the word was the wider half of it. This is the
+    /// tooltip, so it reads as a thing rather than as a label: "another
+    /// input", not "+ input".
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         None
