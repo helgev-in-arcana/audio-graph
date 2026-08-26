@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use audio_graph_engine::{
     AudioIn, AudioOut, Constant, ExprSource, Expression, Graph, Lfo, Math, MathOp, Mix, NodeId,
     NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, SlotOut, Waveform,
-    compile,
+    compile, linear_to_db,
 };
 
 const SLOTS: usize = 32;
@@ -254,7 +254,7 @@ fn mix_with_a_driven_gain() {
         NodeKind::Mix(Mix {
             channels: 2,
             inputs: 3,
-            gains: vec![1.0, 0.5, 0.25],
+            gains: vec![0.0, linear_to_db(0.5), linear_to_db(0.25)],
         }),
         [0.0, 0.0],
     );
@@ -280,7 +280,7 @@ fn audio_feedback_delay() {
         NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
-            gains: vec![1.0, 0.5],
+            gains: vec![0.0, linear_to_db(0.5)],
         }),
         [0.0, 0.0],
     );
@@ -317,7 +317,7 @@ fn latency_compensation() {
         NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
-            gains: vec![0.5, 0.5],
+            gains: vec![linear_to_db(0.5), linear_to_db(0.5)],
         }),
         [0.0, 0.0],
     );

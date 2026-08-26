@@ -7,8 +7,31 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, fallback};
 use crate::port::{Port, PortType};
 
+/// Convert a decibel value to a linear amplitude multiplier.
+///
+/// -100 dB or below evaluates to 0.0 (silence / mute).
+/// For values above -100 dB, this evaluates to 10^(db / 20).
+#[inline]
+pub fn db_to_linear(db: f64) -> f64 {
+    if db <= -100.0 {
+        0.0
+    } else {
+        10.0_f64.powf(db / 20.0)
+    }
+}
+
+/// Convert a linear amplitude multiplier to decibels.
+#[inline]
+pub fn linear_to_db(linear: f64) -> f64 {
+    if linear <= 0.0 {
+        -100.0
+    } else {
+        (20.0 * linear.log10()).max(-100.0)
+    }
+}
+
 /// Sum several audio inputs of the same width into one, each at its own
-/// gain.
+/// gain (in decibels).
 ///
 /// The only way two audio sources reach one destination. An input takes one
 /// link everywhere in this graph, so mixing is a node rather than a rule —
@@ -17,14 +40,13 @@ use crate::port::{Port, PortType};
 ///
 /// The gains are here rather than in a node of their own because a mix with
 /// one input *is* a gain, and the audio half needed a multiply anyway: a
-/// feedback delay whose loop gain is one never decays, and `Math` is the
+/// feedback delay whose loop gain is 0 dB never decays, and `Math` is the
 /// param half's multiply and cannot touch a buffer. Two nodes that share
 /// every line of their implementation are one node.
 ///
 /// Each gain has a socket of its own, after the audio inputs; the number
 /// here is what is used while that socket is unconnected, the same rule
-/// `Math`'s `b` follows. Missing entries are 1.0, which is what makes a
-/// patch saved before the gains existed still mix the way it did.
+/// `Math`'s `b` follows. Missing entries are 0.0 dB (unity gain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mix {
     pub channels: u16,
@@ -113,7 +135,12 @@ impl Node for Mix {
                 // Signal, gain, signal, gain: the gain for input `port` is the
                 // socket right after it.
                 lane: cx.lane((2 * port + 1) as u8),
-                gain: self.gains.get(port).copied().unwrap_or(1.0),
+                gain: self
+                    .gains
+                    .get(port)
+                    .copied()
+                    .map(db_to_linear)
+                    .unwrap_or(1.0),
             });
         }
         for input in &inputs {
@@ -145,14 +172,19 @@ impl Node for Mix {
             return false;
         }
         // Grown here rather than at load: a patch saved before the gains
-        // existed has none, and every missing one is unity.
-        self.gains.resize(self.inputs as usize, 1.0);
+        // existed has none, and every missing one is unity (0 dB).
+        self.gains.resize(self.inputs as usize, 0.0);
         let Some(gain) = self.gains.get_mut(port as usize / 2) else {
             return false;
         };
         fallback(ui, connected, |ui| {
-            ui.add(egui::DragValue::new(gain).speed(0.005).range(0.0..=2.0))
-                .changed()
+            ui.add(
+                egui::DragValue::new(gain)
+                    .speed(0.1)
+                    .range(-100.0..=20.0)
+                    .suffix(" dB"),
+            )
+            .changed()
         })
     }
 
@@ -167,7 +199,7 @@ impl Node for Mix {
     #[cfg(feature = "ui")]
     fn add_input(&mut self) {
         self.inputs += 1;
-        self.gains.resize(self.inputs as usize, 1.0);
+        self.gains.resize(self.inputs as usize, 0.0);
     }
 
     /// One input is two sockets, and they go together: a signal with no gain
@@ -179,7 +211,7 @@ impl Node for Mix {
             return 0;
         }
         self.inputs -= 1;
-        self.gains.resize((self.inputs + 1) as usize, 1.0);
+        self.gains.resize((self.inputs + 1) as usize, 0.0);
         self.gains.remove(index);
         2
     }
@@ -200,8 +232,31 @@ impl Mix {
             Mix {
                 channels: 2,
                 inputs: 2,
-                gains: vec![1.0, 1.0],
+                gains: vec![0.0, 0.0],
             },
         )]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decibel_conversion_round_trips() {
+        assert_eq!(db_to_linear(0.0), 1.0);
+        assert_eq!(linear_to_db(1.0), 0.0);
+
+        assert_eq!(db_to_linear(-100.0), 0.0);
+        assert_eq!(db_to_linear(-120.0), 0.0);
+        assert_eq!(linear_to_db(0.0), -100.0);
+
+        let lin_6db = db_to_linear(6.0);
+        assert!((lin_6db - 1.9952623149688795).abs() < 1e-10);
+        assert!((linear_to_db(lin_6db) - 6.0).abs() < 1e-10);
+
+        let lin_neg6db = db_to_linear(-6.0);
+        assert!((lin_neg6db - 0.5011872336272722).abs() < 1e-10);
+        assert!((linear_to_db(lin_neg6db) - -6.0).abs() < 1e-10);
     }
 }
