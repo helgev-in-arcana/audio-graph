@@ -743,7 +743,7 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
     fn process(
         &mut self,
         instance: u32,
-        notes: audio_graph_engine::NoteSource,
+        notes: audio_graph_engine::NoteStream,
         input: &[f32],
         output: &mut [f32],
         chunk: audio_graph_engine::AudioChunk,
@@ -784,12 +784,19 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
         // A shut gate holds the note-ons back and lets everything else
         // through, so a note that was sounding when it closed still gets its
         // note-off. Filtered into scratch reserved at activate, never grown.
-        let events: &[Event] = match notes {
-            audio_graph_engine::NoteSource::Daw { bus: 0 } => self.events,
-            audio_graph_engine::NoteSource::DawReleases { bus: 0 } => {
+        // A key switch's own keys are dropped outright, both halves: the
+        // note-on went too, so there is no voice left waiting for the release.
+        let events: &[Event] = match notes.source {
+            audio_graph_engine::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
+            source @ (audio_graph_engine::NoteSource::Daw { bus: 0 }
+            | audio_graph_engine::NoteSource::DawReleases { bus: 0 }) => {
+                let shut = matches!(source, audio_graph_engine::NoteSource::DawReleases { .. });
                 gated.clear();
                 for event in self.events {
-                    if matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
+                    if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
+                        continue;
+                    }
+                    if muted(event, notes.mute) {
                         continue;
                     }
                     if gated.len() == gated.capacity() {
@@ -809,6 +816,21 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
             self.context,
             self.out_events,
         );
+    }
+}
+
+/// Whether `mask` names this event's key — see `NoteStream::mute`.
+///
+/// Anything without a key of its own passes: a control change carries the
+/// whole channel, and swallowing it because a key switch sits upstream would
+/// take the pedal with the keys.
+fn muted(event: &Event, mask: u128) -> bool {
+    let Event::Note(note) = event else {
+        return false;
+    };
+    match note.key() {
+        Some(key) if (0..128).contains(&key) => mask & (1u128 << key) != 0,
+        _ => false,
     }
 }
 
@@ -1186,7 +1208,7 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource};
+        use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource, NoteStream};
         use plugin_host_api::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
@@ -1222,7 +1244,7 @@ mod tests {
         let mut output = [0.0f32; 8];
         let daw = NoteRoute::from_source(NoteSource::Daw { bus: 0 });
         nodes.process(0, daw.resolve(None), &input, &mut output, chunk);
-        nodes.process(1, NoteSource::None, &input, &mut output, chunk);
+        nodes.process(1, NoteStream::default(), &input, &mut output, chunk);
 
         assert_eq!(
             wired_saw.lock().unwrap().len(),
@@ -1240,7 +1262,7 @@ mod tests {
     /// note-off. Blocking the lot would leave it hanging for ever.
     #[test]
     fn a_shut_note_gate_still_delivers_the_releases() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
+        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource, NoteStream};
         use plugin_host_api::NoteEvent;
 
         let (gated_node, saw) = harness(Vec::new());
@@ -1284,7 +1306,7 @@ mod tests {
         let mut output = [0.0f32; 8];
         nodes.process(
             0,
-            NoteSource::DawReleases { bus: 0 },
+            NoteStream::from_source(NoteSource::DawReleases { bus: 0 }),
             &input,
             &mut output,
             chunk,

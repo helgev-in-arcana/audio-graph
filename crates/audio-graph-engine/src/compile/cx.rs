@@ -36,30 +36,34 @@ const OUTPUT_SOCKET: u8 = 128;
 /// Returns the source, and the gate socket nearest the reader — nearest
 /// because each gate already folds the ones above it into its own condition,
 /// so the closest one is the whole answer.
-fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>) {
+fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>, u128) {
     let mut at = graph.source_of(node, port);
     let mut gate = None;
+    // Every node on the way may take keys out; they are unioned because a
+    // stream that passed two key switches has lost both sets of keys.
+    let mut mute = 0u128;
     // Bounded by the node count: every step moves to a node upstream of the
     // last, and `check_links` has already refused a cycle.
     for _ in 0..=graph.nodes.len() {
         let Some((from, from_port)) = at else {
-            return (NoteSource::None, gate);
+            return (NoteSource::None, gate, mute);
         };
         let Some(node) = graph.node(from) else {
-            return (NoteSource::None, gate);
+            return (NoteSource::None, gate, mute);
         };
         if let Some(source) = node.kind.note_identity() {
-            return (source, gate);
+            return (source, gate, mute);
         }
         let Some(input) = node.kind.note_passthrough(from_port) else {
             // Something with a notes output that neither makes notes nor
             // passes them on. Nothing to route.
-            return (NoteSource::None, gate);
+            return (NoteSource::None, gate, mute);
         };
+        mute |= node.kind.note_mute(from_port);
         gate = gate.or(Some((from, from_port)));
         at = graph.source_of(from, input);
     }
-    (NoteSource::None, gate)
+    (NoteSource::None, gate, mute)
 }
 use crate::nodes::NodeKind;
 use crate::port::PortType;
@@ -316,7 +320,7 @@ impl<'a> ParamCx<'a> {
     /// and one register saying so is cheaper than the audio half carrying a
     /// list.
     pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
-        let (_, socket) = trace_notes(self.graph, self.id, port);
+        let (_, socket, _) = trace_notes(self.graph, self.id, port);
         let socket = socket?;
         self.note_gates
             .iter()
@@ -633,14 +637,14 @@ impl<'a> AudioCx<'a> {
     /// M9. What sits between the source and here — gates — comes back as a
     /// lane number for the audio half to read each chunk.
     pub(crate) fn note_route(&self, port: u8) -> NoteRoute {
-        let (source, socket) = trace_notes(self.graph, self.id, port);
+        let (source, socket, mute) = trace_notes(self.graph, self.id, port);
         let gate = socket.and_then(|(node, out_port)| {
             self.lanes
                 .iter()
                 .find(|&&(key, _)| key == (node, OUTPUT_SOCKET + out_port))
                 .map(|&(_, lane)| lane)
         });
-        NoteRoute { source, gate }
+        NoteRoute { source, gate, mute }
     }
 
     // --- buffers ----------------------------------------------------------
