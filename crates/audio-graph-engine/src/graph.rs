@@ -256,6 +256,25 @@ impl Graph {
         }
     }
 
+    /// The mirror of [`Graph::drop_inputs`], for a node that lost an output.
+    ///
+    /// Same rule from the other end: the links leaving the sockets that went
+    /// are cut, and every later socket's links slide down so they still mean
+    /// the socket they meant before.
+    pub fn drop_outputs(&mut self, node: NodeId, first: u8, count: u8) {
+        if count == 0 {
+            return;
+        }
+        let end = first.saturating_add(count);
+        self.links
+            .retain(|l| !(l.from == node && (first..end).contains(&l.from_port)));
+        for link in &mut self.links {
+            if link.from == node && link.from_port >= end {
+                link.from_port -= count;
+            }
+        }
+    }
+
     /// What feeds one of a node's inputs: the source node and its output port.
     pub fn source_of(&self, to: NodeId, to_port: u8) -> Option<(NodeId, u8)> {
         self.links

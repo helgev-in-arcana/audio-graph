@@ -163,8 +163,17 @@ impl<'a> ParamCx<'a> {
         }
     }
 
+    /// Whether anything is wired to input `port`.
+    ///
+    /// For the sockets that carry no register — a notes port — where
+    /// [`ParamCx::input`] cannot tell "nothing wired" from "wired to
+    /// something that binds no register".
+    pub(crate) fn has_input(&self, port: u8) -> bool {
+        self.graph.source_of(self.id, port).is_some()
+    }
+
     /// A register holding zero, for an input nobody has connected yet.
-    fn zero(&mut self) -> Result<Reg, CompileError> {
+    pub(crate) fn zero(&mut self) -> Result<Reg, CompileError> {
         // Reuse one if this graph already needed it. Constants are free to run
         // but not free to hold, and a wide graph can want a lot of them.
         if let Some(&Op::Const { out, .. }) = self

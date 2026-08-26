@@ -475,6 +475,7 @@ impl GraphEditor {
         // has given the graph back.
         let mut actions: Vec<NodeAction> = Vec::new();
         let mut dropped: Option<u8> = None;
+        let mut dropped_output: Option<u8> = None;
 
         let response = frame.show(&mut child, |ui| {
             ui.set_width(width - 2.0 * margin);
@@ -549,25 +550,12 @@ impl GraphEditor {
             });
             ui.separator();
 
-            // Outputs above inputs, the way Blender's nodes read: what this
-            // node produces first, what it needs after. The names are here
-            // rather than only in a tooltip because a socket you have to hover
-            // to identify is one you get wrong before you ever hover it.
-            for port in &outputs {
-                let row = ui
-                    .horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(port.name.as_ref())
-                        });
-                    })
-                    .response
-                    .rect;
-                output_rows.push(row.center().y);
-            }
-
-            // The node's own settings sit between the two halves: everything
-            // that belongs to a socket has moved onto that socket's row, so
-            // what is left here is about the node itself.
+            // The node's own settings sit directly under the title, and
+            // nothing below them moves when they change. They used to sit
+            // between the sockets, which was fine while only the inputs could
+            // grow — now that outputs can too, a drop-down that slides up and
+            // down as sockets are added is a control you have to find again
+            // every time.
             let body = ui.scope(|ui| {
                 let mut cx = node_ui(ctx);
                 let changed = graph.nodes[index].kind.controls(ui, &mut cx);
@@ -579,8 +567,58 @@ impl GraphEditor {
             // it drew anything and a separator over nothing is a line across
             // an empty node.
             let drew_body = body.response.rect.height() > 1.0;
+            let add_output_label = graph.nodes[index].kind.add_output_label();
+            if drew_body && (!outputs.is_empty() || add_output_label.is_some()) {
+                ui.separator();
+            }
+
+            // Outputs above inputs, the way Blender's nodes read: what this
+            // node produces first, what it needs after. The names are here
+            // rather than only in a tooltip because a socket you have to hover
+            // to identify is one you get wrong before you ever hover it.
+            for (i, port) in outputs.iter().enumerate() {
+                let row = ui
+                    .horizontal(|ui| {
+                        // Right to left, so the name is against the socket and
+                        // the control sits beside it rather than adrift in the
+                        // middle of the node. The remove button is placed
+                        // first for the same reason it is on an input row: it
+                        // takes its width before the control is offered what
+                        // is left.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(port.name.as_ref());
+                            if port.removable
+                                && ui
+                                    .small_button("x")
+                                    .on_hover_text("remove this output")
+                                    .clicked()
+                            {
+                                dropped_output = Some(i as u8);
+                            }
+                            let mut cx = node_ui(ctx);
+                            outcome.changed |=
+                                graph.nodes[index].kind.output_control(ui, i as u8, &mut cx);
+                            actions.append(&mut cx.actions);
+                        });
+                    })
+                    .response
+                    .rect;
+                output_rows.push(row.center().y);
+            }
+
+            // The button that makes more of them, under the sockets it adds
+            // to — the same place the inputs' one sits.
+            if let Some(label) = add_output_label
+                && ui.small_button(label).clicked()
+            {
+                graph.nodes[index].kind.add_output();
+                outcome.changed = true;
+            }
+
             let add_label = graph.nodes[index].kind.add_input_label();
-            if (!outputs.is_empty() || drew_body) && (!inputs.is_empty() || add_label.is_some()) {
+            if (!outputs.is_empty() || add_output_label.is_some() || drew_body)
+                && (!inputs.is_empty() || add_label.is_some())
+            {
                 ui.separator();
             }
 
@@ -646,6 +684,13 @@ impl GraphEditor {
             let count = graph.nodes[index].kind.remove_input(port);
             if count > 0 {
                 graph.drop_inputs(id, port, count);
+                outcome.changed = true;
+            }
+        }
+        if let Some(port) = dropped_output {
+            let count = graph.nodes[index].kind.remove_output(port);
+            if count > 0 {
+                graph.drop_outputs(id, port, count);
                 outcome.changed = true;
             }
         }

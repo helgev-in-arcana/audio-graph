@@ -602,9 +602,10 @@ mod tests {
             | Op::Lfo { .. }
             | Op::Expr { .. }
             | Op::KeyHeld { .. }
-            | Op::KeyToggle { .. }
+            | Op::KeyStep { .. }
             | Op::KeyLatch { .. }
-            | Op::Latch { .. } => Vec::new(),
+            | Op::Latch { .. }
+            | Op::LatchIs { .. } => Vec::new(),
             Op::Math { a, b, .. } => match b {
                 Operand::Reg(b) => vec![a, b],
                 Operand::Value(_) => vec![a],
@@ -639,10 +640,11 @@ mod tests {
             | Op::Range { out, .. }
             | Op::KeyHeld { out, .. }
             | Op::Latch { out, .. }
+            | Op::LatchIs { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
             // These write a latch rather than a register, which keeps them off
             // the topological sort the same way a delay write is.
-            Op::DelayWrite { .. } | Op::KeyToggle { .. } | Op::KeyLatch { .. } => None,
+            Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,
         }
     }
 }
