@@ -77,10 +77,17 @@ pub struct PluginEntry {
 
 /// Whether the plugin list is split into FX and Instrument tabs.
 ///
-/// Provisional, and deliberately one line to undo: set it to `false` and the
-/// tab row disappears and every plugin shows in one list again. Nothing else
-/// depends on it — the kinds themselves come from the scan cache and are worth
-/// having either way.
+/// Provisional, and there are two ways to take it back out:
+///
+/// * Set this to `false`. The tab row disappears and every plugin shows in one
+///   list again, because [`PluginTab::shows`] then says yes to everything.
+/// * Revert the commit that added it — "Split the plugin list into FX and
+///   Instrument tabs", `8d8254e` on the branch it landed on. It touches this
+///   file and nothing else, so the revert is clean.
+///
+/// Either way nothing underneath it moves: the kinds come from the scan cache
+/// ([`plugin_host::catalogue`]), which was added separately and is worth having
+/// whether or not the list is split by it.
 const PLUGIN_TABS: bool = true;
 
 /// Which half of the plugin list the menu is showing.
