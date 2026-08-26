@@ -18,6 +18,7 @@ mod audio_io;
 mod constant;
 mod delay;
 mod expression;
+mod gate;
 mod lfo;
 mod math;
 mod mix;
@@ -31,6 +32,7 @@ pub use audio_io::{AudioIn, AudioOut};
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
+pub use gate::Gate;
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
@@ -202,11 +204,12 @@ pub enum NodeKind {
     Plugin(Plugin),
     DelayWrite(DelayWrite),
     Mix(Mix),
+    Gate(Gate),
     DelayRead(DelayRead),
 }
 /// Run `$body` against whichever node the kind is carrying.
 ///
-/// The one place the fourteen variants are listed. Every delegating method
+/// The one place the fifteen variants are listed. Every delegating method
 /// below is one line through here, so adding a node means adding an arm here
 /// and nothing else in this file — and the exhaustiveness check still makes
 /// forgetting it a compile error rather than a silent no-op.
@@ -232,6 +235,7 @@ macro_rules! for_kind {
             NodeKind::Plugin($node) => $body,
             NodeKind::DelayWrite($node) => $body,
             NodeKind::Mix($node) => $body,
+            NodeKind::Gate($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -377,6 +381,7 @@ pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
         NodeKind::DelayWrite,
     );
     take(&mut out, Mix::catalogue_defaults(), NodeKind::Mix);
+    take(&mut out, Gate::catalogue_defaults(), NodeKind::Gate);
     take(
         &mut out,
         DelayRead::catalogue_defaults(),

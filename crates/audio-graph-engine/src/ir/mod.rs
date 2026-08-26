@@ -153,6 +153,14 @@ pub struct Program {
     /// evaluator writes it exactly the way it writes a slot and needs to know
     /// nothing about parameters. Sorted by instance, then by parameter.
     pub param_targets: Vec<ParamTarget>,
+    /// The first lane number that carries something the *audio* half reads
+    /// (§14.5): `slot_count + MAX_GRAPH_PARAMS`.
+    ///
+    /// The evaluator needs it to know which of its outputs are 0..1 parameters
+    /// and which are not. A gain is decibels and a delay time is seconds;
+    /// clamping either of those to 0..1 turns a -100 dB mute into unity gain,
+    /// which is exactly what it used to do.
+    pub audio_lane_base: u16,
     /// How each plugin instance has to be activated (§14.11).
     ///
     /// Derived from the graph, not from the plugin: whether a sidechain bus is
@@ -183,6 +191,7 @@ impl Program {
             outputs: Vec::new(),
             audio_ops: Vec::new(),
             param_targets: Vec::new(),
+            audio_lane_base: 0,
             instances: Vec::new(),
             buffers: Vec::new(),
             chunking: Chunking::WholeBlock,

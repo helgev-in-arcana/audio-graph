@@ -34,7 +34,7 @@ pub use ir::{
     Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
+    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, Lfo, Math, Mix, NodeKind,
     NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, db_to_linear,
     linear_to_db,
 };

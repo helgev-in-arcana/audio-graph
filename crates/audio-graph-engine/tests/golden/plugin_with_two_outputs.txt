@@ -47,6 +47,7 @@ Program {
         },
     ],
     param_targets: [],
+    audio_lane_base: 96,
     instances: [
         InstanceIo {
             instance: 1,

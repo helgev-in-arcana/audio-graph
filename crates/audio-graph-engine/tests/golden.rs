@@ -19,9 +19,9 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    AudioIn, AudioOut, Constant, ExprSource, Expression, Graph, Lfo, Math, MathOp, Mix, NodeId,
-    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform, compile,
-    linear_to_db,
+    AudioIn, AudioOut, Constant, ExprSource, Expression, Gate, Graph, Lfo, Math, MathOp, Mix,
+    NodeId, NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform,
+    compile, linear_to_db,
 };
 
 const SLOTS: usize = 32;
@@ -171,6 +171,28 @@ fn math_chain() {
     let out = param_sink(&mut graph);
     graph.connect(shaped, 0, out, 0);
     check("math_chain", &graph);
+}
+
+/// A gate: the parameter half switches the gain, the audio half is a `Mix` of
+/// one. Pinned because the whole node is that arrangement.
+#[test]
+fn gated_audio() {
+    let mut graph = Graph::new();
+    let src = audio_in(&mut graph, 0, 2);
+    let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+    let gate = graph.add(
+        NodeKind::Gate(Gate {
+            channels: 2,
+            threshold: 0.5,
+            invert: false,
+        }),
+        [0.0, 0.0],
+    );
+    let out = audio_out(&mut graph, 0, 2);
+    graph.connect(src, 0, gate, 0);
+    graph.connect(control, 0, gate, 1);
+    graph.connect(gate, 0, out, 0);
+    check("gated_audio", &graph);
 }
 
 /// A plugin with a sidechain bus fed by a source of a different width, which is
