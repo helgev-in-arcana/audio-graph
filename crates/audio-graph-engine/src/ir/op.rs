@@ -65,6 +65,41 @@ pub enum Op {
         low: Operand,
         high: Operand,
     },
+    /// 1 while `key` is held, 0 otherwise.
+    ///
+    /// The one thing the graph could not ask about a note stream: `Expression`
+    /// answers for the newest note whatever it was, and a key switch is a
+    /// question about one particular key regardless of what has been played
+    /// since.
+    KeyHeld {
+        out: Reg,
+        key: u8,
+    },
+    /// Flip a latch between `off` and `on` each time `key` is struck.
+    ///
+    /// Writes no register: the value is read back by a [`Op::Latch`], because
+    /// the latch is what survives a program swap and a register does not.
+    KeyToggle {
+        state: u16,
+        key: u8,
+        off: f64,
+        on: f64,
+    },
+    /// Set a latch to `value` when `key` is struck.
+    ///
+    /// Several of these on one latch is a bank of key switches: the last key
+    /// pressed wins, which is what a bank of switches does.
+    KeyLatch {
+        state: u16,
+        key: u8,
+        value: f64,
+    },
+    /// Read a latch, or `initial` if nothing has set it yet.
+    Latch {
+        out: Reg,
+        state: u16,
+        initial: f64,
+    },
     Math {
         out: Reg,
         a: Reg,
