@@ -66,6 +66,10 @@ pub struct PluginEntry {
     pub name: String,
     pub format: plugin_host::Format,
     pub path: PathBuf,
+    /// Whether the user pinned it to the top of the list. Carried on the entry
+    /// rather than read from the config per row, because the menu draws every
+    /// frame and the config is behind a lock.
+    pub pinned: bool,
 }
 
 /// Something the canvas cannot do itself, because it loads a plugin or touches
@@ -82,6 +86,13 @@ pub enum GraphAction {
     UnloadInstance(usize),
     OpenSubEditor(usize),
     CloseSubEditor(usize),
+    /// Pin or unpin a module in the add-node menu. The canvas cannot do it
+    /// itself because the answer outlives the frame: it is written to the
+    /// config and it reorders the list the menu is reading.
+    PinPlugin {
+        path: PathBuf,
+        pinned: bool,
+    },
 }
 
 /// What the canvas needs to know about the world outside the graph.
@@ -866,6 +877,7 @@ impl GraphEditor {
                     // bottom should not push the other out of reach.
                     ui.set_width(540.0);
                     let mut chosen: Option<PathBuf> = None;
+                    let mut pin: Option<(PathBuf, bool)> = None;
 
                     ui.columns(2, |cols| {
                         let ui = &mut cols[0];
@@ -968,8 +980,17 @@ impl GraphEditor {
                                                     {
                                                         continue;
                                                     }
-                                                    if plugin_row(ui, entry) {
-                                                        chosen = Some(entry.path.clone());
+                                                    match plugin_row(ui, entry) {
+                                                        RowHit::Load => {
+                                                            chosen = Some(entry.path.clone());
+                                                        }
+                                                        RowHit::TogglePin => {
+                                                            pin = Some((
+                                                                entry.path.clone(),
+                                                                !entry.pinned,
+                                                            ));
+                                                        }
+                                                        RowHit::Nothing => {}
                                                     }
                                                 }
                                             });
@@ -1001,6 +1022,10 @@ impl GraphEditor {
                         close = true;
                     }
 
+                    if let Some((path, pinned)) = pin {
+                        self.actions.push(GraphAction::PinPlugin { path, pinned });
+                    }
+
                     ui.separator();
                     if ui.button("cancel").clicked() {
                         close = true;
@@ -1021,13 +1046,25 @@ impl GraphEditor {
     }
 }
 
-/// One plugin in the add-node menu's list. Returns whether it was clicked.
+/// What clicking somewhere in a plugin's row asked for.
+#[derive(PartialEq, Eq)]
+enum RowHit {
+    Nothing,
+    /// The row itself: load this plugin.
+    Load,
+    /// The star at its right end: pin it, or unpin it if it was pinned.
+    TogglePin,
+}
+
+/// One plugin in the add-node menu's list.
 ///
 /// The format tag leads the row at a fixed width so every name starts at the
 /// same x: trailing tags left the names ragged, and a name too long for the
-/// column wraps under itself rather than pushing its tag off the edge.
-fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> bool {
+/// column wraps under itself rather than pushing its tag off the edge. The pin
+/// is at the far right, out of the path of the click that loads the plugin.
+fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> RowHit {
     const TAG_WIDTH: f32 = 38.0;
+    const PIN_WIDTH: f32 = 18.0;
 
     // A point over `small`: small alone read as a footnote next to the name.
     let tag_size = egui::TextStyle::Small.resolve(ui.style()).size + 1.0;
@@ -1036,14 +1073,16 @@ fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> bool {
     // Reserved now, painted once the row's height is known — a hover
     // highlight has to go behind text that has not been laid out yet.
     let bg = ui.painter().add(egui::Shape::Noop);
+    let mut pinned = None;
     let response = ui
         .allocate_ui_with_layout(
             egui::vec2(width, 0.0),
             egui::Layout::left_to_right(egui::Align::TOP),
             |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                let line = ui.text_style_height(&egui::TextStyle::Body);
                 ui.add_sized(
-                    [TAG_WIDTH, ui.text_style_height(&egui::TextStyle::Body)],
+                    [TAG_WIDTH, line],
                     egui::Label::new(
                         egui::RichText::new(entry.format.tag())
                             .weak()
@@ -1051,7 +1090,27 @@ fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> bool {
                     )
                     .selectable(false),
                 );
-                ui.add(egui::Label::new(&entry.name).wrap().selectable(false));
+                // The pin is placed before the name and laid out from the right,
+                // so that the name — the one part that wraps — is what gives on
+                // a narrow column.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    let star = if entry.pinned { "★" } else { "☆" };
+                    let pin = ui.add_sized(
+                        [PIN_WIDTH, line],
+                        egui::Button::new(egui::RichText::new(star).size(tag_size)).frame(false),
+                    );
+                    // Unpinned stars are drawn on every row, so say what they do
+                    // rather than leaving a column of decoration.
+                    let pin = pin.on_hover_text(if entry.pinned {
+                        "unpin"
+                    } else {
+                        "pin to the top"
+                    });
+                    pinned = Some(pin.clicked());
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        ui.add(egui::Label::new(&entry.name).wrap().selectable(false));
+                    });
+                });
             },
         )
         .response
@@ -1067,7 +1126,16 @@ fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> bool {
             ),
         );
     }
-    response.clicked()
+
+    // The pin wins: it sits inside the row, so a click on it is a click on the
+    // row too, and loading the plugin is not what the user asked for.
+    if pinned == Some(true) {
+        RowHit::TogglePin
+    } else if response.clicked() {
+        RowHit::Load
+    } else {
+        RowHit::Nothing
+    }
 }
 
 /// The facts a node's own controls are handed.

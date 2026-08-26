@@ -229,18 +229,33 @@ impl WrapperEditor {
     /// one.
     fn rescan(&mut self) {
         self.entries.clear();
+        let pinned = plugin_host::config::pinned();
         for (format, path) in plugin_host::installed_modules() {
             let name = path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-            self.entries
-                .push(crate::graph_ui::PluginEntry { name, format, path });
+            let pinned = pinned.contains(&path);
+            self.entries.push(crate::graph_ui::PluginEntry {
+                name,
+                format,
+                path,
+                pinned,
+            });
         }
-        // By name, not by format: a user looking for "Raum" should not have to
-        // know which format it was installed as, and the tag on the row says
-        // which one they are about to load.
-        self.entries.sort_by_key(|e| e.name.to_lowercase());
+        self.sort_entries();
         self.scanned = true;
+    }
+
+    /// Pinned first, then by name.
+    ///
+    /// By name, not by format: a user looking for "Raum" should not have to know
+    /// which format it was installed as, and the tag on the row says which one
+    /// they are about to load. Pinned plugins are a short list the user wrote
+    /// themselves, so they sort among themselves the same way rather than in the
+    /// order they happened to be pinned.
+    fn sort_entries(&mut self) {
+        self.entries
+            .sort_by_key(|e| (!e.pinned, e.name.to_lowercase()));
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
@@ -279,6 +294,21 @@ impl WrapperEditor {
                 crate::graph_ui::GraphAction::UnloadInstance(i) => Command::UnloadInstance(i),
                 crate::graph_ui::GraphAction::OpenSubEditor(i) => Command::OpenSub(i),
                 crate::graph_ui::GraphAction::CloseSubEditor(i) => Command::CloseSub(i),
+                // Not a command: writing the config touches no window and
+                // dispatches no message, so it is safe inline for the same
+                // reason the folders window is.
+                crate::graph_ui::GraphAction::PinPlugin { path, pinned } => {
+                    if let Err(e) = plugin_host::config::set_pinned(&path, pinned) {
+                        log::warn!("audio-graph: the pinned plugins could not be saved: {e}");
+                    }
+                    for entry in &mut self.entries {
+                        if entry.path == path {
+                            entry.pinned = pinned;
+                        }
+                    }
+                    self.sort_entries();
+                    continue;
+                }
             });
         }
 

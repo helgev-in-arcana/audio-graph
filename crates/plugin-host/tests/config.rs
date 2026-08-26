@@ -125,6 +125,29 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     )
     .expect("the file is writable");
     assert_eq!(config::directories(), vec![dir.clone()]);
+    assert!(
+        config::pinned().is_empty(),
+        "a file from before pinning loads with nothing pinned"
+    );
+
+    // Pinning is by full path, saved, and asked for as a state rather than as a
+    // toggle: pinning what is already pinned leaves one entry, not two.
+    let plugin = dir.join("Raum.vst3");
+    assert!(config::set_pinned(&plugin, true).expect("a temp profile is writable"));
+    assert!(config::set_pinned(&plugin, true).expect("a temp profile is writable"));
+    assert_eq!(config::pinned(), vec![plugin.clone()]);
+    assert!(config::is_pinned(&plugin));
+    assert!(
+        !config::is_pinned(&dir.join("Other.vst3")),
+        "a pin names one module, not every module beside it"
+    );
+    assert_eq!(
+        config::directories(),
+        vec![dir.clone()],
+        "and saving a pin leaves the folder list alone"
+    );
+    config::set_pinned(&plugin, false).expect("a temp profile is writable");
+    assert!(config::pinned().is_empty());
 
     // Malformed content is not fatal, and — the part that matters — is not
     // mistaken for a missing file, which would throw the user's list away and
