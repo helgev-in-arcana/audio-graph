@@ -1147,7 +1147,9 @@ fn cmd_graph(args: &[String]) -> Result<(), String> {
     }
 
     let with_graph = edit_wrapper_state(&baseline_state, &inject_graph(&wrapper_state, rate)?)?;
-    println!("graph: a {rate} Hz saw on the bound parameter, injected into the wrapper's saved state");
+    println!(
+        "graph: a {rate} Hz saw on the bound parameter, injected into the wrapper's saved state"
+    );
 
     const BLOCK: u32 = 512;
     let plain = render::render_with_state(
@@ -1348,7 +1350,10 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     let param_id = binding["param_id"]
         .as_u64()
         .ok_or("the saved binding has no parameter id")?;
-    let param_name = binding["param_name"].as_str().unwrap_or("bound").to_string();
+    let param_name = binding["param_name"]
+        .as_str()
+        .unwrap_or("bound")
+        .to_string();
     let reference = value["sub_plugin"].clone();
     let path_hint = reference["path_hint"]
         .as_str()
@@ -1359,12 +1364,8 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     // sockets it really has.
     let ports = {
         use std::sync::Arc;
-        let (_, plugin) = render::load(
-            Path::new(&path_hint),
-            None,
-            Arc::new(host::CliHost::new()),
-        )
-        .map_err(|e| e.to_string())?;
+        let (_, plugin) = render::load(Path::new(&path_hint), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
         let mut ports = audio_graph_engine::PluginPorts::from_layout(&plugin.io_layout(), 0);
         ports.params = vec![audio_graph_engine::ParamPort {
             id: param_id as u32,

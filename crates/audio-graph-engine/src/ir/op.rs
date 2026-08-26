@@ -53,6 +53,18 @@ pub enum Op {
         out: Reg,
         source: ExprSource,
     },
+    /// One of two operands, chosen by where `control` sits against
+    /// `threshold`: `high` at the threshold and above, `low` below it.
+    ///
+    /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which
+    /// a gate wired from `Expression`'s `Gate` does — switches.
+    Select {
+        out: Reg,
+        control: Reg,
+        threshold: f64,
+        low: Operand,
+        high: Operand,
+    },
     Math {
         out: Reg,
         a: Reg,
