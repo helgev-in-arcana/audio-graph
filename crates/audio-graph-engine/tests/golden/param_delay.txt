@@ -24,7 +24,7 @@ Program {
     registers: 3,
     outputs: [
         (
-            5,
+            32,
             2,
         ),
     ],
@@ -36,7 +36,12 @@ Program {
         0,
     ],
     audio_ops: [],
-    param_targets: [],
+    param_targets: [
+        ParamTarget {
+            instance: 0,
+            param: 7,
+        },
+    ],
     instances: [],
     buffers: [],
     chunking: WholeBlock,

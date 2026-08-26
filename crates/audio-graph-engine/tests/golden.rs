@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use audio_graph_engine::{
     AudioIn, AudioOut, Constant, ExprSource, Expression, Graph, Lfo, Math, MathOp, Mix, NodeId,
-    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, SlotOut, Waveform,
+    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform,
     compile, linear_to_db,
 };
 
@@ -84,6 +84,24 @@ fn stereo_plugin(instance: usize, latency: u32) -> NodeKind {
     })
 }
 
+/// Somewhere for a parameter chain to go: a plugin node with one parameter
+/// socket and nothing else. `SlotOut` used to play this part.
+fn param_sink(graph: &mut Graph) -> NodeId {
+    graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: vec![ParamPort {
+                    id: 7,
+                    name: "Drive".into(),
+                }],
+                ..PluginPorts::default()
+            },
+        }),
+        [0.0, 0.0],
+    )
+}
+
 fn audio_in(graph: &mut Graph, bus: usize, channels: u16) -> NodeId {
     graph.add(NodeKind::AudioIn(AudioIn { bus, channels }), [0.0, 0.0])
 }
@@ -100,12 +118,12 @@ fn default_patch() {
 }
 
 #[test]
-fn lfo_into_slot_out() {
+fn lfo_into_a_parameter() {
     let mut graph = Graph::new();
     let osc = graph.add(lfo(Rate::Beats(4.0)), [0.0, 0.0]);
-    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
+    let out = param_sink(&mut graph);
     graph.connect(osc, 0, out, 0);
-    check("lfo_into_slot_out", &graph);
+    check("lfo_into_a_parameter", &graph);
 }
 
 /// Both halves of `Math`'s fallback rule: input `b` wired, and input `b` left
@@ -150,7 +168,7 @@ fn math_chain() {
         [0.0, 0.0],
     );
     graph.connect(fallback, 0, shaped, 0);
-    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 1 }), [0.0, 0.0]);
+    let out = param_sink(&mut graph);
     graph.connect(shaped, 0, out, 0);
     check("math_chain", &graph);
 }
@@ -301,7 +319,7 @@ fn param_delay() {
     graph.connect(src, 0, write, 0);
     let time = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
     graph.connect(time, 0, read, 0);
-    let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 5 }), [0.0, 0.0]);
+    let out = param_sink(&mut graph);
     graph.connect(read, 0, out, 0);
     check("param_delay", &graph);
 }
@@ -358,7 +376,6 @@ const EVERY_KIND: &str = r#"{
     {"id": 4, "pos": [0.0, 0.0], "kind": {"Math": {"op": "Multiply", "b": 0.75}}},
     {"id": 5, "pos": [0.0, 0.0], "kind": {"RangeMap": {
       "in_lo": 0.0, "in_hi": 1.0, "out_lo": -1.0, "out_hi": 1.0, "clamp": true}}},
-    {"id": 6, "pos": [0.0, 0.0], "kind": {"SlotOut": {"slot": 1}}},
     {"id": 7, "pos": [0.0, 0.0], "kind": {"AudioIn": {"bus": 0, "channels": 2}}},
     {"id": 8, "pos": [0.0, 0.0], "kind": {"AudioOut": {"bus": 0, "channels": 2}}},
     {"id": 9, "pos": [0.0, 0.0], "kind": "NoteIn"},
@@ -376,7 +393,7 @@ const EVERY_KIND: &str = r#"{
     {"from": 0, "from_port": 0, "to": 4, "to_port": 1},
     {"from": 1, "from_port": 0, "to": 4, "to_port": 0},
     {"from": 4, "from_port": 0, "to": 5, "to_port": 0},
-    {"from": 5, "from_port": 0, "to": 6, "to_port": 0}
+    {"from": 5, "from_port": 0, "to": 10, "to_port": 2}
   ],
   "next_id": 14
 }"#;
@@ -386,7 +403,7 @@ fn every_kind_survives_a_round_trip() {
     let graph: Graph = serde_json::from_str(EVERY_KIND).expect("the literal patch still loads");
     assert_eq!(
         graph.nodes.len(),
-        14,
+        13,
         "one node per kind, plus both delay halves"
     );
 
@@ -421,7 +438,6 @@ fn the_wire_form_is_pinned() {
             "Expression",
             "Math",
             "RangeMap",
-            "SlotOut",
             "AudioIn",
             "AudioOut",
             "NoteIn",
@@ -435,7 +451,7 @@ fn the_wire_form_is_pinned() {
     // The one thing a struct-to-newtype change could plausibly move: the
     // payload sits directly under the variant name, not under a nested field.
     assert_eq!(value["nodes"][0]["kind"]["Constant"]["value"], 0.5);
-    assert_eq!(value["nodes"][9]["kind"], "NoteIn");
+    assert_eq!(value["nodes"][8]["kind"], "NoteIn");
 }
 
 /// Where a plugin node's first parameter socket is, given its buses.

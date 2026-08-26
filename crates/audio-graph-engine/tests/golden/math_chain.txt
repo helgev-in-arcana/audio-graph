@@ -37,7 +37,7 @@ Program {
     registers: 5,
     outputs: [
         (
-            1,
+            32,
             4,
         ),
     ],
@@ -47,7 +47,12 @@ Program {
     audio_delay_nodes: [],
     delay_nodes: [],
     audio_ops: [],
-    param_targets: [],
+    param_targets: [
+        ParamTarget {
+            instance: 0,
+            param: 7,
+        },
+    ],
     instances: [],
     buffers: [],
     chunking: WholeBlock,

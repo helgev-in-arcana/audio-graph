@@ -36,7 +36,7 @@ pub use mix::{Mix, db_to_linear, linear_to_db};
 pub use note_in::NoteIn;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
-pub use slot::{SlotIn, SlotOut};
+pub use slot::SlotIn;
 
 use serde::{Deserialize, Serialize};
 
@@ -190,7 +190,6 @@ pub enum NodeKind {
     Expression(Expression),
     Math(Math),
     RangeMap(RangeMap),
-    SlotOut(SlotOut),
 
     // --- M8 (§14) ---
     AudioIn(AudioIn),
@@ -204,7 +203,7 @@ pub enum NodeKind {
 }
 /// Run `$body` against whichever node the kind is carrying.
 ///
-/// The one place the fourteen variants are listed. Every delegating method
+/// The one place the thirteen variants are listed. Every delegating method
 /// below is one line through here, so adding a node means adding an arm here
 /// and nothing else in this file — and the exhaustiveness check still makes
 /// forgetting it a compile error rather than a silent no-op.
@@ -220,7 +219,6 @@ macro_rules! for_kind {
             NodeKind::Expression($node) => $body,
             NodeKind::Math($node) => $body,
             NodeKind::RangeMap($node) => $body,
-            NodeKind::SlotOut($node) => $body,
             NodeKind::AudioIn($node) => $body,
             NodeKind::AudioOut($node) => $body,
             NodeKind::NoteIn => {
@@ -360,7 +358,6 @@ pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
     );
     take(&mut out, Math::catalogue_defaults(), NodeKind::Math);
     take(&mut out, RangeMap::catalogue_defaults(), NodeKind::RangeMap);
-    take(&mut out, SlotOut::catalogue_defaults(), NodeKind::SlotOut);
     take(&mut out, AudioIn::catalogue_defaults(), NodeKind::AudioIn);
     take(&mut out, AudioOut::catalogue_defaults(), NodeKind::AudioOut);
     out.extend(

@@ -27,14 +27,12 @@ pub enum CompileError {
     TooLarge { what: &'static str, limit: usize },
     /// A slot index outside the wrapper's table.
     BadSlot { node: NodeId, slot: usize },
-    /// Two outputs fighting over the same slot. Silently letting one win would
-    /// make the graph's behaviour depend on node creation order.
-    DuplicateOutput { slot: usize },
     /// A link whose ends carry different things (§14.3). `connect` and `prune`
     /// both refuse to make one, so reaching here means a hand-edited or
     /// future-versioned patch.
     TypeMismatch { node: NodeId, port: u8 },
-    /// Two writers on one delay line. Same reasoning as `DuplicateOutput`.
+    /// Two writers on one delay line. Which one wins would otherwise depend
+    /// on node creation order.
     DuplicateDelayWrite { line: LineId },
     /// A delay line whose two halves disagree about what they carry.
     DelayTypeMismatch { line: LineId },
@@ -60,9 +58,6 @@ impl std::fmt::Display for CompileError {
                     "node {node} names slot {}, which does not exist",
                     slot + 1
                 )
-            }
-            CompileError::DuplicateOutput { slot } => {
-                write!(f, "two nodes both drive slot {}", slot + 1)
             }
             CompileError::TypeMismatch { node, port } => {
                 write!(
@@ -241,10 +236,33 @@ mod tests {
     use super::*;
     use crate::ir::{MAX_REGISTERS, MathOp, Op, Operand, Reg, Waveform};
     use crate::nodes::{
-        AudioIn, Constant, DelayRead, DelayWrite, Lfo, Math, NodeKind, Rate, SlotIn, SlotOut,
+        AudioIn, Constant, DelayRead, DelayWrite, Lfo, Math, NodeKind, ParamPort, Plugin,
+        PluginPorts, Rate, SlotIn,
     };
 
     const SLOTS: usize = 32;
+
+    /// Somewhere for a parameter chain to go.
+    ///
+    /// A graph whose values reach nothing is pruned, so every test that wants
+    /// to see an op emitted needs a sink. `SlotOut` used to be it; §14.12's
+    /// parameter socket is, now — and unlike a slot it does not fight the DAW
+    /// for the lane.
+    fn param_sink(graph: &mut Graph) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    params: vec![ParamPort {
+                        id: 0,
+                        name: "p".into(),
+                    }],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
 
     #[test]
     fn an_empty_graph_compiles_to_an_empty_program() {
@@ -257,7 +275,7 @@ mod tests {
     fn only_what_feeds_an_output_is_compiled() {
         let mut graph = Graph::new();
         let used = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(used, 0, out, 0);
         // Dropped on the canvas and wired to nothing.
         graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
@@ -338,7 +356,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 1 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         // Wired back to front on purpose: creation order must not matter.
         graph.connect(sum, 0, out, 0);
         graph.connect(b, 0, sum, 1);
@@ -376,7 +394,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(x, 0, y, 0);
         graph.connect(y, 0, x, 0);
         graph.connect(y, 0, out, 0);
@@ -388,26 +406,11 @@ mod tests {
     }
 
     #[test]
-    fn two_nodes_driving_one_slot_is_an_error_not_a_coin_toss() {
-        let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
-        let one = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
-        let two = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
-        graph.connect(a, 0, one, 0);
-        graph.connect(a, 0, two, 0);
-
-        assert_eq!(
-            compile(&graph, SLOTS),
-            Err(CompileError::DuplicateOutput { slot: 4 })
-        );
-    }
-
-    #[test]
     fn a_slot_outside_the_table_is_refused() {
         let mut graph = Graph::new();
-        let a = graph.add(NodeKind::Constant(Constant { value: 0.1 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 99 }), [0.0, 0.0]);
-        graph.connect(a, 0, out, 0);
+        let read = graph.add(NodeKind::SlotIn(SlotIn { slot: 99 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
+        graph.connect(read, 0, out, 0);
         assert!(matches!(
             compile(&graph, SLOTS),
             Err(CompileError::BadSlot { .. })
@@ -415,17 +418,9 @@ mod tests {
     }
 
     #[test]
-    fn an_output_with_nothing_plugged_in_leaves_the_slot_to_the_daw() {
-        let mut graph = Graph::new();
-        graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
-        let program = compile(&graph, SLOTS).unwrap();
-        assert!(!program.drives(0));
-    }
-
-    #[test]
     fn a_graph_bigger_than_the_audio_thread_can_hold_is_refused() {
         let mut graph = Graph::new();
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         let mut last = graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         for _ in 0..MAX_REGISTERS + 8 {
             let next = graph.add(
@@ -475,7 +470,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
 
         graph.connect(read, 0, scale, 0);
         graph.connect(scale, 0, write, 0);
@@ -520,7 +515,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(source, 0, write, 0);
         graph.connect(read, 0, out, 0);
 
@@ -585,7 +580,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.links.push(crate::graph::Link {
             from: audio,
             from_port: 0,
