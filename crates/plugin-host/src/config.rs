@@ -52,9 +52,9 @@ use serde::{Deserialize, Serialize};
 
 /// Everything this crate keeps between sessions.
 ///
-/// One field today. It is a struct rather than a bare `Vec` so that adding the
-/// next setting does not invalidate everybody's file, and `serde(default)` is
-/// what makes a file written by an older build still load.
+/// It is a struct rather than a bare `Vec` so that adding a setting does not
+/// invalidate everybody's file, and `serde(default)` is what makes a file
+/// written by an older build — one from before pinning, say — still load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -70,6 +70,15 @@ pub struct Config {
     /// scanned separately.
     #[serde(alias = "extra_directories")]
     pub directories: Vec<PathBuf>,
+
+    /// The modules the user pinned to the top of the add-node menu.
+    ///
+    /// Full paths, because that is what identifies a module: two folders can
+    /// hold a `Raum.vst3` each, and pinning one of them must not pin the other.
+    /// A path that no longer exists is kept rather than pruned — an unplugged
+    /// drive or a plugin folder temporarily off the scan list should not quietly
+    /// cost the user their pins.
+    pub pinned: Vec<PathBuf>,
 }
 
 /// The process-wide copy, and what it was read from.
@@ -201,6 +210,7 @@ pub fn load() -> Config {
     // and every line of it is theirs to remove.
     let seeded = Config {
         directories: conventional(),
+        ..Config::default()
     };
     if let Err(e) = store(&seeded) {
         // Not fatal. The list is right for this session; it just will not
@@ -300,4 +310,34 @@ pub fn restore_defaults() -> Result<(), String> {
         return Ok(());
     }
     store(&config)
+}
+
+/// The modules pinned to the top of the add-node menu.
+pub fn pinned() -> Vec<PathBuf> {
+    load().pinned
+}
+
+/// Whether `path` is pinned.
+pub fn is_pinned(path: &Path) -> bool {
+    load().pinned.iter().any(|p| p == path)
+}
+
+/// Pin or unpin `path`, and save. Returns whether it is pinned afterwards.
+///
+/// Idempotent in both directions: the caller asks for a state rather than for a
+/// change, so two editors toggling the same plugin cannot leave it pinned twice
+/// or unpin what the other just pinned.
+pub fn set_pinned(path: &Path, pin: bool) -> Result<bool, String> {
+    let mut config = load();
+    let had = config.pinned.iter().any(|p| p == path);
+    if had == pin {
+        return Ok(pin);
+    }
+    if pin {
+        config.pinned.push(path.to_path_buf());
+    } else {
+        config.pinned.retain(|p| p != path);
+    }
+    store(&config)?;
+    Ok(pin)
 }
