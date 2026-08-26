@@ -1117,6 +1117,23 @@ impl Engine {
                     }
                     self.phases[i] = advanced.rem_euclid(1.0);
                 }
+                Op::Select {
+                    out,
+                    control,
+                    threshold,
+                    low,
+                    high,
+                } => {
+                    let pick = if self.registers[control as usize] >= threshold {
+                        high
+                    } else {
+                        low
+                    };
+                    self.registers[out as usize] = match pick {
+                        Operand::Reg(reg) => self.registers[reg as usize],
+                        Operand::Value(value) => value,
+                    };
+                }
                 Op::Math { out, a, b, op } => {
                     let a = self.registers[a as usize];
                     let b = match b {
@@ -1198,7 +1215,7 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-        ParamPort, Plugin, PluginPorts, Rate, SlotIn, linear_to_db,
+        ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -1310,6 +1327,76 @@ mod tests {
         slots[3] = 0.8;
         engine.run(&ctx(32), &mut slots);
         assert!((slots[SINK] - 0.4).abs() < 1e-12);
+    }
+
+    /// The parameter half's switch: one value below the threshold, another at
+    /// it and above.
+    #[test]
+    fn a_switch_picks_by_threshold() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                threshold: 0.6,
+                off: 0.2,
+                on: 0.9,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        slots[1] = 0.59;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+
+        slots[1] = 0.6;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.9, "the threshold itself is on");
+    }
+
+    /// Either side of a switch can be a signal rather than a number, which is
+    /// what makes it a router as well as a chooser.
+    #[test]
+    fn a_switch_can_pick_between_two_signals() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let a = graph.add(NodeKind::SlotIn(SlotIn { slot: 2 }), [0.0, 0.0]);
+        let b = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                threshold: 0.5,
+                off: 0.0,
+                on: 1.0,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(a, 0, switch, 1);
+        graph.connect(b, 0, switch, 2);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        slots[2] = 0.25;
+        slots[3] = 0.75;
+        slots[1] = 0.0;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+
+        slots[2] = 0.25;
+        slots[3] = 0.75;
+        slots[1] = 1.0;
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.75);
     }
 
     #[test]
@@ -1448,12 +1535,20 @@ mod tests {
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0) * 0.5
-        assert!((slots[SINK] - 0.5).abs() < 1e-9, "first pass: {}", slots[SINK]);
+        assert!(
+            (slots[SINK] - 0.5).abs() < 1e-9,
+            "first pass: {}",
+            slots[SINK]
+        );
 
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0.5) * 0.5 — the 0.5 came back round.
-        assert!((slots[SINK] - 0.75).abs() < 1e-9, "second pass: {}", slots[SINK]);
+        assert!(
+            (slots[SINK] - 0.75).abs() < 1e-9,
+            "second pass: {}",
+            slots[SINK]
+        );
     }
 
     /// §14.5. The line is state, like an LFO's phase, and an edit somewhere

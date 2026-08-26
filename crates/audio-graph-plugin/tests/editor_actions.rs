@@ -209,9 +209,7 @@ const SINK_LANE: usize = SLOT_COUNT;
 /// format-agnostic, which is the point of §9.
 #[test]
 fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
-    use audio_graph_engine::{
-        BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, Waveform,
-    };
+    use audio_graph_engine::{BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, Waveform};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);

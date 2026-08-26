@@ -20,8 +20,8 @@ use std::path::PathBuf;
 
 use audio_graph_engine::{
     AudioIn, AudioOut, Constant, ExprSource, Expression, Graph, Lfo, Math, MathOp, Mix, NodeId,
-    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform,
-    compile, linear_to_db,
+    NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform, compile,
+    linear_to_db,
 };
 
 const SLOTS: usize = 32;

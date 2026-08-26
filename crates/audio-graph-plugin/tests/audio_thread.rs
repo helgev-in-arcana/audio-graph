@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use audio_graph_engine::{
-    BlockContext, Engine, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform,
+    BlockContext, Engine, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate,
+    Waveform,
 };
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};

@@ -600,6 +600,17 @@ mod tests {
                 Operand::Reg(b) => vec![a, b],
                 Operand::Value(_) => vec![a],
             },
+            Op::Select {
+                control, low, high, ..
+            } => {
+                let mut regs = vec![control];
+                for operand in [low, high] {
+                    if let Operand::Reg(reg) = operand {
+                        regs.push(reg);
+                    }
+                }
+                regs
+            }
             Op::Range { a, .. } => vec![a],
             Op::DelayRead { .. } => Vec::new(),
             Op::DelayWrite { a, .. } => vec![a],
@@ -614,6 +625,7 @@ mod tests {
             | Op::Slot { out, .. }
             | Op::Lfo { out, .. }
             | Op::Expr { out, .. }
+            | Op::Select { out, .. }
             | Op::Math { out, .. }
             | Op::Range { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
