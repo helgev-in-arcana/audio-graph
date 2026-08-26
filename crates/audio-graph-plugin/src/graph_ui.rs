@@ -66,6 +66,68 @@ pub struct PluginEntry {
     pub name: String,
     pub format: plugin_host::Format,
     pub path: PathBuf,
+    /// Whether the user pinned it to the top of the list. Carried on the entry
+    /// rather than read from the config per row, because the menu draws every
+    /// frame and the config is behind a lock.
+    pub pinned: bool,
+    /// Effect or instrument, as the scan cache has it — `Unknown` until this
+    /// module has been opened once.
+    pub kind: plugin_host::catalogue::Kind,
+}
+
+/// The add-node menu's width, and the height each of its two lists gets.
+///
+/// Fixed rather than fitted to the content, and the lists are given the height
+/// whether or not they fill it: a menu that changed shape as the user switched
+/// tabs, typed into the filter, or plugged in a plugin was a menu whose buttons
+/// moved under the pointer.
+const POPUP_WIDTH: f32 = 540.0;
+const LIST_HEIGHT: f32 = 360.0;
+
+/// Whether the plugin list is split into FX and Instrument tabs.
+///
+/// Provisional, and there are two ways to take it back out:
+///
+/// * Set this to `false`. The tab row disappears and every plugin shows in one
+///   list again, because [`PluginTab::shows`] then says yes to everything.
+/// * Revert the commit that added it — "Split the plugin list into FX and
+///   Instrument tabs", `8d8254e` on the branch it landed on. It touches this
+///   file and nothing else, so the revert is clean.
+///
+/// Either way nothing underneath it moves: the kinds come from the scan cache
+/// ([`plugin_host::catalogue`]), which was added separately and is worth having
+/// whether or not the list is split by it.
+const PLUGIN_TABS: bool = true;
+
+/// Which half of the plugin list the menu is showing.
+///
+/// Two tabs rather than a filter dropdown: a plugin is one or the other, the
+/// user knows which they are after before they open the menu, and a tab keeps
+/// the list one column wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginTab {
+    Effect,
+    Instrument,
+}
+
+impl PluginTab {
+    /// Whether a plugin of `kind` belongs under this tab.
+    ///
+    /// `Unknown` — never opened, or it could not be opened — shows under both.
+    /// The alternative is a plugin the user can see in no tab at all, which is
+    /// worse than one shown under the wrong heading.
+    fn shows(self, kind: plugin_host::catalogue::Kind) -> bool {
+        use plugin_host::catalogue::Kind;
+        if !PLUGIN_TABS {
+            return true;
+        }
+        matches!(
+            (self, kind),
+            (_, Kind::Unknown)
+                | (PluginTab::Effect, Kind::Effect)
+                | (PluginTab::Instrument, Kind::Instrument)
+        )
+    }
 }
 
 /// Something the canvas cannot do itself, because it loads a plugin or touches
@@ -82,6 +144,13 @@ pub enum GraphAction {
     UnloadInstance(usize),
     OpenSubEditor(usize),
     CloseSubEditor(usize),
+    /// Pin or unpin a module in the add-node menu. The canvas cannot do it
+    /// itself because the answer outlives the frame: it is written to the
+    /// config and it reorders the list the menu is reading.
+    PinPlugin {
+        path: PathBuf,
+        pinned: bool,
+    },
 }
 
 /// What the canvas needs to know about the world outside the graph.
@@ -134,6 +203,9 @@ pub struct GraphEditor {
     add_at: Option<Pos2>,
     /// Filter text in the add-node menu's plugin list.
     plugin_filter: String,
+    /// Which half of the plugin list is showing. Kept across openings of the
+    /// menu: a user building a rack of effects opens it again for an effect.
+    plugin_tab: PluginTab,
     /// Actions for the caller to carry out once the frame is over.
     actions: Vec<GraphAction>,
 }
@@ -147,6 +219,7 @@ impl Default for GraphEditor {
             linking: None,
             add_at: None,
             plugin_filter: String::new(),
+            plugin_tab: PluginTab::Effect,
             actions: Vec::new(),
         }
     }
@@ -860,101 +933,54 @@ impl GraphEditor {
             .fixed_pos(canvas.min + at.to_vec2() * self.zoom + self.pan)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(260.0);
+                    // Two columns, each scrolling on its own: the built-in
+                    // nodes are a fixed list one learns by heart, the plugins
+                    // are however many are installed, and scrolling one to the
+                    // bottom should not push the other out of reach.
+                    ui.set_width(POPUP_WIDTH);
+                    let mut chosen: Option<PathBuf> = None;
+                    let mut pin: Option<(PathBuf, bool)> = None;
 
-                    // Plugins first: adding one is what this menu is mostly
-                    // for, and there is no other way to load one.
-                    ui.strong("Plugin");
-                    match ctx.free_instance {
-                        Some(instance) => {
-                            ui.horizontal(|ui| {
-                                ui.label("filter");
-                                ui.text_edit_singleline(&mut self.plugin_filter);
-                            });
-                            let needle = self.plugin_filter.to_lowercase();
-                            let mut chosen: Option<PathBuf> = None;
-                            egui::ScrollArea::vertical()
-                                .id_salt("add-plugin")
-                                .max_height(220.0)
-                                .show(ui, |ui| {
-                                    for entry in ctx.plugins {
-                                        // The format is searchable too, so
-                                        // typing "clap" narrows the list to one
-                                        // format without a separate control.
-                                        if !needle.is_empty()
-                                            && !entry.name.to_lowercase().contains(&needle)
-                                            && !entry.format.tag().contains(needle.as_str())
-                                        {
-                                            continue;
-                                        }
-                                        let label = format!("{}   {}", entry.name, entry.format);
-                                        if ui.selectable_label(false, label).clicked() {
-                                            chosen = Some(entry.path.clone());
-                                        }
+                    ui.columns(2, |cols| {
+                        let ui = &mut cols[0];
+                        ui.strong("Node");
+                        list_area(ui, "add-kind", |ui| {
+                            ui.weak("Delay");
+                            ui.horizontal_wrapped(|ui| {
+                                // A wrapped row leaves no gap between lines
+                                // unless asked: square it with the gap
+                                // between buttons.
+                                ui.spacing_mut().item_spacing.y = ui.spacing().item_spacing.x;
+                                for (label, ty) in [
+                                    ("Audio delay", PortType::STEREO),
+                                    ("Param delay", PortType::Param),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        graph.add_delay(ty, [at.x, at.y]);
+                                        added = true;
+                                        close = true;
                                     }
-                                });
-                            if let Some(path) = chosen {
-                                // The node appears now and its sockets arrive
-                                // when the plugin has finished loading, which
-                                // takes hundreds of milliseconds.
-                                let node = graph.add(
-                                    NodeKind::Plugin(Plugin {
-                                        instance,
-                                        ports: PluginPorts::default(),
-                                    }),
-                                    [at.x, at.y],
-                                );
-                                self.actions.push(GraphAction::LoadPlugin {
-                                    node,
-                                    instance,
-                                    path,
-                                });
-                                added = true;
-                                close = true;
-                            }
-                        }
-                        None => {
-                            ui.weak("no free instance — the wrapper is full");
-                        }
-                    }
+                                }
+                            });
 
-                    ui.separator();
-                    ui.strong("Delay");
-                    ui.weak("two nodes on one line: a write and a read (§14.4)");
-                    ui.horizontal_wrapped(|ui| {
-                        for (label, ty) in [
-                            ("Audio delay", PortType::STEREO),
-                            ("Param delay", PortType::Param),
-                        ] {
-                            if ui.button(label).clicked() {
-                                graph.add_delay(ty, [at.x, at.y]);
-                                added = true;
-                                close = true;
-                            }
-                        }
-                    });
-
-                    ui.separator();
-                    ui.strong("Node");
-                    // Wrapped rather than one per row, and under a heading per
-                    // kind of wire: the flat list had grown past the point
-                    // where a reader could find anything in it without reading
-                    // all of it, and "which sort of thing is this" is the
-                    // question being asked while the menu is open.
-                    let entries = catalogue();
-                    egui::ScrollArea::vertical()
-                        .id_salt("add-kind")
-                        .max_height(320.0)
-                        .show(ui, |ui| {
+                            // Wrapped rather than one per row, and under a
+                            // heading per kind of wire: the flat list had
+                            // grown past the point where a reader could
+                            // find anything in it without reading all of
+                            // it, and "which sort of thing is this" is the
+                            // question being asked while the menu is open.
+                            let entries = catalogue();
                             for group in NodeGroup::ALL {
                                 // A group with nothing in it — as `Plugin`
-                                // and the delays are, being added elsewhere —
-                                // gets no heading rather than an empty one.
+                                // and the delays are, being added elsewhere
+                                // — gets no heading rather than an empty
+                                // one.
                                 if !entries.iter().any(|(g, _, _)| *g == group) {
                                     continue;
                                 }
                                 ui.weak(group.label());
                                 ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.y = ui.spacing().item_spacing.x;
                                     for (g, label, kind) in &entries {
                                         if *g != group {
                                             continue;
@@ -968,6 +994,106 @@ impl GraphEditor {
                                 });
                             }
                         });
+
+                        let ui = &mut cols[1];
+                        ui.strong("Plugin");
+                        match ctx.free_instance {
+                            Some(_) => {
+                                ui.horizontal(|ui| {
+                                    ui.label("filter");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.plugin_filter)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                                // Under the filter rather than over it: the
+                                // filter applies to both tabs, and typing is
+                                // what the user does first.
+                                if PLUGIN_TABS {
+                                    ui.horizontal(|ui| {
+                                        for (tab, label) in [
+                                            (PluginTab::Effect, "FX"),
+                                            (PluginTab::Instrument, "Instrument"),
+                                        ] {
+                                            ui.selectable_value(&mut self.plugin_tab, tab, label);
+                                        }
+                                    });
+                                }
+                                let needle = self.plugin_filter.to_lowercase();
+                                let tab = self.plugin_tab;
+                                list_area(ui, "add-plugin", |ui| {
+                                    // Padded so a long name never runs
+                                    // under the scrollbar.
+                                    egui::Frame::new()
+                                        .inner_margin(egui::Margin::symmetric(10, 0))
+                                        .show(ui, |ui| {
+                                            let mut shown = 0usize;
+                                            for entry in ctx.plugins {
+                                                if !tab.shows(entry.kind) {
+                                                    continue;
+                                                }
+                                                // The format is searchable too, so
+                                                // typing "clap" narrows the list to
+                                                // one format without a separate
+                                                // control.
+                                                if !needle.is_empty()
+                                                    && !entry.name.to_lowercase().contains(&needle)
+                                                    && !entry.format.tag().contains(needle.as_str())
+                                                {
+                                                    continue;
+                                                }
+                                                match plugin_row(ui, entry) {
+                                                    RowHit::Load => {
+                                                        chosen = Some(entry.path.clone());
+                                                    }
+                                                    RowHit::TogglePin => {
+                                                        pin = Some((
+                                                            entry.path.clone(),
+                                                            !entry.pinned,
+                                                        ));
+                                                    }
+                                                    RowHit::Nothing => {}
+                                                }
+                                                shown += 1;
+                                            }
+                                            if shown == 0 {
+                                                ui.weak("nothing here");
+                                            }
+                                        });
+                                });
+                            }
+                            None => {
+                                ui.weak("no free instance — the wrapper is full");
+                                // Nothing to list, but the menu keeps its shape.
+                                ui.allocate_space(egui::vec2(0.0, LIST_HEIGHT));
+                            }
+                        }
+                    });
+
+                    if let (Some(path), Some(instance)) = (chosen, ctx.free_instance) {
+                        // The node appears now and its sockets arrive when the
+                        // plugin has finished loading, which takes hundreds of
+                        // milliseconds.
+                        let node = graph.add(
+                            NodeKind::Plugin(Plugin {
+                                instance,
+                                ports: PluginPorts::default(),
+                            }),
+                            [at.x, at.y],
+                        );
+                        self.actions.push(GraphAction::LoadPlugin {
+                            node,
+                            instance,
+                            path,
+                        });
+                        added = true;
+                        close = true;
+                    }
+
+                    if let Some((path, pinned)) = pin {
+                        self.actions.push(GraphAction::PinPlugin { path, pinned });
+                    }
+
                     ui.separator();
                     if ui.button("cancel").clicked() {
                         close = true;
@@ -985,6 +1111,113 @@ impl GraphEditor {
     /// Actions the caller has to carry out after the frame.
     pub fn take_actions(&mut self) -> Vec<GraphAction> {
         std::mem::take(&mut self.actions)
+    }
+}
+
+/// One of the menu's two lists: a scrolling area of a fixed size.
+///
+/// Fixed in both directions. Left to fit its content, the height moved with
+/// whatever was in it and the scrollbar sat wherever the widest row ended
+/// rather than at the column's edge.
+fn list_area(ui: &mut egui::Ui, salt: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let size = egui::vec2(ui.available_width(), LIST_HEIGHT);
+    ui.allocate_ui(size, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt(salt)
+            .auto_shrink([false, false])
+            .show(ui, add);
+    });
+}
+
+/// What clicking somewhere in a plugin's row asked for.
+#[derive(PartialEq, Eq)]
+enum RowHit {
+    Nothing,
+    /// The row itself: load this plugin.
+    Load,
+    /// The star at its right end: pin it, or unpin it if it was pinned.
+    TogglePin,
+}
+
+/// One plugin in the add-node menu's list.
+///
+/// The format tag leads the row at a fixed width so every name starts at the
+/// same x: trailing tags left the names ragged, and a name too long for the
+/// column wraps under itself rather than pushing its tag off the edge. The pin
+/// is at the far right, out of the path of the click that loads the plugin.
+fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> RowHit {
+    const TAG_WIDTH: f32 = 38.0;
+    const PIN_WIDTH: f32 = 18.0;
+
+    // A point over `small`: small alone read as a footnote next to the name.
+    let tag_size = egui::TextStyle::Small.resolve(ui.style()).size + 1.0;
+
+    let width = ui.available_width();
+    // Reserved now, painted once the row's height is known — a hover
+    // highlight has to go behind text that has not been laid out yet.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let mut pinned = None;
+    let response = ui
+        .allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::left_to_right(egui::Align::TOP),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let line = ui.text_style_height(&egui::TextStyle::Body);
+                ui.add_sized(
+                    [TAG_WIDTH, line],
+                    egui::Label::new(
+                        egui::RichText::new(entry.format.tag())
+                            .weak()
+                            .size(tag_size),
+                    )
+                    .selectable(false),
+                );
+                // The pin is placed before the name and laid out from the right,
+                // so that the name — the one part that wraps — is what gives on
+                // a narrow column.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    let star = if entry.pinned { "★" } else { "☆" };
+                    let pin = ui.add_sized(
+                        [PIN_WIDTH, line],
+                        egui::Button::new(egui::RichText::new(star).size(tag_size)).frame(false),
+                    );
+                    // Unpinned stars are drawn on every row, so say what they do
+                    // rather than leaving a column of decoration.
+                    let pin = pin.on_hover_text(if entry.pinned {
+                        "unpin"
+                    } else {
+                        "pin to the top"
+                    });
+                    pinned = Some(pin.clicked());
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        ui.add(egui::Label::new(&entry.name).wrap().selectable(false));
+                    });
+                });
+            },
+        )
+        .response
+        .interact(Sense::click());
+
+    if response.hovered() {
+        ui.painter().set(
+            bg,
+            egui::Shape::rect_filled(
+                response.rect,
+                ui.visuals().widgets.hovered.corner_radius,
+                ui.visuals().widgets.hovered.weak_bg_fill,
+            ),
+        );
+    }
+
+    // The pin wins: it sits inside the row, so a click on it is a click on the
+    // row too, and loading the plugin is not what the user asked for.
+    if pinned == Some(true) {
+        RowHit::TogglePin
+    } else if response.clicked() {
+        RowHit::Load
+    } else {
+        RowHit::Nothing
     }
 }
 
