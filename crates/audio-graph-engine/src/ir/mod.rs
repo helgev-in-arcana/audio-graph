@@ -111,8 +111,12 @@ pub struct Program {
     /// Topologically ordered: every `Op` reads only registers already written.
     pub ops: Vec<Op>,
     pub registers: usize,
-    /// Which slot each output drives, and where its value ends up. Sorted by
-    /// slot, and at most one entry per slot.
+    /// Which lane each output drives, and where its value ends up. Sorted by
+    /// lane, and at most one entry per lane.
+    ///
+    /// Lanes below `slot_count` are the DAW's own automation and the graph
+    /// never writes them (§8); what lands here is a parameter lane (§14.12) or
+    /// an audio lane (§14.5).
     pub outputs: Vec<(u16, Reg)>,
     /// Audio line index → how many samples per channel its ring holds.
     ///
@@ -239,15 +243,15 @@ impl Program {
         want
     }
 
+    /// Whether the graph drives `lane` — a parameter lane (§14.12) or an
+    /// audio lane (§14.5), since the slot lanes below them are the DAW's.
+    pub fn drives_lane(&self, lane: usize) -> bool {
+        u16::try_from(lane).is_ok_and(|l| self.outputs.iter().any(|&(o, _)| o == l))
+    }
+
     /// Whether running this program would do nothing observable.
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.audio_ops.is_empty()
-    }
-
-    /// Whether the graph drives this slot, and so overrides the DAW's
-    /// automation for it.
-    pub fn drives(&self, slot: usize) -> bool {
-        u16::try_from(slot).is_ok_and(|s| self.outputs.iter().any(|&(o, _)| o == s))
     }
 }
 

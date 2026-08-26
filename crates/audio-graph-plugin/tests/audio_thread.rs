@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use audio_graph_engine::{
-    BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform,
+    BlockContext, Engine, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform,
 };
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};
@@ -31,12 +31,35 @@ impl HostContext for SilentHost {
     fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
 }
 
+/// Somewhere for a parameter chain to go.
+///
+/// `SlotOut` used to be it; a §14.12 parameter socket is, now. Its lane is the
+/// first one past the slot table, which is what `SINK_LANE` is.
+fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::NodeId {
+    graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: vec![ParamPort {
+                    id: 0,
+                    name: "p".into(),
+                }],
+                ..PluginPorts::default()
+            },
+        }),
+        [200.0, 0.0],
+    )
+}
+
+/// The lane `param_sink`'s parameter is driven through.
+const SINK_LANE: usize = SLOT_COUNT;
+
 fn shared() -> Arc<Shared> {
     Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new())
 }
 
 /// Build the graph the editor builds when someone drops an LFO on the canvas.
-fn lfo_into(shared: &Arc<Shared>, slot: usize, rate: f64) {
+fn lfo_into(shared: &Arc<Shared>, rate: f64) {
     let mut state = shared.main();
     state.graph = audio_graph_engine::Graph::new();
     let lfo = state.graph.add(
@@ -49,9 +72,7 @@ fn lfo_into(shared: &Arc<Shared>, slot: usize, rate: f64) {
         }),
         [0.0, 0.0],
     );
-    let out = state
-        .graph
-        .add(NodeKind::SlotOut(SlotOut { slot }), [200.0, 0.0]);
+    let out = param_sink(&mut state.graph);
     state.graph.connect(lfo, 0, out, 0);
 }
 
@@ -112,7 +133,7 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
     // The main thread, dragging an LFO's rate control. Every frame of that drag
     // is a recompile and a publish.
     for i in 0..20_000 {
-        lfo_into(&shared, 3, 0.5 + (i % 100) as f64 * 0.1);
+        lfo_into(&shared, 0.5 + (i % 100) as f64 * 0.1);
         shared.publish_graph();
         // The editor's tick, which also frees what the audio thread returns.
         shared.reclaim();
@@ -186,12 +207,12 @@ fn the_old_program_is_freed_on_the_main_thread() {
     let shared = shared();
     let mut engine = Engine::new();
 
-    lfo_into(&shared, 0, 1.0);
+    lfo_into(&shared, 1.0);
     shared.publish_graph();
     assert!(engine.adopt(shared.programs()));
 
     for rate in 1..64 {
-        lfo_into(&shared, 0, rate as f64);
+        lfo_into(&shared, rate as f64);
         shared.publish_graph();
         assert!(engine.adopt(shared.programs()), "rate {rate} never arrived");
     }
@@ -212,7 +233,7 @@ fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
 
     let mut engine = Engine::new();
     engine.adopt(shared.programs());
-    assert!((0..SLOT_COUNT).all(|slot| !engine.drives(slot)));
+    assert!((0..SLOT_COUNT).all(|lane| !engine.drives_lane(lane)));
 
     let mut slots = vec![0.42; SLOT_COUNT];
     engine.run(
@@ -229,15 +250,15 @@ fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
 #[test]
 fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     let shared = shared();
-    lfo_into(&shared, 1, 2.0);
+    lfo_into(&shared, 2.0);
     shared.publish_graph();
 
     let mut engine = Engine::new();
     assert!(engine.adopt(shared.programs()));
-    assert!(engine.drives(1));
+    assert!(engine.drives_lane(SINK_LANE));
 
-    // Now the user wires an output to a second output — halfway through
-    // rearranging something, and not a state worth stopping the music for.
+    // Now the user closes a loop — halfway through rearranging something, and
+    // not a state worth stopping the music for.
     {
         let mut state = shared.main();
         let a = state.graph.add(
@@ -247,10 +268,17 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
             }),
             [0.0, 100.0],
         );
-        let one = state
-            .graph
-            .add(NodeKind::SlotOut(SlotOut { slot: 1 }), [200.0, 100.0]);
-        state.graph.connect(a, 0, one, 0);
+        let b = state.graph.add(
+            NodeKind::Math(Math {
+                op: MathOp::Add,
+                b: 0.0,
+            }),
+            [0.0, 200.0],
+        );
+        let sink = param_sink(&mut state.graph);
+        state.graph.connect(a, 0, b, 0);
+        state.graph.connect(b, 0, a, 0);
+        state.graph.connect(b, 0, sink, 0);
     }
     shared.publish_graph();
 
@@ -259,5 +287,8 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
         !engine.adopt(shared.programs()),
         "a failed compile must publish nothing"
     );
-    assert!(engine.drives(1), "the last good program keeps playing");
+    assert!(
+        engine.drives_lane(SINK_LANE),
+        "the last good program keeps playing"
+    );
 }

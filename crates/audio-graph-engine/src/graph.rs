@@ -295,9 +295,19 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::ir::{MathOp, Waveform};
-    use crate::nodes::{
-        Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotOut,
-    };
+    use crate::nodes::{Constant, Lfo, Math, ParamPort, Plugin, PluginPorts, RangeMap, Rate};
+
+    /// A node with one parameter socket, for the tests that only need
+    /// something to wire *into*.
+    fn param_input(graph: &mut Graph) -> NodeId {
+        graph.add(
+            NodeKind::Math(Math {
+                op: MathOp::Add,
+                b: 0.0,
+            }),
+            [0.0, 0.0],
+        )
+    }
     // `remove_input` is the editor's half of the node set, so the two tests
     // that exercise it are compiled with it.
     #[cfg(feature = "ui")]
@@ -308,7 +318,7 @@ mod tests {
         let mut graph = Graph::new();
         let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         let b = graph.add(NodeKind::Constant(Constant { value: 2.0 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_input(&mut graph);
 
         graph.connect(a, 0, out, 0);
         graph.connect(b, 0, out, 0);
@@ -321,7 +331,7 @@ mod tests {
     fn removing_a_node_takes_its_links_with_it() {
         let mut graph = Graph::new();
         let a = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
+        let out = param_input(&mut graph);
         graph.connect(a, 0, out, 0);
 
         graph.remove(a);
@@ -374,7 +384,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let slot = param_input(&mut graph);
         let speaker = graph.add(
             NodeKind::AudioOut(AudioOut {
                 bus: 0,
@@ -429,7 +439,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let slot = param_input(&mut graph);
         graph.connect(audio, 0, slot, 0);
         assert!(graph.links.is_empty());
     }
@@ -637,7 +647,7 @@ mod tests {
         let json = r#"{
             "nodes": [
                 {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},
-                {"id": 1, "pos": [10.0, 0.0], "kind": {"SlotOut": {"slot": 2}}}
+                {"id": 1, "pos": [10.0, 0.0], "kind": {"Math": {"op": "Add", "b": 0.0}}}
             ],
             "links": [{"from": 0, "to": 1, "input": 0}],
             "next_id": 2
@@ -659,7 +669,7 @@ mod tests {
             }),
             [12.0, 34.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 5 }), [200.0, 34.0]);
+        let out = param_input(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let json = serde_json::to_string(&graph).unwrap();

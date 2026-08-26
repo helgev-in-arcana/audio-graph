@@ -392,9 +392,10 @@ impl Engine {
         }
     }
 
-    /// Whether the graph currently drives `slot`, and so overrides the DAW.
-    pub fn drives(&self, slot: usize) -> bool {
-        self.program.as_ref().is_some_and(|p| p.drives(slot))
+    /// Whether the graph currently drives `lane` — see
+    /// [`Program::drives_lane`].
+    pub fn drives_lane(&self, lane: usize) -> bool {
+        self.program.as_ref().is_some_and(|p| p.drives_lane(lane))
     }
 
     pub fn has_program(&self) -> bool {
@@ -1197,11 +1198,40 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-        Plugin, PluginPorts, Rate, SlotIn, SlotOut, linear_to_db,
+        ParamPort, Plugin, PluginPorts, Rate, SlotIn, linear_to_db,
     };
     use crate::port::PortType;
 
     const SLOTS: usize = 32;
+
+    /// Somewhere for a parameter chain to go.
+    ///
+    /// With `SlotOut` gone, a graph reaches the outside world through a §14.12
+    /// parameter socket, and the lane that carries it is the first one past
+    /// the slot table — which is what [`SINK`] is.
+    fn param_sink(graph: &mut Graph) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    params: vec![ParamPort {
+                        id: 0,
+                        name: "p".into(),
+                    }],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
+
+    /// The lane [`param_sink`]'s parameter is driven through.
+    const SINK: usize = SLOTS;
+
+    /// A lane row: the slot table, and the sink's lane after it.
+    fn lanes() -> Vec<f64> {
+        vec![0.0; SLOTS + 1]
+    }
 
     fn ctx(frames: u32) -> BlockContext {
         BlockContext {
@@ -1243,18 +1273,18 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_the_graph_does_not_drive_keeps_the_daws_value() {
+    fn a_lane_the_graph_does_not_drive_keeps_the_daws_value() {
         let mut graph = Graph::new();
         let c = graph.add(NodeKind::Constant(Constant { value: 0.25 }), [0.0, 0.0]);
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(c, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.9; SLOTS];
+        let mut slots = vec![0.9; SLOTS + 1];
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.25);
+        assert_eq!(slots[SINK], 0.25);
         assert_eq!(slots[1], 0.9, "an undriven slot is left alone");
     }
 
@@ -1269,17 +1299,17 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 4 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(input, 0, half, 0);
         graph.connect(half, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[3] = 0.8;
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[4] - 0.4).abs() < 1e-12);
+        assert!((slots[SINK] - 0.4).abs() < 1e-12);
     }
 
     #[test]
@@ -1295,18 +1325,18 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         let mut seen: Vec<f64> = Vec::new();
         // One second at 48 kHz in 32-sample sub-blocks: a whole cycle.
         for _ in 0..1500 {
             engine.run(&ctx(32), &mut slots);
-            seen.push(slots[0]);
+            seen.push(slots[SINK]);
         }
         let lowest = seen.iter().cloned().fold(f64::INFINITY, f64::min);
         let highest = seen.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -1329,14 +1359,14 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
         // Quarter of a beat at 120 bpm = 0.125 s = 6000 samples.
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         engine.run(
             &BlockContext {
                 sample_rate: 48_000.0,
@@ -1354,9 +1384,9 @@ mod tests {
             &mut slots,
         );
         assert!(
-            (slots[0] - 0.25).abs() < 1e-3,
+            (slots[SINK] - 0.25).abs() < 1e-3,
             "expected a quarter cycle, got {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1396,7 +1426,7 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
 
         graph.connect(seed, 0, mixed, 0);
         graph.connect(read, 0, mixed, 1);
@@ -1414,16 +1444,16 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0) * 0.5
-        assert!((slots[0] - 0.5).abs() < 1e-9, "first pass: {}", slots[0]);
+        assert!((slots[SINK] - 0.5).abs() < 1e-9, "first pass: {}", slots[SINK]);
 
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         // (1 + 0.5) * 0.5 — the 0.5 came back round.
-        assert!((slots[0] - 0.75).abs() < 1e-9, "second pass: {}", slots[0]);
+        assert!((slots[SINK] - 0.75).abs() < 1e-9, "second pass: {}", slots[SINK]);
     }
 
     /// §14.5. The line is state, like an LFO's phase, and an edit somewhere
@@ -1434,10 +1464,10 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[0] - 0.5).abs() < 1e-9);
+        assert!((slots[SINK] - 0.5).abs() < 1e-9);
 
         // An unrelated node appears, as it does on any edit.
         graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
@@ -1446,9 +1476,9 @@ mod tests {
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         assert!(
-            (slots[0] - 0.75).abs() < 1e-9,
+            (slots[SINK] - 0.75).abs() < 1e-9,
             "the line was emptied by the swap: {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1460,15 +1490,15 @@ mod tests {
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         slots[1] = 1.0;
         engine.run(&ctx(32), &mut slots);
         assert!(
-            (slots[0] - 0.75).abs() < 1e-9,
+            (slots[SINK] - 0.75).abs() < 1e-9,
             "a zero time should behave as one sub-block, not as zero: {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1480,12 +1510,12 @@ mod tests {
         let run = |frames: u32, passes: usize| {
             let mut engine = Engine::new();
             load(&mut engine, &graph);
-            let mut slots = vec![0.0; SLOTS];
+            let mut slots = lanes();
             for _ in 0..passes {
                 slots[1] = 1.0;
                 engine.run(&ctx(frames), &mut slots);
             }
-            slots[0]
+            slots[SINK]
         };
         // Same sub-block size, same answer, however the DAW hands us the block.
         assert!((run(32, 4) - run(32, 4)).abs() < 1e-12);
@@ -1718,17 +1748,17 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(lfo, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         for _ in 0..200 {
             engine.run(&ctx(32), &mut slots);
         }
-        let before = slots[0];
+        let before = slots[SINK];
         assert!(before > 0.05, "the LFO should have moved by now");
 
         // Something unrelated changes — a new node appears — and the graph is
@@ -1738,9 +1768,9 @@ mod tests {
         engine.run(&ctx(1), &mut slots);
 
         assert!(
-            (slots[0] - before).abs() < 0.01,
+            (slots[SINK] - before).abs() < 0.01,
             "the phase jumped across a recompile: {before} -> {}",
-            slots[0]
+            slots[SINK]
         );
     }
 
@@ -1753,13 +1783,13 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 7 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(expr, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
 
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
         engine.note(&NoteEvent::Expression {
             note_id: 1,
             port: 0,
@@ -1770,7 +1800,7 @@ mod tests {
             sample_offset: 0,
         });
         engine.run(&ctx(32), &mut slots);
-        assert!((slots[7] - 0.7).abs() < 1e-12);
+        assert!((slots[SINK] - 0.7).abs() < 1e-12);
     }
 
     #[test]
@@ -1782,12 +1812,12 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(gate, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
-        let mut slots = vec![0.0; SLOTS];
+        let mut slots = lanes();
 
         let on = |key: i16| NoteEvent::NoteOn {
             note_id: key as i32,
@@ -1807,21 +1837,21 @@ mod tests {
         };
 
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.0);
+        assert_eq!(slots[SINK], 0.0);
 
         engine.note(&on(60));
         engine.note(&on(64));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 1.0);
+        assert_eq!(slots[SINK], 1.0);
 
         // Releasing one of two held notes must not drop the gate.
         engine.note(&off(60));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 1.0);
+        assert_eq!(slots[SINK], 1.0);
 
         engine.note(&off(64));
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[0], 0.0);
+        assert_eq!(slots[SINK], 0.0);
     }
 
     #[test]
@@ -1835,16 +1865,16 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        let out = graph.add(NodeKind::SlotOut(SlotOut { slot: 0 }), [0.0, 0.0]);
+        let out = param_sink(&mut graph);
         graph.connect(a, 0, div, 0);
         graph.connect(div, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
-        let mut slots = vec![0.5; SLOTS];
+        let mut slots = vec![0.5; SLOTS + 1];
         engine.run(&ctx(32), &mut slots);
-        assert!(slots[0].is_finite());
-        assert!((0.0..=1.0).contains(&slots[0]));
+        assert!(slots[SINK].is_finite());
+        assert!((0.0..=1.0).contains(&slots[SINK]));
     }
 
     #[test]
@@ -2406,7 +2436,7 @@ mod tests {
 
         // An edit somewhere else entirely, between the write and the read.
         let constant = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
-        let slot = graph.add(NodeKind::SlotOut(SlotOut { slot: 3 }), [0.0, 0.0]);
+        let slot = param_sink(&mut graph);
         graph.connect(constant, 0, slot, 0);
         load(&mut engine, &graph);
 

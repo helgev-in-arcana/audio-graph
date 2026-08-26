@@ -204,22 +204,6 @@ impl<'a> ParamCx<'a> {
         Ok(())
     }
 
-    /// Refuse a second output on one slot.
-    ///
-    /// Silently letting one win would make the graph's behaviour depend on
-    /// node creation order.
-    pub(crate) fn claim_slot(&self, slot: usize) -> Result<(), CompileError> {
-        if self.outputs.iter().any(|&(s, _)| s as usize == slot) {
-            return Err(CompileError::DuplicateOutput { slot });
-        }
-        Ok(())
-    }
-
-    /// Drive a wrapper slot from `reg`, replacing the DAW's automation for it.
-    pub(crate) fn drive_slot(&mut self, slot: usize, reg: Reg) {
-        self.outputs.push((slot as u16, reg));
-    }
-
     /// Drive one of a sub-plugin's own parameters from `reg` (§14.12).
     ///
     /// Two sockets naming one parameter is a patch the user can draw; the last
