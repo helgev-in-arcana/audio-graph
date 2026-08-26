@@ -291,6 +291,7 @@ impl Graph {
     /// (§14.2). A patch that loses a few wires is better than one that refuses
     /// to make a sound until every wire is right.
     pub fn prune(&mut self) {
+        self.migrate_plugin_outputs();
         let ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
         let mut keep = Vec::with_capacity(self.links.len());
         for link in &self.links {
@@ -307,6 +308,50 @@ impl Graph {
         self.next_id = self
             .next_id
             .max(ids.iter().copied().max().map_or(0, |m| m + 1));
+    }
+
+    /// Give a plugin node saved before `audio_out_shown` existed the sockets
+    /// it was actually using.
+    ///
+    /// Every output bus had a socket then, which is what an empty
+    /// `audio_out_shown` still means — the alternative, reading it as "none",
+    /// would cut every link on the way in. But honouring it literally reopens
+    /// Kontakt as a node with sixty-four output sockets, which is the wall
+    /// this field exists to take down. So the patch keeps the buses it wired,
+    /// plus the main one, and loses the rest.
+    ///
+    /// The link indices move with them: the socket for bus 5 is port 1 once
+    /// buses 1 to 4 have no socket, and a link still pointing at port 5 would
+    /// be pruned two lines later.
+    pub fn migrate_plugin_outputs(&mut self) {
+        for node in &mut self.nodes {
+            let NodeKind::Plugin(plugin) = &mut node.kind else {
+                continue;
+            };
+            if !plugin.ports.audio_out_shown.is_empty() || plugin.ports.audio_out.is_empty() {
+                continue;
+            }
+            let mut keep: Vec<u16> = vec![0];
+            for link in &self.links {
+                if link.from == node.id && !keep.contains(&u16::from(link.from_port)) {
+                    keep.push(u16::from(link.from_port));
+                }
+            }
+            keep.retain(|&bus| usize::from(bus) < plugin.ports.audio_out.len());
+            keep.sort_unstable();
+            for link in &mut self.links {
+                if link.from != node.id {
+                    continue;
+                }
+                if let Some(port) = keep
+                    .iter()
+                    .position(|&bus| bus == u16::from(link.from_port))
+                {
+                    link.from_port = port as u8;
+                }
+            }
+            plugin.ports.audio_out_shown = keep;
+        }
     }
 }
 
@@ -365,6 +410,53 @@ mod tests {
         graph.remove(a);
         let b = graph.add(NodeKind::Constant(Constant { value: 1.0 }), [0.0, 0.0]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    /// A patch saved before `audio_out_shown` existed keeps the buses it
+    /// wired and loses the rest — which is the difference between reopening
+    /// Kontakt as a node and reopening it as a column of sixty-four sockets.
+    #[test]
+    fn an_old_patch_keeps_only_the_output_buses_it_wired() {
+        let mut graph = Graph::new();
+        let plugin = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2; 8],
+                    // No picks: the file predates the field.
+                    audio_out_shown: Vec::new(),
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let sink = graph.add(
+            NodeKind::Mix(crate::nodes::Mix {
+                channels: 2,
+                inputs: 2,
+                gains: vec![0.0, 0.0],
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(plugin, 5, sink, 0);
+
+        graph.prune();
+
+        let NodeKind::Plugin(node) = &graph.node(plugin).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            node.ports.audio_out_shown,
+            vec![0, 5],
+            "the main bus and the one that was wired"
+        );
+        let link = graph.links.iter().find(|l| l.from == plugin).unwrap();
+        assert_eq!(
+            link.from_port, 1,
+            "bus 5 is the second socket now, and the link says so"
+        );
     }
 
     #[test]
