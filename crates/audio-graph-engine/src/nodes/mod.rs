@@ -435,6 +435,41 @@ impl NodeKind {
     }
 }
 
+/// Which half of the graph a node belongs to, for the "add a node" menu.
+///
+/// The menu had grown to a wall of buttons in which "Range map" sat beside
+/// "Note in", and the only way to find anything was to read all of it. These
+/// three are the three kinds of wire the editor has, so they are the three
+/// piles a reader is already sorting the nodes into.
+///
+/// A node is filed by what it is *for*, not by every socket it owns: a gate
+/// takes a parameter to decide with, but it is an audio node because audio is
+/// what comes out the other side.
+#[cfg(feature = "ui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeGroup {
+    /// Sound in, sound out.
+    Audio,
+    /// Notes in, notes out.
+    Note,
+    /// Numbers: what drives the slots and the sub-plugins' parameters.
+    Param,
+}
+
+#[cfg(feature = "ui")]
+impl NodeGroup {
+    /// The three, in the order the menu lists them.
+    pub const ALL: [NodeGroup; 3] = [NodeGroup::Audio, NodeGroup::Note, NodeGroup::Param];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeGroup::Audio => "Audio",
+            NodeGroup::Note => "MIDI",
+            NodeGroup::Param => "Parameter",
+        }
+    }
+}
+
 /// What the editor's "add a node" menu offers, in the order it offers it.
 ///
 /// A free function rather than a method: `catalogue_defaults` returns `Self`,
@@ -442,52 +477,132 @@ impl NodeKind {
 /// anyway — both halves of a delay arrive together through `Graph::add_delay`
 /// and so are offered here not at all.
 #[cfg(feature = "ui")]
-pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
+pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
     let mut out = Vec::new();
     fn take<T>(
-        out: &mut Vec<(&'static str, NodeKind)>,
+        out: &mut Vec<(NodeGroup, &'static str, NodeKind)>,
+        group: NodeGroup,
         entries: Vec<(&'static str, T)>,
         wrap: fn(T) -> NodeKind,
     ) {
-        out.extend(entries.into_iter().map(|(name, node)| (name, wrap(node))));
+        out.extend(
+            entries
+                .into_iter()
+                .map(|(name, node)| (group, name, wrap(node))),
+        );
     }
-    take(&mut out, Constant::catalogue_defaults(), NodeKind::Constant);
-    take(&mut out, SlotIn::catalogue_defaults(), NodeKind::SlotIn);
-    take(&mut out, Lfo::catalogue_defaults(), NodeKind::Lfo);
+
+    // Audio.
     take(
         &mut out,
-        Expression::catalogue_defaults(),
-        NodeKind::Expression,
+        NodeGroup::Audio,
+        AudioIn::catalogue_defaults(),
+        NodeKind::AudioIn,
     );
-    take(&mut out, Math::catalogue_defaults(), NodeKind::Math);
-    take(&mut out, RangeMap::catalogue_defaults(), NodeKind::RangeMap);
-    take(&mut out, Switch::catalogue_defaults(), NodeKind::Switch);
-    take(&mut out, AudioIn::catalogue_defaults(), NodeKind::AudioIn);
-    take(&mut out, AudioOut::catalogue_defaults(), NodeKind::AudioOut);
-    out.extend(
-        NoteIn::catalogue_defaults()
-            .into_iter()
-            .map(|(name, _)| (name, NodeKind::NoteIn)),
-    );
-    take(&mut out, Plugin::catalogue_defaults(), NodeKind::Plugin);
     take(
         &mut out,
+        NodeGroup::Audio,
+        AudioOut::catalogue_defaults(),
+        NodeKind::AudioOut,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Mix::catalogue_defaults(),
+        NodeKind::Mix,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Gate::catalogue_defaults(),
+        NodeKind::Gate,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Plugin::catalogue_defaults(),
+        NodeKind::Plugin,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
         DelayWrite::catalogue_defaults(),
         NodeKind::DelayWrite,
     );
-    take(&mut out, Mix::catalogue_defaults(), NodeKind::Mix);
-    take(&mut out, Gate::catalogue_defaults(), NodeKind::Gate);
-    take(&mut out, NoteGate::catalogue_defaults(), NodeKind::NoteGate);
     take(
         &mut out,
+        NodeGroup::Audio,
+        DelayRead::catalogue_defaults(),
+        NodeKind::DelayRead,
+    );
+
+    // MIDI.
+    out.extend(
+        NoteIn::catalogue_defaults()
+            .into_iter()
+            .map(|(name, _)| (NodeGroup::Note, name, NodeKind::NoteIn)),
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteGate::catalogue_defaults(),
+        NodeKind::NoteGate,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
         KeySwitch::catalogue_defaults(),
         NodeKind::KeySwitch,
     );
-    take(&mut out, KeyParam::catalogue_defaults(), NodeKind::KeyParam);
+
+    // Parameter.
     take(
         &mut out,
-        DelayRead::catalogue_defaults(),
-        NodeKind::DelayRead,
+        NodeGroup::Param,
+        Constant::catalogue_defaults(),
+        NodeKind::Constant,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        SlotIn::catalogue_defaults(),
+        NodeKind::SlotIn,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Lfo::catalogue_defaults(),
+        NodeKind::Lfo,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Expression::catalogue_defaults(),
+        NodeKind::Expression,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Math::catalogue_defaults(),
+        NodeKind::Math,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        RangeMap::catalogue_defaults(),
+        NodeKind::RangeMap,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        Switch::catalogue_defaults(),
+        NodeKind::Switch,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        KeyParam::catalogue_defaults(),
+        NodeKind::KeyParam,
     );
     out
 }

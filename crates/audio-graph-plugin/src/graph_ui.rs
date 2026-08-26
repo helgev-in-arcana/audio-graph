@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    Graph, NODE_WIDTH, NodeAction, NodeId, NodeKind, NodeUi, Plugin, PluginPorts, PortType,
-    catalogue,
+    Graph, NODE_WIDTH, NodeAction, NodeGroup, NodeId, NodeKind, NodeUi, Plugin, PluginPorts,
+    PortType, catalogue,
 };
 
 /// Re-exported so the wrapper fills one in without naming two crates. It is
@@ -917,23 +917,37 @@ impl GraphEditor {
 
                     ui.separator();
                     ui.strong("Node");
-                    // Wrapped rather than one per row. There are fourteen of
-                    // them and none has a name longer than "Range map", so a
-                    // column made the menu twice as tall as the list needed
-                    // and put half of it behind a scrollbar.
+                    // Wrapped rather than one per row, and under a heading per
+                    // kind of wire: the flat list had grown past the point
+                    // where a reader could find anything in it without reading
+                    // all of it, and "which sort of thing is this" is the
+                    // question being asked while the menu is open.
+                    let entries = catalogue();
                     egui::ScrollArea::vertical()
                         .id_salt("add-kind")
-                        .max_height(240.0)
+                        .max_height(320.0)
                         .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for (label, kind) in catalogue() {
-                                    if ui.button(label).clicked() {
-                                        graph.add(kind, [at.x, at.y]);
-                                        added = true;
-                                        close = true;
-                                    }
+                            for group in NodeGroup::ALL {
+                                // A group with nothing in it — as `Plugin`
+                                // and the delays are, being added elsewhere —
+                                // gets no heading rather than an empty one.
+                                if !entries.iter().any(|(g, _, _)| *g == group) {
+                                    continue;
                                 }
-                            });
+                                ui.weak(group.label());
+                                ui.horizontal_wrapped(|ui| {
+                                    for (g, label, kind) in &entries {
+                                        if *g != group {
+                                            continue;
+                                        }
+                                        if ui.button(*label).clicked() {
+                                            graph.add(kind.clone(), [at.x, at.y]);
+                                            added = true;
+                                            close = true;
+                                        }
+                                    }
+                                });
+                            }
                         });
                     ui.separator();
                     if ui.button("cancel").clicked() {
