@@ -369,10 +369,24 @@ impl Shared {
         };
         if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
             // The parameter sockets are the user's, not the plugin's (§14.12):
-            // discovery replaces the buses and leaves the sockets alone.
+            // discovery replaces the buses and leaves the sockets alone. Which
+            // output buses have a socket is the user's too, for the same
+            // reason — but only once there is something for it to be a choice
+            // between. A node discovering its plugin for the first time takes
+            // the main bus and nothing else.
             let params = std::mem::take(&mut ports.params);
+            let shown = (!ports.audio_out.is_empty()).then(|| ports.shown_outputs());
             *ports = discovered;
             ports.params = params;
+            if let Some(shown) = shown {
+                ports.audio_out_shown = shown;
+                // Every pick pointed at a bus the reloaded plugin no longer
+                // has. Silently ending up with no way out of the node would be
+                // worse than falling back to the main bus.
+                if ports.shown_outputs().is_empty() && !ports.audio_out.is_empty() {
+                    ports.audio_out_shown = vec![0];
+                }
+            }
         }
         state.graph.prune();
         drop(state);

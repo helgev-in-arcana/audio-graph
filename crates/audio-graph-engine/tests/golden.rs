@@ -74,6 +74,7 @@ fn stereo_plugin(instance: usize, latency: u32) -> NodeKind {
         ports: PluginPorts {
             audio_in: vec![2],
             audio_out: vec![2],
+            audio_out_shown: Vec::new(),
             accepts_notes: false,
             params: vec![ParamPort {
                 id: 7,
@@ -208,6 +209,7 @@ fn plugin_with_sidechain() {
             ports: PluginPorts {
                 audio_in: vec![2, 2],
                 audio_out: vec![2],
+                audio_out_shown: Vec::new(),
                 accepts_notes: false,
                 params: vec![ParamPort {
                     id: 12,
@@ -242,6 +244,7 @@ fn plugin_with_two_outputs() {
             ports: PluginPorts {
                 audio_in: vec![2],
                 audio_out: vec![2, 2],
+                audio_out_shown: Vec::new(),
                 accepts_notes: false,
                 params: Vec::new(),
                 latency: 0,
@@ -268,6 +271,7 @@ fn instrument_with_notes() {
             ports: PluginPorts {
                 audio_in: Vec::new(),
                 audio_out: vec![2],
+                audio_out_shown: Vec::new(),
                 accepts_notes: true,
                 params: Vec::new(),
                 latency: 0,
