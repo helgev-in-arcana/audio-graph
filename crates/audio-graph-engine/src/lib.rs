@@ -34,9 +34,9 @@ pub use ir::{
     RateSpec, Reg, Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeySwitch, KeySwitchMode,
-    Lfo, Math, Mix, NodeKind, NoteGate, NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate,
-    SlotIn, Switch, db_to_linear, linear_to_db,
+    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam, KeyParamMode,
+    KeySwitch, KeySwitchMode, KeyValue, Lfo, Math, Mix, NodeKind, NoteGate, NoteIn, ParamPort,
+    Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{
