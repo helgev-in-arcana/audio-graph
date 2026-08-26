@@ -23,6 +23,7 @@ use crate::ir::{
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS,
     MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
 };
+use crate::nodes::db_to_linear;
 
 /// How many `DelayRead` taps one program may have.
 ///
@@ -814,7 +815,8 @@ impl Engine {
                         let gain = input
                             .lane
                             .and_then(|lane| ctx.lane(row, lane))
-                            .unwrap_or(input.gain) as f32;
+                            .map(|db| db_to_linear(db) as f32)
+                            .unwrap_or(input.gain as f32);
                         for ch in 0..width.min(MAX_CHANNELS) {
                             let from = self.at(input.buf, ch, frames);
                             let to = self.at(*out, ch, frames);
@@ -1195,7 +1197,7 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-        Plugin, PluginPorts, Rate, SlotIn, SlotOut,
+        Plugin, PluginPorts, Rate, SlotIn, SlotOut, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2201,7 +2203,7 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 1,
-                gains: vec![0.25],
+                gains: vec![linear_to_db(0.25)],
             }),
             [0.0, 0.0],
         );
@@ -2230,7 +2232,7 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
-                gains: vec![0.5, 0.25],
+                gains: vec![linear_to_db(0.5), linear_to_db(0.25)],
             }),
             [0.0, 0.0],
         );
@@ -2249,6 +2251,65 @@ mod tests {
         assert!(
             daw_out.iter().all(|&v| (v - 3.0).abs() < 1e-6),
             "{daw_out:?}"
+        );
+    }
+
+    /// When a gain socket is driven by a parameter source, the parameter value
+    /// is interpreted as decibels and converted to a linear multiplier for audio.
+    #[test]
+    fn a_driven_gain_socket_interprets_its_value_as_decibels() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let gain_ctl = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 1,
+                gains: vec![0.0],
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, mix, 0);
+        // Sockets alternate: input 1 is socket 0, gain 1 is socket 1.
+        graph.connect(gain_ctl, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let lane = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Mix { inputs, .. } => inputs[0].lane,
+                _ => None,
+            })
+            .expect("the wired gain control got a lane") as usize;
+        let lanes_per_row = lane + 1;
+        let lanes = vec![-6.0; lanes_per_row];
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[2]);
+        load(&mut engine, &graph);
+
+        let daw_in = vec![1.0f32; 2 * 8];
+        let mut daw_out = vec![0.0f32; 2 * 8];
+        engine.run_audio(
+            &AudioContext {
+                frames: 8,
+                quantum: 8,
+                sample_rate: RATE,
+                lanes: &lanes,
+                lanes_per_row,
+            },
+            &daw_in,
+            &mut daw_out,
+            &mut Adders,
+        );
+
+        let want_linear = db_to_linear(-6.0) as f32;
+        assert!(
+            daw_out.iter().all(|&v| (v - want_linear).abs() < 1e-6),
+            "expected {want_linear}, got {daw_out:?}"
         );
     }
 

@@ -2270,10 +2270,10 @@ fn inject_delay(state: &str, time: f64) -> Result<String, String> {
         audio_graph_engine::NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
-            // The dry signal at unity, the loop below it, so the repeats fade
+            // The dry signal at unity (0 dB), the loop below it, so the repeats fade
             // rather than running for ever. Checking that they fade *by this
             // much* is what puts the mix's gains under test too.
-            gains: vec![1.0, FEEDBACK],
+            gains: vec![0.0, audio_graph_engine::linear_to_db(FEEDBACK)],
         }),
         [320.0, 40.0],
     );
@@ -2549,7 +2549,7 @@ fn inject_one_plugin(state: &str, plugin: &str) -> Result<String, String> {
         audio_graph_engine::NodeKind::Mix(Mix {
             channels: 2,
             inputs: 2,
-            gains: vec![1.0, 0.5],
+            gains: vec![0.0, audio_graph_engine::linear_to_db(0.5)],
         }),
         [560.0, 60.0],
     );
