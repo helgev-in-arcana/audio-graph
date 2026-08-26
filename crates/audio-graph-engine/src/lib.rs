@@ -35,7 +35,8 @@ pub use ir::{
 };
 pub use nodes::{
     AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-    NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, SlotOut,
+    NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, SlotOut, db_to_linear,
+    linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{
