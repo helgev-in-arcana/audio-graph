@@ -119,7 +119,8 @@ DAW からのオートメーションは **スロット**（32 本）を通り�
 繋ぎます（かつては `SlotOut` でスロットを上書きできましたが、DAW のオートメーションと
 奪い合いになるため廃止しました）。
 
-信号の ON/OFF は `Audio Gate` と `MIDI Gate`、値の切り替えは `Param Select` です。
+信号の ON/OFF は `Audio Gate` と `MIDI Gate`、値の切り替えは `Param Select` です（値ごとに
+ソケットと閾値を 1 つ持ち、`Mix` の入力と同じように増減できます）。
 MIDI キースイッチで分岐させたいときは `Key MIDI Route`（送出先の切り替え）と
 `Key Param Select`（パラメータ値の切り替え）を使います。どちらも行き先／値ごとに
 鍵を 1 つ持ち、`Mix` の入力と同じように増減できます。`Key MIDI Route` の操作に使う鍵は

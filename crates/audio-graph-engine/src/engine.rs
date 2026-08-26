@@ -1472,9 +1472,8 @@ mod tests {
         let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::Switch(Switch {
-                threshold: 0.6,
-                off: 0.2,
-                on: 0.9,
+                values: vec![0.2, 0.9],
+                thresholds: vec![0.6],
             }),
             [0.0, 0.0],
         );
@@ -1495,6 +1494,34 @@ mod tests {
         assert_eq!(slots[SINK], 0.9, "the threshold itself is on");
     }
 
+    /// More than two rungs: the last threshold the control has passed is the
+    /// one that wins, and below all of them the first value is what is read.
+    #[test]
+    fn a_switch_climbs_a_ladder_of_thresholds() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::Switch(Switch {
+                values: vec![0.1, 0.4, 0.7],
+                thresholds: vec![0.3, 0.8],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(control, 0, switch, 0);
+        graph.connect(switch, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+
+        let mut slots = lanes();
+        for (control, expected) in [(0.0, 0.1), (0.29, 0.1), (0.3, 0.4), (0.79, 0.4), (0.8, 0.7)] {
+            slots[1] = control;
+            engine.run(&ctx(32), &mut slots);
+            assert_eq!(slots[SINK], expected, "at {control}");
+        }
+    }
+
     /// Either side of a switch can be a signal rather than a number, which is
     /// what makes it a router as well as a chooser.
     #[test]
@@ -1505,9 +1532,8 @@ mod tests {
         let b = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::Switch(Switch {
-                threshold: 0.5,
-                off: 0.0,
-                on: 1.0,
+                values: vec![0.0, 1.0],
+                thresholds: vec![0.5],
             }),
             [0.0, 0.0],
         );
