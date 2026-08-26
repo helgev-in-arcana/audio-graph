@@ -121,11 +121,16 @@ pub struct WrapperEditor {
 
     /// Populated on first use, refreshed on demand.
     ///
-    /// Scanned by filename rather than by opening each module: opening 30
-    /// plugins to draw a list would take seconds and, as M2 found, some of them
-    /// crash and at least one hangs.
+    /// Listed by filename from disk and classified from the scan cache, which
+    /// is what makes the list appear at once: opening 30 plugins to draw it
+    /// would take seconds and, as M2 found, some of them crash and at least one
+    /// hangs. The opening happens on `scan`'s thread, and what it learns lands
+    /// here when it is done.
     entries: Vec<crate::graph_ui::PluginEntry>,
     scanned: bool,
+    /// A scan running on its own thread, if one is. Never more than one: a
+    /// second would open the same modules again for the same answer.
+    scan: Option<std::sync::mpsc::Receiver<Vec<plugin_host::catalogue::Module>>>,
 
     /// Whether the plugin-folders window is showing.
     folders_open: bool,
@@ -151,6 +156,7 @@ impl WrapperEditor {
             deferred: None,
             entries: Vec::new(),
             scanned: false,
+            scan: None,
             folders_open: false,
             folder_input: String::new(),
             status: Status::default(),
@@ -174,6 +180,7 @@ impl WrapperEditor {
         if !self.scanned {
             self.rescan();
         }
+        self.collect_scan();
         let state = self.shared.main();
 
         self.view.class = state
@@ -223,27 +230,40 @@ impl WrapperEditor {
 
     /// List every plugin module on the machine, both formats together.
     ///
-    /// Paths only — the module is not opened. Enumerating the classes inside
-    /// would mean running every installed vendor's code just to draw a menu,
-    /// and the loader gets the identity right on its own when the user picks
-    /// one.
+    /// Two halves. The list of modules is paths only, straight off the disk,
+    /// and is instantly available. What each module *is* — an effect or an
+    /// instrument — can only be had by opening it, so it comes from the scan
+    /// cache, and anything the cache does not know yet is `Unknown` until the
+    /// background scan started here says otherwise.
     fn rescan(&mut self) {
-        self.entries.clear();
+        self.fill_entries(&plugin_host::catalogue::cached());
+        self.scanned = true;
+        self.start_scan();
+    }
+
+    /// Rebuild the menu's entries from the modules on disk and what `known`
+    /// says about them.
+    fn fill_entries(&mut self, known: &[plugin_host::catalogue::Module]) {
         let pinned = plugin_host::config::pinned();
+        self.entries.clear();
         for (format, path) in plugin_host::installed_modules() {
             let name = path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let kind = known
+                .iter()
+                .find(|m| m.path == path)
+                .map_or(plugin_host::catalogue::Kind::Unknown, |m| m.kind());
             let pinned = pinned.contains(&path);
             self.entries.push(crate::graph_ui::PluginEntry {
                 name,
                 format,
                 path,
                 pinned,
+                kind,
             });
         }
         self.sort_entries();
-        self.scanned = true;
     }
 
     /// Pinned first, then by name.
@@ -256,6 +276,64 @@ impl WrapperEditor {
     fn sort_entries(&mut self) {
         self.entries
             .sort_by_key(|e| (!e.pinned, e.name.to_lowercase()));
+    }
+
+    /// Start bringing the scan cache up to date, on a thread of its own.
+    ///
+    /// Off the UI thread because it loads third-party code: a plugin that takes
+    /// a second to open — or, as M2 found, hangs — must not take the editor
+    /// with it. Nothing is shared with it but the channel; it works from the
+    /// cache file and hands back what it found.
+    fn start_scan(&mut self) {
+        if self.scan.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("audio-graph plugin scan".into())
+            .spawn(move || {
+                // Every thread that loads a plugin needs this, and this one
+                // loads all of them (§13).
+                plugin_host::init_thread();
+                let _ = tx.send(plugin_host::catalogue::refresh());
+            }) {
+            Ok(_) => self.scan = Some(rx),
+            Err(e) => self.status.set(format!("scan not started: {e}")),
+        }
+    }
+
+    /// Take the scan's answer if it has one.
+    ///
+    /// Polled rather than pushed: the editor already repaints every frame for
+    /// the meters, so there is nothing to wake up. A sender dropped without a
+    /// value — the thread panicked inside somebody's plugin — clears the slot
+    /// so that "Rescan" can try again.
+    fn collect_scan(&mut self) {
+        let Some(rx) = &self.scan else { return };
+        match rx.try_recv() {
+            Ok(modules) => {
+                self.fill_entries(&modules);
+                self.scan = None;
+                let unknown = self
+                    .entries
+                    .iter()
+                    .filter(|e| e.kind == plugin_host::catalogue::Kind::Unknown)
+                    .count();
+                self.status.set(if unknown == 0 {
+                    format!("scanned {} modules", self.entries.len())
+                } else {
+                    format!(
+                        "scanned {} modules, {unknown} would not open",
+                        self.entries.len()
+                    )
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.scan = None;
+                self.status.set("the scan did not finish");
+            }
+        }
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
@@ -425,9 +503,21 @@ impl WrapperEditor {
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Rescan").clicked() {
+                    if ui
+                        .button("Rescan")
+                        .on_hover_text(
+                            "open every module again, rather than trusting what was                              found last time",
+                        )
+                        .clicked()
+                    {
+                        if let Err(e) = plugin_host::catalogue::forget() {
+                            self.status.set(format!("cache not cleared: {e}"));
+                        }
                         self.scanned = false;
-                        self.status.set("rescanned");
+                        self.status.set("rescanning");
+                    }
+                    if self.scan.is_some() {
+                        ui.weak("scanning…");
                     }
                     // Adds, never replaces: the user's own folders are not what
                     // they asked to undo. Also how a folder that appeared after

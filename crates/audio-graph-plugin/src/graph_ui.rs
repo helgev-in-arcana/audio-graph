@@ -70,6 +70,9 @@ pub struct PluginEntry {
     /// rather than read from the config per row, because the menu draws every
     /// frame and the config is behind a lock.
     pub pinned: bool,
+    /// Effect or instrument, as the scan cache has it — `Unknown` until this
+    /// module has been opened once.
+    pub kind: plugin_host::catalogue::Kind,
 }
 
 /// Something the canvas cannot do itself, because it loads a plugin or touches
@@ -949,6 +952,9 @@ impl GraphEditor {
                                             .desired_width(f32::INFINITY),
                                     );
                                 });
+                                // Under the filter rather than over it: the
+                                // filter applies to both tabs, and typing is
+                                // what the user does first.
                                 let needle = self.plugin_filter.to_lowercase();
                                 egui::ScrollArea::vertical()
                                     .id_salt("add-plugin")
@@ -963,6 +969,7 @@ impl GraphEditor {
                                         egui::Frame::new()
                                             .inner_margin(egui::Margin::symmetric(10, 0))
                                             .show(ui, |ui| {
+                                                let mut shown = 0usize;
                                                 for entry in ctx.plugins {
                                                     // The format is searchable too, so
                                                     // typing "clap" narrows the list to
@@ -992,6 +999,10 @@ impl GraphEditor {
                                                         }
                                                         RowHit::Nothing => {}
                                                     }
+                                                    shown += 1;
+                                                }
+                                                if shown == 0 {
+                                                    ui.weak("nothing here");
                                                 }
                                             });
                                     });
