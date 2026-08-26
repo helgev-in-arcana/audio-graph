@@ -412,7 +412,6 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[test]
     /// A patch saved before `audio_out_shown` existed keeps the buses it
     /// wired and loses the rest — which is the difference between reopening
     /// Kontakt as a node and reopening it as a column of sixty-four sockets.
