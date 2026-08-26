@@ -490,6 +490,7 @@ mod tests {
         let ports = PluginPorts {
             audio_in: vec![2, 2],
             audio_out: vec![2],
+            audio_out_shown: Vec::new(),
             accepts_notes: true,
             params: vec![ParamPort {
                 id: 7,
@@ -525,6 +526,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2, 2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     ..PluginPorts::default()
                 },
             }),
@@ -540,6 +542,7 @@ mod tests {
             ports: PluginPorts {
                 audio_in: vec![2],
                 audio_out: vec![2],
+                audio_out_shown: Vec::new(),
                 ..PluginPorts::default()
             },
         });
@@ -621,6 +624,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     params: vec![
                         ParamPort {
                             id: 1,

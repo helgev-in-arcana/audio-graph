@@ -36,6 +36,19 @@ pub struct PluginPorts {
     pub audio_in: Vec<u16>,
     #[serde(default)]
     pub audio_out: Vec<u16>,
+    /// Which output buses have a socket, in socket order (§14.2).
+    ///
+    /// A plugin may report a dozen output buses — Surge XT's scenes, a drum
+    /// machine's per-voice outs — and a node with a dozen sockets is a node
+    /// nobody can read. The user adds the ones they want, the way they add
+    /// parameter sockets, and each socket picks its bus from a dropdown.
+    ///
+    /// Empty means *all of them*, which is what a patch saved before this
+    /// field existed meant by having no field: every bus had a socket then,
+    /// and reading it as "none" would cut every link on the way in. A fresh
+    /// node gets an explicit `[0]` from [`PluginPorts::from_layout`].
+    #[serde(default)]
+    pub audio_out_shown: Vec<u16>,
     #[serde(default)]
     pub accepts_notes: bool,
     #[serde(default)]
@@ -81,13 +94,56 @@ impl PluginPorts {
                 .filter(|&c| c > 0)
                 .collect()
         };
+        let audio_out = widths(&layout.outputs);
         PluginPorts {
+            // Just the main bus to start with. The extra buses are the
+            // plugin's business until the patch says otherwise, and a node
+            // that arrives with one socket per bus is the wall of sockets
+            // this field exists to prevent.
+            audio_out_shown: if audio_out.is_empty() {
+                Vec::new()
+            } else {
+                vec![0]
+            },
             audio_in: widths(&layout.inputs),
-            audio_out: widths(&layout.outputs),
+            audio_out,
             accepts_notes: layout.accepts_notes,
             params: Vec::new(),
             latency,
         }
+    }
+
+    /// The output bus each output socket carries, in socket order.
+    ///
+    /// Picks past the end of `audio_out` are dropped: a plugin that reloaded
+    /// with fewer buses than it had cannot honour them, and a socket that
+    /// cannot be compiled is worse than one that is not drawn.
+    pub fn shown_outputs(&self) -> Vec<u16> {
+        if self.audio_out_shown.is_empty() {
+            return (0..self.audio_out.len() as u16).collect();
+        }
+        self.audio_out_shown
+            .iter()
+            .copied()
+            .filter(|&bus| usize::from(bus) < self.audio_out.len())
+            .collect()
+    }
+
+    /// `audio_out_shown`, written out first if it was standing for "all".
+    #[cfg(feature = "ui")]
+    fn shown_mut(&mut self) -> &mut Vec<u16> {
+        if self.audio_out_shown.is_empty() {
+            self.audio_out_shown = self.shown_outputs();
+        }
+        &mut self.audio_out_shown
+    }
+}
+
+fn out_name(bus: u16) -> String {
+    if bus == 0 {
+        "out".to_string()
+    } else {
+        format!("out {}", bus + 1)
     }
 }
 
@@ -129,17 +185,20 @@ impl Node for Plugin {
     }
 
     fn output_ports(&self) -> Vec<Port> {
-        self.ports
-            .audio_out
+        let shown = self.ports.shown_outputs();
+        let many = shown.len() > 1;
+        shown
             .iter()
-            .enumerate()
-            .map(|(i, &channels)| {
-                let name = if i == 0 {
-                    "out".to_string()
-                } else {
-                    format!("out {}", i + 1)
-                };
-                Port::new(name, PortType::Audio { channels })
+            .map(|&bus| {
+                let channels = self.ports.audio_out[usize::from(bus)];
+                let port = Port::new(out_name(bus), PortType::Audio { channels });
+                // The last one stays: a plugin with no way out of it is a node
+                // that cannot be wired to anything, and the socket is how the
+                // others are got back.
+                #[cfg(feature = "ui")]
+                let port = if many { port.removable() } else { port };
+                let _ = many;
+                port
             })
             .collect()
     }
@@ -240,16 +299,25 @@ impl Node for Plugin {
 
         // The same question on the way out (§14.2): a plugin's extra output
         // buses are handed over only as far as the graph reads them, so Surge
-        // XT's `Scene B` costs nothing in a patch that ignores it.
-        let out_wired = cx.outputs_read();
-        if out_wired > self.ports.audio_out.len() {
+        // XT's `Scene B` costs nothing in a patch that ignores it. Which bus a
+        // socket carries is the user's pick, so how far is the highest bus
+        // anything reads — not how many sockets there are.
+        let shown = self.ports.shown_outputs();
+        if cx.outputs_read() > shown.len() {
             // A socket the node does not have. `connect` cannot make this link,
             // so the patch was hand-edited or written by a later version.
             return Err(CompileError::TypeMismatch {
                 node: cx.node(),
-                port: (out_wired - 1) as u8,
+                port: (cx.outputs_read() - 1) as u8,
             });
         }
+        let out_wired = shown
+            .iter()
+            .enumerate()
+            .filter(|&(port, _)| cx.readers_of(port as u8) > 0)
+            .map(|(_, &bus)| usize::from(bus) + 1)
+            .max()
+            .unwrap_or(0);
         if out_wired > 1 + MAX_AUX_BUSES {
             return Err(CompileError::TooLarge {
                 what: "output buses read from one plugin",
@@ -286,26 +354,35 @@ impl Node for Plugin {
 
         let latency = in_latency + self.ports.latency;
         if single {
-            cx.produce(0, output, latency);
+            // Only bus 0 exists, so any socket that reads carries it, and the
+            // combo never offers two sockets the same bus.
+            let port = shown.iter().position(|&bus| bus == 0).unwrap_or(0);
+            cx.produce(port as u8, output, latency);
             return Ok(());
         }
+        // Where each bus starts in the plugin's output region.
+        let mut offset = Vec::with_capacity(out_buses.len());
         let mut channel = 0u16;
-        for (port, &width) in out_buses.iter().enumerate() {
-            let readers = cx.readers_of(port as u8);
-            // A bus in the middle that nobody reads still occupies its channels
-            // in the plugin's output region; it just never gets copied out of
-            // it.
-            if readers > 0 {
-                let buf = cx.alloc_avoiding(width, readers, &[input, output])?;
-                cx.emit(AudioOp::Split {
-                    from: output,
-                    out: buf,
-                    channel,
-                    width,
-                });
-                cx.produce(port as u8, buf, latency);
-            }
+        for &width in &out_buses {
+            offset.push(channel);
             channel += width;
+        }
+        for (port, &bus) in shown.iter().enumerate() {
+            let readers = cx.readers_of(port as u8);
+            // A bus nobody reads still occupies its channels in the plugin's
+            // output region; it just never gets copied out of it.
+            if readers == 0 || usize::from(bus) >= out_buses.len() {
+                continue;
+            }
+            let width = out_buses[usize::from(bus)];
+            let buf = cx.alloc_avoiding(width, readers, &[input, output])?;
+            cx.emit(AudioOp::Split {
+                from: output,
+                out: buf,
+                channel: offset[usize::from(bus)],
+                width,
+            });
+            cx.produce(port as u8, buf, latency);
         }
         cx.consume(output);
         Ok(())
@@ -446,6 +523,76 @@ impl Node for Plugin {
                 }
             });
         changed
+    }
+
+    /// Which output bus this socket carries.
+    ///
+    /// Drawn only when there is a choice to make. A plugin with one output bus
+    /// is the ordinary case and its node looks exactly as it always did: one
+    /// socket called "out", nothing on the row, and no button to add a second.
+    #[cfg(feature = "ui")]
+    fn output_control(&mut self, ui: &mut egui::Ui, port: u8, _cx: &mut NodeUi<'_>) -> bool {
+        if self.ports.audio_out.len() < 2 {
+            return false;
+        }
+        let shown = self.ports.shown_outputs();
+        let Some(&bus) = shown.get(usize::from(port)) else {
+            return false;
+        };
+        let mut picked = None;
+        // A bus already on another socket is not offered: two sockets on one
+        // bus would be the same signal twice, and the compiler splits each bus
+        // to one buffer.
+        egui::ComboBox::from_id_salt(("out-bus", port))
+            .selected_text(out_name(bus))
+            .width(ui.available_width().min(72.0))
+            .show_ui(ui, |ui| {
+                for candidate in 0..self.ports.audio_out.len() as u16 {
+                    if candidate != bus && shown.contains(&candidate) {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(candidate == bus, out_name(candidate))
+                        .clicked()
+                        && candidate != bus
+                    {
+                        picked = Some(candidate);
+                    }
+                }
+            });
+        let Some(candidate) = picked else {
+            return false;
+        };
+        self.ports.shown_mut()[usize::from(port)] = candidate;
+        true
+    }
+
+    /// One socket per bus is a wall of sockets on a plugin that has a dozen,
+    /// so they are added the way parameter sockets are.
+    #[cfg(feature = "ui")]
+    fn add_output_label(&self) -> Option<&'static str> {
+        (self.ports.shown_outputs().len() < self.ports.audio_out.len()).then_some("+ out")
+    }
+
+    #[cfg(feature = "ui")]
+    fn add_output(&mut self) {
+        let shown = self.ports.shown_outputs();
+        // The lowest bus not already on a socket, so adding twice gives two
+        // different buses rather than two of the same.
+        let Some(next) = (0..self.ports.audio_out.len() as u16).find(|b| !shown.contains(b)) else {
+            return;
+        };
+        self.ports.shown_mut().push(next);
+    }
+
+    #[cfg(feature = "ui")]
+    fn remove_output(&mut self, port: u8) -> u8 {
+        let index = usize::from(port);
+        if self.ports.shown_outputs().len() <= 1 || index >= self.ports.shown_outputs().len() {
+            return 0;
+        }
+        self.ports.shown_mut().remove(index);
+        1
     }
 
     /// A plugin node does not get a socket per parameter — Chroma has 2106 of

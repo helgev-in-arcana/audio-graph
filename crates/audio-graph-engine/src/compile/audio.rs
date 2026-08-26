@@ -82,6 +82,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     latency,
                     ..PluginPorts::default()
                 },
@@ -98,6 +99,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2, aux],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     ..PluginPorts::default()
                 },
             }),
@@ -214,6 +216,7 @@ mod tests {
                     audio_in: vec![2],
                     // Three buses, as Surge XT has.
                     audio_out: vec![2, 2, 2],
+                    audio_out_shown: Vec::new(),
                     ..PluginPorts::default()
                 },
             }),
@@ -248,6 +251,49 @@ mod tests {
             })
             .expect("the read bus is split out");
         assert_eq!(split, (2, 2));
+    }
+
+    /// A socket carries the bus its dropdown says, not the bus it happens to
+    /// sit at. One socket pointed at the third bus is the whole node.
+    #[test]
+    fn an_output_socket_carries_the_bus_it_was_pointed_at() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2, 2, 2],
+                    // One socket, and it is `Scene B`.
+                    audio_out_shown: vec![2],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).expect("a pointed socket is routable");
+
+        // All three buses are handed over, because the one that is read is the
+        // last of them and a plugin's buses are activated as a prefix.
+        let buses = program.audio_ops.iter().find_map(|op| match op {
+            AudioOp::Plugin { output_buses, .. } => Some(output_buses.clone()),
+            _ => None,
+        });
+        assert_eq!(buses, Some(vec![2, 2, 2]));
+        let split = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Split { channel, width, .. } => Some((*channel, *width)),
+                _ => None,
+            })
+            .expect("the pointed bus is split out");
+        assert_eq!(split, (4, 2), "the third bus starts at channel 4");
     }
 
     /// The one-bus case — every patch until now — must not have grown a copy.
@@ -453,6 +499,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
@@ -741,6 +788,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },

@@ -1785,6 +1785,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     latency,
                     ..PluginPorts::default()
                 },
@@ -2052,6 +2053,7 @@ mod tests {
                 instance: 0,
                 ports: PluginPorts {
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
@@ -2150,6 +2152,7 @@ mod tests {
                 instance: 0,
                 ports: PluginPorts {
                     audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
                     accepts_notes: true,
                     ..PluginPorts::default()
                 },
