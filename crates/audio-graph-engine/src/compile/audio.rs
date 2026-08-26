@@ -68,8 +68,8 @@ mod tests {
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
     use crate::ir::{AudioOp, NoteRoute, NoteSource};
     use crate::nodes::{
-        AudioIn, AudioOut, DelayRead, DelayWrite, Mix, NodeKind, NoteGate, Plugin, PluginPorts,
-        SlotIn,
+        AudioIn, AudioOut, DelayRead, DelayWrite, KeySwitch, KeySwitchMode, Mix, NodeKind,
+        NoteGate, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
 
@@ -638,6 +638,55 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, crate::ir::Op::Math { .. })),
             "the second gate multiplies the first one's condition into its own"
+        );
+    }
+
+    /// A toggling key switch has two outputs carrying one stream, and the
+    /// gates on them are opposites: whichever way the switch is thrown, one
+    /// synth hears the notes and the other does not.
+    #[test]
+    fn a_toggling_key_switch_opens_one_output_at_a_time() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                key: 24,
+                mode: KeySwitchMode::Toggle,
+            }),
+            [0.0, 0.0],
+        );
+        let first = synth(&mut graph, 0);
+        let second = synth(&mut graph, 1);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 0, first, 0);
+        graph.connect(switch, 1, second, 0);
+        graph.connect(first, 0, mix, 0);
+        graph.connect(second, 0, mix, 2);
+        graph.connect(mix, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(
+            program.latch_nodes,
+            vec![switch],
+            "the switch keeps a latch"
+        );
+        let mut routes = note_sources(&program);
+        routes.sort_by_key(|&(i, _)| i);
+        let (a, b) = (routes[0].1, routes[1].1);
+        assert_eq!(a.source, NoteSource::Daw { bus: 0 });
+        assert_eq!(b.source, NoteSource::Daw { bus: 0 });
+        assert_ne!(
+            a.gate, b.gate,
+            "the two outputs are gated by different lanes"
         );
     }
 

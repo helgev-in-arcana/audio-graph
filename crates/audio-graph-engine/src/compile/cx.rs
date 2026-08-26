@@ -18,7 +18,8 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, NoteRoute, NoteSource, Op, ParamTarget, Reg,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, NoteSource, Op, ParamTarget,
+    Reg,
 };
 
 /// Where a note gate's lane is filed, so it cannot collide with the lane of an
@@ -76,6 +77,7 @@ pub(crate) struct ParamCx<'a> {
     deferred: Vec<Op>,
     outputs: Vec<(u16, Reg)>,
     lfo_nodes: Vec<NodeId>,
+    latch_nodes: Vec<NodeId>,
     param_targets: Vec<ParamTarget>,
     audio_lanes: Vec<((NodeId, u8), u16)>,
     /// Output socket → the register saying whether notes leaving it pass.
@@ -90,6 +92,7 @@ pub(crate) struct ParamHalf {
     pub registers: usize,
     pub outputs: Vec<(u16, Reg)>,
     pub lfo_nodes: Vec<NodeId>,
+    pub latch_nodes: Vec<NodeId>,
     pub param_targets: Vec<ParamTarget>,
     pub audio_lanes: Vec<((NodeId, u8), u16)>,
 }
@@ -107,6 +110,7 @@ impl<'a> ParamCx<'a> {
             deferred: Vec::new(),
             outputs: Vec::new(),
             lfo_nodes: Vec::new(),
+            latch_nodes: Vec::new(),
             param_targets: Vec::new(),
             audio_lanes: Vec::new(),
             note_gates: Vec::new(),
@@ -126,6 +130,7 @@ impl<'a> ParamCx<'a> {
             registers: self.next_reg,
             outputs: self.outputs,
             lfo_nodes: self.lfo_nodes,
+            latch_nodes: self.latch_nodes,
             param_targets: self.param_targets,
             audio_lanes: self.audio_lanes,
         }
@@ -228,6 +233,20 @@ impl<'a> ParamCx<'a> {
         }
         let state = self.lfo_nodes.len() as u16;
         self.lfo_nodes.push(self.id);
+        Ok(state)
+    }
+
+    /// Book this node a latch, which is what survives a program swap — see
+    /// [`Op::KeyToggle`][crate::Op::KeyToggle].
+    pub(crate) fn latch(&mut self) -> Result<u16, CompileError> {
+        if self.latch_nodes.len() >= MAX_LATCHES {
+            return Err(CompileError::TooLarge {
+                what: "key switches",
+                limit: MAX_LATCHES,
+            });
+        }
+        let state = self.latch_nodes.len() as u16;
+        self.latch_nodes.push(self.id);
         Ok(state)
     }
 

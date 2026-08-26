@@ -44,6 +44,10 @@ pub const MAX_GRAPH_PARAMS: usize = 64;
 /// `process`.
 pub const MAX_REGISTERS: usize = 256;
 pub const MAX_LFOS: usize = 64;
+
+/// How many latches one program may have — one per key-switch node (§9.1
+/// again: the table is allocated once and never resized).
+pub const MAX_LATCHES: usize = 64;
 pub const MAX_DELAY_LINES: usize = 16;
 
 /// How far back a param delay line can read, in sub-blocks.
@@ -174,6 +178,12 @@ pub struct Program {
     /// What the wrapper should report to the DAW as its own latency: the
     /// longest path from an input to an output, after compensation (§14.6).
     pub latency: u32,
+    /// Latch index → the node it belongs to.
+    ///
+    /// Carried across a swap for the same reason `lfo_nodes` is: a key switch
+    /// that forgot which way it was thrown every time the user nudged an
+    /// unrelated control would be unusable.
+    pub latch_nodes: Vec<NodeId>,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
@@ -202,6 +212,7 @@ impl Program {
             audio_rings: Vec::new(),
             audio_ring_seconds: Vec::new(),
             lfo_nodes: Vec::new(),
+            latch_nodes: Vec::new(),
         }
     }
 

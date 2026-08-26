@@ -58,5 +58,6 @@ Program {
     ],
     chunking: SubBlock,
     latency: 0,
+    latch_nodes: [],
     lfo_nodes: [],
 }

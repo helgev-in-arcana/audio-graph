@@ -20,8 +20,8 @@ use plugin_host_api::{NoteEvent, NoteExpression};
 use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
-    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LFOS,
-    MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
+    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
 
@@ -253,6 +253,22 @@ pub struct Engine {
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
     expressions: Expressions,
+    /// Which keys are down, one bit each. 128 keys, which is the whole MIDI
+    /// range, so a `u128` is the table.
+    ///
+    /// Apart from [`Expressions`] because that is the newest note whatever it
+    /// was, and a key switch asks about one particular key regardless of what
+    /// has been played since.
+    keys_held: u128,
+    /// Which keys have been struck since the last [`Engine::run`]. Cleared at
+    /// the end of it, so an op sees each note-on exactly once.
+    keys_struck: u128,
+    /// One value per latch, or NaN for a latch nothing has set yet (§14.10).
+    latches: Vec<f64>,
+    /// Which node each latch belongs to, so a program swap can carry it over.
+    latch_nodes: Vec<u32>,
+    /// Scratch for that swap, sized once so the swap itself allocates nothing.
+    latch_carry: Vec<(u32, f64)>,
     rng: u32,
 }
 
@@ -386,6 +402,11 @@ impl Engine {
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
             expressions: Expressions::default(),
+            keys_held: 0,
+            keys_struck: 0,
+            latches: vec![f64::NAN; MAX_LATCHES],
+            latch_nodes: vec![u32::MAX; MAX_LATCHES],
+            latch_carry: vec![(u32::MAX, f64::NAN); MAX_LATCHES],
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
             rng: 0x2545_F491,
@@ -440,6 +461,29 @@ impl Engine {
         }
         for i in next.lfo_nodes.len()..MAX_LFOS {
             self.phase_nodes[i] = u32::MAX;
+        }
+
+        // Latches keep their values across the swap for the same reason
+        // phases do: recompiling happens on every drag of every control, and a
+        // key switch that forgot which way it was thrown would be unusable.
+        let latched = self
+            .latch_carry
+            .len()
+            .min(self.latch_nodes.len())
+            .min(self.latches.len());
+        for i in 0..latched {
+            self.latch_carry[i] = (self.latch_nodes[i], self.latches[i]);
+        }
+        for (i, &node) in next.latch_nodes.iter().take(MAX_LATCHES).enumerate() {
+            self.latches[i] = self.latch_carry[..latched]
+                .iter()
+                .find(|&&(id, _)| id == node)
+                .map_or(f64::NAN, |&(_, value)| value);
+            self.latch_nodes[i] = node;
+        }
+        for i in next.latch_nodes.len()..MAX_LATCHES {
+            self.latch_nodes[i] = u32::MAX;
+            self.latches[i] = f64::NAN;
         }
 
         // Delay lines keep their contents across the swap (§14.5), both
@@ -511,9 +555,16 @@ impl Engine {
                 self.expressions.velocity = velocity;
                 self.expressions.key = f64::from(key).clamp(0.0, 127.0) / 127.0;
                 self.expressions.held = self.expressions.held.saturating_add(1);
+                if let Some(bit) = key_bit(key) {
+                    self.keys_held |= bit;
+                    self.keys_struck |= bit;
+                }
             }
-            NoteEvent::NoteOff { .. } | NoteEvent::NoteEnd { .. } => {
+            NoteEvent::NoteOff { key, .. } | NoteEvent::NoteEnd { key, .. } => {
                 self.expressions.held = self.expressions.held.saturating_sub(1);
+                if let Some(bit) = key_bit(key) {
+                    self.keys_held &= !bit;
+                }
             }
             NoteEvent::Expression {
                 expression, value, ..
@@ -528,6 +579,12 @@ impl Engine {
     /// transport jumped and any note-offs we were waiting for will never come.
     pub fn reset(&mut self) {
         self.expressions = Expressions::default();
+        // The transport jumped: the note-offs we were waiting for will never
+        // come, so nothing is held any more. The latches are left alone —
+        // which way a key switch is thrown is a setting the user made, not a
+        // note still sounding.
+        self.keys_held = 0;
+        self.keys_struck = 0;
         self.phases.iter_mut().for_each(|p| *p = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
@@ -1137,6 +1194,42 @@ impl Engine {
                         Operand::Value(value) => value,
                     };
                 }
+                Op::KeyHeld { out, key } => {
+                    self.registers[out as usize] = f64::from(self.held(key));
+                }
+                Op::KeyToggle {
+                    state,
+                    key,
+                    off,
+                    on,
+                } => {
+                    if self.struck(key)
+                        && let Some(latch) = self.latches.get_mut(state as usize)
+                    {
+                        // NaN is "never set", and the first strike lands on
+                        // `on` — the switch was off, so throwing it turns it on.
+                        *latch = if *latch == on { off } else { on };
+                    }
+                }
+                Op::KeyLatch { state, key, value } => {
+                    if self.struck(key)
+                        && let Some(latch) = self.latches.get_mut(state as usize)
+                    {
+                        *latch = value;
+                    }
+                }
+                Op::Latch {
+                    out,
+                    state,
+                    initial,
+                } => {
+                    let value = self
+                        .latches
+                        .get(state as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN);
+                    self.registers[out as usize] = if value.is_nan() { initial } else { value };
+                }
                 Op::Math { out, a, b, op } => {
                     let a = self.registers[a as usize];
                     let b = match b {
@@ -1196,8 +1289,28 @@ impl Engine {
             }
         }
 
+        // Each note-on is seen by one evaluation and no more: an op that fired
+        // on it this sub-block must not fire on it again next.
+        self.keys_struck = 0;
+
         self.program = Some(program);
     }
+
+    /// Whether `key` is down. Out of range is never down.
+    fn held(&self, key: u8) -> bool {
+        key_bit(i16::from(key)).is_some_and(|bit| self.keys_held & bit != 0)
+    }
+
+    /// Whether `key` has been struck since the last evaluation.
+    fn struck(&self, key: u8) -> bool {
+        key_bit(i16::from(key)).is_some_and(|bit| self.keys_struck & bit != 0)
+    }
+}
+
+/// One key's bit in the held/struck tables, or `None` for a key outside the
+/// MIDI range — which a malformed event can carry and a bit shift cannot.
+fn key_bit(key: i16) -> Option<u128> {
+    (0..128).contains(&key).then(|| 1u128 << key)
 }
 
 fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
@@ -1222,8 +1335,9 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, Lfo, Math, Mix,
-        NodeKind, ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeySwitch,
+        KeySwitchMode, Lfo, Math, Mix, NodeKind, ParamPort, Plugin, PluginPorts, Rate, SlotIn,
+        Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -1904,6 +2018,183 @@ mod tests {
         });
         engine.run(&ctx(32), &mut slots);
         assert!((slots[SINK] - 0.7).abs() < 1e-12);
+    }
+
+    /// A key switch watches one key, whatever has been played since — which
+    /// is exactly what `Expression`'s sources cannot answer.
+    #[test]
+    fn a_held_key_switch_follows_its_own_key() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                key: 24,
+                mode: KeySwitchMode::Hold,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let lane = program
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Plugin { notes, .. } => notes.gate,
+                _ => None,
+            })
+            .expect("the key switch booked a gate lane") as usize;
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut lanes = vec![0.0; width];
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "nothing is held yet");
+
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "the switch key is down");
+
+        // A different key coming and going must not move it.
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 2,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.note(&NoteEvent::NoteOff {
+            note_id: 2,
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 0.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "another key came and went");
+
+        engine.note(&NoteEvent::NoteOff {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 0.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "let go");
+    }
+
+    /// A toggling switch moves on each strike and stays where it was put —
+    /// including across the recompile that every edit causes.
+    #[test]
+    fn a_toggling_key_switch_latches_and_survives_a_recompile() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                key: 24,
+                mode: KeySwitchMode::Toggle,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 1, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let lane = compile(&graph, SLOTS)
+            .unwrap()
+            .audio_ops
+            .iter()
+            .find_map(|op| match op {
+                AudioOp::Plugin { notes, .. } => notes.gate,
+                _ => None,
+            })
+            .expect("output b got a gate lane") as usize;
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut lanes = vec![0.0; width];
+        let strike = NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "b is shut until the switch is thrown");
+
+        engine.note(&strike);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "thrown");
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "and it stays thrown");
+
+        // An unrelated edit, and the recompile it causes.
+        graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
+        load(&mut engine, &graph);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "a recompile must not move the switch");
+
+        engine.note(&strike);
+        engine.run(&ctx(8), &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "thrown back");
     }
 
     #[test]

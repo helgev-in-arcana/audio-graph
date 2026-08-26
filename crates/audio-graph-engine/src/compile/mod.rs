@@ -144,6 +144,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_ring_len: Vec::new(),
         audio_rings: Vec::new(),
         lfo_nodes: param.lfo_nodes,
+        latch_nodes: param.latch_nodes,
     })
 }
 
@@ -596,7 +597,14 @@ mod tests {
 
     fn reads(op: &Op) -> Vec<Reg> {
         match *op {
-            Op::Const { .. } | Op::Slot { .. } | Op::Lfo { .. } | Op::Expr { .. } => Vec::new(),
+            Op::Const { .. }
+            | Op::Slot { .. }
+            | Op::Lfo { .. }
+            | Op::Expr { .. }
+            | Op::KeyHeld { .. }
+            | Op::KeyToggle { .. }
+            | Op::KeyLatch { .. }
+            | Op::Latch { .. } => Vec::new(),
             Op::Math { a, b, .. } => match b {
                 Operand::Reg(b) => vec![a, b],
                 Operand::Value(_) => vec![a],
@@ -629,8 +637,12 @@ mod tests {
             | Op::Select { out, .. }
             | Op::Math { out, .. }
             | Op::Range { out, .. }
+            | Op::KeyHeld { out, .. }
+            | Op::Latch { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
-            Op::DelayWrite { .. } => None,
+            // These write a latch rather than a register, which keeps them off
+            // the topological sort the same way a delay write is.
+            Op::DelayWrite { .. } | Op::KeyToggle { .. } | Op::KeyLatch { .. } => None,
         }
     }
 }

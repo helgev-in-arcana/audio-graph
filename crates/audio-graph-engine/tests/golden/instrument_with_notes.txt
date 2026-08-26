@@ -48,5 +48,6 @@ Program {
     ],
     chunking: WholeBlock,
     latency: 0,
+    latch_nodes: [],
     lfo_nodes: [],
 }
