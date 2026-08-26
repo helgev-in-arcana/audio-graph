@@ -19,8 +19,11 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: Daw {
-                bus: 0,
+            notes: NoteRoute {
+                source: Daw {
+                    bus: 0,
+                },
+                gate: None,
             },
         },
         Output {

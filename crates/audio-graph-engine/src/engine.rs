@@ -787,9 +787,12 @@ impl Engine {
                     // pool; the region it owns is its own buses (§14.11).
                     let packed_in = in_width as usize * frames;
                     let packed_out = out_width as usize * frames;
+                    // The gate is a lane, so it is read here, once per chunk,
+                    // the same way a mix's gain is (§14.10).
+                    let notes = notes.resolve(notes.gate.and_then(|lane| ctx.lane(row, lane)));
                     nodes.process(
                         *instance,
-                        *notes,
+                        notes,
                         &source[..packed_in],
                         &mut dest[..packed_out],
                         AudioChunk {

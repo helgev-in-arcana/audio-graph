@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use crate::schedule::SlotSchedule;
 use plugin_host::{
-    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, ParamEvent,
-    ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor, Target,
-    TimeContext,
+    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, NoteEvent,
+    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
+    Target, TimeContext,
 };
 
 use crate::main_thread::MainThread;
@@ -451,6 +451,7 @@ impl SubHost {
                     let message = e.to_string();
                     self.deactivate(SubHostProcessors {
                         entries: processors,
+                        gated: Vec::new(),
                     });
                     return Err(message);
                 }
@@ -459,6 +460,7 @@ impl SubHost {
 
         Ok(SubHostProcessors {
             entries: processors,
+            gated: Vec::with_capacity(capacity),
         })
     }
 
@@ -681,6 +683,13 @@ impl SubHostProcessor {
 /// plugin node by index, so an empty slot has to stay empty.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
+    /// The block's events with the note-ons taken out, for an instance behind
+    /// a shut note gate (§14.10).
+    ///
+    /// Owned here, and sized at activate, because the audio thread may not
+    /// allocate (§9.1) and a filtered stream has to live somewhere while the
+    /// sub-plugin reads it.
+    gated: Vec<Event>,
 }
 
 impl SubHostProcessors {
@@ -739,7 +748,11 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
         output: &mut [f32],
         chunk: audio_graph_engine::AudioChunk,
     ) {
-        let Some(processor) = self.processors.get_mut(instance as usize) else {
+        // Destructured rather than reached through twice: the scratch and the
+        // processor are different fields, and saying so is what lets both be
+        // borrowed at once.
+        let SubHostProcessors { entries, gated } = &mut *self.processors;
+        let Some(processor) = entries.get_mut(instance as usize).and_then(Option::as_mut) else {
             // A node whose plugin failed to load, or was deleted while the
             // audio thread held this program. Silence is the only honest
             // answer, and passing the input through would be worse: the user
@@ -768,8 +781,24 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
         // side's job. A node with nothing wired to its notes port hears
         // nothing — which is the whole point, since before M8.3 every instance
         // was handed every event and two synths played in unison.
+        // A shut gate holds the note-ons back and lets everything else
+        // through, so a note that was sounding when it closed still gets its
+        // note-off. Filtered into scratch reserved at activate, never grown.
         let events: &[Event] = match notes {
             audio_graph_engine::NoteSource::Daw { bus: 0 } => self.events,
+            audio_graph_engine::NoteSource::DawReleases { bus: 0 } => {
+                gated.clear();
+                for event in self.events {
+                    if matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
+                        continue;
+                    }
+                    if gated.len() == gated.capacity() {
+                        break;
+                    }
+                    gated.push(*event);
+                }
+                gated.as_slice()
+            }
             _ => &[],
         };
         processor.process(
@@ -1157,12 +1186,13 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
+        use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource};
         use plugin_host_api::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());
         let mut processors = SubHostProcessors {
+            gated: Vec::with_capacity(64),
             entries: vec![Some(wired), Some(idle)],
         };
 
@@ -1190,7 +1220,8 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        nodes.process(0, NoteSource::Daw { bus: 0 }, &input, &mut output, chunk);
+        let daw = NoteRoute::from_source(NoteSource::Daw { bus: 0 });
+        nodes.process(0, daw.resolve(None), &input, &mut output, chunk);
         nodes.process(1, NoteSource::None, &input, &mut output, chunk);
 
         assert_eq!(
@@ -1202,5 +1233,68 @@ mod tests {
             idle_saw.lock().unwrap().is_empty(),
             "an unwired notes port must mean silence, not everything"
         );
+    }
+
+    /// A shut note gate holds the note-ons back and lets everything else
+    /// through, so a note that was sounding when it closed still gets its
+    /// note-off. Blocking the lot would leave it hanging for ever.
+    #[test]
+    fn a_shut_note_gate_still_delivers_the_releases() {
+        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource};
+        use plugin_host_api::NoteEvent;
+
+        let (gated_node, saw) = harness(Vec::new());
+        let mut processors = SubHostProcessors {
+            gated: Vec::with_capacity(64),
+            entries: vec![Some(gated_node)],
+        };
+
+        let incoming = [
+            Event::Note(NoteEvent::NoteOn {
+                note_id: -1,
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity: 1.0,
+                sample_offset: 0,
+            }),
+            Event::Note(NoteEvent::NoteOff {
+                note_id: -1,
+                port: 0,
+                channel: 0,
+                key: 55,
+                velocity: 0.0,
+                sample_offset: 1,
+            }),
+        ];
+        let schedule = SlotSchedule::new(4, 32);
+        let mut sink = EventSink::new();
+        let context = TimeContext::default();
+        let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);
+
+        let chunk = AudioChunk {
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+            frames: 4,
+            offset: 0,
+        };
+        let input = [0.0f32; 8];
+        let mut output = [0.0f32; 8];
+        nodes.process(
+            0,
+            NoteSource::DawReleases { bus: 0 },
+            &input,
+            &mut output,
+            chunk,
+        );
+
+        let seen = saw.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "only the release got through");
+        assert!(matches!(
+            seen[0],
+            Event::Note(NoteEvent::NoteOff { key: 55, .. })
+        ));
     }
 }

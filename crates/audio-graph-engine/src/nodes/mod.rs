@@ -22,6 +22,7 @@ mod gate;
 mod lfo;
 mod math;
 mod mix;
+mod note_gate;
 mod note_in;
 mod plugin;
 mod range_map;
@@ -36,6 +37,7 @@ pub use gate::Gate;
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
+pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
@@ -95,6 +97,18 @@ pub(crate) trait Node {
     /// The note stream a plugin wired to this node's output plays from, if
     /// this node is a source of notes at all (§14.10).
     fn note_identity(&self) -> Option<NoteSource> {
+        None
+    }
+
+    /// Which of this node's inputs the notes leaving output `port` came in
+    /// through, for a node that passes notes on rather than making them.
+    ///
+    /// This is what lets a note stream be routed through several nodes and
+    /// still be found: the compiler walks up the chain socket by socket until
+    /// something answers [`Node::note_identity`]. A node that answers neither
+    /// is the end of the walk, and a plugin behind it hears nothing.
+    fn note_passthrough(&self, port: u8) -> Option<u8> {
+        let _ = port;
         None
     }
 
@@ -205,11 +219,12 @@ pub enum NodeKind {
     DelayWrite(DelayWrite),
     Mix(Mix),
     Gate(Gate),
+    NoteGate(NoteGate),
     DelayRead(DelayRead),
 }
 /// Run `$body` against whichever node the kind is carrying.
 ///
-/// The one place the fifteen variants are listed. Every delegating method
+/// The one place the sixteen variants are listed. Every delegating method
 /// below is one line through here, so adding a node means adding an arm here
 /// and nothing else in this file — and the exhaustiveness check still makes
 /// forgetting it a compile error rather than a silent no-op.
@@ -236,6 +251,7 @@ macro_rules! for_kind {
             NodeKind::DelayWrite($node) => $body,
             NodeKind::Mix($node) => $body,
             NodeKind::Gate($node) => $body,
+            NodeKind::NoteGate($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -269,6 +285,12 @@ impl NodeKind {
     /// is a source of notes at all (§14.10).
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         for_kind!(self, node => node.note_identity())
+    }
+
+    /// Where the notes leaving output `port` came in — see
+    /// [`Node::note_passthrough`].
+    pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
+        for_kind!(self, node => node.note_passthrough(port))
     }
 
     /// Emit this node's parameter-half instructions (§9.2).
@@ -382,6 +404,7 @@ pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
     );
     take(&mut out, Mix::catalogue_defaults(), NodeKind::Mix);
     take(&mut out, Gate::catalogue_defaults(), NodeKind::Gate);
+    take(&mut out, NoteGate::catalogue_defaults(), NodeKind::NoteGate);
     take(
         &mut out,
         DelayRead::catalogue_defaults(),

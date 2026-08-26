@@ -18,7 +18,7 @@
 mod audio_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteSource};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute, NoteSource};
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 
 /// Identifies one node, for the whole life of a patch.

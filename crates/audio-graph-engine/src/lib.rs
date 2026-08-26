@@ -30,12 +30,12 @@ pub use handoff::Handoff;
 pub use ir::{
     AudioOp, Buf, Chunking, ExprSource, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteSource, Op, Operand, ParamTarget, Program, RateSpec, Reg,
-    Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteRoute, NoteSource, Op, Operand, ParamTarget, Program,
+    RateSpec, Reg, Waveform,
 };
 pub use nodes::{
     AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, Lfo, Math, Mix, NodeKind,
-    NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, db_to_linear,
+    NoteGate, NoteIn, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, db_to_linear,
     linear_to_db,
 };
 #[cfg(feature = "ui")]
