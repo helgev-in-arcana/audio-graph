@@ -1335,9 +1335,9 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeySwitch,
-        KeySwitchMode, Lfo, Math, Mix, NodeKind, ParamPort, Plugin, PluginPorts, Rate, SlotIn,
-        Switch, linear_to_db,
+        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
+        KeyParamMode, KeySwitch, KeySwitchMode, KeyValue, Lfo, Math, Mix, NodeKind, ParamPort,
+        Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2195,6 +2195,109 @@ mod tests {
         engine.note(&strike);
         engine.run(&ctx(8), &mut lanes);
         assert_eq!(lanes[lane], 0.0, "thrown back");
+    }
+
+    /// One key flipping a parameter between two values, and staying where it
+    /// was put.
+    #[test]
+    fn a_key_parameter_toggles_between_two_values() {
+        let mut graph = Graph::new();
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Toggle,
+                keys: vec![KeyValue {
+                    key: 24,
+                    value: 0.8,
+                }],
+                resting: 0.2,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        let strike = NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2, "untouched, it reads its resting value");
+
+        engine.note(&strike);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.8, "one strike is one flip, not one per run");
+
+        engine.note(&strike);
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.2, "and back");
+    }
+
+    /// A bank of keys, one value each: the last one struck wins, which is what
+    /// a row of switches does.
+    #[test]
+    fn a_key_parameter_selects_by_the_last_key_struck() {
+        let mut graph = Graph::new();
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![
+                    KeyValue {
+                        key: 24,
+                        value: 0.0,
+                    },
+                    KeyValue {
+                        key: 25,
+                        value: 0.5,
+                    },
+                    KeyValue {
+                        key: 26,
+                        value: 1.0,
+                    },
+                ],
+                resting: 0.25,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        let strike = |key: i16| NoteEvent::NoteOn {
+            note_id: key as i32,
+            port: 0,
+            channel: 0,
+            key,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+
+        engine.note(&strike(25));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.5);
+
+        engine.note(&strike(26));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 1.0);
+
+        // A key the bank does not name changes nothing.
+        engine.note(&strike(60));
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 1.0);
     }
 
     #[test]

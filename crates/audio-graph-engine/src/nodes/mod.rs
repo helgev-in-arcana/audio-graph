@@ -19,6 +19,7 @@ mod constant;
 mod delay;
 mod expression;
 mod gate;
+mod key_param;
 mod key_switch;
 mod lfo;
 mod math;
@@ -35,6 +36,7 @@ pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
 pub use gate::Gate;
+pub use key_param::{KeyParam, KeyParamMode, KeyValue};
 pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
@@ -223,11 +225,12 @@ pub enum NodeKind {
     Gate(Gate),
     NoteGate(NoteGate),
     KeySwitch(KeySwitch),
+    KeyParam(KeyParam),
     DelayRead(DelayRead),
 }
 /// Run `$body` against whichever node the kind is carrying.
 ///
-/// The one place the seventeen variants are listed. Every delegating method
+/// The one place the eighteen variants are listed. Every delegating method
 /// below is one line through here, so adding a node means adding an arm here
 /// and nothing else in this file — and the exhaustiveness check still makes
 /// forgetting it a compile error rather than a silent no-op.
@@ -256,6 +259,7 @@ macro_rules! for_kind {
             NodeKind::Gate($node) => $body,
             NodeKind::NoteGate($node) => $body,
             NodeKind::KeySwitch($node) => $body,
+            NodeKind::KeyParam($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -414,6 +418,7 @@ pub fn catalogue() -> Vec<(&'static str, NodeKind)> {
         KeySwitch::catalogue_defaults(),
         NodeKind::KeySwitch,
     );
+    take(&mut out, KeyParam::catalogue_defaults(), NodeKind::KeyParam);
     take(
         &mut out,
         DelayRead::catalogue_defaults(),
