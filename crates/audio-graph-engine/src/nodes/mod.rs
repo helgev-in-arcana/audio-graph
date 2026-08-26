@@ -36,7 +36,7 @@ pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
 pub use gate::Gate;
-pub use key_param::{KeyParam, KeyParamMode, KeyValue};
+pub use key_param::{KeyParam, KeyParamMode};
 pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
@@ -169,6 +169,42 @@ pub(crate) trait Node {
     ) -> bool {
         let _ = (ui, port, connected, cx);
         false
+    }
+
+    /// The control that stands in for output socket `port`, drawn on that
+    /// socket's own row and right up against the socket.
+    ///
+    /// The mirror of [`Node::input_control`], and there for the same reason: a
+    /// key switch's key belongs to the output it steers, and a node-wide list
+    /// of keys somewhere else is a thing to match up by counting.
+    #[cfg(feature = "ui")]
+    fn output_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        let _ = (ui, port, cx);
+        false
+    }
+
+    /// The label for the button that gives this node another *output*, or
+    /// `None` where they are fixed. Drawn under the outputs it makes more of.
+    #[cfg(feature = "ui")]
+    fn add_output_label(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Give this node another output. Only called when
+    /// [`Node::add_output_label`] offered one.
+    #[cfg(feature = "ui")]
+    fn add_output(&mut self) {}
+
+    /// Take away output `port`, and say how many sockets went with it.
+    #[cfg(feature = "ui")]
+    fn remove_output(&mut self, port: u8) -> u8 {
+        let _ = port;
+        0
     }
 
     /// The label for the button that gives this node another input, or `None`
@@ -347,14 +383,43 @@ impl NodeKind {
         for_kind!(self, node => node.input_control(ui, port, connected, cx))
     }
 
+    /// The control on one output socket's row — see [`Node::output_control`].
+    #[cfg(feature = "ui")]
+    pub fn output_control(
+        &mut self,
+        ui: &mut egui::Ui,
+        port: u8,
+        cx: &mut widgets::NodeUi<'_>,
+    ) -> bool {
+        for_kind!(self, node => node.output_control(ui, port, cx))
+    }
+
+    /// The label of this node's "another output" button, if it has one.
+    #[cfg(feature = "ui")]
+    pub fn add_output_label(&self) -> Option<&'static str> {
+        for_kind!(self, node => node.add_output_label())
+    }
+
+    /// Give this node another output.
+    #[cfg(feature = "ui")]
+    pub fn add_output(&mut self) {
+        for_kind!(self, node => node.add_output())
+    }
+
+    /// Take away output `port`, returning how many sockets went.
+    #[cfg(feature = "ui")]
+    pub fn remove_output(&mut self, port: u8) -> u8 {
+        for_kind!(self, node => node.remove_output(port))
+    }
+
     /// The label of this node's "another input" button, if it has one.
     #[cfg(feature = "ui")]
     pub fn add_input_label(&self) -> Option<&'static str> {
-        match self {
-            NodeKind::Mix(node) => node.add_input_label(),
-            NodeKind::Plugin(node) => node.add_input_label(),
-            _ => None,
-        }
+        // Delegated like everything else rather than listed here. The list was
+        // two arms and a `_ => None`, which is a place to forget a node — and
+        // the fourth node to grow inputs was duly forgotten until its button
+        // did not appear.
+        for_kind!(self, node => node.add_input_label())
     }
 
     /// Give this node another input group.

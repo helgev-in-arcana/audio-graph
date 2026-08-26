@@ -75,15 +75,17 @@ pub enum Op {
         out: Reg,
         key: u8,
     },
-    /// Flip a latch between `off` and `on` each time `key` is struck.
+    /// Move a latch on to the next of `count` positions each time `key` is
+    /// struck, wrapping at the end.
     ///
-    /// Writes no register: the value is read back by a [`Op::Latch`], because
-    /// the latch is what survives a program swap and a register does not.
-    KeyToggle {
+    /// One key cycling a switch, which with `count` of 2 is a plain toggle.
+    /// Writes no register: the value is read back by a [`Op::Latch`] or an
+    /// [`Op::LatchIs`], because the latch is what survives a program swap and
+    /// a register does not.
+    KeyStep {
         state: u16,
         key: u8,
-        off: f64,
-        on: f64,
+        count: u16,
     },
     /// Set a latch to `value` when `key` is struck.
     ///
@@ -98,6 +100,17 @@ pub enum Op {
     Latch {
         out: Reg,
         state: u16,
+        initial: f64,
+    },
+    /// 1 when a latch holds `value`, 0 otherwise.
+    ///
+    /// What makes a bank of switches exclusive: each position asks whether it
+    /// is the one selected, and exactly one of them can be. `initial` is what
+    /// an unset latch counts as, so an untouched bank still has a position.
+    LatchIs {
+        out: Reg,
+        state: u16,
+        value: f64,
         initial: f64,
     },
     Math {

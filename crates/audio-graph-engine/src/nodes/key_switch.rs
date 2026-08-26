@@ -7,45 +7,69 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, combo, key_control};
 use crate::port::{Port, PortType};
 
-/// What a key switch does with the key it watches.
+/// How many destinations one key switch may have.
+///
+/// The same reasoning as a `Mix`'s eight inputs: past this it is a wall of
+/// sockets, and a second key switch reads better than a taller one.
+#[cfg(feature = "ui")]
+const MAX_WAYS: usize = 8;
+
+/// What a key switch does with the keys it watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeySwitchMode {
-    /// Notes pass while the key is held, and stop when it is let go.
+    /// Each output speaks while its own key is held. Several at once is
+    /// allowed and is how a layer is added by holding a key down.
     Hold,
-    /// Each press of the key moves the stream to the other output.
+    /// The last key struck leaves its output open and shuts the others. A
+    /// bank of switches, latching.
+    Select,
+    /// One key — the first output's — moving the stream on to the next output
+    /// each time it is struck, and round to the first again at the end.
     Toggle,
 }
 
 impl KeySwitchMode {
-    pub const ALL: [KeySwitchMode; 2] = [KeySwitchMode::Hold, KeySwitchMode::Toggle];
+    pub const ALL: [KeySwitchMode; 3] = [
+        KeySwitchMode::Hold,
+        KeySwitchMode::Select,
+        KeySwitchMode::Toggle,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             KeySwitchMode::Hold => "Hold",
+            KeySwitchMode::Select => "Select",
             KeySwitchMode::Toggle => "Toggle",
         }
     }
 }
 
-/// Route notes by a key switch: a key played to steer the rest, rather than to
+/// Route notes by a key switch: keys played to steer the rest, rather than to
 /// sound.
 ///
-/// The two modes are the two ways players use one. `Hold` is momentary — the
-/// layer speaks while the key is down, which is what a foot-switch does with
-/// hands instead. `Toggle` is latching: the key is tapped once and the stream
-/// moves to the other output, and stays there until it is tapped again.
+/// One output per destination, each with the key that opens it on its own row,
+/// because a key belongs to the output it steers — a list of keys somewhere
+/// else on the node is a thing to match up by counting.
 ///
-/// Which way a `Toggle` is thrown survives a recompile, so editing an
+/// The three modes are the three ways players use one. `Hold` is momentary:
+/// the layer speaks while the key is down, which is what a foot-switch does
+/// with hands instead. `Select` is a latching bank — tap a key, that
+/// destination stays chosen. `Toggle` is the one-key version of `Select`, for
+/// when there is no room on the keyboard for a key per way.
+///
+/// Where a `Select` or a `Toggle` stands survives a recompile, so editing an
 /// unrelated node does not quietly move the routing back.
 ///
-/// The switch key's own note still reaches whatever is downstream. Taking it
-/// out of the stream would mean the route carrying a key to filter as well as
-/// a gate, and a key switch on a range the patch does not play is the ordinary
-/// case; the exception can be handled when someone hits it.
+/// The switch keys' own notes still reach whatever is downstream. Taking them
+/// out of the stream would mean the route carrying keys to filter as well as a
+/// gate, and a key switch below the played range is the ordinary case; the
+/// exception can be handled when someone hits it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeySwitch {
-    pub key: u8,
     pub mode: KeySwitchMode,
+    /// One key per output, in socket order. Empty is a node the user has not
+    /// finished building; it routes nothing.
+    pub keys: Vec<u8>,
 }
 
 impl Node for KeySwitch {
@@ -57,85 +81,141 @@ impl Node for KeySwitch {
         vec![Port::new("notes", PortType::Note)]
     }
 
-    /// One output while holding, two while toggling — the second is where the
-    /// notes go when the switch is thrown.
     fn output_ports(&self) -> Vec<Port> {
-        match self.mode {
-            KeySwitchMode::Hold => vec![Port::new("out", PortType::Note)],
-            KeySwitchMode::Toggle => vec![
-                Port::new("a", PortType::Note),
-                Port::new("b", PortType::Note),
-            ],
-        }
+        (0..self.keys.len())
+            .map(|i| {
+                let port = Port::new(format!("out {}", i + 1), PortType::Note);
+                // The last way is not offered a remove button: a switch with
+                // nowhere to send anything is not a switch.
+                #[cfg(feature = "ui")]
+                let port = if self.keys.len() > 1 {
+                    port.removable()
+                } else {
+                    port
+                };
+                port
+            })
+            .collect()
     }
 
-    /// Both outputs carry the same stream; which of them is open is the whole
-    /// of what this node decides.
+    /// Every output carries the same stream; which of them are open is the
+    /// whole of what this node decides.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
-        (port < self.output_ports().len() as u8).then_some(0)
+        (usize::from(port) < self.keys.len()).then_some(0)
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         match self.mode {
             KeySwitchMode::Hold => {
-                let held = cx.alloc()?;
-                cx.emit(Op::KeyHeld {
-                    out: held,
-                    key: self.key,
-                });
-                let condition = fold_upstream(cx, 0, held)?;
-                cx.bind_note_gate(0, condition)
+                for (port, &key) in self.keys.iter().enumerate() {
+                    let held = cx.alloc()?;
+                    cx.emit(Op::KeyHeld { out: held, key });
+                    let condition = fold_upstream(cx, held)?;
+                    cx.bind_note_gate(port as u8, condition)?;
+                }
+                Ok(())
             }
-            KeySwitchMode::Toggle => {
+            KeySwitchMode::Select | KeySwitchMode::Toggle => {
+                if self.keys.is_empty() {
+                    return Ok(());
+                }
+                // One latch holding which way is chosen, which is what makes
+                // the ways exclusive — and what survives a program swap.
                 let state = cx.latch()?;
-                cx.emit(Op::KeyToggle {
-                    state,
-                    key: self.key,
-                    off: 0.0,
-                    on: 1.0,
-                });
-                let thrown = cx.alloc()?;
-                cx.emit(Op::Latch {
-                    out: thrown,
-                    state,
-                    initial: 0.0,
-                });
-                // `a` is open while the switch is *not* thrown, so an untouched
-                // key switch leaves the notes where they were plugged in.
-                let on_a = cx.alloc()?;
-                cx.emit(Op::Select {
-                    out: on_a,
-                    control: thrown,
-                    threshold: 0.5,
-                    low: Operand::Value(1.0),
-                    high: Operand::Value(0.0),
-                });
-                let a = fold_upstream(cx, 0, on_a)?;
-                cx.bind_note_gate(0, a)?;
-                let b = fold_upstream(cx, 0, thrown)?;
-                cx.bind_note_gate(1, b)
+                match self.mode {
+                    KeySwitchMode::Toggle => cx.emit(Op::KeyStep {
+                        state,
+                        key: self.keys[0],
+                        count: self.keys.len() as u16,
+                    }),
+                    _ => {
+                        for (port, &key) in self.keys.iter().enumerate() {
+                            cx.emit(Op::KeyLatch {
+                                state,
+                                key,
+                                value: port as f64,
+                            });
+                        }
+                    }
+                }
+                for port in 0..self.keys.len() {
+                    let chosen = cx.alloc()?;
+                    cx.emit(Op::LatchIs {
+                        out: chosen,
+                        state,
+                        value: port as f64,
+                        // Untouched, the first way is the open one, so notes
+                        // go where they were plugged in until a key says
+                        // otherwise.
+                        initial: 0.0,
+                    });
+                    let condition = fold_upstream(cx, chosen)?;
+                    cx.bind_note_gate(port as u8, condition)?;
+                }
+                Ok(())
             }
         }
     }
 
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        let mut changed = combo(
+        combo(
             ui,
             "mode",
             &mut self.mode,
             &KeySwitchMode::ALL,
             KeySwitchMode::label,
-        );
-        changed |= key_control(ui, "key", &mut self.key);
-        changed
+        )
+    }
+
+    /// The key that opens this output, on the output's own row.
+    ///
+    /// In `Toggle` only the first row's key does anything — one key is the
+    /// point of that mode — so the rest are drawn greyed rather than hidden,
+    /// which would make switching modes look like it lost them.
+    #[cfg(feature = "ui")]
+    fn output_control(&mut self, ui: &mut egui::Ui, port: u8, _cx: &mut NodeUi<'_>) -> bool {
+        let toggling = self.mode == KeySwitchMode::Toggle;
+        let Some(key) = self.keys.get_mut(usize::from(port)) else {
+            return false;
+        };
+        let live = !toggling || port == 0;
+        let out = ui.add_enabled_ui(live, |ui| key_control(ui, "", key));
+        if !live {
+            out.response
+                .on_hover_text("Toggle moves on from one key — the first output's");
+        }
+        out.inner
+    }
+
+    #[cfg(feature = "ui")]
+    fn add_output_label(&self) -> Option<&'static str> {
+        (self.keys.len() < MAX_WAYS).then_some("+ way")
+    }
+
+    #[cfg(feature = "ui")]
+    fn add_output(&mut self) {
+        // A semitone up from the last one: a bank of key switches is a run of
+        // adjacent keys far more often than it is not.
+        let next = self.keys.last().map_or(24, |k| k.saturating_add(1));
+        self.keys.push(next);
+    }
+
+    #[cfg(feature = "ui")]
+    fn remove_output(&mut self, port: u8) -> u8 {
+        let index = usize::from(port);
+        if self.keys.len() <= 1 || index >= self.keys.len() {
+            return 0;
+        }
+        self.keys.remove(index);
+        1
     }
 }
 
 /// Multiply a gate condition by whatever gate is already on the chain, so
 /// gates in series pass notes only when every one of them is open.
-fn fold_upstream(cx: &mut ParamCx, port: u8, condition: Reg) -> Result<Reg, CompileError> {
-    let Some(upstream) = cx.upstream_note_gate(port) else {
+fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> {
+    let Some(upstream) = cx.upstream_note_gate(0) else {
         return Ok(condition);
     };
     let both = cx.alloc()?;
@@ -154,9 +234,9 @@ impl KeySwitch {
         vec![(
             "Key switch",
             KeySwitch {
+                mode: KeySwitchMode::Select,
                 // Well below where most parts are played.
-                key: 24,
-                mode: KeySwitchMode::Hold,
+                keys: vec![24, 25],
             },
         )]
     }

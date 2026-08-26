@@ -641,17 +641,17 @@ mod tests {
         );
     }
 
-    /// A toggling key switch has two outputs carrying one stream, and the
-    /// gates on them are opposites: whichever way the switch is thrown, one
-    /// synth hears the notes and the other does not.
+    /// A selecting key switch has one output per destination, all carrying
+    /// one stream, and each gated by a lane of its own: whichever way the
+    /// switch stands, one synth hears the notes and the other does not.
     #[test]
-    fn a_toggling_key_switch_opens_one_output_at_a_time() {
+    fn a_selecting_key_switch_gates_each_output_of_its_own() {
         let mut graph = Graph::new();
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::KeySwitch(KeySwitch {
-                key: 24,
-                mode: KeySwitchMode::Toggle,
+                keys: vec![24, 25],
+                mode: KeySwitchMode::Select,
             }),
             [0.0, 0.0],
         );

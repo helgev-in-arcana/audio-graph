@@ -1197,18 +1197,16 @@ impl Engine {
                 Op::KeyHeld { out, key } => {
                     self.registers[out as usize] = f64::from(self.held(key));
                 }
-                Op::KeyToggle {
-                    state,
-                    key,
-                    off,
-                    on,
-                } => {
+                Op::KeyStep { state, key, count } => {
                     if self.struck(key)
+                        && count > 0
                         && let Some(latch) = self.latches.get_mut(state as usize)
                     {
-                        // NaN is "never set", and the first strike lands on
-                        // `on` — the switch was off, so throwing it turns it on.
-                        *latch = if *latch == on { off } else { on };
+                        // NaN is "never set", which counts as position 0 — so
+                        // the first strike lands on 1, the way throwing a
+                        // switch that was off turns it on.
+                        let at = if latch.is_nan() { 0.0 } else { *latch };
+                        *latch = (at + 1.0).rem_euclid(f64::from(count));
                     }
                 }
                 Op::KeyLatch { state, key, value } => {
@@ -1217,6 +1215,20 @@ impl Engine {
                     {
                         *latch = value;
                     }
+                }
+                Op::LatchIs {
+                    out,
+                    state,
+                    value,
+                    initial,
+                } => {
+                    let at = self
+                        .latches
+                        .get(state as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN);
+                    let at = if at.is_nan() { initial } else { at };
+                    self.registers[out as usize] = f64::from(at == value);
                 }
                 Op::Latch {
                     out,
@@ -1336,8 +1348,8 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
-        KeyParamMode, KeySwitch, KeySwitchMode, KeyValue, Lfo, Math, Mix, NodeKind, ParamPort,
-        Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, ParamPort, Plugin,
+        PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2028,7 +2040,7 @@ mod tests {
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::KeySwitch(KeySwitch {
-                key: 24,
+                keys: vec![24],
                 mode: KeySwitchMode::Hold,
             }),
             [0.0, 0.0],
@@ -2125,7 +2137,7 @@ mod tests {
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::KeySwitch(KeySwitch {
-                key: 24,
+                keys: vec![24, 25],
                 mode: KeySwitchMode::Toggle,
             }),
             [0.0, 0.0],
@@ -2197,23 +2209,22 @@ mod tests {
         assert_eq!(lanes[lane], 0.0, "thrown back");
     }
 
-    /// One key flipping a parameter between two values, and staying where it
-    /// was put.
+    /// One key stepping a parameter through its values, and staying where it
+    /// was put. With two values that is a plain toggle.
     #[test]
     fn a_key_parameter_toggles_between_two_values() {
         let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let key = graph.add(
             NodeKind::KeyParam(KeyParam {
                 mode: KeyParamMode::Toggle,
-                keys: vec![KeyValue {
-                    key: 24,
-                    value: 0.8,
-                }],
-                resting: 0.2,
+                keys: vec![24, 25],
+                values: vec![0.2, 0.8],
             }),
             [0.0, 0.0],
         );
         let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
         graph.connect(key, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -2229,17 +2240,17 @@ mod tests {
         };
 
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[SINK], 0.2, "untouched, it reads its resting value");
+        assert_eq!(slots[SINK], 0.2, "untouched, it reads its first value");
 
         engine.note(&strike);
         engine.run(&ctx(32), &mut slots);
         assert_eq!(slots[SINK], 0.8);
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[SINK], 0.8, "one strike is one flip, not one per run");
+        assert_eq!(slots[SINK], 0.8, "one strike is one step, not one per run");
 
         engine.note(&strike);
         engine.run(&ctx(32), &mut slots);
-        assert_eq!(slots[SINK], 0.2, "and back");
+        assert_eq!(slots[SINK], 0.2, "and round again");
     }
 
     /// A bank of keys, one value each: the last one struck wins, which is what
@@ -2247,28 +2258,17 @@ mod tests {
     #[test]
     fn a_key_parameter_selects_by_the_last_key_struck() {
         let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let key = graph.add(
             NodeKind::KeyParam(KeyParam {
                 mode: KeyParamMode::Select,
-                keys: vec![
-                    KeyValue {
-                        key: 24,
-                        value: 0.0,
-                    },
-                    KeyValue {
-                        key: 25,
-                        value: 0.5,
-                    },
-                    KeyValue {
-                        key: 26,
-                        value: 1.0,
-                    },
-                ],
-                resting: 0.25,
+                keys: vec![24, 25, 26],
+                values: vec![0.25, 0.5, 1.0],
             }),
             [0.0, 0.0],
         );
         let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
         graph.connect(key, 0, out, 0);
 
         let mut engine = Engine::new();
@@ -2298,6 +2298,77 @@ mod tests {
         engine.note(&strike(60));
         engine.run(&ctx(32), &mut slots);
         assert_eq!(slots[SINK], 1.0);
+    }
+
+    /// Nothing wired to the notes port means no keys are read at all. An
+    /// unwired node that quietly followed the keyboard anyway would be a node
+    /// whose links say nothing about what it does.
+    #[test]
+    fn a_key_parameter_with_no_notes_wired_stays_put() {
+        let mut graph = Graph::new();
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.25, 0.75],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 25,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+    }
+
+    /// A value socket wins over the number on its row, the same way `Math`'s
+    /// `b` gives way to its input — so a key switch can pick between two
+    /// signals, not only two numbers.
+    #[test]
+    fn a_key_parameter_value_can_be_a_signal() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.25, 0.75],
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        // Socket 0 is the notes port, so value 2 is socket 2.
+        graph.connect(signal, 0, key, 2);
+        graph.connect(key, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        slots[3] = 0.6;
+        engine.note(&NoteEvent::NoteOn {
+            note_id: 1,
+            port: 0,
+            channel: 0,
+            key: 25,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        engine.run(&ctx(32), &mut slots);
+        assert_eq!(slots[SINK], 0.6, "the wired socket wins over the number");
     }
 
     #[test]
