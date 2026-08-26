@@ -50,7 +50,10 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: None,
+            notes: NoteRoute {
+                source: None,
+                gate: None,
+            },
         },
         Output {
             a: 0,

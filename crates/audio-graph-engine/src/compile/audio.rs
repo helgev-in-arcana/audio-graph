@@ -66,9 +66,10 @@ mod tests {
     use super::*;
     use crate::compile::compile;
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
-    use crate::ir::{AudioOp, NoteSource};
+    use crate::ir::{AudioOp, NoteRoute, NoteSource};
     use crate::nodes::{
-        AudioIn, AudioOut, DelayRead, DelayWrite, Mix, NodeKind, Plugin, PluginPorts,
+        AudioIn, AudioOut, DelayRead, DelayWrite, Mix, NodeKind, NoteGate, Plugin, PluginPorts,
+        SlotIn,
     };
     use crate::port::PortType;
 
@@ -460,7 +461,7 @@ mod tests {
         )
     }
 
-    fn note_sources(program: &crate::ir::Program) -> Vec<(u32, NoteSource)> {
+    fn note_sources(program: &crate::ir::Program) -> Vec<(u32, NoteRoute)> {
         program
             .audio_ops
             .iter()
@@ -519,7 +520,7 @@ mod tests {
         let program = compile(&graph, SLOTS).unwrap();
         assert_eq!(
             note_sources(&program),
-            vec![(0, NoteSource::Daw { bus: 0 })]
+            vec![(0, NoteRoute::from_source(NoteSource::Daw { bus: 0 }))]
         );
     }
 
@@ -552,7 +553,91 @@ mod tests {
         sources.sort_by_key(|&(i, _)| i);
         assert_eq!(
             sources,
-            vec![(0, NoteSource::Daw { bus: 0 }), (1, NoteSource::None)]
+            vec![
+                (0, NoteRoute::from_source(NoteSource::Daw { bus: 0 })),
+                (1, NoteRoute::default())
+            ]
+        );
+    }
+
+    /// A gate on the way does not change *where* the notes come from — it
+    /// adds a lane the audio half reads each chunk to decide whether they get
+    /// through (§14.10).
+    #[test]
+    fn a_note_gate_leaves_the_source_and_adds_a_lane() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes.len(), 1);
+        let route = routes[0].1;
+        assert_eq!(route.source, NoteSource::Daw { bus: 0 });
+        let lane = route.gate.expect("the gate booked a lane");
+        assert!(
+            lane >= program.audio_lane_base,
+            "a note gate's lane is an audio lane, not a parameter one"
+        );
+        assert!(
+            program.outputs.iter().any(|&(l, _)| l == lane),
+            "the parameter half drives the lane it booked"
+        );
+        // Shut, the stream keeps its releases so nothing hangs.
+        assert_eq!(route.resolve(Some(0.0)), NoteSource::DawReleases { bus: 0 });
+        assert_eq!(route.resolve(Some(1.0)), NoteSource::Daw { bus: 0 });
+    }
+
+    /// Two gates in series pass notes only when both are open, and they say so
+    /// in one lane: the nearer gate folds the further one into its condition.
+    #[test]
+    fn gates_in_series_become_one_lane() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let first = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let second = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, first, 0);
+        graph.connect(first, 0, second, 0);
+        graph.connect(second, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let route = note_sources(&program)[0].1;
+        assert_eq!(route.source, NoteSource::Daw { bus: 0 });
+        assert!(route.gate.is_some());
+        assert!(
+            program
+                .ops
+                .iter()
+                .any(|op| matches!(op, crate::ir::Op::Math { .. })),
+            "the second gate multiplies the first one's condition into its own"
         );
     }
 
@@ -584,7 +669,7 @@ mod tests {
         let program = compile(&graph, SLOTS).unwrap();
         assert_eq!(
             note_sources(&program),
-            vec![(0, NoteSource::Daw { bus: 0 })]
+            vec![(0, NoteRoute::from_source(NoteSource::Daw { bus: 0 }))]
         );
     }
 
@@ -600,7 +685,7 @@ mod tests {
         graph.connect(node, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        assert_eq!(note_sources(&program), vec![(0, NoteSource::None)]);
+        assert_eq!(note_sources(&program), vec![(0, NoteRoute::default())]);
     }
 
     /// Instrument -> effect -> effect: the DoD's chain. Only the instrument
@@ -622,9 +707,9 @@ mod tests {
         assert_eq!(
             note_sources(&program),
             vec![
-                (0, NoteSource::Daw { bus: 0 }),
-                (1, NoteSource::None),
-                (2, NoteSource::None)
+                (0, NoteRoute::from_source(NoteSource::Daw { bus: 0 })),
+                (1, NoteRoute::default()),
+                (2, NoteRoute::default())
             ],
             "the order is the order they run in, and only the synth hears notes"
         );

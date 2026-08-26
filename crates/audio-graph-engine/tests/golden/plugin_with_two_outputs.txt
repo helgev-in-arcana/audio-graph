@@ -23,7 +23,10 @@ Program {
                 2,
                 2,
             ],
-            notes: None,
+            notes: NoteRoute {
+                source: None,
+                gate: None,
+            },
         },
         Split {
             from: 1,

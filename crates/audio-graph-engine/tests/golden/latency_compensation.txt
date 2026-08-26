@@ -22,7 +22,10 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: None,
+            notes: NoteRoute {
+                source: None,
+                gate: None,
+            },
         },
         Compensate {
             buf: 0,
