@@ -75,6 +75,45 @@ pub struct PluginEntry {
     pub kind: plugin_host::catalogue::Kind,
 }
 
+/// Whether the plugin list is split into FX and Instrument tabs.
+///
+/// Provisional, and deliberately one line to undo: set it to `false` and the
+/// tab row disappears and every plugin shows in one list again. Nothing else
+/// depends on it — the kinds themselves come from the scan cache and are worth
+/// having either way.
+const PLUGIN_TABS: bool = true;
+
+/// Which half of the plugin list the menu is showing.
+///
+/// Two tabs rather than a filter dropdown: a plugin is one or the other, the
+/// user knows which they are after before they open the menu, and a tab keeps
+/// the list one column wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginTab {
+    Effect,
+    Instrument,
+}
+
+impl PluginTab {
+    /// Whether a plugin of `kind` belongs under this tab.
+    ///
+    /// `Unknown` — never opened, or it could not be opened — shows under both.
+    /// The alternative is a plugin the user can see in no tab at all, which is
+    /// worse than one shown under the wrong heading.
+    fn shows(self, kind: plugin_host::catalogue::Kind) -> bool {
+        use plugin_host::catalogue::Kind;
+        if !PLUGIN_TABS {
+            return true;
+        }
+        matches!(
+            (self, kind),
+            (_, Kind::Unknown)
+                | (PluginTab::Effect, Kind::Effect)
+                | (PluginTab::Instrument, Kind::Instrument)
+        )
+    }
+}
+
 /// Something the canvas cannot do itself, because it loads a plugin or touches
 /// a window — see the module comment on [`crate::editor`] for why that must not
 /// happen inside a draw callback.
@@ -148,6 +187,9 @@ pub struct GraphEditor {
     add_at: Option<Pos2>,
     /// Filter text in the add-node menu's plugin list.
     plugin_filter: String,
+    /// Which half of the plugin list is showing. Kept across openings of the
+    /// menu: a user building a rack of effects opens it again for an effect.
+    plugin_tab: PluginTab,
     /// Actions for the caller to carry out once the frame is over.
     actions: Vec<GraphAction>,
 }
@@ -161,6 +203,7 @@ impl Default for GraphEditor {
             linking: None,
             add_at: None,
             plugin_filter: String::new(),
+            plugin_tab: PluginTab::Effect,
             actions: Vec::new(),
         }
     }
@@ -955,7 +998,18 @@ impl GraphEditor {
                                 // Under the filter rather than over it: the
                                 // filter applies to both tabs, and typing is
                                 // what the user does first.
+                                if PLUGIN_TABS {
+                                    ui.horizontal(|ui| {
+                                        for (tab, label) in [
+                                            (PluginTab::Effect, "FX"),
+                                            (PluginTab::Instrument, "Instrument"),
+                                        ] {
+                                            ui.selectable_value(&mut self.plugin_tab, tab, label);
+                                        }
+                                    });
+                                }
                                 let needle = self.plugin_filter.to_lowercase();
+                                let tab = self.plugin_tab;
                                 egui::ScrollArea::vertical()
                                     .id_salt("add-plugin")
                                     .max_height(360.0)
@@ -971,6 +1025,9 @@ impl GraphEditor {
                                             .show(ui, |ui| {
                                                 let mut shown = 0usize;
                                                 for entry in ctx.plugins {
+                                                    if !tab.shows(entry.kind) {
+                                                        continue;
+                                                    }
                                                     // The format is searchable too, so
                                                     // typing "clap" narrows the list to
                                                     // one format without a separate
