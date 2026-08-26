@@ -437,8 +437,8 @@ impl NodeKind {
 
 /// Which half of the graph a node belongs to, for the "add a node" menu.
 ///
-/// The menu had grown to a wall of buttons in which "Range map" sat beside
-/// "Note in", and the only way to find anything was to read all of it. These
+/// The menu had grown to a wall of buttons in which "Param Map" sat beside
+/// "MIDI In", and the only way to find anything was to read all of it. These
 /// three are the three kinds of wire the editor has, so they are the three
 /// piles a reader is already sorting the nodes into.
 ///

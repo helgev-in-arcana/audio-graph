@@ -34,7 +34,7 @@ pub struct NoteGate {
 
 impl Node for NoteGate {
     fn title(&self) -> String {
-        "Note gate".into()
+        "MIDI Gate".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -104,7 +104,7 @@ impl Node for NoteGate {
 impl NoteGate {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, NoteGate)> {
         vec![(
-            "Note gate",
+            "MIDI Gate",
             NoteGate {
                 threshold: 0.5,
                 invert: false,

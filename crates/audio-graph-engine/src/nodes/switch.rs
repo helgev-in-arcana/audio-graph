@@ -28,7 +28,7 @@ pub struct Switch {
 
 impl Node for Switch {
     fn title(&self) -> String {
-        "Switch".into()
+        "Param Select".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -103,7 +103,7 @@ impl Node for Switch {
 impl Switch {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Switch)> {
         vec![(
-            "Switch",
+            "Param Select",
             Switch {
                 threshold: 0.5,
                 off: 0.0,

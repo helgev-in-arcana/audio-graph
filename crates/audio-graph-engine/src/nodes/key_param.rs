@@ -76,7 +76,7 @@ impl KeyParam {
 
 impl Node for KeyParam {
     fn title(&self) -> String {
-        "Key parameter".into()
+        "Key Param Select".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -255,7 +255,7 @@ impl Node for KeyParam {
 impl KeyParam {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, KeyParam)> {
         vec![(
-            "Key parameter",
+            "Key Param Select",
             KeyParam {
                 mode: KeyParamMode::Select,
                 keys: vec![24, 25],
