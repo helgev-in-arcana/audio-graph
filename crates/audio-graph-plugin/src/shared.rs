@@ -355,6 +355,10 @@ impl Shared {
     /// rule a patch reopened against a newer plugin follows.
     pub fn discover_ports(&self, node: NodeId) {
         let mut state = self.main();
+        // Before anything is read off the node: a patch older than
+        // `audio_out_shown` has no picks to preserve, and settling what it
+        // meant is what turns "every bus" into the handful it wired.
+        state.graph.migrate_plugin_outputs();
         let Some(instance) = state.graph.node(node).and_then(|n| match n.kind {
             NodeKind::Plugin(Plugin { instance, .. }) => Some(instance),
             _ => None,
@@ -375,7 +379,7 @@ impl Shared {
             // between. A node discovering its plugin for the first time takes
             // the main bus and nothing else.
             let params = std::mem::take(&mut ports.params);
-            let shown = (!ports.audio_out.is_empty()).then(|| ports.shown_outputs());
+            let shown = (!ports.audio_out_shown.is_empty()).then(|| ports.audio_out_shown.clone());
             *ports = discovered;
             ports.params = params;
             if let Some(shown) = shown {
