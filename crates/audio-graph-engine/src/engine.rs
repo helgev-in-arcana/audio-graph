@@ -1174,16 +1174,21 @@ impl Engine {
             }
         }
 
-        for &(slot, reg) in &program.outputs {
-            if let Some(target) = slots.get_mut(slot as usize) {
-                // Slots are 0..1 by definition (§8.1); the mapping onto the
-                // sub-plugin's plain range belongs to the slot table. A NaN
-                // from a degenerate graph must not get past here.
+        for &(lane, reg) in &program.outputs {
+            if let Some(target) = slots.get_mut(lane as usize) {
+                // Slots and parameters are 0..1 by definition (§8.1); the
+                // mapping onto the sub-plugin's plain range belongs to the slot
+                // table. An audio lane is not — it carries decibels or seconds
+                // (§14.5) — so only the lanes below the audio range are
+                // clamped. A NaN from a degenerate graph must not get past
+                // here either way.
                 let value = self.registers[reg as usize];
-                *target = if value.is_finite() {
+                *target = if !value.is_finite() {
+                    0.0
+                } else if lane < program.audio_lane_base {
                     value.clamp(0.0, 1.0)
                 } else {
-                    0.0
+                    value
                 };
             }
         }
@@ -1214,8 +1219,8 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Lfo, Math, Mix, NodeKind,
-        ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, Lfo, Math, Mix,
+        NodeKind, ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2376,6 +2381,63 @@ mod tests {
         assert!(
             daw_out.iter().all(|&v| (v - 3.0).abs() < 1e-6),
             "{daw_out:?}"
+        );
+    }
+
+    /// A gate is a `Mix` of one whose gain the parameter half switches, and
+    /// this is the whole round trip: the control lands in a lane, the lane
+    /// becomes a gain, the gain is unity or silence.
+    #[test]
+    fn a_gate_passes_or_silences_by_its_control() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::Gate(Gate {
+                channels: 2,
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[2]);
+        load(&mut engine, &graph);
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut render = |control: f64| -> Vec<f32> {
+            let mut lanes = vec![0.0; width];
+            lanes[0] = control;
+            engine.run(&ctx(8), &mut lanes);
+            let daw_in = vec![1.0f32; 2 * 8];
+            let mut daw_out = vec![0.0f32; 2 * 8];
+            engine.run_audio(
+                &AudioContext {
+                    frames: 8,
+                    quantum: 32,
+                    sample_rate: RATE,
+                    lanes: &lanes,
+                    lanes_per_row: width,
+                },
+                &daw_in,
+                &mut daw_out,
+                &mut Adders,
+            );
+            daw_out
+        };
+
+        assert!(
+            render(1.0).iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "an open gate is unity gain"
+        );
+        assert!(
+            render(0.0).iter().all(|&v| v.abs() < 1e-6),
+            "a shut gate is silence"
         );
     }
 

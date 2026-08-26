@@ -21,6 +21,7 @@ Program {
     delay_nodes: [],
     audio_ops: [],
     param_targets: [],
+    audio_lane_base: 96,
     instances: [],
     buffers: [],
     chunking: WholeBlock,

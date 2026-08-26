@@ -42,6 +42,7 @@ Program {
             param: 7,
         },
     ],
+    audio_lane_base: 96,
     instances: [],
     buffers: [],
     chunking: WholeBlock,
