@@ -658,7 +658,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24, 25],
                 mode: KeySwitchMode::Select,
-                pass_keys: false,
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
@@ -699,21 +699,21 @@ mod tests {
         assert_eq!(
             (a.mute, b.mute),
             (expected, expected),
-            "the switch keys are steering, not sounding, so neither synth hears them"
+            "the switching keys are steering, not sounding, so neither synth hears them"
         );
     }
 
-    /// `pass_keys` puts the switch keys back into the stream, for the patch
-    /// where the key that selects a layer is also meant to play it.
+    /// Clearing `mute_keys` puts the switching keys back into the stream, for
+    /// the patch where the key that selects a layer is also meant to play it.
     #[test]
-    fn a_key_switch_can_be_asked_to_pass_its_own_keys() {
+    fn an_unmuted_key_switch_passes_its_own_keys() {
         let mut graph = Graph::new();
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let switch = graph.add(
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24, 25],
                 mode: KeySwitchMode::Select,
-                pass_keys: true,
+                mute_keys: false,
             }),
             [0.0, 0.0],
         );

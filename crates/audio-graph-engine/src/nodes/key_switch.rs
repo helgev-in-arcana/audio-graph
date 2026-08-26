@@ -60,11 +60,11 @@ impl KeySwitchMode {
 /// Where a `Select` or a `Toggle` stands survives a recompile, so editing an
 /// unrelated node does not quietly move the routing back.
 ///
-/// The switch keys are taken out of the stream by default, because a key
+/// The switching keys are taken out of the stream by default, because a key
 /// played to steer is not a key played to sound and a sampler handed one will
-/// answer with whatever is mapped there. `pass_keys` puts them back for the
-/// patch that wants the switch audible — a key that both selects a layer and
-/// plays it is a real technique, just not the common one.
+/// answer with whatever is mapped there. Clearing `mute_keys` puts them back
+/// for the patch that wants the switch audible — a key that both selects a
+/// layer and plays it is a real technique, just not the common one.
 ///
 /// Both halves of a muted key go, note-on and note-off alike. There is no
 /// sounding voice waiting for the release, so dropping it hangs nothing; that
@@ -76,11 +76,12 @@ pub struct KeySwitch {
     /// One key per output, in socket order. Empty is a node the user has not
     /// finished building; it routes nothing.
     pub keys: Vec<u8>,
-    /// Whether the switch keys go on downstream. Default off, and `default`
-    /// rather than a required field so patches saved before it read as off —
-    /// which is also the answer they would have wanted.
-    #[serde(default)]
-    pub pass_keys: bool,
+    /// Whether the switching keys are taken out of the stream on the way
+    /// out. On by default, and defaulted rather than required so a patch
+    /// saved before the field existed reads as muted — which is the answer it
+    /// would have wanted, and the one it will hear from a fresh node.
+    #[serde(default = "muted")]
+    pub mute_keys: bool,
 }
 
 impl Node for KeySwitch {
@@ -119,7 +120,7 @@ impl Node for KeySwitch {
     /// user asked for them. Keys past 127 cannot be set from the UI and would
     /// not fit the mask, so they are simply not counted.
     fn note_mute(&self, port: u8) -> u128 {
-        if self.pass_keys || usize::from(port) >= self.keys.len() {
+        if !self.mute_keys || usize::from(port) >= self.keys.len() {
             return 0;
         }
         self.keys
@@ -190,13 +191,16 @@ impl Node for KeySwitch {
             &KeySwitchMode::ALL,
             KeySwitchMode::label,
         );
-        // "let ... through" rather than "pass ... on" because it is the verb
-        // the gates already use for the same thing, and because "pass keys on"
-        // can be read as a state rather than as an action.
+        // "switching keys" rather than "switch keys": the second reads as
+        // the keys belonging to a mute switch, which is a thing that exists.
+        // The box is checked in the ordinary case because the node is doing
+        // something — taking events out of the stream — and a filter nobody
+        // asked for should be visible in the node rather than implied by an
+        // empty box.
         changed |= ui
-            .checkbox(&mut self.pass_keys, "let switch keys through")
+            .checkbox(&mut self.mute_keys, "mute switching keys")
             .on_hover_text(
-                "The switch keys steer either way. Off, they stop here; on, they also go                  on downstream and sound.",
+                "The keys steer either way. Muted they stop here; unmuted they also go on                  downstream and sound.",
             )
             .changed();
         changed
@@ -262,6 +266,12 @@ fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> 
     Ok(both)
 }
 
+/// The default for [`KeySwitch::mute_keys`], as a function because serde
+/// cannot spell `true` any other way.
+fn muted() -> bool {
+    true
+}
+
 #[cfg(feature = "ui")]
 impl KeySwitch {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, KeySwitch)> {
@@ -271,7 +281,7 @@ impl KeySwitch {
                 mode: KeySwitchMode::Select,
                 // Well below where most parts are played.
                 keys: vec![24, 25],
-                pass_keys: false,
+                mute_keys: true,
             },
         )]
     }
