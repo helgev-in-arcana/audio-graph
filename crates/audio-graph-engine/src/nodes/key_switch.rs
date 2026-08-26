@@ -74,7 +74,7 @@ pub struct KeySwitch {
 
 impl Node for KeySwitch {
     fn title(&self) -> String {
-        "Key switch".into()
+        "Key MIDI Route".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -232,7 +232,7 @@ fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> 
 impl KeySwitch {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, KeySwitch)> {
         vec![(
-            "Key switch",
+            "Key MIDI Route",
             KeySwitch {
                 mode: KeySwitchMode::Select,
                 // Well below where most parts are played.

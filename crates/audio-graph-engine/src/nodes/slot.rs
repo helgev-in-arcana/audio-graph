@@ -29,7 +29,7 @@ pub struct SlotIn {
 
 impl Node for SlotIn {
     fn title(&self) -> String {
-        format!("Slot {} in", self.slot + 1)
+        format!("Slot {} In", self.slot + 1)
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -60,6 +60,6 @@ impl Node for SlotIn {
 #[cfg(feature = "ui")]
 impl SlotIn {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, SlotIn)> {
-        vec![("Slot in", SlotIn { slot: 0 })]
+        vec![("Slot In", SlotIn { slot: 0 })]
     }
 }

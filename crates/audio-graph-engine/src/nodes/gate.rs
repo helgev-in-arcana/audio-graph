@@ -40,7 +40,7 @@ pub struct Gate {
 
 impl Node for Gate {
     fn title(&self) -> String {
-        "Gate".into()
+        "Audio Gate".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -135,7 +135,7 @@ impl Node for Gate {
 impl Gate {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Gate)> {
         vec![(
-            "Gate",
+            "Audio Gate",
             Gate {
                 channels: 2,
                 threshold: 0.5,

@@ -13,7 +13,7 @@ pub struct NoteIn;
 
 impl Node for NoteIn {
     fn title(&self) -> String {
-        "Note in".into()
+        "MIDI In".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -37,6 +37,6 @@ impl Node for NoteIn {
 #[cfg(feature = "ui")]
 impl NoteIn {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, NoteIn)> {
-        vec![("Note in", NoteIn)]
+        vec![("MIDI In", NoteIn)]
     }
 }
