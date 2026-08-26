@@ -159,6 +159,37 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
     changed
 }
 
+/// Which MIDI key a node watches, shown as a note name beside the number.
+///
+/// A key switch is set by ear and named in the same breath, and 24 is not a
+/// name. The number stays because DAWs disagree with each other about which C
+/// is middle C, and the number never does.
+pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let mut value = i32::from(*key);
+        if ui
+            .add(egui::DragValue::new(&mut value).range(0..=127))
+            .changed()
+        {
+            *key = value.clamp(0, 127) as u8;
+            changed = true;
+        }
+        ui.weak(key_name(*key));
+    });
+    changed
+}
+
+/// A MIDI key as a note name, with 60 as C3 — one of the several conventions
+/// in use, and the one the rest of this editor reads in.
+pub(crate) fn key_name(key: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!("{}{}", NAMES[key as usize % 12], i32::from(key) / 12 - 2)
+}
+
 /// Free-running or tempo-synced, and how fast either way.
 pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
     let mut changed = false;

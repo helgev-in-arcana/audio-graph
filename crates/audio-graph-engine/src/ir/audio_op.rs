@@ -48,6 +48,94 @@ pub enum NoteSource {
     None,
     /// One of the wrapper's own note inputs from the DAW.
     Daw { bus: u16 },
+    /// The same stream with note-ons held back (§14.10).
+    ///
+    /// What a shut gate leaves. Blocking everything would be simpler and
+    /// wrong: a note that was already sounding when the gate closed would
+    /// never get its note-off, and a hung note outlives the patch that caused
+    /// it. Letting the releases through costs nothing and means a gate can be
+    /// thrown mid-phrase without leaving wreckage.
+    DawReleases { bus: u16 },
+}
+
+impl NoteSource {
+    /// This source with its note-ons held back — see
+    /// [`NoteSource::DawReleases`]. Nothing is already nothing.
+    pub fn releases_only(self) -> NoteSource {
+        match self {
+            NoteSource::None => NoteSource::None,
+            NoteSource::Daw { bus } | NoteSource::DawReleases { bus } => {
+                NoteSource::DawReleases { bus }
+            }
+        }
+    }
+}
+
+/// What one instance hears for a chunk: a stream, and the keys taken out of it.
+///
+/// `mute` is a bitmask over MIDI keys 0..128 — bit `k` set means key `k` never
+/// reaches the plugin, note-on and note-off alike. Dropping both halves is
+/// what keeps it safe: the note-on was dropped too, so there is no sounding
+/// voice left waiting for its release, which is the opposite of the situation
+/// [`NoteSource::DawReleases`] exists for.
+///
+/// A mask rather than a list because the audio half copies this per chunk and
+/// tests one bit per event, and because sixteen bytes is cheaper than a
+/// pointer plus the lifetime that would come with it (ADR-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoteStream {
+    pub source: NoteSource,
+    pub mute: u128,
+}
+
+impl NoteStream {
+    pub fn from_source(source: NoteSource) -> NoteStream {
+        NoteStream { source, mute: 0 }
+    }
+}
+
+/// How a plugin's notes reach it: where they come from, what may stop them on
+/// the way, and which keys are swallowed before they arrive (§14.10).
+///
+/// The gate is a lane number rather than a decision because the decision is
+/// the parameter half's and is remade every sub-block, while the audio half
+/// runs on its own grain — the same arrangement a `Mix`'s gain and a delay's
+/// time use. Below 0.5 the stream is shut.
+///
+/// `mute` is settled at compile time instead: which keys a key switch answers
+/// to is an edit, not a signal, so there is nothing for a lane to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NoteRoute {
+    pub source: NoteSource,
+    pub gate: Option<u16>,
+    pub mute: u128,
+}
+
+impl NoteRoute {
+    pub fn from_source(source: NoteSource) -> NoteRoute {
+        NoteRoute {
+            source,
+            gate: None,
+            mute: 0,
+        }
+    }
+
+    /// What the plugin should hear, given where the gate lane stands.
+    ///
+    /// `None` for the lane value means the lane is not there at all, which is
+    /// a program the engine should not have been handed; shutting the stream
+    /// is the quiet failure rather than the loud one.
+    pub fn resolve(self, lane_value: Option<f64>) -> NoteStream {
+        let source = match self.gate {
+            None => self.source,
+            Some(_) if lane_value.is_some_and(|v| v >= 0.5) => self.source,
+            Some(_) => self.source.releases_only(),
+        };
+        NoteStream {
+            source,
+            mute: self.mute,
+        }
+    }
 }
 
 /// One step of the audio half of a program.
@@ -84,8 +172,9 @@ pub enum AudioOp {
         /// common case; more only when a patch reads a plugin's extra outputs
         /// (§14.2).
         output_buses: Vec<u16>,
-        /// Which note stream this instance hears (§14.10).
-        notes: NoteSource,
+        /// Which note stream this instance hears, and what may stop it on the
+        /// way (§14.10).
+        notes: NoteRoute,
     },
     /// Copy one bus out of a plugin's output region (§14.2).
     ///

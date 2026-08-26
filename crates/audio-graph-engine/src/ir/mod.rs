@@ -18,7 +18,7 @@
 mod audio_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteSource};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute, NoteSource, NoteStream};
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 
 /// Identifies one node, for the whole life of a patch.
@@ -44,6 +44,10 @@ pub const MAX_GRAPH_PARAMS: usize = 64;
 /// `process`.
 pub const MAX_REGISTERS: usize = 256;
 pub const MAX_LFOS: usize = 64;
+
+/// How many latches one program may have — one per key-switch node (§9.1
+/// again: the table is allocated once and never resized).
+pub const MAX_LATCHES: usize = 64;
 pub const MAX_DELAY_LINES: usize = 16;
 
 /// How far back a param delay line can read, in sub-blocks.
@@ -111,8 +115,12 @@ pub struct Program {
     /// Topologically ordered: every `Op` reads only registers already written.
     pub ops: Vec<Op>,
     pub registers: usize,
-    /// Which slot each output drives, and where its value ends up. Sorted by
-    /// slot, and at most one entry per slot.
+    /// Which lane each output drives, and where its value ends up. Sorted by
+    /// lane, and at most one entry per lane.
+    ///
+    /// Lanes below `slot_count` are the DAW's own automation and the graph
+    /// never writes them (§8); what lands here is a parameter lane (§14.12) or
+    /// an audio lane (§14.5).
     pub outputs: Vec<(u16, Reg)>,
     /// Audio line index → how many samples per channel its ring holds.
     ///
@@ -149,6 +157,14 @@ pub struct Program {
     /// evaluator writes it exactly the way it writes a slot and needs to know
     /// nothing about parameters. Sorted by instance, then by parameter.
     pub param_targets: Vec<ParamTarget>,
+    /// The first lane number that carries something the *audio* half reads
+    /// (§14.5): `slot_count + MAX_GRAPH_PARAMS`.
+    ///
+    /// The evaluator needs it to know which of its outputs are 0..1 parameters
+    /// and which are not. A gain is decibels and a delay time is seconds;
+    /// clamping either of those to 0..1 turns a -100 dB mute into unity gain,
+    /// which is exactly what it used to do.
+    pub audio_lane_base: u16,
     /// How each plugin instance has to be activated (§14.11).
     ///
     /// Derived from the graph, not from the plugin: whether a sidechain bus is
@@ -162,6 +178,12 @@ pub struct Program {
     /// What the wrapper should report to the DAW as its own latency: the
     /// longest path from an input to an output, after compensation (§14.6).
     pub latency: u32,
+    /// Latch index → the node it belongs to.
+    ///
+    /// Carried across a swap for the same reason `lfo_nodes` is: a key switch
+    /// that forgot which way it was thrown every time the user nudged an
+    /// unrelated control would be unusable.
+    pub latch_nodes: Vec<NodeId>,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
@@ -179,6 +201,7 @@ impl Program {
             outputs: Vec::new(),
             audio_ops: Vec::new(),
             param_targets: Vec::new(),
+            audio_lane_base: 0,
             instances: Vec::new(),
             buffers: Vec::new(),
             chunking: Chunking::WholeBlock,
@@ -189,6 +212,7 @@ impl Program {
             audio_rings: Vec::new(),
             audio_ring_seconds: Vec::new(),
             lfo_nodes: Vec::new(),
+            latch_nodes: Vec::new(),
         }
     }
 
@@ -239,15 +263,15 @@ impl Program {
         want
     }
 
+    /// Whether the graph drives `lane` — a parameter lane (§14.12) or an
+    /// audio lane (§14.5), since the slot lanes below them are the DAW's.
+    pub fn drives_lane(&self, lane: usize) -> bool {
+        u16::try_from(lane).is_ok_and(|l| self.outputs.iter().any(|&(o, _)| o == l))
+    }
+
     /// Whether running this program would do nothing observable.
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.audio_ops.is_empty()
-    }
-
-    /// Whether the graph drives this slot, and so overrides the DAW's
-    /// automation for it.
-    pub fn drives(&self, slot: usize) -> bool {
-        u16::try_from(slot).is_ok_and(|s| self.outputs.iter().any(|&(o, _)| o == s))
     }
 }
 

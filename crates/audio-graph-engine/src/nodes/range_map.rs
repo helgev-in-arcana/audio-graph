@@ -21,7 +21,7 @@ pub struct RangeMap {
 
 impl Node for RangeMap {
     fn title(&self) -> String {
-        "Range map".into()
+        "Param Map".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -78,7 +78,7 @@ impl Node for RangeMap {
 impl RangeMap {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, RangeMap)> {
         vec![(
-            "Range map",
+            "Param Map",
             RangeMap {
                 in_lo: 0.0,
                 in_hi: 1.0,

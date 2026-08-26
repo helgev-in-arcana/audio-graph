@@ -22,7 +22,11 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: None,
+            notes: NoteRoute {
+                source: None,
+                gate: None,
+                mute: 0,
+            },
         },
         Compensate {
             buf: 0,
@@ -50,6 +54,7 @@ Program {
         },
     ],
     param_targets: [],
+    audio_lane_base: 96,
     instances: [
         InstanceIo {
             instance: 0,
@@ -65,5 +70,6 @@ Program {
     ],
     chunking: WholeBlock,
     latency: 512,
+    latch_nodes: [],
     lfo_nodes: [],
 }

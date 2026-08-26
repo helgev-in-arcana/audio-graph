@@ -193,7 +193,7 @@ impl Node for Mix {
     /// better than a taller one.
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
-        (self.inputs < 8).then_some("+ input")
+        (self.inputs < 8).then_some("another input")
     }
 
     #[cfg(feature = "ui")]

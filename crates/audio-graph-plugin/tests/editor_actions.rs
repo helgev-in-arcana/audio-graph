@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};
-use subhost_adapter::SubHost;
+use subhost_adapter::{SLOT_COUNT, SubHost};
 
 struct SilentHost;
 
@@ -178,16 +178,38 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     );
 }
 
+/// Somewhere for a parameter chain to go.
+///
+/// `SlotOut` used to be it; a §14.12 parameter socket is, now, and its lane is
+/// `SINK_LANE` — the first one past the slot table.
+fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::NodeId {
+    use audio_graph_engine::{ParamPort, Plugin, PluginPorts};
+    graph.add(
+        audio_graph_engine::NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: vec![ParamPort {
+                    id: 0,
+                    name: "p".into(),
+                }],
+                ..PluginPorts::default()
+            },
+        }),
+        [200.0, 0.0],
+    )
+}
+
+/// The lane `param_sink`'s parameter is driven through.
+const SINK_LANE: usize = SLOT_COUNT;
+
 /// The other half of what the editor does now: build a graph, publish it, and
 /// check the audio thread ends up driving the slot instead of the DAW.
 ///
 /// Needs no plugin: everything from the canvas down to the compiled program is
 /// format-agnostic, which is the point of §9.
 #[test]
-fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
-    use audio_graph_engine::{
-        BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, SlotOut, Waveform,
-    };
+fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
+    use audio_graph_engine::{BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, Waveform};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
@@ -212,9 +234,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
             }),
             [200.0, 0.0],
         );
-        let out = state
-            .graph
-            .add(NodeKind::SlotOut(SlotOut { slot: 4 }), [400.0, 0.0]);
+        let out = param_sink(&mut state.graph);
         state.graph.connect(lfo, 0, half, 0);
         state.graph.connect(half, 0, out, 0);
     }
@@ -230,14 +250,17 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
         engine.adopt(shared.programs()),
         "the program has to arrive without a lock"
     );
-    assert!(engine.drives(4));
-    assert!(!engine.drives(5), "an untouched slot stays the DAW's");
+    assert!(engine.drives_lane(SINK_LANE));
+    assert!(
+        (0..SLOT_COUNT).all(|slot| !engine.drives_lane(slot)),
+        "the DAW keeps every slot lane"
+    );
 
-    let mut slots = vec![0.9; subhost_adapter::SLOT_COUNT];
+    let mut slots = vec![0.9; subhost_adapter::LANES];
     let mut lowest = f64::INFINITY;
     let mut highest = f64::NEG_INFINITY;
     for _ in 0..2000 {
-        slots[4] = 0.9;
+        slots[SINK_LANE] = 0.9;
         engine.run(
             &BlockContext {
                 sample_rate: 48_000.0,
@@ -246,16 +269,16 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
             },
             &mut slots,
         );
-        lowest = lowest.min(slots[4]);
-        highest = highest.max(slots[4]);
+        lowest = lowest.min(slots[SINK_LANE]);
+        highest = highest.max(slots[SINK_LANE]);
     }
     assert!(
         highest > 0.45 && lowest < 0.05,
-        "the slot should sweep 0..0.5, got {lowest}..{highest}"
+        "the parameter should sweep 0..0.5, got {lowest}..{highest}"
     );
     assert_eq!(
-        slots[5], 0.9,
-        "the graph must not touch a slot it does not drive"
+        slots[4], 0.9,
+        "the graph must not touch a lane it does not drive"
     );
 
     // A graph the user has broken keeps the working program running.
@@ -275,9 +298,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
             }),
             [0.0, 300.0],
         );
-        let out = state
-            .graph
-            .add(NodeKind::SlotOut(SlotOut { slot: 6 }), [0.0, 400.0]);
+        let out = param_sink(&mut state.graph);
         state.graph.connect(a, 0, b, 0);
         state.graph.connect(b, 0, a, 0);
         state.graph.connect(b, 0, out, 0);
@@ -292,7 +313,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_slot() {
         "nothing new should have been published"
     );
     assert!(
-        engine.drives(4),
+        engine.drives_lane(SINK_LANE),
         "the last program that compiled keeps running"
     );
 }
@@ -343,7 +364,7 @@ fn adoption_leaves_an_existing_graph_alone() {
 /// sub-plugin it was built against is not there (§8.3).
 #[test]
 fn a_graph_survives_the_state_round_trip() {
-    use audio_graph_engine::{Constant, Graph, NodeKind, SlotOut};
+    use audio_graph_engine::{Constant, Graph, NodeKind};
 
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params.clone());
@@ -354,9 +375,7 @@ fn a_graph_survives_the_state_round_trip() {
         let c = state
             .graph
             .add(NodeKind::Constant(Constant { value: 0.25 }), [10.0, 20.0]);
-        let out = state
-            .graph
-            .add(NodeKind::SlotOut(SlotOut { slot: 2 }), [210.0, 20.0]);
+        let out = param_sink(&mut state.graph);
         state.graph.connect(c, 0, out, 0);
     }
     shared.store_state();

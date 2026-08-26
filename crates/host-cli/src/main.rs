@@ -1147,7 +1147,9 @@ fn cmd_graph(args: &[String]) -> Result<(), String> {
     }
 
     let with_graph = edit_wrapper_state(&baseline_state, &inject_graph(&wrapper_state, rate)?)?;
-    println!("graph: a {rate} Hz saw on slot 1, injected into the wrapper's saved state");
+    println!(
+        "graph: a {rate} Hz saw on the bound parameter, injected into the wrapper's saved state"
+    );
 
     const BLOCK: u32 = 512;
     let plain = render::render_with_state(
@@ -1328,19 +1330,71 @@ fn walk(
     }
 }
 
-/// Put an LFO on slot 1, the one `AUDIO_GRAPH_SUB_BIND` bound.
+/// Put an LFO on the parameter `AUDIO_GRAPH_SUB_BIND` bound.
+///
+/// The sub-plugin becomes a node in the graph and the LFO drives one of its
+/// parameter sockets (§14.12). That used to be a slot binding with a `SlotOut`
+/// on the other end; the slot is the DAW's lane, and the graph writing it was
+/// the wrapper arguing with the host over who owns the automation.
 fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    // The binding the wrapper saved says which parameter to wobble; the
+    // reference says which plugin it belongs to.
+    let binding = value["slots"]
+        .as_array()
+        .and_then(|slots| slots.iter().find_map(|s| s["binding"].as_object()))
+        .ok_or("no slot is bound; set AUDIO_GRAPH_SUB_BIND to a parameter id")?
+        .clone();
+    let param_id = binding["param_id"]
+        .as_u64()
+        .ok_or("the saved binding has no parameter id")?;
+    let param_name = binding["param_name"]
+        .as_str()
+        .unwrap_or("bound")
+        .to_string();
+    let reference = value["sub_plugin"].clone();
+    let path_hint = reference["path_hint"]
+        .as_str()
+        .ok_or("the saved sub-plugin has no path")?
+        .to_string();
+
+    // Ports discovered from the plugin itself (§14.2), so the node has the
+    // sockets it really has.
+    let ports = {
+        use std::sync::Arc;
+        let (_, plugin) = render::load(Path::new(&path_hint), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+        let mut ports = audio_graph_engine::PluginPorts::from_layout(&plugin.io_layout(), 0);
+        ports.params = vec![audio_graph_engine::ParamPort {
+            id: param_id as u32,
+            name: param_name,
+        }];
+        serde_json::to_value(&ports).map_err(|e| e.to_string())?
+    };
+    // The parameter socket sits after the audio inputs and the notes port.
+    let param_port = ports["audio_in"].as_array().map_or(0, |a| a.len())
+        + usize::from(ports["accepts_notes"].as_bool().unwrap_or(false));
+
+    value["sub_plugins"] = serde_json::json!([{ "instance": 0, "reference": reference }]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
     value["graph"] = serde_json::json!({
         "nodes": [
-            { "id": 0, "pos": [40.0, 40.0], "kind": { "Lfo": {
+            { "id": 0, "pos": [40.0, 40.0],  "kind": { "AudioIn": { "bus": 0, "channels": 2 } } },
+            { "id": 1, "pos": [260.0, 40.0], "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 2, "pos": [480.0, 40.0], "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
+            { "id": 3, "pos": [40.0, 240.0], "kind": { "Lfo": {
                 "waveform": "Saw", "rate": { "Hz": rate },
-                "phase": 0.0, "depth": 0.5, "offset": 0.5 } } },
-            { "id": 1, "pos": [260.0, 40.0], "kind": { "SlotOut": { "slot": 0 } } }
+                "phase": 0.0, "depth": 0.5, "offset": 0.5 } } }
         ],
-        "links": [{ "from": 0, "to": 1, "input": 0 }],
-        "next_id": 2
+        "links": [
+            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
+            { "from": 1, "from_port": 0, "to": 2, "to_port": 0 },
+            { "from": 3, "from_port": 0, "to": 1, "to_port": param_port }
+        ],
+        "next_id": 4
     });
     // The finest rate on offer, so a fast LFO is not the thing being measured.
     value["sub_block"] = serde_json::json!(16);
@@ -2303,9 +2357,9 @@ fn inject_sidechain(
     // or Surge XT Effects' choice of which effect is loaded. `None` wires the
     // aux bus and leaves the parameters alone.
     //
-    // Driven through a slot rather than written directly because that is the
-    // path a real patch uses, and because some plugins act on a parameter only
-    // when it arrives as an event during `process`.
+    // Driven through a parameter socket (§14.12) rather than written directly
+    // because that is the path a real patch uses, and because some plugins act
+    // on a parameter only when it arrives as an event during `process`.
     switch: Option<(u32, f64)>,
     keyed: bool,
 ) -> Result<String, String> {
@@ -2333,7 +2387,7 @@ fn inject_sidechain(
 
     // Ports are discovered rather than written down here (§14.2): the whole
     // point is that the sidechain socket is the one the plugin really has.
-    let (comp_ref, comp_id, comp_in, _) = describe(comp)?;
+    let (comp_ref, _, comp_in, _) = describe(comp)?;
     let (synth_ref, _, synth_in, synth_notes) = describe(synth)?;
     if comp_in.len() < 2 {
         return Err(format!(
@@ -2355,28 +2409,22 @@ fn inject_sidechain(
     value["sub_plugin"] = serde_json::Value::Null;
     value["sub_state"] = serde_json::Value::Null;
 
-    // Slot 0 drives the compressor's sidechain-enable switch. Bound to
-    // instance 0 explicitly -- keying on the plugin id alone is what §12-7 was
-    // about.
-    let mut slots: Vec<serde_json::Value> = (0..32)
-        .map(|_| serde_json::json!({ "name": null, "binding": null }))
-        .collect();
-    if let Some((switch, _)) = switch {
-        slots[0] = serde_json::json!({
-            "name": "SC Active",
-            "binding": {
-                "instance": 0,
-                "plugin_id": comp_id,
-                "param_id": switch,
-                "param_name": "SC Active",
-            }
-        });
-    }
-    value["slots"] = serde_json::Value::Array(slots);
+    // Nothing is bound to a slot: the graph drives the compressor's
+    // sidechain-enable switch through a parameter socket of its own, which is
+    // the only route from the graph to a parameter now.
+    value["slots"] = serde_json::Value::Array(
+        (0..32)
+            .map(|_| serde_json::json!({ "name": null, "binding": null }))
+            .collect(),
+    );
 
+    let comp_params = match switch {
+        Some((switch, _)) => serde_json::json!([{ "id": switch, "name": "SC Active" }]),
+        None => serde_json::json!([]),
+    };
     let comp_ports = serde_json::json!({
         "audio_in": comp_in, "audio_out": [2],
-        "accepts_notes": false, "params": [], "latency": 0
+        "accepts_notes": false, "params": comp_params, "latency": 0
     });
     let synth_ports = serde_json::json!({
         "audio_in": synth_in, "audio_out": [2],
@@ -2388,8 +2436,14 @@ fn inject_sidechain(
     let mut links = vec![
         serde_json::json!({ "from": 0, "from_port": 0, "to": 1, "to_port": 0 }),
         serde_json::json!({ "from": 1, "from_port": 0, "to": 4, "to_port": 0 }),
-        serde_json::json!({ "from": 5, "from_port": 0, "to": 6, "to_port": 0 }),
     ];
+    if switch.is_some() {
+        // The switch's socket sits after the compressor's audio inputs; it
+        // takes no notes, so there is nothing else in between.
+        links.push(serde_json::json!({
+            "from": 5, "from_port": 0, "to": 1, "to_port": comp_in.len() as u32
+        }));
+    }
     if synth_notes {
         links.push(serde_json::json!({
             "from": 3, "from_port": 0, "to": 2, "to_port": synth_notes_port
@@ -2407,11 +2461,10 @@ fn inject_sidechain(
             { "id": 2, "pos": [220.0, 220.0], "kind": { "Plugin": { "instance": 1, "ports": synth_ports } } },
             { "id": 3, "pos": [40.0, 220.0],  "kind": "NoteIn" },
             { "id": 4, "pos": [600.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } },
-            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": switch.map_or(1.0, |(_, v)| v) } } },
-            { "id": 6, "pos": [220.0, 400.0], "kind": { "SlotOut": { "slot": 0 } } }
+            { "id": 5, "pos": [40.0, 400.0],  "kind": { "Constant": { "value": switch.map_or(1.0, |(_, v)| v) } } }
         ],
         "links": links,
-        "next_id": 7
+        "next_id": 6
     });
     Ok(value.to_string())
 }
