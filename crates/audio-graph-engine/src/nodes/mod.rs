@@ -116,6 +116,18 @@ pub(crate) trait Node {
         None
     }
 
+    /// Which MIDI keys this node takes *out* of the stream leaving output
+    /// `port` — bit `k` set means key `k` does not go on.
+    ///
+    /// A key switch's own keys are the case: they are played to steer, not to
+    /// sound, and by default the thing being steered should never hear them.
+    /// The mask is collected while the compiler walks the chain, so several
+    /// switches in series each swallow their own.
+    fn note_mute(&self, port: u8) -> u128 {
+        let _ = port;
+        0
+    }
+
     /// Draw this node's own controls, inside the frame the canvas laid out.
     /// Returns whether anything changed.
     ///
@@ -335,6 +347,11 @@ impl NodeKind {
     /// [`Node::note_passthrough`].
     pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
         for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// The keys this node swallows on output `port` — see [`Node::note_mute`].
+    pub(crate) fn note_mute(&self, port: u8) -> u128 {
+        for_kind!(self, node => node.note_mute(port))
     }
 
     /// Emit this node's parameter-half instructions (§9.2).

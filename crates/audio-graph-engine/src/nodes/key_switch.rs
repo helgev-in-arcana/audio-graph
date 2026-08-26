@@ -60,16 +60,27 @@ impl KeySwitchMode {
 /// Where a `Select` or a `Toggle` stands survives a recompile, so editing an
 /// unrelated node does not quietly move the routing back.
 ///
-/// The switch keys' own notes still reach whatever is downstream. Taking them
-/// out of the stream would mean the route carrying keys to filter as well as a
-/// gate, and a key switch below the played range is the ordinary case; the
-/// exception can be handled when someone hits it.
+/// The switch keys are taken out of the stream by default, because a key
+/// played to steer is not a key played to sound and a sampler handed one will
+/// answer with whatever is mapped there. `pass_keys` puts them back for the
+/// patch that wants the switch audible — a key that both selects a layer and
+/// plays it is a real technique, just not the common one.
+///
+/// Both halves of a muted key go, note-on and note-off alike. There is no
+/// sounding voice waiting for the release, so dropping it hangs nothing; that
+/// is the difference between this and a shut gate, which must let releases
+/// through.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeySwitch {
     pub mode: KeySwitchMode,
     /// One key per output, in socket order. Empty is a node the user has not
     /// finished building; it routes nothing.
     pub keys: Vec<u8>,
+    /// Whether the switch keys go on downstream. Default off, and `default`
+    /// rather than a required field so patches saved before it read as off —
+    /// which is also the answer they would have wanted.
+    #[serde(default)]
+    pub pass_keys: bool,
 }
 
 impl Node for KeySwitch {
@@ -102,6 +113,19 @@ impl Node for KeySwitch {
     /// whole of what this node decides.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         (usize::from(port) < self.keys.len()).then_some(0)
+    }
+
+    /// The keys this switch answers to, swallowed on the way out unless the
+    /// user asked for them. Keys past 127 cannot be set from the UI and would
+    /// not fit the mask, so they are simply not counted.
+    fn note_mute(&self, port: u8) -> u128 {
+        if self.pass_keys || usize::from(port) >= self.keys.len() {
+            return 0;
+        }
+        self.keys
+            .iter()
+            .filter(|&&key| key < 128)
+            .fold(0u128, |mask, &key| mask | (1u128 << key))
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
@@ -159,13 +183,18 @@ impl Node for KeySwitch {
 
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        combo(
+        let mut changed = combo(
             ui,
             "mode",
             &mut self.mode,
             &KeySwitchMode::ALL,
             KeySwitchMode::label,
-        )
+        );
+        changed |= ui
+            .checkbox(&mut self.pass_keys, "pass keys on")
+            .on_hover_text("Send the switch keys downstream as well as steering with them")
+            .changed();
+        changed
     }
 
     /// The key that opens this output, on the output's own row.
@@ -237,6 +266,7 @@ impl KeySwitch {
                 mode: KeySwitchMode::Select,
                 // Well below where most parts are played.
                 keys: vec![24, 25],
+                pass_keys: false,
             },
         )]
     }

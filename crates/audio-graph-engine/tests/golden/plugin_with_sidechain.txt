@@ -53,6 +53,7 @@ Program {
             notes: NoteRoute {
                 source: None,
                 gate: None,
+                mute: 0,
             },
         },
         Output {

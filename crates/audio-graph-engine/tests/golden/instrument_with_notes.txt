@@ -24,6 +24,7 @@ Program {
                     bus: 0,
                 },
                 gate: None,
+                mute: 0,
             },
         },
         Output {

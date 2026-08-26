@@ -21,7 +21,7 @@ use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteSource, Op, Operand, Program, RateSpec, Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteStream, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
 
@@ -166,12 +166,13 @@ pub trait AudioNodes {
     /// the pool held, so a plugin that produces nothing should clear it.
     ///
     /// `notes` says which note stream this instance hears (§14.10). It is a
-    /// name, not a buffer: the engine routes notes without knowing what one is,
-    /// and the implementation is what turns the name into events.
+    /// name and a key mask, not a buffer: the engine routes notes without
+    /// knowing what one is, and the implementation is what turns the name into
+    /// events and drops the keys the mask names.
     fn process(
         &mut self,
         instance: u32,
-        notes: NoteSource,
+        notes: NoteStream,
         input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
@@ -185,7 +186,7 @@ impl AudioNodes for NoNodes {
     fn process(
         &mut self,
         _instance: u32,
-        _notes: NoteSource,
+        _notes: NoteStream,
         _input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
@@ -1763,7 +1764,7 @@ mod tests {
         fn process(
             &mut self,
             instance: u32,
-            _notes: NoteSource,
+            _notes: NoteStream,
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
@@ -2042,6 +2043,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24],
                 mode: KeySwitchMode::Hold,
+                pass_keys: false,
             }),
             [0.0, 0.0],
         );
@@ -2139,6 +2141,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24, 25],
                 mode: KeySwitchMode::Toggle,
+                pass_keys: false,
             }),
             [0.0, 0.0],
         );
@@ -2645,7 +2648,7 @@ mod tests {
             fn process(
                 &mut self,
                 _instance: u32,
-                _notes: NoteSource,
+                _notes: NoteStream,
                 _input: &[f32],
                 output: &mut [f32],
                 chunk: AudioChunk,

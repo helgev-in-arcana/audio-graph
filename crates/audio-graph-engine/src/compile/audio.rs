@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use crate::compile::compile;
     use crate::engine::{AudioChunk, AudioContext, AudioNodes};
-    use crate::ir::{AudioOp, NoteRoute, NoteSource};
+    use crate::ir::{AudioOp, NoteRoute, NoteSource, NoteStream};
     use crate::nodes::{
         AudioIn, AudioOut, DelayRead, DelayWrite, KeySwitch, KeySwitchMode, Mix, NodeKind,
         NoteGate, Plugin, PluginPorts, SlotIn,
@@ -597,8 +597,14 @@ mod tests {
             "the parameter half drives the lane it booked"
         );
         // Shut, the stream keeps its releases so nothing hangs.
-        assert_eq!(route.resolve(Some(0.0)), NoteSource::DawReleases { bus: 0 });
-        assert_eq!(route.resolve(Some(1.0)), NoteSource::Daw { bus: 0 });
+        assert_eq!(
+            route.resolve(Some(0.0)),
+            NoteStream::from_source(NoteSource::DawReleases { bus: 0 })
+        );
+        assert_eq!(
+            route.resolve(Some(1.0)),
+            NoteStream::from_source(NoteSource::Daw { bus: 0 })
+        );
     }
 
     /// Two gates in series pass notes only when both are open, and they say so
@@ -652,6 +658,7 @@ mod tests {
             NodeKind::KeySwitch(KeySwitch {
                 keys: vec![24, 25],
                 mode: KeySwitchMode::Select,
+                pass_keys: false,
             }),
             [0.0, 0.0],
         );
@@ -688,6 +695,37 @@ mod tests {
             a.gate, b.gate,
             "the two outputs are gated by different lanes"
         );
+        let expected = (1u128 << 24) | (1u128 << 25);
+        assert_eq!(
+            (a.mute, b.mute),
+            (expected, expected),
+            "the switch keys are steering, not sounding, so neither synth hears them"
+        );
+    }
+
+    /// `pass_keys` puts the switch keys back into the stream, for the patch
+    /// where the key that selects a layer is also meant to play it.
+    #[test]
+    fn a_key_switch_can_be_asked_to_pass_its_own_keys() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                keys: vec![24, 25],
+                mode: KeySwitchMode::Select,
+                pass_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.mute, 0);
     }
 
     /// The notes port sits after the audio inputs, so an effect that also takes
@@ -872,7 +910,7 @@ mod tests {
         fn process(
             &mut self,
             _instance: u32,
-            _notes: NoteSource,
+            _notes: NoteStream,
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
