@@ -93,11 +93,11 @@ pub struct AudioChunk {
     pub frames: u32,
     /// Where this chunk starts inside the block the DAW handed us.
     ///
-    /// Zero for the whole block under [`Chunking::WholeBlock`]. Under
-    /// `SubBlock` it is what lets the implementation cut the block's events and
-    /// automation down to the part this call covers, with offsets rebased —
-    /// without it, every chunk would be handed every event in the block and a
-    /// note would sound once per chunk (§14.9, §14.10).
+    /// Zero when the caller runs a whole block at once. When it cuts the block
+    /// into sub-blocks instead, this is what lets the implementation cut the
+    /// block's events and automation down to the part this call covers, with
+    /// offsets rebased — without it, every chunk would be handed every event in
+    /// the block and a note would sound once per chunk.
     pub offset: u32,
 }
 
