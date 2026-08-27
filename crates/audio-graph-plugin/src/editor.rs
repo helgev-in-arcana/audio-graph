@@ -42,8 +42,8 @@ use std::sync::Arc;
 use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
+use plugin_host::MainThread;
 use plugin_host::ParamInfo;
-use subhost_adapter::MainThread;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;

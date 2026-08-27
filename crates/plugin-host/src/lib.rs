@@ -27,14 +27,21 @@
 //! forwarding the DAW's transport, combining latency, nesting state. That is
 //! `subhost-adapter`'s job (ARCHITECTURE.md §7), and the test is unchanged:
 //! would an offline renderer or a plugin scanner still need it?
+//!
+//! [`MainThread`] is here by that test rather than in spite of it. The rule it
+//! encodes — VST3 pins a controller call to the thread that created the
+//! instance — is a format's rule, not a nesting one, and the two values it
+//! wraps today are both this crate's: a [`Plugin`] and a [`Deferred`].
 
 pub mod catalogue;
 pub mod config;
 mod format;
+mod main_thread;
 mod plugin;
 mod scan;
 
 pub use format::{FORMATS, Format};
+pub use main_thread::MainThread;
 pub use plugin::Plugin;
 pub use scan::{
     ClassInfo, PluginRef, default_plugin_directories, find_modules, installed_modules,
