@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
+use crate::state::WrapperState;
 use audio_graph_engine::{BlockContext, Engine, Graph};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SlotSchedule, SubHost, WrapperState};
+use subhost_adapter::{SlotSchedule, SubHost};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -155,7 +156,7 @@ impl Wrapper {
                     Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
                     None => {}
                 }
-                for problem in self.shared.main().host.load_state(&state) {
+                for problem in self.shared.main().host.load_state(&state.sub_host_state()) {
                     // Not fatal by design (§8.3): a sub-plugin that cannot be
                     // found must not stop the project from opening, and the
                     // bindings are kept so reinstalling it brings them back.

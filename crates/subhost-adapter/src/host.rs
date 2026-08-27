@@ -17,7 +17,7 @@ use plugin_host::{
 
 use crate::nodes::{InstanceIo, ParamTarget};
 use crate::slots::{ResolvedTarget, SlotTable};
-use crate::state::WrapperState;
+use crate::state::{InstanceState, SubHostState};
 
 pub use crate::state::SubPluginRef;
 
@@ -499,8 +499,11 @@ impl SubHost {
     /// unconditionally (see `tick_editors`) this is the only thing that runs
     /// them before a save. CHOWTapeModel does exactly that; without the tick it
     /// saves the values it held before the last edit.
-    pub fn save_state(&mut self) -> WrapperState {
-        let mut state = WrapperState::new(self.slots.to_state());
+    pub fn save_state(&mut self) -> SubHostState {
+        let mut state = SubHostState {
+            slots: self.slots.to_state(),
+            instances: Vec::new(),
+        };
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {
                 loaded.plugin.tick();
@@ -518,7 +521,11 @@ impl SubHost {
                     None
                 }
             };
-            state.set_instance(instance, loaded.reference.clone(), bytes.as_deref());
+            state.instances.push(InstanceState {
+                instance,
+                reference: loaded.reference.clone(),
+                state: bytes.as_deref().map(crate::state::base64_encode),
+            });
         }
         state
     }
@@ -528,12 +535,12 @@ impl SubHost {
     /// Returns a description of anything that could not be restored, rather
     /// than an error: a missing sub-plugin must not stop the rest of the patch
     /// from loading.
-    pub fn load_state(&mut self, state: &WrapperState) -> Vec<String> {
+    pub fn load_state(&mut self, state: &SubHostState) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
         self.unload_all();
 
-        for entry in state.instances() {
+        for entry in &state.instances {
             let reference = &entry.reference;
             let Some(path) = Self::resolve_reference(reference) else {
                 problems.push(format!(

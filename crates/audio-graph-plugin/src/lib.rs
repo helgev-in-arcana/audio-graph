@@ -13,6 +13,7 @@ mod host_context;
 mod params;
 mod plugin;
 mod shared;
+mod state;
 mod tick;
 
 use std::sync::Arc;
@@ -24,6 +25,7 @@ pub use host_context::WrapperHostContext;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
 pub use shared::{MainState, Shared};
+pub use state::{STATE_VERSION, WrapperState};
 
 /// The effect form: audio in, audio out.
 #[derive(Default)]
