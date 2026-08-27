@@ -13,10 +13,10 @@ mod slots;
 mod state;
 
 pub use host::{
-    GraphNodes, MAX_INSTANCES, SubHost, SubHostProcessor, SubHostProcessors, SubPluginRef,
+    GraphNodes, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
-pub use schedule::{DEFAULT_QUANTUM, LANES, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
-pub use slots::{Binding, ResolvedTarget, SLOT_COUNT, Slot, SlotTable};
+pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
+pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
 pub use state::{InstanceState, WrapperState};
 
 /// How the wrapper reports its own latency to the DAW.

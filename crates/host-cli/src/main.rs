@@ -15,6 +15,18 @@ use std::process::ExitCode;
 use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Mix, NodeKind, SlotIn};
 use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
+use subhost_adapter::SubHostConfig;
+
+/// The wrapper's ceilings, as `audio-graph-plugin` builds them.
+///
+/// Repeated rather than imported: this crate checks the engine and the adapter
+/// without linking the wrapper (and so without egui). Keep in step with
+/// `audio_graph_plugin::SUB_HOST`.
+const SUB_HOST: SubHostConfig = SubHostConfig {
+    max_instances: 16,
+    slot_count: 32,
+    lanes: 32 + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES,
+};
 
 fn main() -> ExitCode {
     fault::install_crash_handler();
@@ -900,7 +912,7 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
     use std::sync::Arc;
     use subhost_adapter::SubHost;
 
-    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(path), Some(class_id))?;
 
     let config = plugin_host::AudioConfig {
@@ -2491,7 +2503,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let patched = inject_one_plugin(&read_wrapper_state(&baseline)?, plugin)?;
     let state = edit_wrapper_state(&baseline, &patched)?;
 
-    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(wrapper), Some(&class.id))?;
     sub.load_sub_state(0, &state)?;
     // The wrapper reads its own state at activate, not when the blob arrives:
@@ -2721,7 +2733,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let hold = hold_for(args.get(2).filter(|s| !s.starts_with("--")))?;
     let reverse = args.iter().any(|a| a == "--reverse");
 
-    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(path), class_id)?;
     let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
     sub.open_editor(0, std::ptr::null_mut())?;
