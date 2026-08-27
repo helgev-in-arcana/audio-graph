@@ -22,7 +22,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | atomic_float | 1.1.0 | Apache-2.0 OR MIT OR Unlicense |
 | atomic_refcell | 0.1.14 | Apache-2.0 OR MIT |
 | backtrace | 0.3.76 | MIT OR Apache-2.0 |
-| baseview | 0.3.1 | MIT OR Apache-2.0 |
+| baseview | 0.3.2 | MIT OR Apache-2.0 |
 | bitflags | 2.13.1 | MIT OR Apache-2.0 |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
 | bytemuck_derive | 1.12.0 | Zlib OR Apache-2.0 OR MIT |
@@ -44,7 +44,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | egui | 0.36.1 | MIT OR Apache-2.0 |
 | egui-baseview | 0.7.0 | MIT OR Apache-2.0 |
 | egui_glow | 0.36.1 | MIT OR Apache-2.0 |
-| either | 1.17.0 | MIT OR Apache-2.0 |
+| either | 1.18.0 | MIT OR Apache-2.0 |
 | emath | 0.36.1 | MIT OR Apache-2.0 |
 | epaint | 0.36.1 | MIT OR Apache-2.0 |
 | epaint_default_fonts | 0.36.1 | (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 |
@@ -52,7 +52,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | euclid | 0.22.14 | MIT OR Apache-2.0 |
 | fearless_simd | 0.4.1 | Apache-2.0 OR MIT |
 | foldhash | 0.2.0 | Zlib |
-| font-types | 0.12.3 | MIT OR Apache-2.0 |
+| font-types | 0.12.4 | MIT OR Apache-2.0 |
 | fragile | 2.1.0 | Apache-2.0 |
 | glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib |
 | guillotiere | 0.7.0 | MIT/Apache-2.0 |
@@ -65,7 +65,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 |
 | linebender_resource_handle | 0.1.1 | Apache-2.0 OR MIT |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 |
-| log | 0.4.33 | MIT OR Apache-2.0 |
+| log | 0.4.34 | MIT OR Apache-2.0 |
 | memchr | 2.8.3 | Unlicense OR MIT |
 | midi-consts | 0.1.0 | MIT OR Apache-2.0 |
 | nice-log | 0.3.1 | ISC |
@@ -77,7 +77,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
-| open | 5.4.1 | MIT |
+| open | 5.4.2 | MIT |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 |
 | peniko | 0.6.1 | Apache-2.0 OR MIT |
@@ -102,7 +102,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
 | syn | 2.0.119 | MIT OR Apache-2.0 |
-| syn | 3.0.3 | MIT OR Apache-2.0 |
+| syn | 3.0.4 | MIT OR Apache-2.0 |
 | thiserror | 2.0.20 | MIT OR Apache-2.0 |
 | thiserror-impl | 2.0.20 | MIT OR Apache-2.0 |
 | thread_local | 1.1.10 | MIT OR Apache-2.0 |
@@ -117,7 +117,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | unicode-general-category | 1.1.0 | Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
-| uuid | 1.24.1 | Apache-2.0 OR MIT |
+| uuid | 1.26.0 | Apache-2.0 OR MIT |
 | vello_common | 0.1.0 | Apache-2.0 OR MIT |
 | vello_cpu | 0.1.0 | Apache-2.0 OR MIT |
 | vst3 | 0.3.0 | MIT OR Apache-2.0 |
@@ -174,7 +174,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 - crossbeam-epoch 0.9.20 (LICENSE-APACHE)
 - crossbeam-queue 0.3.13 (LICENSE-APACHE)
 - crossbeam-utils 0.8.22 (LICENSE-APACHE)
-- either 1.17.0 (LICENSE-APACHE)
+- either 1.18.0 (LICENSE-APACHE)
 - euclid 0.22.14 (LICENSE-APACHE)
 - glow 0.17.0 (LICENSE-APACHE)
 - hashbrown 0.17.1 (LICENSE-APACHE)
@@ -182,7 +182,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 - keyboard-types 0.8.3 (LICENSE-APACHE)
 - lazy_static 1.5.0 (LICENSE-APACHE)
 - lock_api 0.4.14 (LICENSE-APACHE)
-- log 0.4.33 (LICENSE-APACHE)
+- log 0.4.34 (LICENSE-APACHE)
 - midi-consts 0.1.0 (LICENSE-APACHE.txt)
 - num-traits 0.2.19 (LICENSE-APACHE)
 - once_cell 1.21.4 (LICENSE-APACHE)
@@ -195,7 +195,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 - syn 1.0.109 (LICENSE-APACHE)
 - thread_local 1.1.10 (LICENSE-APACHE)
 - unicode-segmentation 1.13.3 (LICENSE-APACHE)
-- uuid 1.24.1 (LICENSE-APACHE)
+- uuid 1.26.0 (LICENSE-APACHE)
 
 ```
 Apache License
@@ -440,7 +440,7 @@ DEALINGS IN THE SOFTWARE.
 適用先:
 
 - anyhow 1.0.104 (LICENSE-APACHE)
-- baseview 0.3.1 (LICENSE-APACHE)
+- baseview 0.3.2 (LICENSE-APACHE)
 - itoa 1.0.18 (LICENSE-APACHE)
 - proc-macro2 1.0.107 (LICENSE-APACHE)
 - quote 1.0.47 (LICENSE-APACHE)
@@ -449,7 +449,7 @@ DEALINGS IN THE SOFTWARE.
 - serde_derive 1.0.229 (LICENSE-APACHE)
 - serde_json 1.0.151 (LICENSE-APACHE)
 - syn 2.0.119 (LICENSE-APACHE)
-- syn 3.0.3 (LICENSE-APACHE)
+- syn 3.0.4 (LICENSE-APACHE)
 - thiserror 2.0.20 (LICENSE-APACHE)
 - thiserror-impl 2.0.20 (LICENSE-APACHE)
 - unicode-ident 1.0.24 (LICENSE-APACHE)
@@ -638,7 +638,7 @@ END OF TERMS AND CONDITIONS
 適用先:
 
 - anyhow 1.0.104 (LICENSE-MIT)
-- baseview 0.3.1 (LICENSE-MIT)
+- baseview 0.3.2 (LICENSE-MIT)
 - clap-sys 0.5.0 (LICENSE-MIT)
 - glow 0.17.0 (LICENSE-MIT)
 - itoa 1.0.18 (LICENSE-MIT)
@@ -653,7 +653,7 @@ END OF TERMS AND CONDITIONS
 - serde_json 1.0.151 (LICENSE-MIT)
 - syn 1.0.109 (LICENSE-MIT)
 - syn 2.0.119 (LICENSE-MIT)
-- syn 3.0.3 (LICENSE-MIT)
+- syn 3.0.4 (LICENSE-MIT)
 - thiserror 2.0.20 (LICENSE-MIT)
 - thiserror-impl 2.0.20 (LICENSE-MIT)
 - unicode-ident 1.0.24 (LICENSE-MIT)
@@ -1312,7 +1312,7 @@ DEALINGS IN THE SOFTWARE.
 適用先:
 
 - bitflags 2.13.1 (LICENSE-MIT)
-- log 0.4.33 (LICENSE-MIT)
+- log 0.4.34 (LICENSE-MIT)
 - num-traits 0.2.19 (LICENSE-MIT)
 
 ```
@@ -3321,7 +3321,7 @@ SOFTWARE.
 
 適用先:
 
-- either 1.17.0 (LICENSE-MIT)
+- either 1.18.0 (LICENSE-MIT)
 - itertools 0.15.0 (LICENSE-MIT)
 
 ```
@@ -3487,7 +3487,7 @@ the following restrictions:
 
 適用先:
 
-- font-types 0.12.3 (LICENSE-APACHE)
+- font-types 0.12.4 (LICENSE-APACHE)
 - read-fonts 0.41.0 (LICENSE-APACHE)
 - skrifa 0.44.0 (LICENSE-APACHE)
 
@@ -3565,7 +3565,7 @@ limitations under the License.
 
 適用先:
 
-- font-types 0.12.3 (LICENSE-MIT)
+- font-types 0.12.4 (LICENSE-MIT)
 - read-fonts 0.41.0 (LICENSE-MIT)
 - skrifa 0.44.0 (LICENSE-MIT)
 
@@ -3961,7 +3961,7 @@ SOFTWARE.
 
 適用先:
 
-- open 5.4.1 (LICENSE.md)
+- open 5.4.2 (LICENSE.md)
 
 ```
 The MIT License (MIT)
@@ -4911,7 +4911,7 @@ DEALINGS IN THE SOFTWARE.
 
 適用先:
 
-- uuid 1.24.1 (LICENSE-MIT)
+- uuid 1.26.0 (LICENSE-MIT)
 
 ```
 Copyright (c) 2014 The Rust Project Developers
