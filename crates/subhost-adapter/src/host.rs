@@ -10,12 +10,11 @@ use std::sync::Arc;
 
 use crate::schedule::SlotSchedule;
 use plugin_host::{
-    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, NoteEvent,
-    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
-    Target, TimeContext,
+    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
+    NoteEvent, ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain,
+    SubPluginProcessor, Target, TimeContext,
 };
 
-use crate::main_thread::MainThread;
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
 use audio_graph_engine::{InstanceIo, ParamTarget};
