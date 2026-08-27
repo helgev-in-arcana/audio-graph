@@ -1,6 +1,6 @@
-use crate::ir::NoteSource;
 use crate::nodes::Node;
 use crate::port::{Port, PortType};
+use subhost_adapter::NoteSource;
 
 /// Notes arriving from the DAW.
 ///

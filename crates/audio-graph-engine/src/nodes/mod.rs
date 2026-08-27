@@ -249,8 +249,8 @@ pub(crate) trait Node {
 }
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-use crate::ir::NoteSource;
 use crate::port::Port;
+use subhost_adapter::NoteSource;
 
 /// One node's identity and settings.
 ///

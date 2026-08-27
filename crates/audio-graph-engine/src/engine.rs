@@ -21,9 +21,10 @@ use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteStream, Op, Operand, Program, RateSpec, Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
+use subhost_adapter::{AudioChunk, AudioNodes};
 
 /// How many `DelayRead` taps one program may have.
 ///
@@ -111,89 +112,6 @@ fn expression_index(kind: NoteExpression) -> usize {
         NoteExpression::Expression => 4,
         NoteExpression::Brightness => 5,
         NoteExpression::Pressure => 6,
-    }
-}
-
-/// The shape of one chunk handed to a sub-plugin.
-///
-/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses
-/// (§4.3). The pool has room for the longest block the host promised, but the
-/// channels inside a chunk sit at `frames` rather than at that maximum — so a
-/// short sub-block is a smaller buffer rather than a sparse one, and the slice
-/// can be handed straight to a sub-plugin without repacking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioChunk {
-    /// Channels in the input region: the main bus plus every aux bus (§14.11).
-    pub input_channels: u16,
-    /// Channels in the output region, counted the same way (§14.2).
-    pub output_channels: u16,
-    /// Where the joins in the input region are. Empty for the usual one-bus
-    /// plugin.
-    pub aux_inputs: plugin_host::AuxBuses,
-    /// Where the joins in the output region are. Empty in the same case.
-    pub aux_outputs: plugin_host::AuxBuses,
-    pub frames: u32,
-    /// Where this chunk starts inside the block the DAW handed us.
-    ///
-    /// Zero for the whole block under [`Chunking::WholeBlock`]. Under
-    /// `SubBlock` it is what lets the implementation cut the block's events and
-    /// automation down to the part this call covers, with offsets rebased —
-    /// without it, every chunk would be handed every event in the block and a
-    /// note would sound once per chunk (§14.9, §14.10).
-    pub offset: u32,
-}
-
-impl AudioChunk {
-    /// One output channel of a chunk, as a range into the flat buffer.
-    pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
-        let start = channel as usize * self.frames as usize;
-        start..start + self.frames as usize
-    }
-}
-
-/// How the engine runs a sub-plugin.
-///
-/// The engine schedules audio but has no idea what is at the other end of a
-/// plugin node — this crate does not know what a VST3 is, and after M6 it will
-/// not know what a CLAP is either (§7). Everything crossing this boundary is a
-/// flat slice or a `Copy` value, for the same reason as §4.1: it has to still
-/// work when the plugin is in another process (ADR-6).
-pub trait AudioNodes {
-    /// Run instance `instance` from `input` into `output`.
-    ///
-    /// The two slices never alias. `output` is written in full for the frames
-    /// the chunk covers; anything the implementation does not write is whatever
-    /// the pool held, so a plugin that produces nothing should clear it.
-    ///
-    /// `notes` says which note stream this instance hears (§14.10). It is a
-    /// name and a key mask, not a buffer: the engine routes notes without
-    /// knowing what one is, and the implementation is what turns the name into
-    /// events and drops the keys the mask names.
-    fn process(
-        &mut self,
-        instance: u32,
-        notes: NoteStream,
-        input: &[f32],
-        output: &mut [f32],
-        chunk: AudioChunk,
-    );
-}
-
-/// An implementation that produces silence, for a wrapper with nothing loaded.
-pub struct NoNodes;
-
-impl AudioNodes for NoNodes {
-    fn process(
-        &mut self,
-        _instance: u32,
-        _notes: NoteStream,
-        _input: &[f32],
-        output: &mut [f32],
-        chunk: AudioChunk,
-    ) {
-        for ch in 0..chunk.output_channels {
-            output[chunk.channel(ch)].fill(0.0);
-        }
     }
 }
 
@@ -1353,6 +1271,7 @@ mod tests {
         PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
+    use subhost_adapter::NoteStream;
 
     const SLOTS: usize = 32;
 

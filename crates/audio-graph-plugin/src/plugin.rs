@@ -463,8 +463,8 @@ impl Wrapper {
             // (§14). Sub-plugins are reached through `AudioNodes`, so the
             // engine still knows nothing about what a plugin is.
             let mut loaded;
-            let mut empty = audio_graph_engine::NoNodes;
-            let nodes: &mut dyn audio_graph_engine::AudioNodes = match processor {
+            let mut empty = subhost_adapter::NoNodes;
+            let nodes: &mut dyn subhost_adapter::AudioNodes = match processor {
                 Some(processor) => {
                     loaded =
                         processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);

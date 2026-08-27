@@ -8,7 +8,8 @@
 //! runs.
 
 use crate::graph::{Graph, NodeId};
-use crate::ir::{AudioOp, Chunking, InstanceIo};
+use crate::ir::{AudioOp, Chunking};
+use subhost_adapter::InstanceIo;
 
 use crate::compile::{AudioCx, CompileError, Line};
 
@@ -65,13 +66,14 @@ mod tests {
     }
     use super::*;
     use crate::compile::compile;
-    use crate::engine::{AudioChunk, AudioContext, AudioNodes};
-    use crate::ir::{AudioOp, NoteRoute, NoteSource, NoteStream};
+    use crate::engine::AudioContext;
+    use crate::ir::{AudioOp, NoteRoute};
     use crate::nodes::{
         AudioIn, AudioOut, DelayRead, DelayWrite, KeySwitch, KeySwitchMode, Mix, NodeKind,
         NoteGate, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
+    use subhost_adapter::{AudioChunk, AudioNodes, NoteSource, NoteStream};
 
     const SLOTS: usize = 32;
 

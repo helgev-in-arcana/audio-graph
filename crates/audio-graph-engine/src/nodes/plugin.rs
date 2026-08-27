@@ -3,11 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, ParamCx};
-use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, ParamTarget};
+use crate::ir::{AudioOp, Buf, MAX_AUX_BUSES};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
 use crate::port::{Port, PortType};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// One sub-plugin parameter the graph is allowed to drive.
 ///
