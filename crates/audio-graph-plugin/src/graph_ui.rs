@@ -201,6 +201,11 @@ pub struct GraphEditor {
     linking: Option<(NodeId, u8)>,
     /// Where a right-click asked for a new node, in graph coordinates.
     add_at: Option<Pos2>,
+    /// Where to draw the add-node menu, in screen coordinates. The place the
+    /// node lands and the place the menu appears are the same for a
+    /// right-click but not for the toolbar button, which wants its menu
+    /// hanging off itself rather than out over the canvas.
+    add_screen: Option<Pos2>,
     /// Filter text in the add-node menu's plugin list.
     plugin_filter: String,
     /// Which half of the plugin list is showing. Kept across openings of the
@@ -218,6 +223,7 @@ impl Default for GraphEditor {
             dragging: None,
             linking: None,
             add_at: None,
+            add_screen: None,
             plugin_filter: String::new(),
             plugin_tab: PluginTab::Effect,
             actions: Vec::new(),
@@ -384,6 +390,7 @@ impl GraphEditor {
         {
             self.add_at =
                 Some(Pos2::ZERO + (pointer - self.pan - canvas.min.to_vec2()).to_vec2() / zoom);
+            self.add_screen = Some(pointer);
         }
         changed |= self.add_menu(ui, canvas, graph, ctx);
 
@@ -400,9 +407,15 @@ impl GraphEditor {
         ui.horizontal(|ui| {
             ui.heading("Graph");
             ui.weak(format!("{} nodes", graph.nodes.len()));
-            if ui.button("Add node").clicked() {
+            let add = ui.button("Add node");
+            if add.clicked() {
                 // Somewhere visible whatever the pan is.
                 self.add_at = Some(Pos2::new(40.0, 40.0) - self.pan);
+                // Under the button that opened it, so the menu appears where
+                // the eye already is rather than off across the canvas.
+                let mut screen_pos = add.rect.left_bottom();
+                screen_pos.y += 5.0;
+                self.add_screen = Some(screen_pos);
             }
             if ui.button("Centre").clicked() {
                 self.pan = Vec2::ZERO;
@@ -930,7 +943,10 @@ impl GraphEditor {
 
         egui::Area::new(ui.id().with("add-node"))
             .order(egui::Order::Foreground)
-            .fixed_pos(canvas.min + at.to_vec2() * self.zoom + self.pan)
+            .fixed_pos(
+                self.add_screen
+                    .unwrap_or(canvas.min + at.to_vec2() * self.zoom + self.pan),
+            )
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     // Two columns, each scrolling on its own: the built-in
