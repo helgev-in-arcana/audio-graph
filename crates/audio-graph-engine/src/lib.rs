@@ -1,10 +1,16 @@
 //! The node graph: what turns a wrapper into an instrument of its own.
 //!
-//! ARCHITECTURE.md §9. Constants, LFOs and note expressions are combined into
+//! ARCHITECTURE.md §4. Constants, LFOs and note expressions are combined into
 //! values that drive the wrapper's slots, and the slots drive the sub-plugin's
-//! parameters. Nothing here knows what a VST3 is, what a slot is bound to, or
-//! that there is a sub-plugin at all — it reads numbers and writes numbers, and
-//! the outer layers decide what those numbers mean.
+//! parameters. Nothing here knows what a VST3 is or what a slot is bound to —
+//! it reads numbers and writes numbers, and the outer layers decide what those
+//! numbers mean.
+//!
+//! It does know that a plugin node has something behind it, but only through
+//! `subhost-adapter`'s [`AudioNodes`][subhost_adapter::AudioNodes]: an instance
+//! number, a note stream's *name*, and two flat slices. Which way that
+//! dependency points matters — `subhost-adapter` is the general crate and this
+//! one is AudioGraph's, so this one does the depending.
 //!
 //! The crate is split along the one line that matters, the thread boundary:
 //!

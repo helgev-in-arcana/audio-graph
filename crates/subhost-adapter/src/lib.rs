@@ -1,11 +1,21 @@
 //! Everything specific to hosting a plugin from *inside* another plugin.
 //!
-//! ARCHITECTURE.md §7 defines this crate by subtraction: if a standalone
-//! offline renderer or a plugin scanner would still need a piece of code, it
-//! belongs in `vst3-host`, not here. What is left is the nesting itself —
-//! forwarding the DAW's transport down, combining latency on the way up,
-//! nesting one plugin's state inside another's, and deciding what to do with
-//! the sub-plugin's own edit notifications.
+//! Defined by subtraction: if a standalone offline renderer or a plugin scanner
+//! would still need a piece of code, it belongs in `plugin-host`, not here.
+//! What is left is the nesting itself — forwarding the DAW's transport down,
+//! combining latency on the way up, publishing slots the DAW can automate and
+//! binding them to the sub-plugin's own parameters, nesting one plugin's state
+//! inside another's, and deciding what to do with the sub-plugin's edit
+//! notifications.
+//!
+//! Defined by subtraction the other way too: nothing here knows what AudioGraph
+//! is. The wrapper above decides how many slots to publish, how many lanes a
+//! sub-block carries and what its saved document looks like, and hands those in
+//! ([`SubHostConfig`], [`SlotSchedule`], [`SubHostState`]); a different wrapper
+//! — a chain, a rack, a bare pair of plugins — makes different choices and gets
+//! the same crate. [`AudioNodes`] is where that line is drawn: a caller schedules
+//! audio and says which instance hears what, and everything crossing back is a
+//! flat slice or a `Copy` value.
 
 mod host;
 mod nodes;

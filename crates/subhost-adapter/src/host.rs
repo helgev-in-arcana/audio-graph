@@ -702,10 +702,11 @@ impl SubHostProcessor {
     }
 }
 
-/// Every instance's audio-thread half, indexed the way the graph indexes them.
+/// Every instance's audio-thread half, indexed the way the caller indexes them.
 ///
-/// Sparse for the same reason [`SubHost::instances`] is: the graph names a
-/// plugin node by index, so an empty slot has to stay empty.
+/// Sparse for the same reason [`SubHost`]'s own table is: the caller names an
+/// instance by index, so an empty slot has to stay empty rather than be closed
+/// up and renumber everything after it.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
     /// The block's events with the note-ons taken out, for an instance behind
@@ -732,7 +733,8 @@ impl SubHostProcessors {
         }
     }
 
-    /// Bind the per-block context that [`AudioNodes`] does not carry.
+    /// Bind the per-block context that [`AudioNodes`][crate::AudioNodes] does
+    /// not carry.
     ///
     /// The engine calls `process(instance, ...)` with nothing but buffers,
     /// because it does not know that a plugin has events or a transport
