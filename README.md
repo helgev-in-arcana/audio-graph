@@ -1,88 +1,39 @@
-# AudioGraph (v0.1.2-alpha)
+<div align="center">
 
-中でプラグインを読み込んで、ノードベースで音を弄れるプラグインです。
+# AudioGraph
 
-音の配線、パラメーターの配線、MIDIの配線すべてをノードで編集できます。
+**A _node-based_ Instrument / Effect plugin
+for VST3 and CLAP plugins.**
+
+**中でプラグインを読み込んで、ノードベースで音を弄れるプラグインです。**<br>
+**音の配線、パラメーターの配線、MIDIの配線すべてをノードで編集できます。**
 
 ![](./docs/example-screenshot.png)
 
-## 現時点でできること
+</div>
 
-- Fx と Instrument の 2 クラスを 1 バイナリから提供
-- **VST3 と CLAP の両方を読み込める**（同じグラフの中で混在できます）
-- プラグイン読み込みは16個まで
-- 音声、MIDI、パラメーター値のノードベース編集
-- DAWからのオートメーションスロットが32本
-- 自動遅延保証対応
+## Why AudioGraph?
 
-## 現時点でできないこと
+DTMで、ディレイループにエフェクトを掛けることは、伝統的なトラックベースの音声処理では不可能です。
 
-- Win以外の対応 (Win11(x86_64)のみ動作確認)
-- プラグイン読み込み制限を無くしたい
-- プラグインプロセス分離
-- 32bitプラグイン読み込み
-- 出力バスを 2 本以上持つプラグインのソケットは表示されますが、実機での検査は未実施です。
-- 出力バスを 1 本も宣言しないプラグインは、オーディオのコンパイル対象から外れます。
+また、不可能ではない表現でも、複雑なエフェクトや複雑な音声ルーティングは見にくく作業しずらい。
 
-## 今後も出来ないこと
+ノードなら全て解決できます。一発で音声やパラメーターの流れを理解でき、作業しやすく、表現力も完全上位互換。
+マクロやLFOなど、手持ちのプラグインに存在しない機能を外から取り付けることもできます。
 
-- VST2ネイティブ対応
-  - 　ライセンスがありません
-- VST3のAudioGraphでの可変数オートメーションスロット
+音源/エフェクト問わず、複数のプラグインを組み合わせて大きなマクロを組むことも可能。
 
-## 把握しているバグ
+## Getting Started / Features
 
-- ディレイノードでディレイ量が変化したときに波形の補間がうまくいっていない
-- ゲインが実数倍率になっている
-- ほか、存在するであろう未発見のバグ
+1. [Releases](https://github.com/helgev-in-arcana/audio-graph/releases) から環境に合わせてダウンロード
+2. DAW で AudioGraph を立ち上げ、`Plugin folders` に手持ちのプラグインのスキャンディレクトリを登録
+3. 空白を右クリック（または `Add Node`）でノードを置き、繋ぐ
 
-見つけた場合はIssueまで。
-一方で、現在アルファ版ですので開発によってバグが直ったり増えたり復活したりするかもしれません。
+機能、詳しい操作とノードの一覧は →[Nodes and Usage](docs/nodes-usage.md)
 
-## リリース
+## Build from source
 
-https://github.com/helgev-in-arcana/audio-graph/releases
-
-- Windows (x86_64) 以外は一切動作確認していません
-- LinuxとmacOSはGUIまわりで動かないはずです。
-
-## License
-
-MIT OR Apache-2.0
-
-配布バイナリに組み込まれる依存ライブラリとフォントの著作権表示は
-[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) にまとめてあります。
-
-VST is a trademark of Steinberg Media Technologies GmbH, registered in Europe
-and other countries. 本プロジェクトは Steinberg Media Technologies GmbH と
-提携・関連するものではありません。
-
-## 注意
-
-🚧🚧🚧―――――――――――――――――――――――――――――――――――――――
-
-- 現時点のコミット先頭はほとんどバイブコードされた状態です。
-  - 私(@helgev-in-arcana)が現在コード・設計監査を進めています。
-- UIは現在仮組みです。改良中です。
-- 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
-- コード署名が現在ありません。
-- 今はアルファ版で、動作確認ができているのは Windows (x86_64) のみです。読み込めるプラグインは VST3 と CLAP です。
-  - リリースに色んなビルドが並んでますが、**Windows (x86_64) 以外は一切動作確認していません**。ビルドが通っているというだけの状態です。
-    - LinuxとMacはおそらくGUIが出ないと思われます。
-  - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
-  - VST2ネイティブ対応はライセンスの問題で不可能です。VST3化ツールなど使ってください。
-
-―――――――――――――――――――――――――――――――――――――――🚧🚧🚧
-
----
-
-❗以下Claude執筆❗
-
----
-
-## ビルド
-
-Rust（edition 2024 が通る版）が必要です。
+MSRV: Rust 1.95.0
 
 ```sh
 cargo xtask bundle audio-graph-plugin --release
@@ -90,85 +41,63 @@ cargo xtask bundle audio-graph-plugin --release
 
 `target/bundled/` に `AudioGraph.vst3` と `AudioGraph.clap` ができます。
 
-開発時は先に `cargo build --workspace` を通してから `cargo test --workspace`
-を実行してください（`cargo test` は他パッケージの cdylib を作らないため）。
+<div align="center">
 
-## 導入
+---
 
-出来上がったバンドルを、使う形式のフォルダへ置きます。
+---
 
-| 形式 | Windows | Linux | macOS |
-|---|---|---|---|
-| VST3 | `C:\Program Files\Common Files\VST3\` | `~/.vst3/` | `~/Library/Audio/Plug-Ins/VST3/` |
-| CLAP | `C:\Program Files\Common Files\CLAP\` | `~/.clap/` | `~/Library/Audio/Plug-Ins/CLAP/` |
+</div>
 
-DAW を再スキャンすると `Audio Graph FX` と `Audio Graph Instrument` の 2 つが現れます。
+## Architecture / Development
 
-## 使い方
+```mermaid
+flowchart TD
+    plugin[audio-graph-plugin<br/>VST3/CLAP として外に出る層]
+    cli[host-cli]
+    adapter[subhost-adapter<br/>入れ子であることに固有の処理]
+    engine[audio-graph-engine<br/>グラフ・コンパイラ・IR]
+    host[plugin-host<br/>形式を畳むファサード]
+    api[plugin-host-api<br/>共通トレイトとデータモデル]
+    vst3[vst3-host]
+    vst3v[vst3-host-view]
+    clap[clap-host]
+    win[host-window]
 
-1. トラックに AudioGraph を挿してエディタを開く
-2. キャンバスに **Plugin ノード**を置き、手持ちの VST3 か CLAP を読み込む
-3. `Audio In` → Plugin → `Audio Out` を繋ぐ（ここまでで普通のプラグインとして音が通ります）
-4. **LFO ノード**などを置き、その出力を Plugin ノードのパラメータソケットへ繋ぐ
 
-繋げられるのは同じ型のソケット同士だけです（音・ノート・パラメータ値の 3 種、色で区別できます）。
-入力ソケットは線を 1 本しか受けないので、合流は `Mix` ノードで行います。ゲインも `Mix` が持ちます。
+    api --> vst3
+    api --> clap
 
-DAW からのオートメーションは **スロット**（32 本）を通り、`SlotIn` ノードとして現れます。
-グラフからサブプラグインのパラメータへ書き込むには、Plugin ノードのパラメータソケットへ
-繋ぎます（かつては `SlotOut` でスロットを上書きできましたが、DAW のオートメーションと
-奪い合いになるため廃止しました）。
+    win --> clap
+    win --> vst3v
 
-信号の ON/OFF は `Audio Gate` と `MIDI Gate`、値の切り替えは `Param Select` です（値ごとに
-ソケットと閾値を 1 つ持ち、`Mix` の入力と同じように増減できます）。
-MIDI キースイッチで分岐させたいときは `Key MIDI Route`（送出先の切り替え）と
-`Key Param Select`（パラメータ値の切り替え）を使います。どちらも行き先／値ごとに
-鍵を 1 つ持ち、`Mix` の入力と同じように増減できます。`Key MIDI Route` の操作に使う鍵は
-既定では下流へ流れません（鳴らすためではなく選ぶために弾く鍵なので）。流したいときは
-ノードの **mute switching keys** を外してください。`MIDI Gate` が閉じている間は
-ノートオンだけが止まり、ノートオフは通るので、鳴っている音が吊ることはありません。
 
-ノード名は `[制御] <出力型> <動詞>` の順です。型語（`Audio` / `MIDI` / `Param`）が
-付くのは型をまたぐノードと名前が衝突するノードだけで、`Constant` や `LFO` のように
-出力型が自明なものには付きません。動詞はソケットの形と対応していて、`Gate` は
-通す／止める（入 1・出 1）、`Select` は候補から 1 つ選ぶ（入 N・出 1）、`Route` は
-1 本を行き先の 1 つへ送る（入 1・出 N）、`Map` は値を連続的に変換します。
+    api --> host
+    clap --> host
+    vst3 --> host
+    vst3v --> host
+    win --> host
 
-ディレイは `DelayWrite` と `DelayRead` の 2 ノードに分かれていて、`line` 番号で対応づきます。
-線で繋がっていないのでフィードバックが組めます。1 本の line を複数の `DelayRead` が読めばマルチタップです。
+    host --> engine
 
-### プラグインが一覧に出てこないとき
+    host --> adapter
+    engine --> adapter
 
-エディタ上部の **Plugin folders** を開いてフォルダを追加してください。初回起動時に
-その OS の慣例的な設置場所が書き込まれており、以降はそこに並ぶフォルダが探索対象の
-すべてです。慣例由来の行も削除できます。消しすぎたときは **Add the usual folders** で戻ります。
 
-設定はユーザーごとの領域（Windows は `%LOCALAPPDATA%\AudioGraph\config.json`、
-macOS は `~/Library/Application Support/AudioGraph/`、
-Linux は `$XDG_CONFIG_HOME/audio-graph/`）に保存され、同じマシンの全インスタンスで共有されます。
 
-## host-cli — DAW なしで確かめる
 
-DAW を立ち上げずに、実物のプラグインを相手に検証できる CLI が付属します。
-プラグインを指す引数は `.vst3` でも `.clap` でもかまいません。
+    host --> cli
+    engine --> cli
+    adapter --> cli
 
-```sh
-cargo run -p host-cli -- <コマンド>
+    host --> plugin
+    engine --> plugin
+    adapter --> plugin
 ```
 
-主なコマンド：
+→[Development](docs/devlopment.md)
 
-| コマンド | 内容 |
-|---|---|
-| `dirs` | 実際に探索する設置場所と設定ファイルの位置 |
-| `scan [DIR...]` / `info` / `params` / `buses` | 見つかったプラグインの中身を列挙 |
-| `render <PLUGIN> <IN.wav> <OUT.wav>` / `synth <PLUGIN> <OUT.wav>` | 音を出す |
-| `graph` / `chain` / `instrument` / `sidechain` / `delay` | グラフの振る舞いを検査する |
-| `churn` / `twice` / `state` / `sweep` / `probe` / `gui` | 寿命まわりを痛めつける |
-
-`cargo run -p host-cli -- --help` で全コマンドが出ます。
-
-## プラグインホストライブラリ
+## plugin-host — 単体で使えるホストライブラリ
 
 副産物として、**Rust から VST3 / CLAP プラグインをホストするためのライブラリ**が
 `plugin-host` クレートとして手に入ります。形式は拡張子から決まり、コードに形式名は現れません。
@@ -183,3 +112,33 @@ plugin.deactivate(processor);
 ```
 
 現時点では API は AudioGraph の内部利用が主で、安定していません。
+
+## Roadmap
+
+→[Roadmap](docs/roadmap.md)
+
+## Notice / 注意
+
+🚧🚧🚧―――――――――――――――――――――――――――――――――――――――
+
+- 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
+- UIは現在仮組みです。改良中です。
+- コード署名が現在ありません。
+- 動作確認ができているのは **Windows (x86_64)** のみです。
+  - リリースに色んなビルドが並んでいますが、Windows (x86_64) 以外はビルドが通っているというだけの状態です。LinuxとmacOSはGUIまわりで動かないはずです。
+  - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
+- VST2ネイティブ対応はライセンスの問題で不可能です。VST3化ツールなど使ってください。
+- コードベースは初期に生成コードで立ち上げた部分が残っており、私(@helgev-in-arcana)が設計・コード監査を進めています。上の §Architecture/Development は確認済みの設計です。
+
+―――――――――――――――――――――――――――――――――――――――🚧🚧🚧
+
+## License
+
+MIT OR Apache-2.0
+
+配布バイナリに組み込まれる依存ライブラリとフォントの著作権表示は
+[THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) にまとめてあります。
+
+VST is a trademark of Steinberg Media Technologies GmbH, registered in Europe
+and other countries. 本プロジェクトは Steinberg Media Technologies GmbH と
+提携・関連するものではありません。
