@@ -1366,7 +1366,14 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
         .as_str()
         .unwrap_or("bound")
         .to_string();
-    let reference = value["sub_plugin"].clone();
+    // M8 on, the wrapper saves its sub-plugins as a list; `sub_plugin` is the
+    // pre-M8 single one, still read so an old project loads. Looking only at
+    // the old field left this reading `null` for every state the wrapper has
+    // written since.
+    let reference = match value["sub_plugins"].as_array().and_then(|xs| xs.first()) {
+        Some(entry) => entry["reference"].clone(),
+        None => value["sub_plugin"].clone(),
+    };
     let path_hint = reference["path_hint"]
         .as_str()
         .ok_or("the saved sub-plugin has no path")?
