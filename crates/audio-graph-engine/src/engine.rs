@@ -24,7 +24,7 @@ use crate::ir::{
     MAX_LFOS, MAX_REGISTERS, MathOp, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
-use subhost_adapter::{AudioChunk, AudioNodes};
+use subhost_adapter::{AudioChunk, AudioInstances};
 
 /// How many `DelayRead` taps one program may have.
 ///
@@ -583,7 +583,7 @@ impl Engine {
         ctx: &AudioContext<'_>,
         daw_in: &[f32],
         daw_out: &mut [f32],
-        nodes: &mut dyn AudioNodes,
+        nodes: &mut dyn AudioInstances,
     ) {
         let total = ctx.frames as usize;
         if self.stride == 0 || total > self.stride {
@@ -624,7 +624,7 @@ impl Engine {
         &mut self,
         program: &Program,
         ctx: &AudioContext<'_>,
-        nodes: &mut dyn AudioNodes,
+        nodes: &mut dyn AudioInstances,
         daw_in: &[f32],
         daw_out: &mut [f32],
         start: usize,
@@ -1705,7 +1705,7 @@ mod tests {
     /// makes the order it ran in readable off the output.
     struct Adders;
 
-    impl AudioNodes for Adders {
+    impl AudioInstances for Adders {
         fn process(
             &mut self,
             instance: u32,
@@ -2592,7 +2592,7 @@ mod tests {
     #[test]
     fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
         struct Counting(usize);
-        impl AudioNodes for Counting {
+        impl AudioInstances for Counting {
             fn process(
                 &mut self,
                 _instance: u32,

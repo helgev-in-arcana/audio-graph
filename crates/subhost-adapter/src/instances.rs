@@ -10,28 +10,29 @@
 
 use plugin_host::AuxBuses;
 
-/// Where a plugin node's notes come from (§14.10).
+/// Where one instance's notes come from.
 ///
-/// An identity rather than a buffer: this crate does not know what a note is
-/// (§7), so it routes the *name* of a source and lets the adapter turn that
-/// into events. That is also what keeps a `Program` free of pointers (ADR-6).
+/// An identity rather than a buffer. The caller decides which instance hears
+/// which stream without knowing what a note is, and this side turns the name
+/// into events — which is also what keeps whatever the caller schedules from
+/// holding a pointer (ADR-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoteSource {
-    /// Nothing wired to the notes port.
+    /// Nothing routed to this instance.
     ///
-    /// The plugin gets no notes at all — not the DAW's, not anyone's. Before
-    /// M8.3 every instance was handed every event the DAW sent, which is why
-    /// two synths in one patch played in unison whatever the graph said.
+    /// It gets no notes at all — not the DAW's, not anyone's. Handing every
+    /// instance every event the DAW sent is the tempting default and the wrong
+    /// one: two synths then play in unison whatever the caller intended.
     #[default]
     None,
     /// One of the wrapper's own note inputs from the DAW.
     Daw { bus: u16 },
-    /// The same stream with note-ons held back (§14.10).
+    /// The same stream with note-ons held back.
     ///
     /// What a shut gate leaves. Blocking everything would be simpler and
     /// wrong: a note that was already sounding when the gate closed would
-    /// never get its note-off, and a hung note outlives the patch that caused
-    /// it. Letting the releases through costs nothing and means a gate can be
+    /// never get its note-off, and a hung note outlives whatever caused it.
+    /// Letting the releases through costs nothing and means a gate can be
     /// thrown mid-phrase without leaving wreckage.
     DawReleases { bus: u16 },
 }
@@ -57,9 +58,9 @@ impl NoteSource {
 /// voice left waiting for its release, which is the opposite of the situation
 /// [`NoteSource::DawReleases`] exists for.
 ///
-/// A mask rather than a list because the audio half copies this per chunk and
-/// tests one bit per event, and because sixteen bytes is cheaper than a
-/// pointer plus the lifetime that would come with it (ADR-6).
+/// A mask rather than a list because it is copied per chunk and tested one bit
+/// per event, and because sixteen bytes is cheaper than a pointer plus the
+/// lifetime that would come with it (ADR-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NoteStream {
     pub source: NoteSource,
@@ -74,16 +75,16 @@ impl NoteStream {
 
 /// The shape of one chunk handed to a sub-plugin.
 ///
-/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses
-/// (§4.3). The pool has room for the longest block the host promised, but the
+/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses.
+/// The caller's pool has room for the longest block the host promised, but the
 /// channels inside a chunk sit at `frames` rather than at that maximum — so a
 /// short sub-block is a smaller buffer rather than a sparse one, and the slice
 /// can be handed straight to a sub-plugin without repacking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioChunk {
-    /// Channels in the input region: the main bus plus every aux bus (§14.11).
+    /// Channels in the input region: the main bus plus every aux bus.
     pub input_channels: u16,
-    /// Channels in the output region, counted the same way (§14.2).
+    /// Channels in the output region, counted the same way.
     pub output_channels: u16,
     /// Where the joins in the input region are. Empty for the usual one-bus
     /// plugin.
@@ -109,24 +110,24 @@ impl AudioChunk {
     }
 }
 
-/// How the engine runs a sub-plugin.
+/// Every sub-plugin a caller can run, addressed by index.
 ///
-/// The engine schedules audio but has no idea what is at the other end of a
-/// plugin node — this crate does not know what a VST3 is, and after M6 it will
-/// not know what a CLAP is either (§7). Everything crossing this boundary is a
-/// flat slice or a `Copy` value, for the same reason as §4.1: it has to still
-/// work when the plugin is in another process (ADR-6).
-pub trait AudioNodes {
+/// This is the one line between scheduling audio and hosting a plugin. The
+/// caller decides *when* each instance runs and *what* it hears; it has no idea
+/// what is at the other end, and does not learn whether it was a VST3 or a
+/// CLAP. Everything crossing back is a flat slice or a `Copy` value, so the
+/// arrangement still works when the sub-plugin is in another process (ADR-6).
+pub trait AudioInstances {
     /// Run instance `instance` from `input` into `output`.
     ///
     /// The two slices never alias. `output` is written in full for the frames
     /// the chunk covers; anything the implementation does not write is whatever
     /// the pool held, so a plugin that produces nothing should clear it.
     ///
-    /// `notes` says which note stream this instance hears (§14.10). It is a
-    /// name and a key mask, not a buffer: the engine routes notes without
-    /// knowing what one is, and the implementation is what turns the name into
-    /// events and drops the keys the mask names.
+    /// `notes` says which note stream this instance hears. It is a name and a
+    /// key mask, not a buffer: the caller routes notes without knowing what one
+    /// is, and the implementation is what turns the name into events and drops
+    /// the keys the mask names.
     fn process(
         &mut self,
         instance: u32,
@@ -138,9 +139,9 @@ pub trait AudioNodes {
 }
 
 /// An implementation that produces silence, for a wrapper with nothing loaded.
-pub struct NoNodes;
+pub struct NoInstances;
 
-impl AudioNodes for NoNodes {
+impl AudioInstances for NoInstances {
     fn process(
         &mut self,
         _instance: u32,
@@ -155,31 +156,33 @@ impl AudioNodes for NoNodes {
     }
 }
 
-/// A sub-plugin has to be activated with the buses the graph will actually
-/// feed it, and that is a property of the patch rather than of the plugin. It
-/// lives in the `Program` because the compiler is what knows it, and because
+/// How one instance has to be activated: the buses that will actually be fed to
+/// it.
+///
+/// A property of the arrangement rather than of the plugin — whether a
+/// sidechain is switched on depends on whether the caller wired anything to it.
+/// The caller is what knows this, which is why it comes in from that side; and
 /// changing it means the sub-plugin has to be deactivated and activated again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceIo {
     pub instance: u32,
     /// Main input bus width. Zero for an instrument.
     pub input_channels: u16,
-    /// Aux input buses, in order. Only the ones the graph wired.
+    /// Aux input buses, in order. Only the ones the caller wired.
     pub aux_inputs: Vec<u16>,
     /// Main output bus width.
     pub output_channels: u16,
-    /// Aux output buses, in order. Only as far as the graph reads them, so a
+    /// Aux output buses, in order. Only as far as the caller reads them, so a
     /// plugin's third output is absent when only the second is wired.
     pub aux_outputs: Vec<u16>,
 }
 
-/// One sub-plugin parameter the graph drives directly (§14.12).
+/// One sub-plugin parameter the caller drives directly.
 ///
-/// The wrapper's slots are the DAW's automation lanes and there are 32 of them;
-/// this is the other way in, and it is not limited that way because nothing
-/// outside the patch has to name it. A `SlotIn` node wired to a parameter
-/// socket is how a DAW lane reaches a parameter now — the slot table is no
-/// longer the only route.
+/// The other way in. A [`Slot`][crate::Slot] is the DAW's lane and is published
+/// to it, so there is a fixed number of those; this is not limited the same way
+/// because nothing outside the caller has to name it. Both arrive on the same
+/// schedule and the merge does not care which is which — see [`SlotSchedule`][crate::SlotSchedule].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamTarget {
     pub instance: u32,

@@ -73,7 +73,7 @@ mod tests {
         NoteGate, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
-    use subhost_adapter::{AudioChunk, AudioNodes, NoteSource, NoteStream};
+    use subhost_adapter::{AudioChunk, AudioInstances, NoteSource, NoteStream};
 
     const SLOTS: usize = 32;
 
@@ -956,7 +956,7 @@ mod tests {
         first_of_each: Vec<f32>,
     }
 
-    impl AudioNodes for RecordInput {
+    impl AudioInstances for RecordInput {
         fn process(
             &mut self,
             _instance: u32,
