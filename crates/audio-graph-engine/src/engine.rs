@@ -15,7 +15,7 @@
 //! is a `Program` and nothing else. A `use crate::graph::…` appearing above
 //! the `#[cfg(test)]` line is the signal that something has leaked across.
 
-use plugin_host_api::{NoteEvent, NoteExpression};
+use plugin_host::{NoteEvent, NoteExpression};
 
 use crate::handoff::Handoff;
 use crate::ir::{
@@ -129,9 +129,9 @@ pub struct AudioChunk {
     pub output_channels: u16,
     /// Where the joins in the input region are. Empty for the usual one-bus
     /// plugin.
-    pub aux_inputs: plugin_host_api::AuxBuses,
+    pub aux_inputs: plugin_host::AuxBuses,
     /// Where the joins in the output region are. Empty in the same case.
-    pub aux_outputs: plugin_host_api::AuxBuses,
+    pub aux_outputs: plugin_host::AuxBuses,
     pub frames: u32,
     /// Where this chunk starts inside the block the DAW handed us.
     ///
@@ -856,10 +856,10 @@ impl Engine {
                         AudioChunk {
                             input_channels: in_width,
                             output_channels: out_width,
-                            aux_inputs: plugin_host_api::AuxBuses::new(
+                            aux_inputs: plugin_host::AuxBuses::new(
                                 input_buses.get(1..).unwrap_or(&[]),
                             ),
-                            aux_outputs: plugin_host_api::AuxBuses::new(
+                            aux_outputs: plugin_host::AuxBuses::new(
                                 output_buses.get(1..).unwrap_or(&[]),
                             ),
                             frames: frames as u32,
