@@ -15,9 +15,9 @@ use plugin_host::{
     SubPluginProcessor, Target, TimeContext,
 };
 
+use crate::nodes::{InstanceIo, ParamTarget};
 use crate::slots::{ResolvedTarget, SlotTable};
 use crate::state::WrapperState;
-use audio_graph_engine::{InstanceIo, ParamTarget};
 
 pub use crate::state::SubPluginRef;
 
@@ -757,14 +757,14 @@ pub struct GraphNodes<'a> {
     out_events: &'a mut EventSink,
 }
 
-impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
+impl crate::nodes::AudioNodes for GraphNodes<'_> {
     fn process(
         &mut self,
         instance: u32,
-        notes: audio_graph_engine::NoteStream,
+        notes: crate::nodes::NoteStream,
         input: &[f32],
         output: &mut [f32],
-        chunk: audio_graph_engine::AudioChunk,
+        chunk: crate::nodes::AudioChunk,
     ) {
         // Destructured rather than reached through twice: the scratch and the
         // processor are different fields, and saying so is what lets both be
@@ -805,10 +805,10 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
         // A key switch's own keys are dropped outright, both halves: the
         // note-on went too, so there is no voice left waiting for the release.
         let events: &[Event] = match notes.source {
-            audio_graph_engine::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
-            source @ (audio_graph_engine::NoteSource::Daw { bus: 0 }
-            | audio_graph_engine::NoteSource::DawReleases { bus: 0 }) => {
-                let shut = matches!(source, audio_graph_engine::NoteSource::DawReleases { .. });
+            crate::nodes::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
+            source @ (crate::nodes::NoteSource::Daw { bus: 0 }
+            | crate::nodes::NoteSource::DawReleases { bus: 0 }) => {
+                let shut = matches!(source, crate::nodes::NoteSource::DawReleases { .. });
                 gated.clear();
                 for event in self.events {
                     if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
@@ -1231,7 +1231,7 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource, NoteStream};
+        use crate::nodes::{AudioChunk, AudioNodes, NoteSource, NoteStream};
         use plugin_host::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
@@ -1265,8 +1265,8 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        let daw = NoteRoute::from_source(NoteSource::Daw { bus: 0 });
-        nodes.process(0, daw.resolve(None), &input, &mut output, chunk);
+        let daw = NoteStream::from_source(NoteSource::Daw { bus: 0 });
+        nodes.process(0, daw, &input, &mut output, chunk);
         nodes.process(1, NoteStream::default(), &input, &mut output, chunk);
 
         assert_eq!(
@@ -1285,7 +1285,7 @@ mod tests {
     /// note-off. Blocking the lot would leave it hanging for ever.
     #[test]
     fn a_shut_note_gate_still_delivers_the_releases() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource, NoteStream};
+        use crate::nodes::{AudioChunk, AudioNodes, NoteSource, NoteStream};
         use plugin_host::NoteEvent;
 
         let (gated_node, saw) = harness(Vec::new());

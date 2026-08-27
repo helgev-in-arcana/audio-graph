@@ -8,6 +8,7 @@
 //! the sub-plugin's own edit notifications.
 
 mod host;
+mod nodes;
 mod schedule;
 mod slots;
 mod state;
@@ -15,6 +16,7 @@ mod state;
 pub use host::{
     GraphNodes, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
+pub use nodes::{AudioChunk, AudioNodes, InstanceIo, NoNodes, NoteSource, NoteStream, ParamTarget};
 pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
 pub use state::{InstanceState, WrapperState};

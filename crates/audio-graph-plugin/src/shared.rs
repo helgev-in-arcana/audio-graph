@@ -35,10 +35,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::config::SLOT_COUNT;
 use audio_graph_engine::{Graph, Handoff, Program, compile};
-use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, Plugin, PluginPorts};
+use audio_graph_engine::{NodeId, NodeKind, Plugin, PluginPorts};
 use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
-use subhost_adapter::{DEFAULT_QUANTUM, SubHost, SubHostProcessors, WrapperState};
+use subhost_adapter::{
+    DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors, WrapperState,
+};
 
 use crate::params::WrapperParams;
 

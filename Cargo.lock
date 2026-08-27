@@ -113,6 +113,7 @@ dependencies = [
  "plugin-host",
  "serde",
  "serde_json",
+ "subhost-adapter",
 ]
 
 [[package]]
@@ -2061,7 +2062,6 @@ dependencies = [
 name = "subhost-adapter"
 version = "0.1.2"
 dependencies = [
- "audio-graph-engine",
  "log",
  "plugin-host",
  "serde",

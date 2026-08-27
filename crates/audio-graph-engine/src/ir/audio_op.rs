@@ -4,6 +4,8 @@
 //! rates. Buffers are indices into a pool the engine owns; nothing here is a
 //! pointer, so a `Program` still crosses a process boundary unchanged (ADR-6).
 
+use subhost_adapter::{NoteSource, NoteStream};
+
 /// An index into the audio buffer pool.
 pub type Buf = u16;
 
@@ -30,68 +32,6 @@ pub enum Chunking {
     /// Once per sub-block. Required as soon as an audio feedback loop exists:
     /// §14.4's `D >= chunk length` binds the plugins in the loop too.
     SubBlock,
-}
-
-/// Where a plugin node's notes come from (§14.10).
-///
-/// An identity rather than a buffer: this crate does not know what a note is
-/// (§7), so it routes the *name* of a source and lets the adapter turn that
-/// into events. That is also what keeps a `Program` free of pointers (ADR-6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NoteSource {
-    /// Nothing wired to the notes port.
-    ///
-    /// The plugin gets no notes at all — not the DAW's, not anyone's. Before
-    /// M8.3 every instance was handed every event the DAW sent, which is why
-    /// two synths in one patch played in unison whatever the graph said.
-    #[default]
-    None,
-    /// One of the wrapper's own note inputs from the DAW.
-    Daw { bus: u16 },
-    /// The same stream with note-ons held back (§14.10).
-    ///
-    /// What a shut gate leaves. Blocking everything would be simpler and
-    /// wrong: a note that was already sounding when the gate closed would
-    /// never get its note-off, and a hung note outlives the patch that caused
-    /// it. Letting the releases through costs nothing and means a gate can be
-    /// thrown mid-phrase without leaving wreckage.
-    DawReleases { bus: u16 },
-}
-
-impl NoteSource {
-    /// This source with its note-ons held back — see
-    /// [`NoteSource::DawReleases`]. Nothing is already nothing.
-    pub fn releases_only(self) -> NoteSource {
-        match self {
-            NoteSource::None => NoteSource::None,
-            NoteSource::Daw { bus } | NoteSource::DawReleases { bus } => {
-                NoteSource::DawReleases { bus }
-            }
-        }
-    }
-}
-
-/// What one instance hears for a chunk: a stream, and the keys taken out of it.
-///
-/// `mute` is a bitmask over MIDI keys 0..128 — bit `k` set means key `k` never
-/// reaches the plugin, note-on and note-off alike. Dropping both halves is
-/// what keeps it safe: the note-on was dropped too, so there is no sounding
-/// voice left waiting for its release, which is the opposite of the situation
-/// [`NoteSource::DawReleases`] exists for.
-///
-/// A mask rather than a list because the audio half copies this per chunk and
-/// tests one bit per event, and because sixteen bytes is cheaper than a
-/// pointer plus the lifetime that would come with it (ADR-6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct NoteStream {
-    pub source: NoteSource,
-    pub mute: u128,
-}
-
-impl NoteStream {
-    pub fn from_source(source: NoteSource) -> NoteStream {
-        NoteStream { source, mute: 0 }
-    }
 }
 
 /// How a plugin's notes reach it: where they come from, what may stop them on
