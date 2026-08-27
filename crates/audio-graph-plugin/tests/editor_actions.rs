@@ -388,7 +388,7 @@ fn a_graph_survives_the_state_round_trip() {
     shared.store_state();
 
     let json = params.state.0.read().unwrap().clone();
-    let saved: subhost_adapter::WrapperState = serde_json::from_str(&json).unwrap();
+    let saved: audio_graph_plugin::WrapperState = serde_json::from_str(&json).unwrap();
     assert_eq!(saved.sub_block, 64);
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
