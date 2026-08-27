@@ -107,7 +107,7 @@ pub const MAX_CHANNELS: usize = 2;
 /// kinds of buffer to keep straight.
 pub const MAX_BUFFER_CHANNELS: usize = MAX_CHANNELS * (1 + MAX_AUX_BUSES);
 
-pub use plugin_host_api::MAX_AUX_BUSES;
+pub use plugin_host::MAX_AUX_BUSES;
 
 /// A graph, compiled.
 #[derive(Debug, Clone, PartialEq)]

@@ -430,8 +430,8 @@ impl SubHost {
                 Some(entry) => AudioConfig {
                     input_channels: u32::from(entry.input_channels),
                     output_channels: u32::from(entry.output_channels),
-                    aux_inputs: plugin_host_api::AuxBuses::new(&entry.aux_inputs),
-                    aux_outputs: plugin_host_api::AuxBuses::new(&entry.aux_outputs),
+                    aux_inputs: plugin_host::AuxBuses::new(&entry.aux_inputs),
+                    aux_outputs: plugin_host::AuxBuses::new(&entry.aux_outputs),
                     ..config
                 },
                 None => config,
@@ -773,7 +773,7 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
             chunk.input_channels as u32,
             chunk.output_channels as u32,
             chunk.frames,
-            plugin_host_api::BufferLayout::Planar,
+            plugin_host::BufferLayout::Planar,
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
@@ -858,7 +858,7 @@ fn push(scratch: &mut Vec<Event>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_host_api::{BufferLayout, NoteEvent, ParamFlags};
+    use plugin_host::{BufferLayout, NoteEvent, ParamFlags};
 
     /// A processor that records what it was handed.
     struct Recorder {
@@ -1148,7 +1148,7 @@ mod tests {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
         }
         let notes = [
-            Event::Note(plugin_host_api::NoteEvent::NoteOn {
+            Event::Note(plugin_host::NoteEvent::NoteOn {
                 note_id: 1,
                 port: 0,
                 channel: 0,
@@ -1156,7 +1156,7 @@ mod tests {
                 velocity: 1.0,
                 sample_offset: 40,
             }),
-            Event::Note(plugin_host_api::NoteEvent::NoteOff {
+            Event::Note(plugin_host::NoteEvent::NoteOff {
                 note_id: 1,
                 port: 0,
                 channel: 0,
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
         use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource, NoteStream};
-        use plugin_host_api::NoteEvent;
+        use plugin_host::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());
@@ -1263,7 +1263,7 @@ mod tests {
     #[test]
     fn a_shut_note_gate_still_delivers_the_releases() {
         use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource, NoteStream};
-        use plugin_host_api::NoteEvent;
+        use plugin_host::NoteEvent;
 
         let (gated_node, saw) = harness(Vec::new());
         let mut processors = SubHostProcessors {

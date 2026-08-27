@@ -5,7 +5,7 @@
 //! each slot may be bound to one sub-plugin parameter. That indirection is what
 //! lets the sub-plugin be swapped without destroying the DAW's automation.
 
-use plugin_host_api::{ParamId, ParamInfo};
+use plugin_host::{ParamId, ParamInfo};
 use serde::{Deserialize, Serialize};
 
 /// How many slots the wrapper publishes.
@@ -223,7 +223,7 @@ impl SlotTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_host_api::ParamFlags;
+    use plugin_host::ParamFlags;
 
     fn param(id: u32, name: &str, min: f64, max: f64) -> ParamInfo {
         ParamInfo {
