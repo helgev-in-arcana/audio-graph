@@ -22,11 +22,11 @@ use audio_graph_engine::{
     PortType, catalogue,
 };
 
+use crate::config::SLOT_COUNT;
 /// Re-exported so the wrapper fills one in without naming two crates. It is
 /// the engine's type: what a plugin node draws is the engine's business now.
 pub use audio_graph_engine::InstanceView;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
-use subhost_adapter::SLOT_COUNT;
 
 /// What each kind of socket is painted.
 ///

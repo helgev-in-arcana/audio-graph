@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
+use crate::config::SLOT_COUNT;
 use nice_plug::params::persist::PersistentField;
 use nice_plug::prelude::*;
-use subhost_adapter::SLOT_COUNT;
 
 /// Serialised wrapper state, carried through nice-plug's `#[persist]` support.
 ///

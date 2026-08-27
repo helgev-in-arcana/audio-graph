@@ -26,6 +26,7 @@ pub use crate::state::SubPluginRef;
 /// The VST3 objects are main-thread only, which the outer plugin cannot express
 /// in its own type — see [`MainThread`].
 pub struct SubHost {
+    config: SubHostConfig,
     /// One entry per plugin node the graph may address (§14.1). Sparse: a slot
     /// stays empty when its node has been deleted, because the graph names
     /// instances by index and renumbering them would repoint every node.
@@ -38,12 +39,23 @@ pub struct SubHost {
     latencies: Vec<u32>,
 }
 
-/// How many plugin nodes one wrapper may host.
+/// The ceilings a wrapper is built with.
 ///
-/// A ceiling rather than guidance: the audio graph names instances by index and
-/// the buffer pool is sized at activate, so the number has to be known before
-/// the user starts drawing.
-pub const MAX_INSTANCES: usize = 16;
+/// All three are the wrapper's numbers rather than this crate's. They are
+/// ceilings rather than guidance because everything below is preallocated: the
+/// instance table and the buffer pool are sized at activate, and `process` may
+/// not grow either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubHostConfig {
+    /// How many sub-plugins one wrapper may host. Known before the user starts
+    /// working, because callers name an instance by index.
+    pub max_instances: usize,
+    /// How many slots the wrapper publishes to the DAW (§8).
+    pub slot_count: usize,
+    /// How many values one sub-block of the schedule carries — the slots plus
+    /// whatever else the caller packs alongside them. See [`SlotSchedule`].
+    pub lanes: usize,
+}
 
 /// One loaded sub-plugin, plus how it was found.
 ///
@@ -57,13 +69,18 @@ struct Loaded {
 }
 
 impl SubHost {
-    pub fn new(context: Arc<dyn HostContext>) -> SubHost {
+    pub fn new(context: Arc<dyn HostContext>, config: SubHostConfig) -> SubHost {
         SubHost {
             instances: Vec::new(),
-            slots: SlotTable::default(),
+            slots: SlotTable::new(config.slot_count),
+            config,
             context,
             latencies: Vec::new(),
         }
+    }
+
+    pub fn config(&self) -> SubHostConfig {
+        self.config
     }
 
     /// Highest instance index in use, plus one. Not a count: the middle may be
@@ -88,8 +105,9 @@ impl SubHost {
 
     /// Grow the table so `instance` can be written to.
     fn reserve(&mut self, instance: usize) -> Result<(), String> {
-        if instance >= MAX_INSTANCES {
-            return Err(format!("at most {MAX_INSTANCES} plugin nodes"));
+        if instance >= self.config.max_instances {
+            let max = self.config.max_instances;
+            return Err(format!("at most {max} plugin nodes"));
         }
         if self.instances.len() <= instance {
             self.instances.resize_with(instance + 1, || None);
@@ -168,9 +186,10 @@ impl SubHost {
     /// The lowest instance index nothing is loaded into.
     ///
     /// Reused rather than always-increasing so that deleting a plugin node and
-    /// adding another does not walk off the end of [`MAX_INSTANCES`].
+    /// adding another does not walk off the end of
+    /// [`max_instances`][SubHostConfig::max_instances].
     pub fn free_instance(&self) -> Option<usize> {
-        (0..MAX_INSTANCES).find(|&i| !self.is_loaded(i))
+        (0..self.config.max_instances).find(|&i| !self.is_loaded(i))
     }
 
     pub fn params(&self, instance: usize) -> &[ParamInfo] {
@@ -373,7 +392,7 @@ impl SubHost {
                 continue;
             };
             targets.push((
-                crate::slots::SLOT_COUNT + lane,
+                self.slots.count() + lane,
                 ResolvedTarget {
                     instance: target.instance,
                     id: info.id,
@@ -409,7 +428,7 @@ impl SubHost {
             .max_block_size
             .div_ceil(crate::schedule::MIN_QUANTUM)
             .max(1) as usize;
-        let capacity = crate::schedule::LANES * sub_blocks + INCOMING_EVENT_CAPACITY;
+        let capacity = self.config.lanes * sub_blocks + INCOMING_EVENT_CAPACITY;
 
         let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
         for instance in 0..self.instances.len() {
@@ -442,7 +461,7 @@ impl SubHost {
                     processors.push(Some(SubHostProcessor {
                         processor,
                         targets,
-                        last_sent: vec![f64::NAN; crate::schedule::LANES],
+                        last_sent: vec![f64::NAN; self.config.lanes],
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }
@@ -878,6 +897,11 @@ mod tests {
         fn reset(&mut self) {}
     }
 
+    /// The AudioGraph wrapper's numbers, local to the tests: the crate itself
+    /// no longer names one.
+    const SLOTS: usize = 32;
+    const LANES: usize = SLOTS + 64 + 16;
+
     fn harness(
         targets: Vec<(usize, ResolvedTarget)>,
     ) -> (
@@ -888,14 +912,14 @@ mod tests {
         let processor = SubHostProcessor {
             processor: Box::new(Recorder { seen: seen.clone() }),
             targets,
-            last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
+            last_sent: vec![f64::NAN; LANES],
             scratch: Vec::with_capacity(4096),
         };
         (processor, seen)
     }
 
     fn run(p: &mut SubHostProcessor, values: &[f64]) {
-        let mut schedule = SlotSchedule::new(4, 32);
+        let mut schedule = SlotSchedule::new(LANES, 4, 32);
         schedule.begin(4);
         schedule.fill(values);
         run_scheduled(p, &schedule, &[]);
@@ -925,7 +949,7 @@ mod tests {
             max: 20_000.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let mut values = vec![0.0; crate::slots::SLOT_COUNT];
+        let mut values = vec![0.0; SLOTS];
         values[0] = 0.5;
         run(&mut p, &values);
 
@@ -952,7 +976,7 @@ mod tests {
             max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let values = vec![0.25; crate::slots::SLOT_COUNT];
+        let values = vec![0.25; SLOTS];
 
         run(&mut p, &values);
         assert_eq!(seen.lock().unwrap().len(), 1, "first block must send");
@@ -979,7 +1003,7 @@ mod tests {
             max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let values = vec![0.25; crate::slots::SLOT_COUNT];
+        let values = vec![0.25; SLOTS];
 
         run(&mut p, &values);
         p.reset();
@@ -994,7 +1018,7 @@ mod tests {
     #[test]
     fn unbound_slots_produce_no_events() {
         let (mut p, seen) = harness(Vec::new());
-        run(&mut p, &vec![0.5; crate::slots::SLOT_COUNT]);
+        run(&mut p, &vec![0.5; SLOTS]);
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -1015,7 +1039,7 @@ mod tests {
             sample_offset: 40,
         });
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         schedule.begin(64);
 
         let input = [0.0f32; 64];
@@ -1056,7 +1080,7 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
@@ -1096,7 +1120,7 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         assert_eq!(blocks, 4);
         for i in 0..blocks {
@@ -1119,9 +1143,9 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         schedule.begin(128);
-        schedule.fill(&vec![0.5; crate::slots::SLOT_COUNT]);
+        schedule.fill(&vec![0.5; SLOTS]);
         run_scheduled(&mut p, &schedule, &[]);
 
         assert_eq!(
@@ -1141,7 +1165,7 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
@@ -1176,7 +1200,7 @@ mod tests {
     fn a_binding_kept_across_a_swap_still_maps_correctly() {
         // §8.3 in one check: bindings are by id, so a plugin that reorders its
         // parameters between versions still drives the right control.
-        let mut table = SlotTable::default();
+        let mut table = SlotTable::new(SLOTS);
         let param = ParamInfo {
             id: ParamId(42),
             name: "Drive".into(),
@@ -1225,7 +1249,7 @@ mod tests {
             velocity: 1.0,
             sample_offset: 0,
         });
-        let schedule = SlotSchedule::new(4, 32);
+        let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
         let incoming = [note];
@@ -1288,7 +1312,7 @@ mod tests {
                 sample_offset: 1,
             }),
         ];
-        let schedule = SlotSchedule::new(4, 32);
+        let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
         let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);

@@ -199,7 +199,7 @@ impl WrapperEditor {
         self.view.params = state.host.params(0).to_vec();
 
         self.view.free_instance = state.host.free_instance();
-        self.view.instances = (0..subhost_adapter::MAX_INSTANCES)
+        self.view.instances = (0..crate::config::MAX_INSTANCES)
             .map(|i| crate::graph_ui::InstanceView {
                 loaded: state.host.is_loaded(i),
                 name: state

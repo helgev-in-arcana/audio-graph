@@ -16,23 +16,6 @@
 //! activate, for the finest granularity on offer, so changing the sub-block
 //! size while the DAW is running costs nothing and allocates nothing.
 
-use crate::slots::SLOT_COUNT;
-
-/// How many values one sub-block carries.
-///
-/// The 32 slots the DAW automates, then one lane per parameter the graph drives
-/// directly (§14.12), then one per audio-side control the graph automates — a
-/// delay time (§14.5) or a gain. One buffer
-/// rather than three because they are produced by the same evaluator pass and
-/// consumed by the same merge: the evaluator writes a lane exactly the way it
-/// writes a slot, and nothing below the compiler has to know which is which.
-///
-/// The ranges are disjoint and fixed, which is what lets each consumer read
-/// only its own: the sub-plugin adapter never sees a delay time or a gain, and
-/// the audio half never sees a parameter.
-pub const LANES: usize =
-    SLOT_COUNT + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES;
-
 /// The finest sub-block the schedule is sized for.
 pub const MIN_QUANTUM: u32 = 16;
 
@@ -46,7 +29,17 @@ pub const DEFAULT_QUANTUM: u32 = 32;
 /// Slot and graph-parameter values at each sub-block boundary of one process
 /// call.
 pub struct SlotSchedule {
-    /// [`LANES`] values per sub-block, one sub-block after another.
+    /// How many values one sub-block carries.
+    ///
+    /// A caller's number, not this crate's. The wrapper packs its own slots,
+    /// the parameters its graph drives directly and any audio-side control it
+    /// automates into one buffer, because they are produced by the same pass
+    /// and consumed by the same merge — and nothing here has to know which
+    /// lane is which. What matters on this side is only that the ranges are
+    /// disjoint and fixed, so each consumer reads its own and no other.
+    lanes: usize,
+    /// [`lanes`][Self::lanes] values per sub-block, one sub-block after
+    /// another.
     values: Vec<f64>,
     quantum: u32,
     /// Set by `begin`, valid until the next one.
@@ -59,9 +52,10 @@ impl SlotSchedule {
     ///
     /// Sizing for the finest granularity rather than the current one is what
     /// makes [`set_quantum`][Self::set_quantum] free.
-    pub fn new(max_block: u32, quantum: u32) -> SlotSchedule {
-        let capacity = max_block.div_ceil(MIN_QUANTUM).max(1) as usize * LANES;
+    pub fn new(lanes: usize, max_block: u32, quantum: u32) -> SlotSchedule {
+        let capacity = max_block.div_ceil(MIN_QUANTUM).max(1) as usize * lanes;
         SlotSchedule {
+            lanes,
             values: vec![0.0; capacity],
             quantum: sanitise(quantum),
             blocks: 0,
@@ -69,10 +63,15 @@ impl SlotSchedule {
         }
     }
 
+    /// How many values one sub-block carries.
+    pub fn lanes(&self) -> usize {
+        self.lanes
+    }
+
     /// The largest number of sub-blocks any call can produce, for callers
     /// sizing their own buffers.
     pub fn max_blocks(&self) -> usize {
-        self.values.len() / LANES
+        self.values.len() / self.lanes
     }
 
     pub fn quantum(&self) -> u32 {
@@ -119,22 +118,22 @@ impl SlotSchedule {
     /// Every row, one after another — the shape the audio half wants, because
     /// it walks chunks itself and picks a row per chunk (§14.9).
     pub fn rows(&self) -> &[f64] {
-        &self.values[..self.blocks * LANES]
+        &self.values[..self.blocks * self.lanes]
     }
 
     pub fn block(&self, index: usize) -> &[f64] {
-        &self.values[index * LANES..(index + 1) * LANES]
+        &self.values[index * self.lanes..(index + 1) * self.lanes]
     }
 
     pub fn block_mut(&mut self, index: usize) -> &mut [f64] {
-        &mut self.values[index * LANES..(index + 1) * LANES]
+        &mut self.values[index * self.lanes..(index + 1) * self.lanes]
     }
 
     /// Fill every sub-block with the same values — the shape a wrapper with no
     /// graph produces, and the one that reproduces the pre-M5 behaviour
     /// exactly.
     pub fn fill(&mut self, values: &[f64]) {
-        let n = values.len().min(LANES);
+        let n = values.len().min(self.lanes);
         for index in 0..self.blocks {
             let block = self.block_mut(index);
             block[..n].copy_from_slice(&values[..n]);
@@ -157,9 +156,13 @@ fn sanitise(quantum: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// The AudioGraph wrapper's lane count, for the tests only.
+    const SLOTS: usize = 32;
+    const LANES: usize = SLOTS + 64 + 16;
+
     #[test]
     fn a_block_is_cut_into_whole_sub_blocks_plus_a_remainder() {
-        let mut schedule = SlotSchedule::new(512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32);
         assert_eq!(schedule.begin(100), 4);
         assert_eq!(schedule.offset(0), 0);
         assert_eq!(schedule.offset(3), 96);
@@ -178,7 +181,7 @@ mod tests {
 
     #[test]
     fn changing_the_quantum_never_needs_more_memory() {
-        let mut schedule = SlotSchedule::new(512, 128);
+        let mut schedule = SlotSchedule::new(LANES, 512, 128);
         let capacity = schedule.max_blocks();
         schedule.set_quantum(16);
         assert_eq!(
@@ -194,7 +197,7 @@ mod tests {
         // A host is allowed to give us fewer samples than the maximum, and an
         // event at an offset past the end is a contract violation the
         // sub-plugin would be entitled to crash on.
-        let mut schedule = SlotSchedule::new(512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32);
         schedule.begin(8);
         for i in 0..schedule.blocks() {
             assert!(schedule.offset(i) < 8);
@@ -203,9 +206,9 @@ mod tests {
 
     #[test]
     fn filling_gives_every_sub_block_the_same_value() {
-        let mut schedule = SlotSchedule::new(256, 32);
+        let mut schedule = SlotSchedule::new(LANES, 256, 32);
         schedule.begin(256);
-        let mut values = vec![0.0; SLOT_COUNT];
+        let mut values = vec![0.0; SLOTS];
         values[3] = 0.75;
         schedule.fill(&values);
         for i in 0..schedule.blocks() {

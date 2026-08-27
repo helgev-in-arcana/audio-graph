@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
 use audio_graph_engine::{BlockContext, Engine, Graph};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
+use subhost_adapter::{SlotSchedule, SubHost, WrapperState};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -64,13 +65,13 @@ impl Default for Wrapper {
     fn default() -> Self {
         let context = Arc::new(WrapperHostContext::new());
         let params = WrapperParams::new();
-        let shared = Shared::new(SubHost::new(context.clone()), params.clone());
+        let shared = Shared::new(SubHost::new(context.clone(), SUB_HOST), params.clone());
         Wrapper {
             params,
             context,
             shared,
             engine: Engine::new(),
-            schedule: SlotSchedule::new(0, subhost_adapter::DEFAULT_QUANTUM),
+            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
@@ -270,7 +271,7 @@ impl Wrapper {
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
-        self.schedule = SlotSchedule::new(max_block, self.shared.quantum());
+        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum());
         // The graph's audio buffers (§14.7). Sized for the ceilings rather than
         // for the current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
@@ -479,7 +480,7 @@ impl Wrapper {
                     // The same buffer the parameter lanes ride in. The audio
                     // half reads only the delay-time range out of it (§14.5).
                     lanes: self.schedule.rows(),
-                    lanes_per_row: subhost_adapter::LANES,
+                    lanes_per_row: LANES,
                 },
                 &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
@@ -757,7 +758,6 @@ mod tests {
     use audio_graph_engine::{
         Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,
     };
-    use subhost_adapter::LANES;
 
     /// Somewhere for a parameter chain to go.
     ///
@@ -792,7 +792,7 @@ mod tests {
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
         let mut engine = Engine::new();
-        let mut schedule = SlotSchedule::new(512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32);
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.
