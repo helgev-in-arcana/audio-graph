@@ -7,7 +7,7 @@
 //! numbers mean.
 //!
 //! It does know that a plugin node has something behind it, but only through
-//! `subhost-adapter`'s [`AudioNodes`][subhost_adapter::AudioNodes]: an instance
+//! `subhost-adapter`'s [`AudioInstances`][subhost_adapter::AudioInstances]: an instance
 //! number, a note stream's *name*, and two flat slices. Which way that
 //! dependency points matters — `subhost-adapter` is the general crate and this
 //! one is AudioGraph's, so this one does the depending.

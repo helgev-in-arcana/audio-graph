@@ -13,20 +13,23 @@
 //! sub-block carries and what its saved document looks like, and hands those in
 //! ([`SubHostConfig`], [`SlotSchedule`], [`SubHostState`]); a different wrapper
 //! — a chain, a rack, a bare pair of plugins — makes different choices and gets
-//! the same crate. [`AudioNodes`] is where that line is drawn: a caller schedules
+//! the same crate. [`AudioInstances`] is where that line is drawn: a caller
+//! schedules
 //! audio and says which instance hears what, and everything crossing back is a
 //! flat slice or a `Copy` value.
 
 mod host;
-mod nodes;
+mod instances;
 mod schedule;
 mod slots;
 mod state;
 
 pub use host::{
-    GraphNodes, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
+    BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
-pub use nodes::{AudioChunk, AudioNodes, InstanceIo, NoNodes, NoteSource, NoteStream, ParamTarget};
+pub use instances::{
+    AudioChunk, AudioInstances, InstanceIo, NoInstances, NoteSource, NoteStream, ParamTarget,
+};
 pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
 pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};

@@ -384,7 +384,7 @@ impl Wrapper {
         // delay line and a mix with no sub-plugin anywhere in it (§14.4), and
         // passing the input through would be exactly the invisible route
         // §14.13 got rid of. The graph runs either way; a plugin node with no
-        // plugin behind it produces silence, which `NoNodes` is.
+        // plugin behind it produces silence, which `NoInstances` is.
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
@@ -461,14 +461,14 @@ impl Wrapper {
         self.out_events.clear();
         let status = if self.engine.has_audio() {
             // The graph decides where the audio goes and which plugins see it
-            // (§14). Sub-plugins are reached through `AudioNodes`, so the
+            // (§14). Sub-plugins are reached through `AudioInstances`, so the
             // engine still knows nothing about what a plugin is.
             let mut loaded;
-            let mut empty = subhost_adapter::NoNodes;
-            let nodes: &mut dyn subhost_adapter::AudioNodes = match processor {
+            let mut empty = subhost_adapter::NoInstances;
+            let nodes: &mut dyn subhost_adapter::AudioInstances = match processor {
                 Some(processor) => {
                     loaded =
-                        processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
+                        processor.bind(&self.schedule, &self.events, &time, &mut self.out_events);
                     &mut loaded
                 }
                 None => &mut empty,
