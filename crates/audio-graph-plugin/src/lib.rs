@@ -6,22 +6,26 @@
 //! input, and an instrument without one. The implementation is shared; only the
 //! bus layout and the descriptor differ.
 
+mod config;
 mod editor;
 mod graph_ui;
 mod host_context;
 mod params;
 mod plugin;
 mod shared;
+mod state;
 mod tick;
 
 use std::sync::Arc;
 
 use nice_plug::prelude::*;
 
+pub use config::{LANES, MAX_INSTANCES, SLOT_COUNT, SUB_HOST};
 pub use host_context::WrapperHostContext;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
 pub use shared::{MainState, Shared};
+pub use state::{STATE_VERSION, WrapperState};
 
 /// The effect form: audio in, audio out.
 #[derive(Default)]

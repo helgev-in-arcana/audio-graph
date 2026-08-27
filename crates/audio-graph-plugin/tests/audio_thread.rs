@@ -18,9 +18,10 @@ use audio_graph_engine::{
     BlockContext, Engine, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate,
     Waveform,
 };
+use audio_graph_plugin::{SLOT_COUNT, SUB_HOST};
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};
-use subhost_adapter::{SLOT_COUNT, SubHost};
+use subhost_adapter::SubHost;
 
 struct SilentHost;
 impl HostContext for SilentHost {
@@ -56,7 +57,10 @@ fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::Node
 const SINK_LANE: usize = SLOT_COUNT;
 
 fn shared() -> Arc<Shared> {
-    Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new())
+    Shared::new(
+        SubHost::new(Arc::new(SilentHost), SUB_HOST),
+        WrapperParams::new(),
+    )
 }
 
 /// Build the graph the editor builds when someone drops an LFO on the canvas.

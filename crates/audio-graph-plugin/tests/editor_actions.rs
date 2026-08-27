@@ -11,9 +11,10 @@
 
 use std::sync::Arc;
 
+use audio_graph_plugin::{SLOT_COUNT, SUB_HOST};
 use audio_graph_plugin::{Shared, WrapperParams};
 use plugin_host::{AudioConfig, HostContext, RestartReason};
-use subhost_adapter::{SLOT_COUNT, SubHost};
+use subhost_adapter::SubHost;
 
 struct SilentHost;
 
@@ -77,7 +78,7 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
         eprintln!("trying {name}");
 
         let params = WrapperParams::new();
-        let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
+        let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params);
         if shared.load(&path).is_err() {
             continue;
         }
@@ -212,7 +213,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
     use audio_graph_engine::{BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, Waveform};
 
     let params = WrapperParams::new();
-    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params);
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params);
 
     // Dropping three nodes on the canvas and wiring them up.
     {
@@ -256,7 +257,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
         "the DAW keeps every slot lane"
     );
 
-    let mut slots = vec![0.9; subhost_adapter::LANES];
+    let mut slots = vec![0.9; audio_graph_plugin::LANES];
     let mut lowest = f64::INFINITY;
     let mut highest = f64::NEG_INFINITY;
     for _ in 0..2000 {
@@ -324,7 +325,10 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
 fn a_patch_saved_without_a_graph_gets_the_default_one() {
     use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeKind};
 
-    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
+    let shared = Shared::new(
+        SubHost::new(Arc::new(SilentHost), SUB_HOST),
+        WrapperParams::new(),
+    );
     shared.main().graph = Graph::new();
     shared.adopt_default_patch();
 
@@ -348,7 +352,10 @@ fn a_patch_saved_without_a_graph_gets_the_default_one() {
 fn adoption_leaves_an_existing_graph_alone() {
     use audio_graph_engine::{Constant, NodeKind};
 
-    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), WrapperParams::new());
+    let shared = Shared::new(
+        SubHost::new(Arc::new(SilentHost), SUB_HOST),
+        WrapperParams::new(),
+    );
     let before = {
         let mut state = shared.main();
         state
@@ -367,7 +374,7 @@ fn a_graph_survives_the_state_round_trip() {
     use audio_graph_engine::{Constant, Graph, NodeKind};
 
     let params = WrapperParams::new();
-    let shared = Shared::new(SubHost::new(Arc::new(SilentHost)), params.clone());
+    let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params.clone());
     shared.set_quantum(64);
     {
         let mut state = shared.main();
@@ -381,7 +388,7 @@ fn a_graph_survives_the_state_round_trip() {
     shared.store_state();
 
     let json = params.state.0.read().unwrap().clone();
-    let saved: subhost_adapter::WrapperState = serde_json::from_str(&json).unwrap();
+    let saved: audio_graph_plugin::WrapperState = serde_json::from_str(&json).unwrap();
     assert_eq!(saved.sub_block, 64);
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();

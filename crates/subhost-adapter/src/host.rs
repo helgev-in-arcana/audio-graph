@@ -10,15 +10,14 @@ use std::sync::Arc;
 
 use crate::schedule::SlotSchedule;
 use plugin_host::{
-    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, NoteEvent,
-    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
-    Target, TimeContext,
+    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
+    NoteEvent, ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain,
+    SubPluginProcessor, Target, TimeContext,
 };
 
-use crate::main_thread::MainThread;
+use crate::instances::{InstanceIo, ParamTarget};
 use crate::slots::{ResolvedTarget, SlotTable};
-use crate::state::WrapperState;
-use audio_graph_engine::{InstanceIo, ParamTarget};
+use crate::state::{InstanceState, SubHostState};
 
 pub use crate::state::SubPluginRef;
 
@@ -27,24 +26,36 @@ pub use crate::state::SubPluginRef;
 /// The VST3 objects are main-thread only, which the outer plugin cannot express
 /// in its own type — see [`MainThread`].
 pub struct SubHost {
-    /// One entry per plugin node the graph may address (§14.1). Sparse: a slot
-    /// stays empty when its node has been deleted, because the graph names
-    /// instances by index and renumbering them would repoint every node.
+    config: SubHostConfig,
+    /// One entry per instance the caller may address. Sparse: an entry stays
+    /// empty when whatever owned it has gone, because the caller names an
+    /// instance by index and renumbering would repoint every one of them.
     instances: Vec<Option<MainThread<Loaded>>>,
     slots: SlotTable,
     context: Arc<dyn HostContext>,
     /// Each instance's latency at its last activate, cached so the DAW can be
-    /// answered without touching a plugin (§7.4). The compiler needs these too,
-    /// to line up parallel paths (§14.6).
+    /// answered without touching a plugin. The caller needs these too, to line
+    /// up parallel paths.
     latencies: Vec<u32>,
 }
 
-/// How many plugin nodes one wrapper may host.
+/// The ceilings a wrapper is built with.
 ///
-/// A ceiling rather than guidance: the audio graph names instances by index and
-/// the buffer pool is sized at activate, so the number has to be known before
-/// the user starts drawing.
-pub const MAX_INSTANCES: usize = 16;
+/// All three are the wrapper's numbers rather than this crate's. They are
+/// ceilings rather than guidance because everything below is preallocated: the
+/// instance table and the buffer pool are sized at activate, and `process` may
+/// not grow either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubHostConfig {
+    /// How many sub-plugins one wrapper may host. Known before the user starts
+    /// working, because callers name an instance by index.
+    pub max_instances: usize,
+    /// How many slots the wrapper publishes to the DAW (§8).
+    pub slot_count: usize,
+    /// How many values one sub-block of the schedule carries — the slots plus
+    /// whatever else the caller packs alongside them. See [`SlotSchedule`].
+    pub lanes: usize,
+}
 
 /// One loaded sub-plugin, plus how it was found.
 ///
@@ -58,13 +69,18 @@ struct Loaded {
 }
 
 impl SubHost {
-    pub fn new(context: Arc<dyn HostContext>) -> SubHost {
+    pub fn new(context: Arc<dyn HostContext>, config: SubHostConfig) -> SubHost {
         SubHost {
             instances: Vec::new(),
-            slots: SlotTable::default(),
+            slots: SlotTable::new(config.slot_count),
+            config,
             context,
             latencies: Vec::new(),
         }
+    }
+
+    pub fn config(&self) -> SubHostConfig {
+        self.config
     }
 
     /// Highest instance index in use, plus one. Not a count: the middle may be
@@ -89,8 +105,9 @@ impl SubHost {
 
     /// Grow the table so `instance` can be written to.
     fn reserve(&mut self, instance: usize) -> Result<(), String> {
-        if instance >= MAX_INSTANCES {
-            return Err(format!("at most {MAX_INSTANCES} plugin nodes"));
+        if instance >= self.config.max_instances {
+            let max = self.config.max_instances;
+            return Err(format!("at most {max} sub-plugins"));
         }
         if self.instances.len() <= instance {
             self.instances.resize_with(instance + 1, || None);
@@ -99,10 +116,11 @@ impl SubHost {
         Ok(())
     }
 
-    /// Every instance's latency, indexed the way the graph indexes them.
+    /// Every instance's latency, indexed the way the caller indexes them.
     ///
-    /// Handed to the compiler, which needs it to line up parallel paths and to
-    /// know how short a feedback loop may be (§14.6, §14.4).
+    /// A caller that runs instances in parallel needs these to line the paths
+    /// up, and one that runs them in a loop needs them to know how short the
+    /// loop may be.
     pub fn latencies(&self) -> &[u32] {
         &self.latencies
     }
@@ -168,10 +186,11 @@ impl SubHost {
 
     /// The lowest instance index nothing is loaded into.
     ///
-    /// Reused rather than always-increasing so that deleting a plugin node and
-    /// adding another does not walk off the end of [`MAX_INSTANCES`].
+    /// Reused rather than always-increasing so that dropping one sub-plugin and
+    /// adding another does not walk off the end of
+    /// [`max_instances`][SubHostConfig::max_instances].
     pub fn free_instance(&self) -> Option<usize> {
-        (0..MAX_INSTANCES).find(|&i| !self.is_loaded(i))
+        (0..self.config.max_instances).find(|&i| !self.is_loaded(i))
     }
 
     pub fn params(&self, instance: usize) -> &[ParamInfo] {
@@ -349,21 +368,17 @@ impl SubHost {
     /// Everything driving one instance's parameters, as the audio thread
     /// wants it: `(lane, target)`.
     ///
-    /// Two sources, one shape. The slot table is the DAW's automation lanes
-    /// (§8), and the lanes past it are parameter sockets the user wired in the
-    /// graph (§14.12). The merge in `SubHostProcessor::process` does not care
-    /// which is which, and that is the point.
-    fn targets_for(
-        &self,
-        instance: usize,
-        graph_params: &[ParamTarget],
-    ) -> Vec<(usize, ResolvedTarget)> {
+    /// Two sources, one shape. The slot table is the DAW's automation lanes,
+    /// and the lanes past it are whatever else the caller drives directly. The
+    /// merge in `SubHostProcessor::process` does not care which is which, and
+    /// that is the point.
+    fn targets_for(&self, instance: usize, direct: &[ParamTarget]) -> Vec<(usize, ResolvedTarget)> {
         // Only the slots bound against *this* instance. Handing every instance
         // the whole table would make one slot drive the same parameter on every
         // copy (§12-7).
         let mut targets = self.slots.active_targets(instance as u32);
         let params = self.params(instance);
-        for (lane, target) in graph_params.iter().enumerate() {
+        for (lane, target) in direct.iter().enumerate() {
             if target.instance as usize != instance {
                 continue;
             }
@@ -374,7 +389,7 @@ impl SubHost {
                 continue;
             };
             targets.push((
-                crate::slots::SLOT_COUNT + lane,
+                self.slots.count() + lane,
                 ResolvedTarget {
                     instance: target.instance,
                     id: info.id,
@@ -392,25 +407,24 @@ impl SubHost {
     /// already activated are wound back rather than left running, because a
     /// half-activated set is a state no later call knows how to handle.
     ///
-    /// `io` says how each instance has to be activated — which buses, how wide
-    /// (§14.11). It comes from the compiled program rather than from the
-    /// plugin, because whether a sidechain is switched on depends on whether
-    /// the graph wired anything to it. An instance the program does not mention
-    /// is activated with `config` as it stands, which is the pre-M8 shape.
+    /// `io` says how each instance has to be activated — which buses, how wide.
+    /// It comes from the caller rather than from the plugin, because whether a
+    /// sidechain is switched on depends on whether anything was wired to it. An
+    /// instance `io` does not mention is activated with `config` as it stands.
     pub fn activate(
         &mut self,
         config: AudioConfig,
         io: &[InstanceIo],
-        graph_params: &[ParamTarget],
+        direct: &[ParamTarget],
     ) -> Result<SubHostProcessors, String> {
-        // One event per slot per sub-block is the worst a graph can ask for,
+        // One event per lane per sub-block is the worst a caller can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
         // not allowed to grow it.
         let sub_blocks = config
             .max_block_size
             .div_ceil(crate::schedule::MIN_QUANTUM)
             .max(1) as usize;
-        let capacity = crate::schedule::LANES * sub_blocks + INCOMING_EVENT_CAPACITY;
+        let capacity = self.config.lanes * sub_blocks + INCOMING_EVENT_CAPACITY;
 
         let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
         for instance in 0..self.instances.len() {
@@ -421,7 +435,7 @@ impl SubHost {
             // Worked out before the plugin is borrowed for activation,
             // because it reads both the slot table and the plugin's own
             // parameter list.
-            let targets = self.targets_for(instance, graph_params);
+            let targets = self.targets_for(instance, direct);
             let Some(loaded) = self.at_mut(instance) else {
                 unreachable!("checked just above")
             };
@@ -430,8 +444,8 @@ impl SubHost {
                 Some(entry) => AudioConfig {
                     input_channels: u32::from(entry.input_channels),
                     output_channels: u32::from(entry.output_channels),
-                    aux_inputs: plugin_host_api::AuxBuses::new(&entry.aux_inputs),
-                    aux_outputs: plugin_host_api::AuxBuses::new(&entry.aux_outputs),
+                    aux_inputs: plugin_host::AuxBuses::new(&entry.aux_inputs),
+                    aux_outputs: plugin_host::AuxBuses::new(&entry.aux_outputs),
                     ..config
                 },
                 None => config,
@@ -443,7 +457,7 @@ impl SubHost {
                     processors.push(Some(SubHostProcessor {
                         processor,
                         targets,
-                        last_sent: vec![f64::NAN; crate::schedule::LANES],
+                        last_sent: vec![f64::NAN; self.config.lanes],
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }
@@ -481,8 +495,11 @@ impl SubHost {
     /// unconditionally (see `tick_editors`) this is the only thing that runs
     /// them before a save. CHOWTapeModel does exactly that; without the tick it
     /// saves the values it held before the last edit.
-    pub fn save_state(&mut self) -> WrapperState {
-        let mut state = WrapperState::new(self.slots.to_state());
+    pub fn save_state(&mut self) -> SubHostState {
+        let mut state = SubHostState {
+            slots: self.slots.to_state(),
+            instances: Vec::new(),
+        };
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {
                 loaded.plugin.tick();
@@ -500,7 +517,11 @@ impl SubHost {
                     None
                 }
             };
-            state.set_instance(instance, loaded.reference.clone(), bytes.as_deref());
+            state.instances.push(InstanceState {
+                instance,
+                reference: loaded.reference.clone(),
+                state: bytes.as_deref().map(crate::state::base64_encode),
+            });
         }
         state
     }
@@ -510,12 +531,12 @@ impl SubHost {
     /// Returns a description of anything that could not be restored, rather
     /// than an error: a missing sub-plugin must not stop the rest of the patch
     /// from loading.
-    pub fn load_state(&mut self, state: &WrapperState) -> Vec<String> {
+    pub fn load_state(&mut self, state: &SubHostState) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
         self.unload_all();
 
-        for entry in state.instances() {
+        for entry in &state.instances {
             let reference = &entry.reference;
             let Some(path) = Self::resolve_reference(reference) else {
                 problems.push(format!(
@@ -677,10 +698,11 @@ impl SubHostProcessor {
     }
 }
 
-/// Every instance's audio-thread half, indexed the way the graph indexes them.
+/// Every instance's audio-thread half, indexed the way the caller indexes them.
 ///
-/// Sparse for the same reason [`SubHost::instances`] is: the graph names a
-/// plugin node by index, so an empty slot has to stay empty.
+/// Sparse for the same reason [`SubHost`]'s own table is: the caller names an
+/// instance by index, so an empty slot has to stay empty rather than be closed
+/// up and renumber everything after it.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
     /// The block's events with the note-ons taken out, for an instance behind
@@ -707,20 +729,21 @@ impl SubHostProcessors {
         }
     }
 
-    /// Bind the per-block context that [`AudioNodes`] does not carry.
+    /// Attach the per-block context that
+    /// [`AudioInstances`][crate::AudioInstances] does not carry.
     ///
-    /// The engine calls `process(instance, ...)` with nothing but buffers,
-    /// because it does not know that a plugin has events or a transport
-    /// position (§7). Everything else one needs is fixed for the whole block,
-    /// so it is attached here and the borrow lasts exactly that long.
-    pub fn nodes<'a>(
+    /// A caller runs `process(instance, ...)` with nothing but buffers, because
+    /// it has no reason to know that a plugin has events or a transport
+    /// position. Everything else one needs is fixed for the whole block, so it
+    /// is attached here and the borrow lasts exactly that long.
+    pub fn bind<'a>(
         &'a mut self,
         slots: &'a SlotSchedule,
         events: &'a [Event],
         context: &'a TimeContext,
         out_events: &'a mut EventSink,
-    ) -> GraphNodes<'a> {
-        GraphNodes {
+    ) -> BoundInstances<'a> {
+        BoundInstances {
             processors: self,
             slots,
             events,
@@ -731,7 +754,7 @@ impl SubHostProcessors {
 }
 
 /// [`SubHostProcessors`] with one block's worth of context attached.
-pub struct GraphNodes<'a> {
+pub struct BoundInstances<'a> {
     processors: &'a mut SubHostProcessors,
     slots: &'a SlotSchedule,
     events: &'a [Event],
@@ -739,14 +762,14 @@ pub struct GraphNodes<'a> {
     out_events: &'a mut EventSink,
 }
 
-impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
+impl crate::instances::AudioInstances for BoundInstances<'_> {
     fn process(
         &mut self,
         instance: u32,
-        notes: audio_graph_engine::NoteStream,
+        notes: crate::instances::NoteStream,
         input: &[f32],
         output: &mut [f32],
-        chunk: audio_graph_engine::AudioChunk,
+        chunk: crate::instances::AudioChunk,
     ) {
         // Destructured rather than reached through twice: the scratch and the
         // processor are different fields, and saying so is what lets both be
@@ -773,7 +796,7 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
             chunk.input_channels as u32,
             chunk.output_channels as u32,
             chunk.frames,
-            plugin_host_api::BufferLayout::Planar,
+            plugin_host::BufferLayout::Planar,
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
@@ -787,10 +810,10 @@ impl audio_graph_engine::AudioNodes for GraphNodes<'_> {
         // A key switch's own keys are dropped outright, both halves: the
         // note-on went too, so there is no voice left waiting for the release.
         let events: &[Event] = match notes.source {
-            audio_graph_engine::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
-            source @ (audio_graph_engine::NoteSource::Daw { bus: 0 }
-            | audio_graph_engine::NoteSource::DawReleases { bus: 0 }) => {
-                let shut = matches!(source, audio_graph_engine::NoteSource::DawReleases { .. });
+            crate::instances::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
+            source @ (crate::instances::NoteSource::Daw { bus: 0 }
+            | crate::instances::NoteSource::DawReleases { bus: 0 }) => {
+                let shut = matches!(source, crate::instances::NoteSource::DawReleases { .. });
                 gated.clear();
                 for event in self.events {
                     if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
@@ -858,7 +881,7 @@ fn push(scratch: &mut Vec<Event>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_host_api::{BufferLayout, NoteEvent, ParamFlags};
+    use plugin_host::{BufferLayout, NoteEvent, ParamFlags};
 
     /// A processor that records what it was handed.
     struct Recorder {
@@ -879,6 +902,11 @@ mod tests {
         fn reset(&mut self) {}
     }
 
+    /// The AudioGraph wrapper's numbers, local to the tests: the crate itself
+    /// no longer names one.
+    const SLOTS: usize = 32;
+    const LANES: usize = SLOTS + 64 + 16;
+
     fn harness(
         targets: Vec<(usize, ResolvedTarget)>,
     ) -> (
@@ -889,14 +917,14 @@ mod tests {
         let processor = SubHostProcessor {
             processor: Box::new(Recorder { seen: seen.clone() }),
             targets,
-            last_sent: vec![f64::NAN; crate::slots::SLOT_COUNT],
+            last_sent: vec![f64::NAN; LANES],
             scratch: Vec::with_capacity(4096),
         };
         (processor, seen)
     }
 
     fn run(p: &mut SubHostProcessor, values: &[f64]) {
-        let mut schedule = SlotSchedule::new(4, 32);
+        let mut schedule = SlotSchedule::new(LANES, 4, 32);
         schedule.begin(4);
         schedule.fill(values);
         run_scheduled(p, &schedule, &[]);
@@ -926,7 +954,7 @@ mod tests {
             max: 20_000.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let mut values = vec![0.0; crate::slots::SLOT_COUNT];
+        let mut values = vec![0.0; SLOTS];
         values[0] = 0.5;
         run(&mut p, &values);
 
@@ -953,7 +981,7 @@ mod tests {
             max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let values = vec![0.25; crate::slots::SLOT_COUNT];
+        let values = vec![0.25; SLOTS];
 
         run(&mut p, &values);
         assert_eq!(seen.lock().unwrap().len(), 1, "first block must send");
@@ -980,7 +1008,7 @@ mod tests {
             max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
-        let values = vec![0.25; crate::slots::SLOT_COUNT];
+        let values = vec![0.25; SLOTS];
 
         run(&mut p, &values);
         p.reset();
@@ -995,7 +1023,7 @@ mod tests {
     #[test]
     fn unbound_slots_produce_no_events() {
         let (mut p, seen) = harness(Vec::new());
-        run(&mut p, &vec![0.5; crate::slots::SLOT_COUNT]);
+        run(&mut p, &vec![0.5; SLOTS]);
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -1016,7 +1044,7 @@ mod tests {
             sample_offset: 40,
         });
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         schedule.begin(64);
 
         let input = [0.0f32; 64];
@@ -1057,7 +1085,7 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
@@ -1097,7 +1125,7 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         assert_eq!(blocks, 4);
         for i in 0..blocks {
@@ -1120,9 +1148,9 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         schedule.begin(128);
-        schedule.fill(&vec![0.5; crate::slots::SLOT_COUNT]);
+        schedule.fill(&vec![0.5; SLOTS]);
         run_scheduled(&mut p, &schedule, &[]);
 
         assert_eq!(
@@ -1142,13 +1170,13 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(128, 32);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32);
         let blocks = schedule.begin(128);
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
         }
         let notes = [
-            Event::Note(plugin_host_api::NoteEvent::NoteOn {
+            Event::Note(plugin_host::NoteEvent::NoteOn {
                 note_id: 1,
                 port: 0,
                 channel: 0,
@@ -1156,7 +1184,7 @@ mod tests {
                 velocity: 1.0,
                 sample_offset: 40,
             }),
-            Event::Note(plugin_host_api::NoteEvent::NoteOff {
+            Event::Note(plugin_host::NoteEvent::NoteOff {
                 note_id: 1,
                 port: 0,
                 channel: 0,
@@ -1177,7 +1205,7 @@ mod tests {
     fn a_binding_kept_across_a_swap_still_maps_correctly() {
         // §8.3 in one check: bindings are by id, so a plugin that reorders its
         // parameters between versions still drives the right control.
-        let mut table = SlotTable::default();
+        let mut table = SlotTable::new(SLOTS);
         let param = ParamInfo {
             id: ParamId(42),
             name: "Drive".into(),
@@ -1208,8 +1236,8 @@ mod tests {
     /// list, so a second synth played along whatever the graph said.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteRoute, NoteSource, NoteStream};
-        use plugin_host_api::NoteEvent;
+        use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};
+        use plugin_host::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());
@@ -1226,11 +1254,11 @@ mod tests {
             velocity: 1.0,
             sample_offset: 0,
         });
-        let schedule = SlotSchedule::new(4, 32);
+        let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
         let incoming = [note];
-        let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);
+        let mut running = processors.bind(&schedule, &incoming, &context, &mut sink);
 
         let chunk = AudioChunk {
             input_channels: 2,
@@ -1242,9 +1270,9 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        let daw = NoteRoute::from_source(NoteSource::Daw { bus: 0 });
-        nodes.process(0, daw.resolve(None), &input, &mut output, chunk);
-        nodes.process(1, NoteStream::default(), &input, &mut output, chunk);
+        let daw = NoteStream::from_source(NoteSource::Daw { bus: 0 });
+        running.process(0, daw, &input, &mut output, chunk);
+        running.process(1, NoteStream::default(), &input, &mut output, chunk);
 
         assert_eq!(
             wired_saw.lock().unwrap().len(),
@@ -1262,8 +1290,8 @@ mod tests {
     /// note-off. Blocking the lot would leave it hanging for ever.
     #[test]
     fn a_shut_note_gate_still_delivers_the_releases() {
-        use audio_graph_engine::{AudioChunk, AudioNodes, NoteSource, NoteStream};
-        use plugin_host_api::NoteEvent;
+        use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};
+        use plugin_host::NoteEvent;
 
         let (gated_node, saw) = harness(Vec::new());
         let mut processors = SubHostProcessors {
@@ -1289,10 +1317,10 @@ mod tests {
                 sample_offset: 1,
             }),
         ];
-        let schedule = SlotSchedule::new(4, 32);
+        let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
-        let mut nodes = processors.nodes(&schedule, &incoming, &context, &mut sink);
+        let mut running = processors.bind(&schedule, &incoming, &context, &mut sink);
 
         let chunk = AudioChunk {
             input_channels: 2,
@@ -1304,7 +1332,7 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        nodes.process(
+        running.process(
             0,
             NoteStream::from_source(NoteSource::DawReleases { bus: 0 }),
             &input,

@@ -3,11 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, ParamCx};
-use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, ParamTarget};
+use crate::ir::{AudioOp, Buf, MAX_AUX_BUSES};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
 use crate::port::{Port, PortType};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// One sub-plugin parameter the graph is allowed to drive.
 ///
@@ -86,8 +87,8 @@ impl PluginPorts {
     /// Widths are clamped to [`MAX_CHANNELS`][crate::MAX_CHANNELS]. M8 is
     /// stereo throughout (§14.8), and a node drawn with a socket the compiler
     /// will refuse is worse than one drawn narrow.
-    pub fn from_layout(layout: &plugin_host_api::IoLayout, latency: u32) -> PluginPorts {
-        let widths = |buses: &[plugin_host_api::BusInfo]| -> Vec<u16> {
+    pub fn from_layout(layout: &plugin_host::IoLayout, latency: u32) -> PluginPorts {
+        let widths = |buses: &[plugin_host::BusInfo]| -> Vec<u16> {
             buses
                 .iter()
                 .map(|b| b.channels.min(crate::MAX_CHANNELS as u16))

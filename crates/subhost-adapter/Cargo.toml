@@ -5,9 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-audio-graph-engine.workspace = true
-plugin-host-api.workspace = true
 plugin-host.workspace = true
 log.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true

@@ -18,8 +18,10 @@
 mod audio_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute, NoteSource, NoteStream};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute};
+
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// Identifies one node, for the whole life of a patch.
 ///
@@ -107,7 +109,7 @@ pub const MAX_CHANNELS: usize = 2;
 /// kinds of buffer to keep straight.
 pub const MAX_BUFFER_CHANNELS: usize = MAX_CHANNELS * (1 + MAX_AUX_BUSES);
 
-pub use plugin_host_api::MAX_AUX_BUSES;
+pub use plugin_host::MAX_AUX_BUSES;
 
 /// A graph, compiled.
 #[derive(Debug, Clone, PartialEq)]
@@ -273,37 +275,4 @@ impl Program {
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.audio_ops.is_empty()
     }
-}
-
-/// The activation shape of one plugin instance (§14.11).
-///
-/// A sub-plugin has to be activated with the buses the graph will actually
-/// feed it, and that is a property of the patch rather than of the plugin. It
-/// lives in the `Program` because the compiler is what knows it, and because
-/// changing it means the sub-plugin has to be deactivated and activated again.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstanceIo {
-    pub instance: u32,
-    /// Main input bus width. Zero for an instrument.
-    pub input_channels: u16,
-    /// Aux input buses, in order. Only the ones the graph wired.
-    pub aux_inputs: Vec<u16>,
-    /// Main output bus width.
-    pub output_channels: u16,
-    /// Aux output buses, in order. Only as far as the graph reads them, so a
-    /// plugin's third output is absent when only the second is wired.
-    pub aux_outputs: Vec<u16>,
-}
-
-/// One sub-plugin parameter the graph drives directly (§14.12).
-///
-/// The wrapper's slots are the DAW's automation lanes and there are 32 of them;
-/// this is the other way in, and it is not limited that way because nothing
-/// outside the patch has to name it. A `SlotIn` node wired to a parameter
-/// socket is how a DAW lane reaches a parameter now — the slot table is no
-/// longer the only route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParamTarget {
-    pub instance: u32,
-    pub param: u32,
 }

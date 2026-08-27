@@ -16,10 +16,9 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, Chunking, InstanceIo, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
-    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, NoteSource, Op, ParamTarget,
-    Reg,
+    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
+    MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS,
+    MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
 };
 
 /// Where a note gate's lane is filed, so it cannot collide with the lane of an
@@ -67,6 +66,7 @@ fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(No
 }
 use crate::nodes::NodeKind;
 use crate::port::PortType;
+use subhost_adapter::{InstanceIo, NoteSource, ParamTarget};
 
 pub(crate) struct ParamCx<'a> {
     graph: &'a Graph,

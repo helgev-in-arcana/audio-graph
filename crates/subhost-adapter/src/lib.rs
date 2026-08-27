@@ -1,25 +1,38 @@
 //! Everything specific to hosting a plugin from *inside* another plugin.
 //!
-//! ARCHITECTURE.md §7 defines this crate by subtraction: if a standalone
-//! offline renderer or a plugin scanner would still need a piece of code, it
-//! belongs in `vst3-host`, not here. What is left is the nesting itself —
-//! forwarding the DAW's transport down, combining latency on the way up,
-//! nesting one plugin's state inside another's, and deciding what to do with
-//! the sub-plugin's own edit notifications.
+//! Defined by subtraction: if a standalone offline renderer or a plugin scanner
+//! would still need a piece of code, it belongs in `plugin-host`, not here.
+//! What is left is the nesting itself — forwarding the DAW's transport down,
+//! combining latency on the way up, publishing slots the DAW can automate and
+//! binding them to the sub-plugin's own parameters, nesting one plugin's state
+//! inside another's, and deciding what to do with the sub-plugin's edit
+//! notifications.
+//!
+//! Defined by subtraction the other way too: nothing here knows what AudioGraph
+//! is. The wrapper above decides how many slots to publish, how many lanes a
+//! sub-block carries and what its saved document looks like, and hands those in
+//! ([`SubHostConfig`], [`SlotSchedule`], [`SubHostState`]); a different wrapper
+//! — a chain, a rack, a bare pair of plugins — makes different choices and gets
+//! the same crate. [`AudioInstances`] is where that line is drawn: a caller
+//! schedules
+//! audio and says which instance hears what, and everything crossing back is a
+//! flat slice or a `Copy` value.
 
 mod host;
-mod main_thread;
+mod instances;
 mod schedule;
 mod slots;
 mod state;
 
 pub use host::{
-    GraphNodes, MAX_INSTANCES, SubHost, SubHostProcessor, SubHostProcessors, SubPluginRef,
+    BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
-pub use main_thread::MainThread;
-pub use schedule::{DEFAULT_QUANTUM, LANES, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
-pub use slots::{Binding, ResolvedTarget, SLOT_COUNT, Slot, SlotTable};
-pub use state::{InstanceState, WrapperState};
+pub use instances::{
+    AudioChunk, AudioInstances, InstanceIo, NoInstances, NoteSource, NoteStream, ParamTarget,
+};
+pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
+pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
+pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};
 
 /// How the wrapper reports its own latency to the DAW.
 ///

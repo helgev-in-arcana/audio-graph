@@ -1,13 +1,12 @@
-//! The wrapper's persisted state (ARCHITECTURE.md §8.3).
+//! Naming a sub-plugin, and nesting its state inside the wrapper's.
 //!
-//! The sub-plugin's own chunk is nested inside, opaque. The parts the wrapper
-//! owns — slot table, bindings, and eventually the node graph — are serialised
-//! separately and deliberately do *not* depend on the sub-plugin being present,
-//! so swapping the sub-plugin leaves everything else standing.
+//! What a wrapper saves is its own business — which slots it publishes, what a
+//! patch looks like. What is *not* its own business is the sub-plugin's chunk:
+//! it is opaque, it has to survive a round trip unread, and the reference that
+//! says which plugin to reload has to outlive that plugin going missing. Those
+//! are the pieces here.
 
 use serde::{Deserialize, Serialize};
-
-use crate::slots::Slot;
 
 /// Identifies which sub-plugin to reload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,110 +32,13 @@ pub struct InstanceState {
     /// renumber the ones after it.
     pub instance: usize,
     pub reference: SubPluginRef,
-    /// The sub-plugin's own opaque chunk, base64 for the same reason as
-    /// [`WrapperState::sub_state`].
+    /// The sub-plugin's own opaque chunk.
+    ///
+    /// Base64 rather than raw bytes because a wrapper's saved state is usually
+    /// a text document, and a chunk that has to survive one unread cannot be
+    /// carried as bytes in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-}
-
-/// Everything the wrapper writes into the DAW's project file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct WrapperState {
-    /// Bumped when the layout changes incompatibly. Present from the start so
-    /// there is somewhere to branch when it does.
-    pub version: u32,
-    pub slots: Vec<Slot>,
-    /// Pre-M8 projects hold one sub-plugin here. Read on load and folded into
-    /// `instances`; never written any more (see [`WrapperState::instances`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub_plugin: Option<SubPluginRef>,
-    /// The pre-M8 sub-plugin's own opaque chunk.
-    ///
-    /// Base64 rather than raw bytes because this lives inside a JSON document
-    /// that nice-plug persists as a string field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sub_state: Option<String>,
-    /// The hosted sub-plugins, from M8 on (§14.1).
-    ///
-    /// Empty in a pre-M8 project, where `sub_plugin` carries the single one
-    /// instead; [`instances`][WrapperState::instances] hides that difference
-    /// from every caller so there is one shape to handle rather than two.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sub_plugins: Vec<InstanceState>,
-    /// The node graph (§9), as its own JSON value.
-    ///
-    /// Held opaquely rather than as a `Graph` so that this crate — which is
-    /// about nesting one plugin inside another and knows nothing about node
-    /// graphs — does not grow a dependency on the engine to describe a field it
-    /// only ever passes through. It also means a project saved by a newer
-    /// version survives a round trip through an older one instead of losing the
-    /// patch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graph: Option<serde_json::Value>,
-    /// Sub-block size for modulation, in samples (§9.2).
-    #[serde(default = "default_sub_block")]
-    pub sub_block: u32,
-}
-
-fn default_sub_block() -> u32 {
-    crate::schedule::DEFAULT_QUANTUM
-}
-
-/// Current layout version.
-pub const STATE_VERSION: u32 = 1;
-
-impl WrapperState {
-    pub fn new(slots: Vec<Slot>) -> WrapperState {
-        WrapperState {
-            version: STATE_VERSION,
-            slots,
-            sub_plugin: None,
-            sub_state: None,
-            sub_plugins: Vec::new(),
-            graph: None,
-            sub_block: default_sub_block(),
-        }
-    }
-
-    pub fn set_sub_state(&mut self, bytes: &[u8]) {
-        self.sub_state = Some(base64_encode(bytes));
-    }
-
-    pub fn sub_state_bytes(&self) -> Option<Vec<u8>> {
-        base64_decode(self.sub_state.as_deref()?)
-    }
-
-    /// Record one instance's plugin and settings.
-    pub fn set_instance(&mut self, instance: usize, reference: SubPluginRef, state: Option<&[u8]>) {
-        let entry = InstanceState {
-            instance,
-            reference,
-            state: state.map(base64_encode),
-        };
-        match self.sub_plugins.iter_mut().find(|e| e.instance == instance) {
-            Some(existing) => *existing = entry,
-            None => self.sub_plugins.push(entry),
-        }
-    }
-
-    /// The hosted sub-plugins, whichever way the project spelled them.
-    ///
-    /// A project saved before M8 has one in `sub_plugin`; one saved after has
-    /// any number in `sub_plugins`. Callers should not have to know which, so
-    /// the old shape is presented as instance 0 of the new one.
-    pub fn instances(&self) -> Vec<InstanceState> {
-        if !self.sub_plugins.is_empty() {
-            return self.sub_plugins.clone();
-        }
-        match &self.sub_plugin {
-            Some(reference) => vec![InstanceState {
-                instance: 0,
-                reference: reference.clone(),
-                state: self.sub_state.clone(),
-            }],
-            None => Vec::new(),
-        }
-    }
 }
 
 impl InstanceState {
@@ -145,9 +47,25 @@ impl InstanceState {
     }
 }
 
+/// What a [`SubHost`][crate::SubHost] saves and restores.
+///
+/// Not itself a saved document: a wrapper owns its own file format — a version
+/// number, whatever patch it holds — and this is only the part of it that this
+/// crate can fill in and read back. Keeping the two apart is what lets a
+/// wrapper lay its file out however it likes, and lets a project written by a
+/// newer build survive a round trip through an older one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SubHostState {
+    pub slots: Vec<crate::slots::Slot>,
+    pub instances: Vec<InstanceState>,
+}
+
 /// Minimal standard base64. Written out rather than taken as a dependency:
 /// it is thirty lines, and this is the only place the project needs it.
-fn base64_encode(bytes: &[u8]) -> String {
+///
+/// Public because a wrapper's own state has the same problem this solves: an
+/// opaque chunk, in a text document.
+pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
@@ -174,7 +92,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     fn value(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => u32::from(c - b'A'),
@@ -215,33 +133,6 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slots::Binding;
-
-    #[test]
-    fn state_survives_a_json_round_trip() {
-        let mut state = WrapperState::new(vec![
-            Slot {
-                name: Some("Cutoff".into()),
-                binding: Some(Binding {
-                    instance: 0,
-                    plugin_id: "ABCD".repeat(8),
-                    param_id: 7,
-                    param_name: "Filter Cutoff".into(),
-                }),
-            },
-            Slot::default(),
-        ]);
-        state.set_sub_state(&[0, 1, 2, 253, 254, 255]);
-
-        let json = serde_json::to_string(&state).unwrap();
-        let back: WrapperState = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(back, state);
-        assert_eq!(
-            back.sub_state_bytes().unwrap(),
-            vec![0, 1, 2, 253, 254, 255]
-        );
-    }
 
     #[test]
     fn base64_handles_every_padding_case() {
@@ -262,36 +153,22 @@ mod tests {
     }
 
     #[test]
-    fn a_state_written_before_the_graph_existed_still_loads() {
-        // Projects saved by M3 and M4 have no `graph` and no `sub_block`. They
-        // must open with an empty graph and the default rate, not fail.
-        let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null}"#;
-        let state: WrapperState = serde_json::from_str(json).unwrap();
-        assert!(state.graph.is_none());
-        assert_eq!(state.sub_block, crate::schedule::DEFAULT_QUANTUM);
-    }
+    fn an_instance_carries_its_chunk_through_a_round_trip() {
+        let state = InstanceState {
+            instance: 2,
+            reference: SubPluginRef {
+                format: "vst3".into(),
+                plugin_id: "ABCD".repeat(8),
+                path_hint: "/plugins/Thing.vst3".into(),
+                display_name: "Thing".into(),
+            },
+            state: Some(base64_encode(&[0, 1, 2, 253, 254, 255])),
+        };
 
-    #[test]
-    fn a_graph_saved_by_a_newer_version_survives_a_round_trip() {
-        // The field is opaque here on purpose: this crate must not be the
-        // reason a patch is lost when versions disagree.
-        let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null,
-                       "graph":{"nodes":[{"kind":"SomethingFromTheFuture"}]},"sub_block":64}"#;
-        let state: WrapperState = serde_json::from_str(json).unwrap();
-        let back: WrapperState =
-            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        assert_eq!(back.graph, state.graph);
-        assert_eq!(back.sub_block, 64);
-    }
-
-    #[test]
-    fn a_state_with_no_sub_plugin_is_still_valid() {
-        // Bindings outlive the plugin they point at (§8.3), so this has to
-        // serialise cleanly.
-        let state = WrapperState::new(vec![Slot::default(); 2]);
         let json = serde_json::to_string(&state).unwrap();
-        let back: WrapperState = serde_json::from_str(&json).unwrap();
-        assert!(back.sub_plugin.is_none());
-        assert!(back.sub_state_bytes().is_none());
+        let back: InstanceState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back, state);
+        assert_eq!(back.state_bytes().unwrap(), vec![0, 1, 2, 253, 254, 255]);
     }
 }

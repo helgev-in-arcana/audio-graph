@@ -110,9 +110,10 @@ name = "audio-graph-engine"
 version = "0.1.2"
 dependencies = [
  "egui",
- "plugin-host-api",
+ "plugin-host",
  "serde",
  "serde_json",
+ "subhost-adapter",
 ]
 
 [[package]]
@@ -2061,10 +2062,8 @@ dependencies = [
 name = "subhost-adapter"
 version = "0.1.2"
 dependencies = [
- "audio-graph-engine",
  "log",
  "plugin-host",
- "plugin-host-api",
  "serde",
  "serde_json",
 ]

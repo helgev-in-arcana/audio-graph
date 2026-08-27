@@ -33,13 +33,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use crate::config::SLOT_COUNT;
+use crate::state::WrapperState;
 use audio_graph_engine::{Graph, Handoff, Program, compile};
-use audio_graph_engine::{InstanceIo, NodeId, NodeKind, ParamTarget, Plugin, PluginPorts};
+use audio_graph_engine::{NodeId, NodeKind, Plugin, PluginPorts};
 use parking_lot::Mutex;
-use plugin_host::AudioConfig;
-use subhost_adapter::{
-    DEFAULT_QUANTUM, MainThread, SLOT_COUNT, SubHost, SubHostProcessors, WrapperState,
-};
+use plugin_host::{AudioConfig, MainThread};
+use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
 
 use crate::params::WrapperParams;
 
@@ -450,7 +450,9 @@ impl Shared {
     /// decides to save the project there is something current waiting for it.
     pub fn store_state(&self) {
         let mut state = self.main();
-        let mut blob = state.host.save_state();
+        let mut blob = WrapperState::default();
+        blob.set_sub_host_state(state.host.save_state());
+        blob.version = crate::state::STATE_VERSION;
         blob.graph = serde_json::to_value(&state.graph).ok();
         blob.sub_block = self.quantum();
         drop(state);
