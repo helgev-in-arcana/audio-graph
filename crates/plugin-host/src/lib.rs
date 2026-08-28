@@ -24,7 +24,7 @@
 //! Here: anything whose answer differs by format. Where plugins live, how a
 //! module is enumerated, how an instance is created, how an editor is attached.
 //!
-//! Not here: anything specific to hosting a plugin *inside another plugin* --
+//! Not here: anything specific to hosting a plugin *inside another plugin* —
 //! forwarding the DAW's transport, combining latency, nesting state. That is
 //! `subhost-adapter`'s job, and the test is: would an offline renderer or a
 //! plugin scanner still need it?

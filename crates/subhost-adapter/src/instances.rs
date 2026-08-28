@@ -78,7 +78,7 @@ impl NoteStream {
 
 /// Buffer layout and timing geometry for an audio processing chunk.
 ///
-/// Channels are stored contiguously in planar format packed by `frames` --
+/// Channels are stored contiguously in planar format packed by `frames` —
 /// the same layout `AudioBuffers` uses. The caller's pool has room for the
 /// longest block the host promised, but the channels inside a chunk sit at
 /// `frames` rather than at that maximum, so a short sub-block is a smaller

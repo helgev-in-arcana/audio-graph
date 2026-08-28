@@ -1,7 +1,12 @@
 //! Parameter instruction set and evaluation primitives.
 //!
-//! Contains the payload definitions ([`Waveform`], [`MathOp`], [`ExprSource`])
-//! and scalar operations executed by the parameter engine during each sub-block.
+//! Contains the scalar operations the parameter engine executes each sub-block.
+//!
+//! The payload enums a node's settings reduce to — [`Waveform`], [`MathOp`],
+//! [`ExprSource`] — live here rather than next to the node that offers them,
+//! because an instruction carries them: they are part of what crosses to the
+//! audio thread, and `ir` is what may not depend on the edit side. The node
+//! modules use them from here.
 
 use serde::{Deserialize, Serialize};
 
@@ -15,11 +20,13 @@ pub enum Operand {
     Value(f64),
 }
 
-/// LFO rate specification.
+/// How fast an LFO runs, resolved into what the evaluator needs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RateSpec {
     Hz(f64),
-    /// Rate expressed in cycles per beat for tempo-synchronized evaluation.
+    /// Cycles per beat is what the evaluator wants; the editor thinks in beats
+    /// per cycle, so the reciprocal is taken once, here, rather than every
+    /// sub-block.
     CyclesPerBeat(f64),
 }
 
@@ -48,8 +55,11 @@ pub enum Op {
         out: Reg,
         source: ExprSource,
     },
-    /// Select between two operands based on whether `control` meets or exceeds `threshold`:
-    /// outputs `high` when `control >= threshold`, otherwise `low`.
+    /// One of two operands, chosen by where `control` sits against `threshold`:
+    /// `high` at the threshold and above, `low` below it.
+    ///
+    /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which a
+    /// gate wired from `Expression`'s `Gate` does — switches.
     Select {
         out: Reg,
         control: Reg,
@@ -57,12 +67,22 @@ pub enum Op {
         low: Operand,
         high: Operand,
     },
-    /// Outputs 1.0 while `key` is held, 0.0 otherwise.
+    /// 1 while `key` is held, 0 otherwise.
+    ///
+    /// The one thing the graph could not otherwise ask about a note stream:
+    /// `Expression` answers for the newest note whatever it was, and a key
+    /// switch is a question about one particular key regardless of what has been
+    /// played since.
     KeyHeld {
         out: Reg,
         key: u8,
     },
-    /// Advances latch `state` to the next of `count` positions when `key` is struck, wrapping around.
+    /// Advances latch `state` to the next of `count` positions when `key` is
+    /// struck, wrapping around. One key cycling a switch, which with `count` of
+    /// 2 is a plain toggle.
+    ///
+    /// The value is read back by an [`Op::Latch`] or an [`Op::LatchIs`], because
+    /// the latch is what survives a program swap and a register does not.
     /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
     /// the topological sort, preventing cycles.
     KeyStep {
@@ -71,6 +91,9 @@ pub enum Op {
         count: u16,
     },
     /// Sets latch `state` to `value` when `key` is struck.
+    ///
+    /// Several of these on one latch is a bank of key switches: the last key
+    /// pressed wins, which is what a bank of switches does.
     /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
     /// the topological sort, preventing cycles.
     KeyLatch {
@@ -84,7 +107,11 @@ pub enum Op {
         state: u16,
         initial: f64,
     },
-    /// Outputs 1.0 when latch `state` matches `value`, 0.0 otherwise.
+    /// 1 when latch `state` holds `value`, 0 otherwise.
+    ///
+    /// What makes a bank of switches exclusive: each position asks whether it is
+    /// the one selected, and exactly one of them can be. `initial` is what an
+    /// unset latch counts as, so an untouched bank still has a position.
     LatchIs {
         out: Reg,
         state: u16,
@@ -109,7 +136,10 @@ pub enum Op {
     /// Read from a parameter delay line, `time` seconds back.
     ///
     /// When `time_reg` is present, its value overrides `time`.
-    /// The delay duration is clamped to at least one sub-block at runtime.
+    /// The delay duration is clamped at run time to at least one sub-block: a
+    /// read that could see the current sub-block's own write would close a loop
+    /// with no delay in it. The compiler cannot do the clamping — the floor
+    /// depends on the sample rate and the quantum, and it knows neither.
     DelayRead {
         out: Reg,
         line: u16,
@@ -155,7 +185,13 @@ impl Waveform {
     }
 }
 
-/// Expression and per-note controller sources tracked by the engine.
+/// Which per-note controller a node reads.
+///
+/// The graph is monophonic, so polyphony is reduced away: each source keeps the
+/// most recent value from any note, because a per-voice value would have nowhere
+/// to go. `Capabilities.poly_modulation` is what will decide whether the *voice*
+/// level ever becomes reachable, and the editor already greys these out when the
+/// sub-plugin cannot accept per-note modulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExprSource {
     Pressure,
@@ -202,8 +238,9 @@ impl ExprSource {
         }
     }
 
-    /// Whether this source represents continuous per-note controller expression
-    /// (pressure, tuning, brightness, expression, vibrato, volume, pan) rather than basic note metadata.
+    /// Whether this source comes from a per-note controller rather than from the
+    /// note itself. These are the ones a sub-plugin without per-note modulation
+    /// cannot meaningfully receive.
     pub fn is_per_note(self) -> bool {
         !matches!(
             self,
@@ -219,7 +256,7 @@ pub enum MathOp {
     Multiply,
     Min,
     Max,
-    /// Power curve `a^b` for values in 0..1.
+    /// `a^b` on a 0..1 input — the curve control.
     Curve,
 }
 

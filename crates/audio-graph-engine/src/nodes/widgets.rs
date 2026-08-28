@@ -1,11 +1,32 @@
 //! Shared UI widgets and context structures for rendering graph nodes with egui.
+//!
+//! Only compiled with the `ui` feature, which only the wrapper turns on. The CLI
+//! and the adapter link the same crate without egui in the tree at all —
+//! `cargo tree -p host-cli` is the check.
+//!
+//! The feature exists so that a node's controls can sit in the node's own file
+//! rather than in a second `match` in the editor crate. Putting the canvas on
+//! one side of the line and the node on the other is what settles where a new
+//! node's code goes: all of it in the node's file.
+//!
+//! What stays with the canvas is everything *about the canvas* — panning,
+//! zooming, drawing links, the add-node menu, loading plugins. A node never
+//! learns any of that; it is handed a `Ui` the right size and a [`NodeUi`] of
+//! facts about the world outside the graph.
 
 use crate::nodes::Rate;
 
 /// Standard width of a node's body in canvas units.
+///
+/// Here rather than in the editor because a node's controls are laid out against
+/// it — a combo box wider than the node it sits in is the kind of thing that
+/// only shows up once somebody adds a node.
 pub const NODE_WIDTH: f32 = 232.0;
 
-/// UI state snapshot of a hosted sub-plugin instance provided by the host wrapper.
+/// One sub-plugin instance, as the node holding it needs to draw it.
+///
+/// Filled in by the wrapper: this crate has no idea what is loaded, and does not
+/// gain one by drawing it.
 #[derive(Default, Clone)]
 pub struct InstanceView {
     pub loaded: bool,
@@ -15,27 +36,41 @@ pub struct InstanceView {
     pub params: Vec<(u32, String)>,
 }
 
-/// Asynchronous action requested by node UI controls to be executed by the host wrapper.
+/// Something a node's controls asked for that only the wrapper can do.
+///
+/// Opening a window may not happen inside a draw callback, so the request is
+/// recorded and carried out afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeAction {
     OpenSubEditor(usize),
     CloseSubEditor(usize),
 }
 
-/// External context and runtime state passed to node UI rendering callbacks.
+/// What a node's controls know about the world outside the graph.
+///
+/// Deliberately narrow. The editor's own context carries the scanned plugin
+/// list, the free instance number and the canvas's error banner as well; none of
+/// that is a node's business, and leaving it out is what keeps this crate from
+/// needing to know what a plugin format is.
 pub struct NodeUi<'a> {
-    /// Total number of available automation slots in the host wrapper.
+    /// How many slots the wrapper has, so a slot picker cannot point past the
+    /// table.
     pub slot_count: usize,
-    /// Slot mappings: (slot index, target parameter name, whether binding resolved).
+    /// Slot index → the sub-plugin parameter it drives and whether that binding
+    /// resolved. Shown on slot nodes so the graph reads as "drive the filter
+    /// cutoff" rather than as "drive slot 12".
     pub bindings: &'a [(usize, String, bool)],
     /// Live normalized parameter values for each slot.
     pub live: &'a [f32],
     /// Whether the hosted plugin supports polyphonic parameter modulation.
     pub poly_modulation: bool,
-    /// Audio engine block processing quantum (in samples) and sample rate.
+    /// The sub-block size and the sample rate, which together are the floor a
+    /// delay time cannot go below. The editor shows it and holds the control at
+    /// it; the audio thread applies it again regardless, because these two can
+    /// change while a patch is loaded.
     pub quantum: u32,
     pub sample_rate: f64,
-    /// Sub-plugin instance metadata indexed by instance ID.
+    /// Indexed by instance number, so a plugin node can look itself up.
     pub instances: &'a [InstanceView],
     /// List of requested actions queued for execution by the host wrapper.
     pub actions: Vec<NodeAction>,
@@ -47,10 +82,16 @@ impl NodeUi<'_> {
     }
 }
 
-/// Warning highlight color for non-critical advisory notices.
+/// Colour for a warning that is not an error: a control that still works, but
+/// not the way the patch implies.
 pub(crate) const CAUTION: egui::Color32 = egui::Color32::from_rgb(200, 140, 60);
 
-/// Renders an inline fallback control disabled/greyed out when an input socket is connected.
+/// A control that is only in effect while its socket is empty.
+///
+/// The rule could be a line of prose under the node — "b is used only while its
+/// input is unconnected" — but that is a thing to read rather than a thing to
+/// see. Greying the control out says it in the place it applies, and the hover
+/// says why.
 pub(crate) fn fallback<R>(
     ui: &mut egui::Ui,
     connected: bool,
@@ -64,7 +105,10 @@ pub(crate) fn fallback<R>(
     out.inner
 }
 
-/// Renders delay line ID selector (1-indexed for display).
+/// Which delay line a half belongs to.
+///
+/// One-based on screen for the same reason a slot is: the two halves are paired
+/// by this number and nothing else, so it has to be readable at a glance.
 pub(crate) fn line_control(ui: &mut egui::Ui, line: &mut u32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -86,7 +130,9 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
     let mut changed = false;
     let slots = cx.slot_count.max(1);
     ui.horizontal(|ui| {
-        // 1-indexed for display to match host DAW slot labeling.
+        // One-based on screen, zero-based in the data: the DAW's automation
+        // lanes are called "Slot 1".."Slot 32", and disagreeing with them is how
+        // a user binds the wrong control.
         let mut shown = *slot + 1;
         if ui
             .add(egui::DragValue::new(&mut shown).range(1..=slots))
@@ -112,7 +158,11 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
     changed
 }
 
-/// Renders MIDI key selector (0..=127) with note name display.
+/// Which MIDI key a node watches, shown as a note name beside the number.
+///
+/// A key switch is set by ear and named in the same breath, and 24 is not a
+/// name. The number stays because DAWs disagree with each other about which C is
+/// middle C, and the number never does.
 pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -130,7 +180,8 @@ pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool 
     changed
 }
 
-/// Converts a MIDI note number (0..=127) to standard note name notation (e.g. 60 -> "C3").
+/// A MIDI key as a note name, with 60 as C3 — one of the several conventions in
+/// use, and the one the rest of this editor reads in.
 pub(crate) fn key_name(key: u8) -> String {
     const NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -186,7 +237,9 @@ pub(crate) fn combo<T: PartialEq + Copy>(
     name: fn(T) -> &'static str,
 ) -> bool {
     let mut changed = false;
-    // Scale combo box to occupy available row width.
+    // Whatever the row has left rather than a fixed width: `NODE_WIDTH` is in
+    // canvas units and the `Ui` here is already zoomed, so a constant made the
+    // dropdown the one control that did not scale with the rest.
     egui::ComboBox::from_id_salt(ui.id().with(label))
         .selected_text(name(*current))
         .width(ui.available_width())
@@ -204,7 +257,7 @@ pub(crate) fn combo<T: PartialEq + Copy>(
     changed
 }
 
-/// Truncates strings longer than 16 characters with an ellipsis for compact UI display.
+/// Combo boxes are only so wide, and a parameter name can be long.
 pub(crate) fn shorten(text: &str) -> String {
     if text.chars().count() <= 16 {
         return text.to_string();

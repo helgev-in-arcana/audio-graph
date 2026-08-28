@@ -31,9 +31,11 @@ use subhost_adapter::{AudioChunk, AudioInstances};
 
 /// Maximum number of `DelayRead` taps supported in a single program.
 ///
-/// Multiple delay reads can share the same underlying delay line. The engine tracks
-/// the previous fractional read distance for each tap to support smooth interpolation
-/// across sub-block boundaries without clicks.
+/// More than one read may share a line — that is a multi-tap delay, and it falls
+/// out of splitting a delay into a write and a read for free — so this is not
+/// `MAX_AUDIO_DELAY_LINES`. The engine keeps one number per tap: where its read
+/// pointer was at the end of the last chunk, so the next one can ramp rather
+/// than jump.
 pub const MAX_AUDIO_TAPS: usize = 16;
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
@@ -129,44 +131,68 @@ pub struct Engine {
     /// Which node each phase belongs to, mirrored from the program so the swap
     /// can match old state to new without touching the old program again.
     phase_nodes: Vec<u32>,
-    /// Parameter delay line ring buffers, indexed by line ID.
-    /// Uses `Vec<Vec<f64>>` to allow lock-free outer pointer swapping during program
-    /// swaps without copying large sample buffers.
+    /// One ring per parameter delay line, each `MAX_DELAY_TAPS` sub-blocks long.
+    ///
+    /// A `Vec<Vec<f64>>` rather than one flat buffer specifically so that a
+    /// program swap can reorder the lines by swapping the outer entries, which
+    /// moves pointers instead of 32 kB of samples.
     rings: Vec<Vec<f64>>,
     /// Current write head position per parameter delay line.
     ring_heads: Vec<usize>,
-    /// Node IDs associated with active parameter delay lines.
+    /// Which `DelayWrite` node each ring belongs to. Same role as
+    /// `phase_nodes`.
     ring_nodes: Vec<u32>,
-    /// Scratch buffer for reordering delay line buffers during swaps.
+    /// Scratch for reordering `rings` on a swap, so the swap allocates
+    /// nothing.
     ring_order: Vec<usize>,
-    /// Preallocated audio buffer pool.
+    /// The audio buffer pool, one `MAX_CHANNELS * max_frames` region per buffer
+    /// index. Sized by [`prepare`][Engine::prepare], which is the only place in
+    /// this type that allocates.
     pool: Vec<f32>,
-    /// Stride in frames per channel buffer.
+    /// Frames one buffer's channel holds. Zero until `prepare`.
     stride: usize,
-    /// Channel widths of host input buses.
+    /// Channel width of each of the wrapper's own input buses, main first. Set
+    /// by `prepare`, because it is fixed for as long as the DAW keeps us
+    /// activated.
     daw_inputs: Vec<u16>,
-    /// Audio delay line ring buffers.
+    /// One ring per audio delay line, as long as the node asked for.
+    ///
+    /// Allocated on the main thread and carried in on the program, because this
+    /// thread may not allocate and only that side knows both the graph's
+    /// `max_time` and the sample rate. Split per line for the same reason the
+    /// param rings are: a program swap reorders them by moving pointers.
     audio_rings: Vec<Vec<f32>>,
-    /// Samples per channel in each audio delay ring buffer.
+    /// Samples per channel in each of those, mirrored so the ops do not have to
+    /// reach into the program for it.
     audio_ring_len: Vec<usize>,
     audio_ring_heads: Vec<usize>,
     audio_ring_nodes: Vec<u32>,
     audio_ring_order: Vec<usize>,
-    /// Previous read pointer distances for audio delay taps.
+    /// Where each tap's read pointer stood at the end of the last chunk, in
+    /// samples. NaN means "no previous", which is what a fresh program leaves
+    /// behind and what makes the first chunk after a swap jump rather than sweep
+    /// from wherever the old patch happened to be.
     tap_distance: Vec<f64>,
-    /// Ring buffers for delay latency compensation.
+    /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
     expressions: Expressions,
-    /// Bitmask of actively held MIDI keys (128 keys).
+    /// Which keys are down, one bit each. 128 keys, which is the whole MIDI
+    /// range, so a `u128` is the table.
+    ///
+    /// Apart from [`Expressions`] because that is the newest note whatever it
+    /// was, and a key switch asks about one particular key regardless of what
+    /// has been played since.
     keys_held: u128,
-    /// Bitmask of MIDI keys struck during the current evaluation block.
+    /// Which keys have been struck since the last [`Engine::run`]. Cleared at
+    /// the end of it, so an op sees each note-on exactly once.
     keys_struck: u128,
-    /// Persistent latch values for switch and stepped controls.
+    /// One value per latch, or NaN for a latch nothing has set yet.
     latches: Vec<f64>,
-    /// Node IDs associated with active latch states.
+    /// Which node each latch belongs to, so a program swap can carry it over.
     latch_nodes: Vec<u32>,
-    /// Scratch buffer for carrying latch values across program swaps.
+    /// Scratch for that swap, sized once so the swap itself allocates
+    /// nothing.
     latch_carry: Vec<(u32, f64)>,
     rng: u32,
 }
@@ -206,9 +232,11 @@ fn copy_ring(from: &[f32], from_len: usize, to: &mut [f32], to_len: usize, head:
     *head = keep % to_len;
 }
 
-/// Four-point cubic Hermite polynomial interpolator.
+/// Four-point cubic Hermite, the interpolator a modulated delay asks for.
 ///
-/// Used for fractional delay line read pointer interpolation. `x` is the fractional
+/// Linear interpolation loses audible high end while the delay time is moving,
+/// and an all-pass interpolator misbehaves under exactly the modulation this
+/// exists to support. `x` is the fractional
 /// offset between `y1` and `y2`.
 fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, x: f32) -> f32 {
     let c1 = 0.5 * (y2 - y0);

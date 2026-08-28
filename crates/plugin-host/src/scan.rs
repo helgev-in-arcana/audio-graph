@@ -20,7 +20,7 @@ use crate::format::{FORMATS, Format};
 pub struct ClassInfo {
     pub format: Format,
     /// Stable identity, and the authority a saved binding is resolved by. A
-    /// VST3 class id in platform-independent hex, or a CLAP reverse-DNS id --
+    /// VST3 class id in platform-independent hex, or a CLAP reverse-DNS id —
     /// opaque either way.
     pub id: String,
     pub name: String,

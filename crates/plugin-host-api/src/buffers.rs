@@ -130,7 +130,7 @@ impl Default for AudioConfig {
 
 /// Borrowed view over flat audio buffer memory for a single processing block.
 ///
-/// The input region holds the main bus first and then each aux bus, packed --
+/// The input region holds the main bus first and then each aux bus, packed —
 /// so `input_channels` is the total and `aux_inputs` says where the joins are.
 /// The output region is the same shape. One region per direction rather than
 /// one per bus because a nested slice cannot live in shared memory, and the

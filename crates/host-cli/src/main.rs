@@ -318,7 +318,7 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 
     // Reading the factory says what a module offers; only an instance can say
     // what it implements, because both formats answer that question through the
-    // instance (`get_extension` / `queryInterface`). So one plugin is loaded --
+    // instance (`get_extension` / `queryInterface`). So one plugin is loaded —
     // the one named, or the first -- rather than all of them: a module like
     // Airwindows Consolidated has hundreds of classes, and instantiating every
     // one to print the same list is not worth the wait.
