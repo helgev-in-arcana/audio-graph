@@ -17,6 +17,8 @@
 //! [`SlotSchedule`], [`SubHostState`]); a different wrapper — a chain, a rack,
 //! a bare pair of plugins — makes different choices and gets the same crate.
 //! [`AudioInstances`] is where that line is drawn.
+//!
+//! See `README.md` in this crate for the invariants that boundary depends on.
 
 mod host;
 mod instances;

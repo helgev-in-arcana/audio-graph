@@ -1,9 +1,22 @@
 //! Realtime audio engine execution runtime.
 //!
 //! Executes compiled [`Program`] instructions on the audio thread.
-//! Guarantees realtime safety: no heap allocation, no locking, and no blocking operations.
-//! State that persists across program recompilations (e.g. LFO phases, delay ring buffers,
-//! latch registers, note expressions) is maintained here.
+//!
+//! The rules this file exists to keep: no allocation, no locking, and no `Drop`
+//! of anything the main thread gave us. Every buffer is sized once in
+//! [`Engine::new`] against the compiler's ceilings, so adopting a new program
+//! is a pointer swap and a short loop, never a resize.
+//!
+//! It also holds the state that must *survive* a swap — LFO phases, delay ring
+//! contents, latch registers, the current note expression values.
+//! Recompiling happens on every drag of every control, and an oscillator that
+//! restarted each time would make the editor unusable for exactly the thing an
+//! LFO is for.
+//!
+//! Outside of its own tests, nothing here mentions `graph` or a node kind, and
+//! that is the thread boundary rather than an accident: what reaches this side
+//! is a [`Program`] and nothing else. A `use crate::graph::…` appearing above
+//! the `#[cfg(test)]` line is the signal that something has leaked across.
 
 use plugin_host::{NoteEvent, NoteExpression};
 
@@ -31,17 +44,24 @@ const NOT_PRESENT: usize = usize::MAX;
 pub struct BlockContext {
     pub sample_rate: f64,
     pub tempo_bpm: f64,
-    /// Number of audio frames processed during this evaluation.
+    /// Number of audio frames processed during this evaluation. Phases advance
+    /// by this much afterwards, which is what makes the sub-block rate a
+    /// property of the caller rather than of the engine.
     pub frames: u32,
 }
 
 /// Context for evaluating one whole block of audio.
 ///
-/// Contains automation lanes, chunking metadata, and sample rate.
+/// The lanes are the same buffer the parameter side fills: one row of values
+/// per sub-block boundary. The audio half reads only its own range of lane
+/// numbers out of it — delay times, and the like — and passes the rest through
+/// untouched. It does not know what a parameter is.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioContext<'a> {
     pub frames: u32,
-    /// Sub-block chunk size in frames.
+    /// Sub-block chunk size in frames. Chunk boundaries are computed from it
+    /// the same way the wrapper's slot schedule does, so chunk `i` and lane row
+    /// `i` cover the same samples.
     pub quantum: u32,
     pub sample_rate: f64,
     pub lanes: &'a [f64],
@@ -57,7 +77,11 @@ impl AudioContext<'_> {
     }
 }
 
-/// Monophonic note controller values and expression state.
+/// The per-note controllers, flattened to one value each.
+///
+/// Monophonic: the graph has one value per source, and the newest note wins.
+/// Nothing here assumes it will stay that way — the wrapper feeds note events
+/// in, and a per-voice engine would feed the same events into more of these.
 #[derive(Debug, Clone, Copy)]
 struct Expressions {
     /// Indexed by `NoteExpression as usize`.
@@ -70,6 +94,8 @@ struct Expressions {
 impl Default for Expressions {
     fn default() -> Self {
         Expressions {
+            // Centres, not zeros: pan and tuning are signed, and a graph
+            // reading Pan before any note has arrived should read "middle".
             values: [1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
             velocity: 0.0,
             key: 0.5,
@@ -97,9 +123,11 @@ pub struct Engine {
     phases: Vec<f64>,
     /// Sample-and-hold values, per state index.
     holds: Vec<f64>,
-    /// Scratch buffer for preserving LFO phases across program swaps.
+    /// Scratch for carrying phases across a program swap. Sized once so the
+    /// swap itself allocates nothing.
     carry: Vec<(u32, f64, f64)>,
-    /// Node IDs associated with active LFO phases.
+    /// Which node each phase belongs to, mirrored from the program so the swap
+    /// can match old state to new without touching the old program again.
     phase_nodes: Vec<u32>,
     /// Parameter delay line ring buffers, indexed by line ID.
     /// Uses `Vec<Vec<f64>>` to allow lock-free outer pointer swapping during program
