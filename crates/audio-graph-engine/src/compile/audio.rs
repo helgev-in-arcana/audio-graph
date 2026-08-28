@@ -1,11 +1,8 @@
-//! The audio half of compilation (§14.6, §14.7, §14.9).
+//! Audio pipeline compilation pass.
 //!
-//! Separate from the param half because the two run at different rates and
-//! share nothing but the topological order they were both derived from. This
-//! pass does three things the param half never has to: it hands out buffers
-//! rather than registers (a buffer is expensive enough to be worth reusing), it
-//! lines up paths of unequal latency, and it decides how often the whole thing
-//! runs.
+//! Compiles audio-rate graph nodes into topological [`AudioOp`] operations,
+//! manages audio buffer pool allocation and reuse, inserts delay compensation
+//! for paths of unequal latency, and sets audio evaluation chunking granularity.
 
 use crate::graph::{Graph, NodeId};
 use crate::ir::{AudioOp, Chunking};
@@ -13,14 +10,12 @@ use subhost_adapter::InstanceIo;
 
 use crate::compile::{AudioCx, CompileError, Line};
 
-/// The audio half of a `Program`.
+/// Compiled audio operations and pipeline metadata.
 pub(crate) struct Audio {
     pub ops: Vec<AudioOp>,
-    /// Audio line index → its `DelayWrite` node, so a program swap can carry
-    /// the ring contents over (§14.5).
+    /// Audio line index -> associated `DelayWrite` node ID for preserving ring buffer state across updates.
     pub delay_nodes: Vec<NodeId>,
-    /// Audio line index → the longest any read on it asks for, in seconds.
-    /// What the main thread sizes the ring from.
+    /// Audio line index -> maximum delay duration in seconds.
     pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
     pub chunking: Chunking,
@@ -28,12 +23,7 @@ pub(crate) struct Audio {
     pub instances: Vec<InstanceIo>,
 }
 
-/// Walk the order a second time and emit the audio half.
-///
-/// The same order as the param half, and for the same reason: a node may only
-/// read what is already in a buffer. What differs is what a node is handed —
-/// see [`AudioCx`], which owns the buffer pool, the latency bookkeeping and the
-/// audio line numbering.
+/// Compiles audio nodes in topological order into an [`Audio`] program.
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
@@ -152,8 +142,7 @@ mod tests {
         assert_eq!(order, vec![0, 1]);
     }
 
-    /// §14.7. Nothing reads the first plugin's output once the second has run,
-    /// so the third one may have it back.
+    /// Verifies that audio buffers are reused once intermediate nodes finish reading them.
     #[test]
     fn a_buffer_comes_back_once_nothing_reads_it() {
         let mut graph = Graph::new();
@@ -198,14 +187,7 @@ mod tests {
         }
     }
 
-    /// A plugin's second output bus is its own signal, not a second name for
-    /// the first (§14.2).
-    ///
-    /// Surge XT is the plugin that made this real: it declares `Output`,
-    /// `Scene A` and `Scene B`, and until the buses were routed all three
-    /// sockets rendered the main output. What the program has to show is a
-    /// plugin handed one packed output region and a `Split` per bus somebody
-    /// reads.
+    /// Verifies multi-bus plugin outputs are split correctly from the packed output region.
     #[test]
     fn each_output_bus_is_split_out_of_the_plugins_output_region() {
         let mut graph = Graph::new();
@@ -216,7 +198,7 @@ mod tests {
                 instance: 0,
                 ports: PluginPorts {
                     audio_in: vec![2],
-                    // Three buses, as Surge XT has.
+                    // Three buses.
                     audio_out: vec![2, 2, 2],
                     audio_out_shown: Vec::new(),
                     ..PluginPorts::default()
@@ -229,8 +211,7 @@ mod tests {
 
         let program = compile(&graph, SLOTS).expect("the second bus is routable");
 
-        // Two buses are handed over, not three: nothing reads `Scene B`, so
-        // the plugin is never asked to produce it.
+        // Two buses are handed over: nothing reads the third bus.
         let buses = program.audio_ops.iter().find_map(|op| match op {
             AudioOp::Plugin { output_buses, .. } => Some(output_buses.clone()),
             _ => None,
@@ -242,8 +223,7 @@ mod tests {
         );
         assert_eq!(program.instances[0].aux_outputs, vec![2]);
 
-        // And the bus that is read is copied out of the region at its own
-        // offset — channel 2, not channel 0.
+        // And the bus that is read is copied out of the region at channel offset 2.
         let split = program
             .audio_ops
             .iter()
@@ -268,7 +248,7 @@ mod tests {
                 ports: PluginPorts {
                     audio_in: vec![2],
                     audio_out: vec![2, 2, 2],
-                    // One socket, and it is `Scene B`.
+                    // One socket, pointed at the third bus.
                     audio_out_shown: vec![2],
                     ..PluginPorts::default()
                 },
@@ -298,7 +278,7 @@ mod tests {
         assert_eq!(split, (4, 2), "the third bus starts at channel 4");
     }
 
-    /// The one-bus case — every patch until now — must not have grown a copy.
+    /// A single output bus writes directly into the next node without an extra split.
     #[test]
     fn one_output_bus_still_writes_straight_into_the_next_node() {
         let mut graph = Graph::new();
@@ -319,8 +299,7 @@ mod tests {
         );
     }
 
-    /// A link from a socket the node does not have. `connect` cannot make one,
-    /// so this is a hand-edited or future-versioned patch.
+    /// A link from a socket the node does not have is rejected.
     #[test]
     fn a_link_from_an_output_bus_the_plugin_does_not_have_is_refused() {
         let mut graph = Graph::new();
@@ -342,8 +321,7 @@ mod tests {
         );
     }
 
-    /// §14.6. One branch goes through a plugin with latency, the other does
-    /// not; the short branch has to wait or the two phase-cancel at the mix.
+    /// Verifies latency compensation delay is inserted for parallel paths with unequal latency.
     #[test]
     fn parallel_paths_of_unequal_latency_are_lined_up() {
         let mut graph = Graph::new();
@@ -353,7 +331,6 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
-                // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
             }),
             [0.0, 0.0],
@@ -388,7 +365,6 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
-                // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
             }),
             [0.0, 0.0],
@@ -410,7 +386,7 @@ mod tests {
         assert_eq!(program.latency, 64);
     }
 
-    /// §14.9. A graph with no audio loop is not made to pay for one.
+    /// Verifies that only audio feedback loops require sub-block chunking.
     #[test]
     fn only_an_audio_loop_forces_the_fine_grain() {
         let mut graph = Graph::new();
@@ -445,7 +421,6 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
-                // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
             }),
             [0.0, 0.0],
@@ -523,8 +498,7 @@ mod tests {
             .collect()
     }
 
-    /// §14.14. An analyser is fed audio and its output goes nowhere, which is
-    /// exactly the shape the compiler otherwise deletes.
+    /// An analyzer receives audio inputs even when its outputs are unconnected if marked always_on.
     #[test]
     fn an_always_on_plugin_still_gets_its_input() {
         let mut graph = Graph::new();
@@ -555,7 +529,7 @@ mod tests {
         );
     }
 
-    /// §14.10, the DoD: notes reach the instrument the graph points at.
+    /// Verifies notes from NoteIn are routed to the connected instrument.
     #[test]
     fn a_wired_instrument_hears_the_daw() {
         let mut graph = Graph::new();
@@ -573,9 +547,7 @@ mod tests {
         );
     }
 
-    /// The bug M8.3 exists to fix: before this, every instance was handed every
-    /// event the DAW sent, so a second synth played along whatever the graph
-    /// said. An unwired notes port has to mean silence.
+    /// Verifies that an unwired instrument receives no note events.
     #[test]
     fn an_unwired_instrument_hears_nothing() {
         let mut graph = Graph::new();
@@ -586,7 +558,6 @@ mod tests {
             NodeKind::Mix(Mix {
                 channels: 2,
                 inputs: 2,
-                // Empty is unity: what a mix did before it had gains.
                 gains: Vec::new(),
             }),
             [0.0, 0.0],
@@ -609,9 +580,7 @@ mod tests {
         );
     }
 
-    /// A gate on the way does not change *where* the notes come from — it
-    /// adds a lane the audio half reads each chunk to decide whether they get
-    /// through (§14.10).
+    /// A gate on the note path adds an audio control lane that the audio engine evaluates per chunk.
     #[test]
     fn a_note_gate_leaves_the_source_and_adds_a_lane() {
         let mut graph = Graph::new();
@@ -645,7 +614,7 @@ mod tests {
             program.outputs.iter().any(|&(l, _)| l == lane),
             "the parameter half drives the lane it booked"
         );
-        // Shut, the stream keeps its releases so nothing hangs.
+        // When shut, the stream keeps note-offs/releases so notes do not hang.
         assert_eq!(
             route.resolve(Some(0.0)),
             NoteStream::from_source(NoteSource::DawReleases { bus: 0 })
@@ -656,8 +625,7 @@ mod tests {
         );
     }
 
-    /// Two gates in series pass notes only when both are open, and they say so
-    /// in one lane: the nearer gate folds the further one into its condition.
+    /// Two gates in series pass notes only when both are open, combined into one control lane.
     #[test]
     fn gates_in_series_become_one_lane() {
         let mut graph = Graph::new();
@@ -696,9 +664,7 @@ mod tests {
         );
     }
 
-    /// A selecting key switch has one output per destination, all carrying
-    /// one stream, and each gated by a lane of its own: whichever way the
-    /// switch stands, one synth hears the notes and the other does not.
+    /// A selecting key switch has one output per destination, each gated by a distinct lane.
     #[test]
     fn a_selecting_key_switch_gates_each_output_of_its_own() {
         let mut graph = Graph::new();
@@ -748,12 +714,11 @@ mod tests {
         assert_eq!(
             (a.mute, b.mute),
             (expected, expected),
-            "the switching keys are steering, not sounding, so neither synth hears them"
+            "switching keys are filtered from the sounding note stream"
         );
     }
 
-    /// Clearing `mute_keys` puts the switching keys back into the stream, for
-    /// the patch where the key that selects a layer is also meant to play it.
+    /// Clearing `mute_keys` retains the switching keys in the note stream.
     #[test]
     fn an_unmuted_key_switch_passes_its_own_keys() {
         let mut graph = Graph::new();
@@ -810,8 +775,7 @@ mod tests {
         );
     }
 
-    /// A plugin that does not take notes has no notes port, and nothing may be
-    /// wired to it — so it stays `None` whatever the user does.
+    /// A plugin that does not accept notes has no notes port and receives a default note route.
     #[test]
     fn a_plugin_that_takes_no_notes_is_never_given_any() {
         let mut graph = Graph::new();
@@ -825,8 +789,7 @@ mod tests {
         assert_eq!(note_sources(&program), vec![(0, NoteRoute::default())]);
     }
 
-    /// Instrument -> effect -> effect: the DoD's chain. Only the instrument
-    /// hears the notes, and the effects run after it in order.
+    /// Verifies note routing through an instrument followed by series effects.
     #[test]
     fn an_instrument_into_two_effects_routes_notes_only_to_the_instrument() {
         let mut graph = Graph::new();
@@ -852,10 +815,7 @@ mod tests {
         );
     }
 
-    /// A plugin with a sidechain socket nobody wired is activated with one bus.
-    ///
-    /// Not "activated with a silent sidechain": a compressor whose sidechain is
-    /// switched on and fed nothing ducks to silence (§14.11).
+    /// Verifies that an unwired sidechain bus is not activated.
     #[test]
     fn an_unwired_sidechain_is_not_switched_on() {
         let mut graph = Graph::new();

@@ -1,25 +1,19 @@
-//! The node graph: what turns a wrapper into an instrument of its own.
+//! Audio graph engine crate for evaluating node graphs.
 //!
-//! ARCHITECTURE.md §4. Constants, LFOs and note expressions are combined into
-//! values that drive the wrapper's slots, and the slots drive the sub-plugin's
-//! parameters. Nothing here knows what a VST3 is or what a slot is bound to —
-//! it reads numbers and writes numbers, and the outer layers decide what those
-//! numbers mean.
+//! Modulation sources (constants, LFOs, note expressions) and audio routing
+//! nodes are evaluated to drive parameters and process multi-channel audio
+//! streams. The engine operates on numeric signals and buffer indices without
+//! direct coupling to plugin formats or external host parameter mappings.
 //!
-//! It does know that a plugin node has something behind it, but only through
-//! `subhost-adapter`'s [`AudioInstances`][subhost_adapter::AudioInstances]: an instance
-//! number, a note stream's *name*, and two flat slices. Which way that
-//! dependency points matters — `subhost-adapter` is the general crate and this
-//! one is AudioGraph's, so this one does the depending.
+//! Plugin nodes interact through [`AudioInstances`][subhost_adapter::AudioInstances],
+//! passing instance IDs, note stream names, and audio slices.
 //!
-//! The crate is split along the one line that matters, the thread boundary:
+//! The crate architecture is organized across the UI/audio thread boundary:
 //!
-//! - [`Graph`] is the edit side. Freely mutable, serialisable, allowed to be
-//!   nonsense in the middle of an edit.
-//! - [`compile`] turns a graph into a [`Program`] — flat, ordered, checked.
-//! - [`Handoff`] carries the program down to the audio thread and the old one
-//!   back up, without a lock in either direction.
-//! - [`Engine`] runs it, allocating nothing and freeing nothing.
+//! - [`Graph`]: Mutable, serializable graph representation for editing.
+//! - [`compile`]: Compiles and validates a graph into a flattened execution [`Program`].
+//! - [`Handoff`]: Lock-free message passing mechanism between threads.
+//! - [`Engine`]: Audio-thread execution engine that runs compiled programs without allocations.
 
 mod compile;
 mod engine;

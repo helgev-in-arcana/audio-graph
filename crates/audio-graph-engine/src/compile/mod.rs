@@ -1,14 +1,8 @@
-//! Edit graph → `Program`. Runs on the UI thread, as often as the user edits.
+//! Graph compilation: transforms an editable [`Graph`] into an executable [`Program`].
 //!
-//! Three jobs, in order: find the nodes that actually matter, put them in an
-//! order where every node comes after the ones it reads, and hand out
-//! registers. Everything the audio thread would otherwise have to work out —
-//! which input is connected, whether a value needs clamping, what a tempo-sync
-//! rate means in cycles per beat — is settled here.
-//!
-//! Failures are values, not panics. A cycle or a missing input is an ordinary
-//! state for a graph someone is halfway through drawing; the editor shows the
-//! message and keeps running the last program that compiled.
+//! Compilation performs cycle detection, topological sorting, register allocation,
+//! parameter operation emission, and audio pipeline assembly.
+//! Validation errors are returned as [`CompileError`] values.
 
 mod audio;
 mod cx;
@@ -21,25 +15,19 @@ use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
-    /// A link chain that comes back to where it started.
+    /// A cycle was detected in the graph connections.
     Cycle { node: NodeId },
-    /// More registers or LFOs than the audio thread has room for.
+    /// Exceeded preallocated resource limits (e.g. registers, LFOs, delay lines).
     TooLarge { what: &'static str, limit: usize },
-    /// A slot index outside the wrapper's table.
+    /// A slot index is outside the configured slot table range.
     BadSlot { node: NodeId, slot: usize },
-    /// A link whose ends carry different things (§14.3). `connect` and `prune`
-    /// both refuse to make one, so reaching here means a hand-edited or
-    /// future-versioned patch.
+    /// A connection links two ports of incompatible types.
     TypeMismatch { node: NodeId, port: u8 },
-    /// Two writers on one delay line. Which one wins would otherwise depend
-    /// on node creation order.
+    /// Multiple writer nodes declared for the same delay line.
     DuplicateDelayWrite { line: LineId },
-    /// A delay line whose two halves disagree about what they carry.
+    /// Read and write nodes on the same delay line declare different port types.
     DelayTypeMismatch { line: LineId },
-    /// A node kind the compiler does not emit code for yet. M8.1 settles the
-    /// graph's shape. Audio and note routing landed in M8.2 and M8.3; what is
-    /// left behind this is note delay lines (§14.10) and a plugin's own note
-    /// output.
+    /// A node kind or routing feature is not implemented.
     NotYet { what: &'static str },
 }
 
@@ -85,19 +73,15 @@ impl std::fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-/// Compile `graph` for a wrapper with `slot_count` slots.
+/// Compiles a [`Graph`] into an execution [`Program`] for a host with `slot_count` automation slots.
 pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError> {
-    // Only what feeds an output matters. A node the user has dropped on the
-    // canvas but not wired up yet must cost the audio thread nothing.
     check_links(graph)?;
 
     let mut order: Vec<NodeId> = Vec::new();
     let mut mark = vec![Mark::New; graph.nodes.len()];
     let index: Vec<NodeId> = graph.nodes.iter().map(|n| n.id).collect();
 
-    // Every sink is a root. `DelayWrite` is one even though nothing reads it —
-    // that is exactly what makes it a graph cut rather than an edge (§14.4).
-    // So is anything the user has marked always-on (§14.14).
+    // Sinks and always-on nodes serve as the roots for topological reachability traversal.
     let sinks: Vec<NodeId> = graph
         .nodes
         .iter()
@@ -105,16 +89,13 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         .map(|n| n.id)
         .collect();
 
-    // Delay lines, numbered in the order their writers appear. Done before the
-    // walk so that a `DelayRead` compiled early already knows its line index.
+    // Collect delay line declarations prior to traversal.
     let lines = collect_lines(graph)?;
 
     for &root in &sinks {
         visit(graph, &index, root, &mut mark, &mut order)?;
     }
 
-    // The registers, the op list and the lane books all live in the context
-    // now; each node reaches for what it needs through it (see `cx.rs`).
     let mut cx = ParamCx::new(graph, &lines, slot_count);
     for &id in &order {
         let node = graph.node(id).expect("ordering only contains real nodes");
@@ -139,8 +120,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         audio_delay_nodes: audio.delay_nodes,
         audio_ring_seconds: audio.ring_seconds,
-        // Filled in on the main thread, which is the only side that knows the
-        // sample rate and the only side allowed to allocate (§9.1).
+        // Sized and allocated on the main thread via Program::size_rings.
         audio_ring_len: Vec::new(),
         audio_rings: Vec::new(),
         lfo_nodes: param.lfo_nodes,
@@ -148,18 +128,16 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     })
 }
 
-/// One delay line, as the compiler sees it.
+/// Compilation metadata for a delay line.
 pub(crate) struct Line {
     pub id: LineId,
-    /// The `DelayWrite` node, which is what the line's ring state is keyed to
-    /// across a program swap (§14.5).
+    /// The `DelayWrite` node ID associated with this line for state tracking.
     pub writer: NodeId,
-    /// What the line carries. An audio line with a writer closes an audio loop,
-    /// which is what forces the fine evaluation grain (§14.9).
+    /// Data type carried by the delay line.
     pub ty: PortType,
 }
 
-/// Ask every node what delay lines it is an end of, and number them.
+/// Collects delay line declarations across all nodes in the graph.
 fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
     let mut cx = DeclareCx::new();
     for node in &graph.nodes {
@@ -169,17 +147,10 @@ fn collect_lines(graph: &Graph) -> Result<Vec<Line>, CompileError> {
     Ok(cx.finish())
 }
 
-/// Stands in for "this line has no writer yet". Node ids are never reused, and
-/// `Graph::next_id` cannot reach `u32::MAX` without exhausting the counter
-/// first, so no real node can collide with it.
+/// Sentinel node ID indicating a delay line currently has no writer node.
 pub(crate) const NO_WRITER: NodeId = NodeId::MAX;
 
-/// Every link's two ends must carry the same thing (§14.3).
-///
-/// `Graph::connect` and `Graph::prune` both refuse to make a mismatched link,
-/// so this only ever fires on a patch that was edited by hand or written by a
-/// later version. Checking anyway is cheap, and the alternative is the
-/// compiler reading a register that holds the wrong kind of value.
+/// Validates that all links in the graph connect ports of compatible types.
 fn check_links(graph: &Graph) -> Result<(), CompileError> {
     for link in &graph.links {
         if !graph.can_connect(link.from, link.from_port, link.to, link.to_port) {
@@ -195,13 +166,12 @@ fn check_links(graph: &Graph) -> Result<(), CompileError> {
 #[derive(Clone, Copy, PartialEq)]
 enum Mark {
     New,
-    /// On the current path — seeing this again is a cycle.
+    /// On the current search path (cycle detected if revisited).
     Open,
     Done,
 }
 
-/// Depth-first post-order, which is exactly a topological sort when it
-/// finishes: a node is appended only once everything it reads is already in.
+/// Depth-first post-order traversal for topological sorting and cycle detection.
 fn visit(
     graph: &Graph,
     index: &[NodeId],
@@ -210,8 +180,6 @@ fn visit(
     order: &mut Vec<NodeId>,
 ) -> Result<(), CompileError> {
     let Some(pos) = index.iter().position(|&n| n == id) else {
-        // A link to a node that no longer exists. `Graph::prune` normally
-        // clears these; ignoring one is better than refusing to compile.
         return Ok(());
     };
     match mark[pos] {
@@ -244,12 +212,7 @@ mod tests {
 
     const SLOTS: usize = 32;
 
-    /// Somewhere for a parameter chain to go.
-    ///
-    /// A graph whose values reach nothing is pruned, so every test that wants
-    /// to see an op emitted needs a sink. `SlotOut` used to be it; §14.12's
-    /// parameter socket is, now — and unlike a slot it does not fight the DAW
-    /// for the lane.
+    /// Helper that creates a parameter destination socket for testing output compilation.
     fn param_sink(graph: &mut Graph) -> NodeId {
         graph.add(
             NodeKind::Plugin(Plugin {
@@ -301,8 +264,7 @@ mod tests {
         assert!(program.lfo_nodes.is_empty());
     }
 
-    /// §14.14. An analyser produces nothing anyone reads, so the rule above
-    /// would delete it — the toggle is how the user says otherwise.
+    /// An analyzer or visualizer node produces nothing downstream, but compiles when always_on is true.
     #[test]
     fn an_always_on_node_is_compiled_with_nothing_downstream() {
         let mut graph = Graph::new();
@@ -327,7 +289,7 @@ mod tests {
         assert_eq!(program.lfo_nodes.len(), 1, "and it keeps its phase");
     }
 
-    /// Whatever it reads has to be compiled too, or it runs on nothing.
+    /// Whatever an always-on node reads has to be compiled too.
     #[test]
     fn an_always_on_node_pulls_its_inputs_in_with_it() {
         let mut graph = Graph::new();
@@ -442,10 +404,7 @@ mod tests {
         ));
     }
 
-    /// §14.4: the point of splitting a delay into two halves is that the
-    /// existing cycle check needs no exception for it. This is the same graph
-    /// as `a_cycle_is_reported_rather_than_hung_on`, with the loop closed
-    /// through a delay line instead of directly.
+    /// Verifies that feedback closed through delay lines is permitted and not classified as an illegal cycle.
     #[test]
     fn a_loop_closed_through_a_delay_is_not_a_cycle() {
         let mut graph = Graph::new();
@@ -569,9 +528,7 @@ mod tests {
         ));
     }
 
-    /// `connect` refuses to make one, so this can only arrive from a file. It
-    /// still has to be caught: the compiler would otherwise read a register
-    /// holding the wrong kind of value.
+    /// Verifies that connections between mismatched port types are rejected at compile time.
     #[test]
     fn a_hand_written_link_between_two_types_is_refused() {
         let mut graph = Graph::new();
@@ -627,8 +584,7 @@ mod tests {
         }
     }
 
-    /// The register an op writes, if it writes one. `DelayWrite` does not:
-    /// that is what keeps it off the topological sort (§14.4).
+    /// Returns the register an op writes, if any.
     fn writes(op: &Op) -> Option<Reg> {
         match *op {
             Op::Const { out, .. }
@@ -642,8 +598,6 @@ mod tests {
             | Op::Latch { out, .. }
             | Op::LatchIs { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
-            // These write a latch rather than a register, which keeps them off
-            // the topological sort the same way a delay write is.
             Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,
         }
     }

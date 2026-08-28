@@ -7,9 +7,8 @@ use crate::nodes::Node;
 use crate::nodes::widgets::NodeUi;
 use crate::port::Port;
 
-/// Rescale one range onto another. The 0..1 → plain-units half of §9.3 is
-/// the slot table's job (`ResolvedTarget::to_plain`); this is the shaping
-/// that happens before it.
+/// Maps a parameter from an input range `[in_lo, in_hi]` to an output range `[out_lo, out_hi]`.
+/// Optionally clamps the result to the output range.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RangeMap {
     pub in_lo: f64,

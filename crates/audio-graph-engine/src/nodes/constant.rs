@@ -7,7 +7,7 @@ use crate::nodes::Node;
 use crate::nodes::widgets::NodeUi;
 use crate::port::Port;
 
-/// A fixed number.
+/// A constant scalar parameter value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Constant {
     pub value: f64,

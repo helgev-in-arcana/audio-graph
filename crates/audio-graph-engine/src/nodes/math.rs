@@ -8,8 +8,9 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, combo, fallback};
 use crate::port::Port;
 
-/// Two inputs and an operator. Input 1 falls back to `b` when unconnected,
-/// so a "multiply by 0.5" node needs no second node feeding it.
+/// Performs a mathematical operation on two parameter inputs.
+///
+/// If the second input port `b` is unconnected, it falls back to the configured constant `b`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Math {
     pub op: MathOp,
@@ -51,9 +52,7 @@ impl Node for Math {
         combo(ui, "op", &mut self.op, &MathOp::ALL, MathOp::label)
     }
 
-    /// `b` sits on the row of the socket it stands in for, and greys out when
-    /// that socket is fed — which is the whole of what the line of prose under
-    /// this node used to say.
+    /// Input control for the fallback value `b` when port 1 is unconnected.
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,

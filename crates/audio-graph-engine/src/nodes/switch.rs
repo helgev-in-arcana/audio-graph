@@ -7,50 +7,25 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, fallback};
 use crate::port::Port;
 
-/// How many values one switch may choose between. A `Mix`'s ceiling, for a
-/// `Mix`'s reason.
+/// Maximum number of selectable values supported by the Switch node.
 #[cfg(feature = "ui")]
 const MAX_VALUES: usize = 8;
 
-/// One of several values, chosen by where a control sits against a ladder of
-/// thresholds.
+/// Selects among multiple input values or signals based on threshold rungs.
 ///
-/// The parameter half's answer to a switch. `Math` can express a crossfade and
-/// `RangeMap` a curve, but neither can say "this value below, that value
-/// above" without a chain of three nodes that reads as arithmetic rather than
-/// as a decision — and a decision is what the user is making.
-///
-/// Every value has a socket of its own, so a switch can pick between *signals*
-/// as easily as between numbers; the number on the row is what is used while
-/// that socket is empty, the same rule `Math`'s `b` follows.
-///
-/// The first value has no threshold. It is what the control reads below every
-/// other one, so a threshold on it would be a threshold to nothing — and the
-/// node has to have an answer for a control that has not reached anything yet.
-/// Each later value carries the threshold at which it takes over, `>=` rather
-/// than `>` so that a control reaching exactly 1.0 switches.
-///
-/// The thresholds are not sorted or checked. Out of order they still mean
-/// something exact — the last one the control has reached wins — and a switch
-/// being edited passes through half-finished ladders on the way to a finished
-/// one.
+/// Output begins at the base value (`values[0]`) when below all thresholds.
+/// Each subsequent threshold in `thresholds` activates its corresponding value
+/// in `values[1..]` when the control signal meets or exceeds (`>=`) that threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "SwitchWire")]
 pub struct Switch {
-    /// The number each value socket falls back to while it is unwired. Missing
-    /// entries are 0.0.
+    /// Fallback scalar values for unwired value sockets. Defaults to 0.0.
     pub values: Vec<f64>,
-    /// The threshold at which each value *after the first* takes over, so
-    /// `thresholds[i]` belongs to `values[i + 1]`. Missing entries are 0.0.
+    /// Thresholds for activating values after the first (`thresholds[i]` corresponds to `values[i + 1]`).
     pub thresholds: Vec<f64>,
 }
 
-/// What a `Switch` may be read from, old shape or new.
-///
-/// Before it grew a ladder, a switch was two values and one threshold. A patch
-/// saved then still says `off`, `on` and `threshold`, and it means the
-/// two-value ladder that says the same thing — so it is read as one rather
-/// than as a node with no values at all.
+/// Deserialization helper supporting legacy 2-state format (`off`/`on`/`threshold`) and multi-value ladders.
 #[derive(Deserialize)]
 struct SwitchWire {
     #[serde(default)]
@@ -75,8 +50,7 @@ impl From<SwitchWire> for Switch {
                 values: vec![off, on],
                 thresholds: vec![wire.threshold.unwrap_or(0.5)],
             },
-            // Neither shape. A node with one value and nothing to switch to is
-            // what an empty file deserves, and the editor's `+` is right there.
+            // Fallback for unrecognized payload: single 0.0 value with no thresholds.
             _ => Switch {
                 values: vec![0.0],
                 thresholds: Vec::new(),
@@ -95,8 +69,7 @@ impl Switch {
         self.values.get(index).copied().unwrap_or(0.0)
     }
 
-    /// The threshold at which `values[index]` takes over. The first value has
-    /// none — it is what is read until something else has been reached.
+    /// Threshold for `values[index]`. Returns 0.0 for index 0 (which has no threshold).
     fn threshold(&self, index: usize) -> f64 {
         index
             .checked_sub(1)
@@ -114,9 +87,7 @@ impl Node for Switch {
         let mut out = vec![Port::param("control")];
         for i in 0..self.values.len() {
             let port = Port::param(format!("{}", i + 1));
-            // The first value is not offered a remove button: it is the one
-            // with no threshold, and a switch that had lost it would have
-            // nothing to read below its own ladder.
+            // First value cannot be removed as it represents the baseline output.
             #[cfg(feature = "ui")]
             let port = if i > 0 { port.removable() } else { port };
             out.push(port);
@@ -140,8 +111,7 @@ impl Node for Switch {
             return Ok(());
         }
 
-        // The first value, in a register so the ladder has something to build
-        // on. It is what the output is when the control has reached nothing.
+        // Initialize base register with the first value.
         let mut chosen = match operand(cx, 0) {
             Operand::Reg(reg) => reg,
             Operand::Value(value) => {
@@ -150,10 +120,7 @@ impl Node for Switch {
                 out
             }
         };
-        // One `Select` per rung, each overriding the last where the control
-        // has reached it. Written this way round — later rungs on the outside
-        // — the last threshold the control has passed is the one that wins,
-        // which is what a ladder reads as.
+        // Evaluate ladder rungs sequentially, overriding output as thresholds are met.
         for index in 1..self.values.len() {
             let next = cx.alloc()?;
             cx.emit(Op::Select {
@@ -169,8 +136,7 @@ impl Node for Switch {
         Ok(())
     }
 
-    /// The value each socket stands in for, and the threshold that picks it,
-    /// on the row of the socket they belong to.
+    /// Renders threshold and fallback value controls for a value socket row.
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,
@@ -187,9 +153,7 @@ impl Node for Switch {
         }
         self.thresholds.resize(self.values.len().max(1) - 1, 0.0);
         let mut changed = false;
-        // The row runs right to left, so the first thing added is the
-        // right-hand one: threshold, then value, reading back as
-        // "socket, value, threshold".
+        // Draw threshold input for rungs after the base value.
         if let Some(rung) = index.checked_sub(1) {
             changed |= ui
                 .add(egui::DragValue::new(&mut self.thresholds[rung]).speed(0.01))
@@ -211,8 +175,7 @@ impl Node for Switch {
     #[cfg(feature = "ui")]
     fn add_input(&mut self) {
         self.values.push(0.0);
-        // A rung above the last, so a second press gives a ladder rather than
-        // two rungs at the same height that can never both be reached.
+        // Set next threshold 0.5 above the previous rung.
         let next = self.thresholds.last().map_or(0.5, |t| t + 0.5);
         self.thresholds.push(next);
     }
@@ -249,9 +212,7 @@ impl Switch {
 mod tests {
     use super::*;
 
-    /// A patch saved when a switch was two values and one threshold still
-    /// means what it meant. Reading it as a node with no values would empty
-    /// the socket its links point at.
+    // Verify backward compatibility with legacy 2-state format.
     #[test]
     fn the_old_two_value_shape_reads_as_a_two_rung_ladder() {
         let old = r#"{"threshold": 0.6, "off": 0.2, "on": 0.9}"#;
@@ -260,8 +221,7 @@ mod tests {
         assert_eq!(switch.thresholds, vec![0.6]);
     }
 
-    /// And the ports are where the links expect them: control, then a socket
-    /// per value.
+    // Verify port ordering matches expected layout (control followed by value ports).
     #[test]
     fn the_old_shape_keeps_its_socket_order() {
         let old = r#"{"threshold": 0.5, "off": 0.0, "on": 1.0}"#;
