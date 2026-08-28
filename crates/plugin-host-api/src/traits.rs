@@ -1,8 +1,15 @@
 //! Core traits for plugin hosting backends.
 //!
-//! Separates main-thread lifecycle and parameter management ([`SubPluginMain`])
-//! from real-time audio processing ([`SubPluginProcessor`]). Calling `activate`
-//! transitions the plugin into the processing state and yields the audio processor.
+//! Two rules drive the shape here:
+//!
+//! * Nothing that cannot cross a process boundary appears in a signature, so an
+//!   out-of-process backend is a drop-in replacement rather than a rewrite.
+//!   That is why there are no single-shot getters and no `Arc`s.
+//! * Main-thread and audio-thread surfaces are *different traits*
+//!   ([`SubPluginMain`] and [`SubPluginProcessor`]), so calling `process` on an
+//!   inactive plugin is a compile error rather than a rule in a document.
+//!   `activate` hands out the processor by value; you cannot hold one without
+//!   having activated.
 
 use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
@@ -22,6 +29,11 @@ pub enum ProcessStatus {
 
 /// Services the host offers a backend.
 ///
+/// `vst3-host` never builds an `IHostApplication` of its own — it is injected
+/// through this trait. That keeps "forwarded from the DAW" out of the core's
+/// vocabulary entirely, so a standalone scanner and the nested wrapper are
+/// expressed by the same types.
+///
 /// All methods are called on the main thread.
 pub trait HostContext: Send + Sync {
     /// Shown to the plugin; some plugins branch on it.
@@ -31,13 +43,17 @@ pub trait HostContext: Send + Sync {
     /// I/O changed). The host decides when to honour it.
     fn request_restart(&self, reason: RestartReason);
 
-    /// The plugin's reported latency changed.
+    /// The plugin's reported latency changed. `subhost-adapter` combines this
+    /// with the wrapper's own latency and reports the sum to the DAW.
     fn latency_changed(&self, samples: u32) {
         let _ = samples;
         self.request_restart(RestartReason::Latency);
     }
 
     /// The sub-plugin edited a parameter from its own GUI.
+    ///
+    /// Swallowed today: the wrapper is the sole authority for values, so there
+    /// is nothing to forward to the DAW. It is still logged.
     fn param_edited(&self, id: ParamId, plain: f64) {
         let _ = (id, plain);
     }
@@ -62,23 +78,36 @@ pub enum RestartReason {
 /// Deliberately not `Send`: both VST3 and CLAP pin these calls to the thread
 /// that created the instance.
 pub trait SubPluginMain {
-    /// Full parameter list.
+    /// Full parameter list. Batched by construction — there is no `param(id)`
+    /// accessor anywhere in this API.
     fn params(&self) -> &[ParamInfo];
 
     fn capabilities(&self) -> Capabilities;
 
     /// How many voices an instrument has, if the format has a way to ask.
+    ///
+    /// Defaulted to `None` rather than made mandatory: CLAP's `voice-info` has
+    /// no VST3 counterpart, and a backend that invented a number would be
+    /// making one up. Nothing in the engine branches on it — it is reported,
+    /// the way `params` is.
     fn voice_info(&self) -> Option<VoiceInfo> {
         None
     }
 
     /// The plugin's audio buses and note input/output layout.
+    ///
+    /// Read after loading and used to build the node's sockets. Batched for the
+    /// same reason as `params`: one round trip, so an out-of-process backend is
+    /// not a per-bus conversation.
     fn io_layout(&self) -> IoLayout;
 
     /// Current values of every parameter, in one round trip.
     fn snapshot(&self) -> ParamSnapshot;
 
     /// Format the value the way the plugin itself would.
+    ///
+    /// Delegated rather than formatted locally: units and enum labels are the
+    /// plugin's business, not ours.
     fn param_to_text(&self, id: ParamId, plain: f64) -> Option<String>;
 
     fn param_from_text(&self, id: ParamId, text: &str) -> Option<f64>;

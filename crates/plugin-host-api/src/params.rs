@@ -1,6 +1,13 @@
-//! Parameter model representing raw plain values with explicit ranges.
+//! Parameter model — plain values with an explicit range.
+//!
+//! Normalising to 0..1 in the core would bake VST3's poverty in: CLAP's stepped
+//! and enum semantics do not survive the round trip. Backends normalise on the
+//! way out instead.
 
 /// Format-crossing stable parameter identity.
+///
+/// VST3 `ParamID` and CLAP `clap_id` are both 32-bit, so one opaque newtype
+/// covers both without either format leaking into the core vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParamId(pub u32);
 
@@ -19,7 +26,7 @@ bitflags_lite! {
         const BYPASS      = 1 << 4;
         /// The host may automate it.
         const AUTOMATABLE = 1 << 5;
-        /// The host may apply non-destructive modulation.
+        /// The host may apply non-destructive modulation (CLAP `PARAM_MOD`).
         const MODULATABLE = 1 << 6;
         /// Modulation may differ per voice.
         const POLY_MODULATABLE = 1 << 7;
@@ -31,7 +38,7 @@ bitflags_lite! {
 pub struct ParamInfo {
     pub id: ParamId,
     pub name: String,
-    /// Hierarchical path (slash-separated module/unit path).
+    /// Hierarchical path: CLAP's `module`, VST3's unit chain. `/`-separated.
     pub module: String,
     pub min: f64,
     pub max: f64,
@@ -69,7 +76,9 @@ pub struct ParamValue {
 
 /// Snapshot containing parameter values for an entire plugin instance.
 ///
-/// Parameter reads are batched to avoid chatty inter-thread or inter-process communication.
+/// The API deliberately has no `get_param(id)`. Reads are batched so the
+/// boundary cannot be made chatty, which is what keeps an out-of-process
+/// backend viable.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParamSnapshot {
     pub values: Vec<ParamValue>,
@@ -82,9 +91,13 @@ impl ParamSnapshot {
 }
 
 /// Capabilities reported by the loaded sub-plugin instance.
+///
+/// The engine queries this *ahead of time* — per-voice sources are greyed out
+/// when `poly_modulation` is false, because that is a format limitation and not
+/// a missing feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
-    /// Non-destructive modulation is supported natively.
+    /// Non-destructive modulation is native (CLAP `PARAM_MOD`).
     pub modulation: bool,
     /// Modulation can be addressed per voice.
     pub poly_modulation: bool,
@@ -93,18 +106,28 @@ pub struct Capabilities {
     pub dynamic_params: bool,
 }
 
-/// Voice polyphony information reported by an instrument plugin.
+/// How many voices an instrument has, when it will say.
+///
+/// CLAP's `voice-info` is the only place this comes from; VST3 has no
+/// equivalent, so a VST3 sub-plugin reports `None` rather than a guess. Read
+/// after loading and again whenever the plugin says it changed: a synth may
+/// change it when its patch's polyphony setting moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VoiceInfo {
     /// Voices the plugin will actually use with its current patch.
     pub count: u32,
     /// The most it could ever use. Never smaller than `count`.
     pub capacity: u32,
-    /// Whether two notes with the same key and channel may overlap.
+    /// Whether two notes with the same key and channel may overlap. A host
+    /// that ends notes by key alone gets this wrong for the plugins that say
+    /// yes, which is why the flag exists at all.
     pub overlapping_notes: bool,
 }
 
-/// Minimal stand-in for the `bitflags` crate without external dependencies.
+/// Minimal stand-in for the `bitflags` crate.
+///
+/// Only a handful of ops are needed and this keeps `plugin-host-api`
+/// dependency-free, which matters because every other crate depends on it.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! bitflags_lite {
@@ -196,13 +219,17 @@ pub struct BusInfo {
     /// The plugin's own name for it: "Main", "Sidechain", "Key".
     pub name: String,
     pub channels: u16,
-    /// Indicates whether this bus is auxiliary (e.g., a sidechain or secondary output) rather than the main audio bus.
+    /// True for everything the format marks auxiliary. A sidechain is aux; the
+    /// bus a plugin actually processes is not.
     pub is_aux: bool,
 }
 
 /// Total audio and event I/O layout reported by a plugin.
 ///
-/// Contains all input and output bus descriptions as well as MIDI/event capabilities.
+/// Discovered rather than declared: what a plugin reports before negotiation is
+/// a wish, and the node's sockets have to match what it will actually accept.
+/// Returned in one call for the same reason as
+/// [`SubPluginMain::params`] — there is no per-bus getter anywhere.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IoLayout {
     pub inputs: Vec<BusInfo>,

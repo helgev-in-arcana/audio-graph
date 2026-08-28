@@ -1,8 +1,16 @@
 //! Format-agnostic plugin hosting API.
 //!
-//! Provides a unified data model and trait definitions for hosting audio plugins
-//! across different plugin formats (such as CLAP and VST3). Public types are
-//! designed to be self-contained and suitable for process boundary isolation.
+//! Provides a unified data model and trait definitions for hosting audio
+//! plugins across different plugin formats (such as CLAP and VST3).
+//!
+//! Two rules shape everything here, and `README.md` in this crate spells out
+//! why:
+//!
+//! * The model is shaped after CLAP, the richer format. VST3 backends
+//!   *degrade* to it; it is never narrowed to the intersection of the two.
+//! * Nothing that cannot cross a process boundary may appear in a public
+//!   signature — no `ComPtr`, no raw pointers, no references or `Arc` in
+//!   payloads, no single-shot getters.
 
 mod buffers;
 mod events;
@@ -19,7 +27,8 @@ pub use traits::{HostContext, ProcessStatus, RestartReason, SubPluginMain, SubPl
 
 /// Errors surfaced across the host API boundary.
 ///
-/// Uses an owned, self-contained representation suitable for IPC boundaries.
+/// Deliberately a flat, owned enum: it must be serializable across an IPC
+/// boundary without dragging backend types along.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
     /// The module (bundle / DLL / .so) could not be loaded.

@@ -1,7 +1,18 @@
 //! `cargo xtask bundle audio-graph-plugin --release`.
 //!
-//! Builds and bundles plugin packages using `nice-plug-xtask`.
-//! Resolves the workspace root deterministically relative to `CARGO_MANIFEST_DIR`.
+//! The bundling itself lives in `nice-plug-xtask`, which is the bundler
+//! nice-plug's own examples use. Sharing it rather than rolling our own is what
+//! keeps the bundle layout and the export macros in agreement: the bundler
+//! decides which formats to emit by reading the exported symbols out of the
+//! built binary, and those symbols come from `nice_export_vst3!`.
+//!
+//! What is *not* shared is finding the workspace root. `nice-plug-xtask`'s own
+//! entry point walks up to the outermost ancestor holding a `Cargo.toml`, which
+//! walks straight out of a git worktree kept inside the repository. The failure
+//! is silent and expensive: it builds and bundles the main checkout while you
+//! are looking at the worktree. This crate always sits directly under its own
+//! workspace root, so that root is the one thing we can name without guessing —
+//! hence resolving it from `CARGO_MANIFEST_DIR` rather than by walking up.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

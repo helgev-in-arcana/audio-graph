@@ -1,11 +1,29 @@
 //! Mechanism for deferring execution to the next turn of the platform message loop.
 //!
-//! GUI toolkit draw callbacks cannot safely perform operations that synchronously
-//! dispatch window messages (such as creating, showing, or destroying windows), as
-//! re-entrant message dispatch during rendering can violate internal assumptions.
+//! A GUI toolkit's draw callback is not a safe place to create, show or destroy
+//! a window. Those calls dispatch messages synchronously, and the message lands
+//! back inside the toolkit while it is still in the middle of the frame that
+//! started the whole thing. egui, through egui-baseview, holds a `RefCell`
+//! borrow across the draw callback and panics outright when that happens:
 //!
-//! [`Deferred`] provides a queue to post closures that will be drained on the next
-//! message loop turn using a platform-specific message mechanism (e.g. a Win32 message-only window).
+//! ```text
+//! pump_events -> egui-baseview renders (inner.borrow_mut() held)
+//!             -> our ui() opens the sub-plugin's window
+//!             -> ShowWindow dispatches a message to the egui window
+//!             -> egui-baseview::on_event -> inner.borrow() -> panic
+//! ```
+//!
+//! The rule that follows is simple and applies to every toolkit, not just this
+//! one: **the draw callback may only record what the user asked for.**
+//! [`Deferred`] is where the recorded work goes. A message-only window takes a
+//! posted message, and by the time its handler runs the frame is over and the
+//! toolkit is no longer inside itself.
+//!
+//! It carries one-shot work only. The periodic tick a sub-plugin's window needs
+//! used to live here as well, on a Win32 timer, which quietly meant no tick at
+//! all on the platforms whose backend is still a stub. It belongs to the plugin
+//! instance now, which reaches the main thread through its host rather than
+//! through a window — see `audio-graph-plugin`'s `tick`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
