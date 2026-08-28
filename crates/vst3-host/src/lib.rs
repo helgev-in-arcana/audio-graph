@@ -1,21 +1,13 @@
-//! A VST3 host backend, in pure Rust (ADR-1).
+//! A VST3 host backend implementation in pure Rust.
 //!
-//! Scope discipline (ARCHITECTURE.md §7): this crate knows how to load and run
-//! a VST3 plugin and nothing about *why*. Anything specific to hosting a plugin
-//! from inside another plugin — forwarding the DAW's transport, combining
-//! latency, nesting state — lives in `subhost-adapter`. The test for whether
-//! code belongs here is whether an offline renderer or a plugin scanner would
-//! still need it.
-//!
-//! Consequently the crate never constructs an `IHostApplication` of its own;
-//! host services are injected through [`plugin_host_api::HostContext`].
+//! This crate handles loading, introspecting, and executing VST3 plugins.
+//! Higher-level concerns such as DAW wrapping, multi-plugin graph orchestration,
+//! and transport adaptation live in higher layers. Host services and policies
+//! are injected through [`plugin_host_api::HostContext`].
 
-// The `vst3` crate's constants are bindgen output, and bindgen picks the
-// integer type from the platform's C++ ABI: `i32` on MSVC, `u32` elsewhere.
-// So `MediaTypes_::kAudio as i32` is redundant on Windows — where clippy sees
-// it — and load-bearing everywhere else. Taking clippy's advice on a Windows
-// machine breaks the Linux and macOS builds outright, which is exactly what
-// happened once. The casts stay; the lint goes.
+// The `vst3` crate's constants are bindgen outputs whose types depend on
+// platform C++ ABIs (`i32` on MSVC, `u32` elsewhere). The explicit casts
+// are necessary for cross-platform builds.
 #![allow(clippy::unnecessary_cast)]
 
 mod cid;
@@ -40,10 +32,7 @@ pub use plugin::{Vst3Plugin, Vst3Processor};
 /// The file extension of a VST3 module, bundle or bare library alike.
 pub const VST3_EXTENSION: &str = "vst3";
 
-/// Directories the OS conventionally keeps VST3 plugins in.
-///
-/// Used to re-resolve a saved binding whose recorded path has moved (§8.3), and
-/// by the scanner CLI.
+/// Standard platform directories where VST3 plugins are installed.
 pub fn default_plugin_directories() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
 

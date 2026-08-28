@@ -1,10 +1,8 @@
 //! Host-side containers passed into `IAudioProcessor::process`.
 //!
-//! Everything here is pre-sized at activate time and only ever refilled, never
-//! grown, during processing: the audio thread must not allocate (§9.1). The
-//! capacity limits are therefore real limits, and overflow is dropped rather
-//! than allocated for — a dropped automation point is a glitch, a malloc in the
-//! audio callback is a dropout.
+//! Buffers are pre-sized during activation and reused during processing to ensure
+//! the audio thread never allocates. Capacity limits are strict; points exceeding
+//! capacity are dropped rather than triggering reallocations on the real-time thread.
 
 use std::cell::{Cell, RefCell};
 
@@ -121,10 +119,9 @@ impl ParameterChanges {
         self.used.set(0);
     }
 
-    /// Record `value` (normalised) for `id` at `sample_offset`.
+    /// Record `value` (normalized) for `id` at `sample_offset`.
     ///
-    /// Consecutive calls for the same parameter reuse its queue, which is the
-    /// common case when a sub-block quantiser emits a stream of updates (§9.2).
+    /// Consecutive calls for the same parameter reuse its existing queue.
     /// Returns false if a limit was hit and the point was dropped.
     pub fn add_point(&self, id: ParamID, sample_offset: int32, value: ParamValue) -> bool {
         let used = self.used.get();

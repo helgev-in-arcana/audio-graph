@@ -4,12 +4,11 @@ use vst3::Steinberg::TUID;
 
 /// A VST3 class ID in a platform-independent form.
 ///
-/// `TUID`'s in-memory byte order differs between Windows and everything else,
-/// so the raw bytes are not a safe thing to persist: a project saved on Windows
-/// would fail to find its plugin on macOS. `Cid` stores the four 32-bit words
-/// that the SDK's `INLINE_UID` macro takes, which is the form the byte-order
-/// difference is defined *against*, and is therefore stable across platforms.
-/// This is what §8.3 persists as the authoritative `plugin_id`.
+/// `TUID`'s in-memory byte order differs between Windows and other platforms,
+/// so the raw bytes cannot be safely persisted across platforms. `Cid` stores
+/// the four 32-bit words accepted by the SDK's `INLINE_UID` macro, providing
+/// a stable, platform-independent representation suitable for serialization
+/// and identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cid(pub [u32; 4]);
 

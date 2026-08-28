@@ -28,14 +28,7 @@ impl HostContext for TestHost {
     fn param_edited(&self, _id: ParamId, _plain: f64) {}
 }
 
-/// Plugins probed in-process, so anything known to corrupt its own heap on
-/// teardown has to stay out.
-///
-/// OTT (Xfer) faults inside `createInstance` once a previous instance has been
-/// released — reproducible with nothing but create/release/create, so it is a
-/// plugin-side defect rather than something a host can work around in process.
-/// It is exactly the trigger ADR-6 names for the out-of-process backend, and
-/// the reason `host-cli sweep` runs each plugin in a child process.
+/// Plugins excluded from in-process lifecycle tests due to known teardown issues.
 const EXCLUDED: &[&str] = &["OTT.vst3"];
 
 /// Cap the search: the point is to find *a* usable effect, and some sampler
@@ -57,7 +50,7 @@ const MAX_PARAMS_FOR_PROBE: usize = 200;
 const CANDIDATES: usize = 8;
 
 fn candidates() -> Vec<PathBuf> {
-    // A test thread is not an initialised STA and plugins assume one (§13).
+    // Initialize COM STA apartment on test runner thread.
     vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
@@ -121,9 +114,8 @@ fn vst3_lifecycle_against_installed_plugins() {
     parameters_report_usable_ranges(&module, &class);
 }
 
-/// Creating *after* destroying is what catches module-scoped state that was
-/// mistakenly made per-instance — the `setHostContext` pointer being the
-/// concrete case that broke here.
+/// Repeated activation verifies that module-level and instance-level state
+/// are properly separated and can be created, activated, and dropped repeatedly.
 fn repeated_activation(module: &Module, class: &ClassInfo) {
     let host = Arc::new(TestHost);
     for round in 0..3 {
@@ -202,12 +194,8 @@ fn try_round_trip(
         .set_param(target.id, wanted)
         .map_err(|e| e.to_string())?;
 
-    // Run a block before saving. Not ceremony: VST3 keeps the processor and the
-    // controller apart, and an edit only reaches the processor through the
-    // change list in `process`. Saving without it captures whatever the
-    // processor still believed, which is how a preset silently comes back
-    // wrong — Raum and Replika both failed this way before the edit queue
-    // existed.
+    // Process a block before saving to ensure pending parameter edits in the
+    // controller are propagated to the processor before state serialization.
     run_one_block(&mut first)?;
 
     let saved = first.snapshot().get(target.id).unwrap_or(f64::NAN);
