@@ -1,9 +1,10 @@
 //! Concurrency and real-time invariants for the audio thread.
 //!
 //! Routine main-thread operations (drawing the editor, ticking sub-plugin windows,
-//! recompiling the graph during editing) must never block the audio thread or cause
-//! dropped blocks. Heavy operations (such as loading or unloading sub-plugins) are
-//! permitted to block.
+//! recompiling the graph during editing) must not be able to make the audio thread miss a block.
+//! The audio thread's only non-wait-free instruction is `try_lock`ing a superseded graph, and it
+//! never hits a system wait. Heavy operations (such as loading or unloading sub-plugins)
+//! are permitted to block.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

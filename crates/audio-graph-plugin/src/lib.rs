@@ -101,7 +101,8 @@ macro_rules! wrapper_class {
                 let latency = self.0.activate($kind, audio_io_layout, buffer_config);
                 match latency {
                     Some(samples) => {
-                        // Report the combined latency (wrapper plus sub-plugins) to the host.
+                        // Report the combined latency (wrapper plus sub-plugins) to the host,
+                        // or the track sits misaligned.
                         context.set_latency_samples(samples);
                         true
                     }

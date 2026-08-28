@@ -88,6 +88,8 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
         main.host.any_loaded()
     };
     // Free superseded compiled graph programs returned by the audio thread.
+    // This is done here because nothing else on the main thread is guaranteed
+    // to run while a patch just sits there playing.
     shared.reclaim();
 
     state

@@ -70,6 +70,9 @@ pub struct Shared {
     audio: Mutex<AudioState>,
     programs: Handoff<Program>,
     /// Sub-block modulation quantum in samples.
+    ///
+    /// Stored as a standalone atomic rather than in `MainState` because the audio
+    /// thread reads it every block and must not have to acquire a lock to do so.
     quantum: AtomicU32,
     /// Host sample rate used for GUI calculations (e.g. delay times).
     sample_rate: AtomicU32,
