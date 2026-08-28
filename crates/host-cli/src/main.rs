@@ -1618,6 +1618,9 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
 ///
 /// Ensures each declared audio output bus is mapped to a distinct output port
 /// and that signals from secondary buses are not mirrored or merged incorrectly.
+/// Each render is its own instance, and a synth with a free-running oscillator
+/// does not repeat itself, so socket 0 is rendered twice to establish a
+/// divergence baseline for what "the same" means.
 fn cmd_outbus(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -2114,14 +2117,13 @@ fn cmd_aux(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Tone -> compressor -> out, with an instrument keying the compressor's aux
-/// bus, and a `Constant` driving a slot bound to the sidechain-enable switch.
+/// How much of the loop goes back round, on the `Mix` node's second input.
+const FEEDBACK: f64 = 0.7;
+
 /// Verifies feedback delay line timing, decay, and consistency across varying block sizes.
 ///
 /// Tests that delay echo peaks occur at expected sample offsets, decay exponentially
 /// by the mix feedback gain, and produce identical output at 512 vs. 64 sample block sizes.
-const FEEDBACK: f64 = 0.7;
-
 fn cmd_delay(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
