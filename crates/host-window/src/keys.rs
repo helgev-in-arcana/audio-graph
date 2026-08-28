@@ -1,21 +1,11 @@
-//! Handing keystrokes back to the DAW.
+//! Keyboard event forwarding to host windows.
 //!
-//! A plugin editor is a child window, and child windows are the end of the line
-//! for keyboard messages: Windows delivers `WM_KEYDOWN` to whatever has focus
-//! and `DefWindowProc` does not pass it to the parent the way it does for, say,
-//! a command. So while the editor has focus the DAW hears nothing, and the
-//! space bar — which every DAW binds to transport — stops the user's tape
-//! machine from responding.
+//! When a plugin editor child window has focus, keyboard events are delivered
+//! directly to the child window without propagating to parent windows. This can
+//! prevent host-level keyboard shortcuts (such as transport controls) from functioning.
 //!
-//! Neither VST3 nor the GUI stack has a route for this. `IPlugView::onKeyDown`
-//! runs the other way (host to plugin), and baseview reports a key as consumed
-//! whether or not anything did anything with it. So the editor decides for
-//! itself: if egui had no use for the key, post it to the DAW's own window and
-//! let the DAW's accelerators see it.
-//!
-//! Only the virtual key travels. Modifier state is left to `GetKeyState`, which
-//! is still accurate because the user is physically holding the modifier down
-//! while this runs.
+//! Unhandled key events can be forwarded directly to the root host window to ensure
+//! host accelerators continue to operate.
 
 /// Post a key up or down to `window`, as if it had been typed there.
 ///

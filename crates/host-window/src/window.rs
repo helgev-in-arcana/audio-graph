@@ -1,13 +1,6 @@
-//! The container window a hosted plugin's editor is attached to.
+//! Container window implementation for hosting plugin editors.
 //!
-//! ARCHITECTURE.md §5.2: this window draws nothing. It is a titled, resizable
-//! frame and nothing else, so wgpu, Vello, layout and a windowing crate are all
-//! beside the point.
-//!
-//! `winit` in particular does not fit: it is built around owning the event
-//! loop, and inside a plugin the DAW owns it. On Windows that is not even a
-//! difficulty — a window created on the DAW's UI thread has its messages
-//! delivered by the DAW's own pump, so there is no loop to run at all.
+//! Provides a top-level titled frame to embed child plugin view windows.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -35,11 +28,7 @@ pub struct WindowState {
     pub size: Cell<Size>,
 }
 
-/// A top-level container window.
-///
-/// Deliberately owns no VST3 object. The ordering rules of §5.3 live in
-/// [`crate::EditorWindow`], which owns both this and the view, so that the
-/// sequence is written once in one place.
+/// A top-level container window for hosting plugin editors.
 pub struct ContainerWindow {
     inner: imp::Window,
     state: Rc<WindowState>,
@@ -60,11 +49,8 @@ impl ContainerWindow {
     /// front of the DAW and minimises with it, which is what every other plugin
     /// window does.
     ///
-    /// It must be the DAW's *root* window, not the wrapper's editor view:
-    /// Windows destroys owned windows along with their owner, and the editor
-    /// view is destroyed every time the user closes the wrapper's UI — which
-    /// would take the sub-plugin's window with it, without the plugin ever
-    /// being told (§5.3). The root window only dies when the DAW does.
+    /// It must be the DAW's root window, not the wrapper's editor view, so that
+    /// closing the wrapper UI does not destroy the child window unexpectedly.
     pub fn new(
         title: &str,
         size: Size,
@@ -375,9 +361,8 @@ mod imp {
             }
 
             match msg {
-                // Recorded, not obeyed. Destroying the window here would take
-                // the plugin's child window with it without the plugin ever
-                // being told (§5.3); the owner tears things down in order.
+                // Record close request rather than immediately destroying window,
+                // allowing proper teardown ordering by the owner.
                 WM_CLOSE => {
                     (*state).close_requested.set(true);
                     0
@@ -421,12 +406,7 @@ mod imp {
 
     use super::{Size, WindowState};
 
-    /// Not yet implemented.
-    ///
-    /// ROADMAP M4 puts the platforms in order Windows, macOS, Linux/X11, and
-    /// this is a real stub rather than a silently broken window: returning an
-    /// error is the honest answer until `NSWindow` (macOS, main thread only)
-    /// and `XCreateWindow` plus the `IRunLoop` proxy of §5.4 are written.
+    /// Stub implementation for non-Windows platforms.
     pub struct Window;
 
     impl Window {
