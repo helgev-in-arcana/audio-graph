@@ -109,7 +109,8 @@ fn the_host_forwards_what_the_plugin_asks_for() {
 /// A `.clap` on Windows and Linux *is* the shared library, so the artifact is
 /// loadable as it stands and nothing has to be copied or renamed.
 ///
-/// **Panics rather than skipping when it is missing.**
+/// **Panics rather than skipping when it is missing:** cargo does not build another
+/// package's `cdylib` on its own.
 pub fn fixture_path() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     // .../target/<profile>/deps/<test>.exe

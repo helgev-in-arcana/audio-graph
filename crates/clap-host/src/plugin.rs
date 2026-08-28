@@ -1119,7 +1119,8 @@ impl SubPluginProcessor for ClapProcessor {
 fn empty_buffer(channels: u16) -> clap_audio_buffer {
     clap_audio_buffer {
         data32: std::ptr::null_mut(),
-        // 32-bit float audio buffers.
+        // 32-bit float audio buffers. The graph's own buffers are f32, so offering
+        // 64-bit would only add a conversion.
         data64: std::ptr::null_mut(),
         channel_count: u32::from(channels),
         latency: 0,

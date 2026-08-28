@@ -111,6 +111,9 @@ pub const SIDECHAIN_GAIN: f32 = 0.5;
 pub const NOTE_LEVEL: f32 = 0.25;
 
 /// Output scaling factor applied to the secondary (auxiliary) output bus.
+///
+/// This value (-0.75) is negative and not a power of two, so a host that read
+/// the wrong bus cannot land on this value by accident.
 pub const AUX_OUTPUT_GAIN: f32 = -0.75;
 
 /// Counts live instances, so a test can prove `destroy` actually runs.
@@ -189,7 +192,9 @@ pub(crate) struct Instance {
     /// [`PARAM_RENDER_MODE`]. Realtime is the value a fresh instance has,
     /// which is what CLAP says too.
     render_mode: i32,
-    /// GUI state for the plugin instance.
+    /// GUI state for the plugin instance. Declared last so it drops last, which is the wrong
+    /// order on purpose — it verifies the host calls `gui.destroy` first. Cleaning it up
+    /// automatically would hide lifecycle bugs.
     gui: gui::Gui,
 }
 
