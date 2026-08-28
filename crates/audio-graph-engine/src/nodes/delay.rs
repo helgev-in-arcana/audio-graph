@@ -182,10 +182,7 @@ impl Node for DelayRead {
                 .changed();
         });
         if matches!(self.ty, PortType::Audio { .. }) {
-            ui.weak(format!(
-                "at least {:.1} ms (one sub-block)",
-                floor * 1000.0
-            ));
+            ui.weak(format!("at least {:.1} ms (one sub-block)", floor * 1000.0));
         }
         changed
     }

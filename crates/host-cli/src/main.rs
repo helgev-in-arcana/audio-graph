@@ -1052,10 +1052,7 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
         }
     }
 
-    println!(
-        "\n{ok} module(s) passed, {} problem(s)",
-        problems.len()
-    );
+    println!("\n{ok} module(s) passed, {} problem(s)", problems.len());
     for p in &problems {
         println!("  !! {p}");
     }

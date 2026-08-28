@@ -213,10 +213,7 @@ fn the_backend_drives_a_real_clap_module() {
     assert_eq!(io.inputs[0].name, "Main");
     assert!(!io.inputs[0].is_aux);
     assert_eq!(io.inputs[1].name, "Sidechain");
-    assert!(
-        io.inputs[1].is_aux,
-        "the sidechain is an auxiliary socket"
-    );
+    assert!(io.inputs[1].is_aux, "the sidechain is an auxiliary socket");
     assert_eq!(io.aux_inputs().len(), 1);
     assert_eq!(io.outputs.len(), 2, "main plus auxiliary output");
     assert_eq!(io.outputs[1].name, "Aux Out");
