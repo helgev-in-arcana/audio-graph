@@ -1,15 +1,11 @@
-//! Event model (ARCHITECTURE.md §3.2).
+//! Event model for parameter changes, MIDI, and note expressions.
 //!
-//! `SetValue` and `Modulate` are separate variants on purpose: CLAP keeps
-//! `PARAM_VALUE` and `PARAM_MOD` apart so modulation is non-destructive, and
-//! collapsing them here would delete that capability from every backend.
-//! VST3 flattens them back together in its own layer (§3.4).
+//! `SetValue` and `Modulate` are distinct variants to preserve non-destructive
+//! modulation across plugin backends that support it.
 
 use crate::params::ParamId;
 
-/// Who a parameter event applies to.
-///
-/// VST3 can only express `Global`; the VST3 backend folds or drops the rest.
+/// Target scope of a parameter event (e.g. global, per-note, or per-channel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Target {
     #[default]
@@ -65,11 +61,9 @@ impl ParamEvent {
         }
     }
 
-    /// The same event, timed at `offset` instead.
+    /// Returns a copy of the event with its sample offset updated to `offset`.
     ///
-    /// A gesture has no offset to move; it is returned unchanged rather than
-    /// refused, so a caller rebasing a whole stream does not have to know which
-    /// events carry a time.
+    /// Gesture events do not carry a sample offset and are returned unchanged.
     pub fn at_offset(mut self, offset: u32) -> ParamEvent {
         if let ParamEvent::SetValue { sample_offset, .. }
         | ParamEvent::Modulate { sample_offset, .. } = &mut self
@@ -80,9 +74,7 @@ impl ParamEvent {
     }
 }
 
-/// Per-note continuous controllers. Both formats have these; VST3 declares the
-/// available types at runtime via `INoteExpressionController`, CLAP uses a
-/// fixed enum, so backends keep a mapping table.
+/// Per-note continuous expression types supported across plugin backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteExpression {
     Volume,
@@ -113,8 +105,7 @@ pub enum NoteEvent {
         velocity: f64,
         sample_offset: u32,
     },
-    /// The plugin tells the host a voice ended (CLAP `NOTE_END`). Forwarded so
-    /// per-voice graph state can be released.
+    /// The plugin tells the host a voice ended. Forwarded so per-voice state can be released.
     NoteEnd {
         note_id: i32,
         port: i16,
@@ -131,7 +122,7 @@ pub enum NoteEvent {
         value: f64,
         sample_offset: u32,
     },
-    /// Raw 3-byte MIDI for anything without a first-class representation.
+    /// Raw 3-byte MIDI message.
     Midi {
         port: i16,
         data: [u8; 3],
@@ -197,12 +188,7 @@ impl Event {
         }
     }
 
-    /// The same event, timed at `offset` instead.
-    ///
-    /// Used when a block is cut into chunks and each chunk is handed to the
-    /// sub-plugin as its own `process` call (§14.9): an event at sample 40 of
-    /// the block is at sample 8 of the chunk that starts at 32, and handing it
-    /// over still saying 40 would put it past the end of a 32-sample buffer.
+    /// Returns a copy of the event with its sample offset adjusted to `offset`.
     pub fn at_offset(self, offset: u32) -> Event {
         match self {
             Event::Param(e) => Event::Param(e.at_offset(offset)),
@@ -211,10 +197,7 @@ impl Event {
     }
 }
 
-/// Collects events emitted *by* the sub-plugin during `process`.
-///
-/// A plain owned buffer rather than a callback: a callback would be a reference
-/// crossing the boundary, which §4.1 forbids.
+/// Collects events emitted by the sub-plugin during `process`.
 #[derive(Debug, Clone, Default)]
 pub struct EventSink {
     events: Vec<Event>,
@@ -225,7 +208,7 @@ impl EventSink {
         Self::default()
     }
 
-    /// Pre-allocate so the audio thread never grows the buffer (§9.1).
+    /// Pre-allocate so the audio thread never grows the buffer dynamically.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             events: Vec::with_capacity(cap),
@@ -249,10 +232,7 @@ impl EventSink {
     }
 }
 
-/// Transport / tempo state for one process block.
-///
-/// `subhost-adapter` forwards the DAW's context to the sub-plugin, adjusting
-/// for any latency the wrapper itself introduces (§7.1).
+/// Transport, tempo, and playback position state for an audio processing block.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimeContext {
     pub tempo_bpm: f64,
@@ -266,16 +246,9 @@ pub struct TimeContext {
     pub playing: bool,
     pub recording: bool,
     pub loop_active: bool,
-    /// The loop's bounds in quarter notes, when the host knows them.
-    ///
-    /// Separate from `loop_active` because the two are not the same claim: a
-    /// host can know a loop is running without being able to say where it is,
-    /// and both formats care about the difference. VST3 spells it out with
-    /// `kCycleValid`; CLAP has no such flag, so the CLAP backend reports no
-    /// loop at all rather than a loop of length zero.
+    /// The loop boundaries in quarter notes, if active and known by the host.
     pub loop_range_music: Option<(f64, f64)>,
-    /// The same bounds in seconds, which CLAP asks for separately and VST3
-    /// does not carry at all.
+    /// The loop boundaries in seconds, if active and known by the host.
     pub loop_range_seconds: Option<(f64, f64)>,
 }
 

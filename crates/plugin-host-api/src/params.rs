@@ -1,13 +1,6 @@
-//! Parameter model — plain values with an explicit range (ARCHITECTURE.md §3.1).
-//!
-//! Normalising to 0..1 in the core would bake VST3's poverty in: CLAP's stepped
-//! and enum semantics do not survive the round trip. Backends normalise on the
-//! way out instead.
+//! Parameter model representing raw plain values with explicit ranges.
 
 /// Format-crossing stable parameter identity.
-///
-/// VST3 `ParamID` and CLAP `clap_id` are both 32-bit, so one opaque newtype
-/// covers both without either format leaking into the core vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParamId(pub u32);
 
@@ -26,7 +19,7 @@ bitflags_lite! {
         const BYPASS      = 1 << 4;
         /// The host may automate it.
         const AUTOMATABLE = 1 << 5;
-        /// The host may apply non-destructive modulation (CLAP `PARAM_MOD`).
+        /// The host may apply non-destructive modulation.
         const MODULATABLE = 1 << 6;
         /// Modulation may differ per voice.
         const POLY_MODULATABLE = 1 << 7;
@@ -38,7 +31,7 @@ bitflags_lite! {
 pub struct ParamInfo {
     pub id: ParamId,
     pub name: String,
-    /// Hierarchical path: CLAP's `module`, VST3's unit chain. `/`-separated.
+    /// Hierarchical path (slash-separated module/unit path).
     pub module: String,
     pub min: f64,
     pub max: f64,
@@ -74,10 +67,9 @@ pub struct ParamValue {
     pub plain: f64,
 }
 
-/// A whole-plugin parameter read.
+/// Snapshot containing parameter values for an entire plugin instance.
 ///
-/// §4.1: the API deliberately has no `get_param(id)`. Reads are batched so the
-/// boundary cannot be made chatty, which is what keeps IPC (ADR-6) viable.
+/// Parameter reads are batched to avoid chatty inter-thread or inter-process communication.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParamSnapshot {
     pub values: Vec<ParamValue>,
@@ -89,14 +81,10 @@ impl ParamSnapshot {
     }
 }
 
-/// What the loaded sub-plugin can actually do (ARCHITECTURE.md §3.3).
-///
-/// The engine queries this *ahead of time* — e.g. per-voice sources are greyed
-/// out when `poly_modulation` is false, because that is a format limitation and
-/// not a missing feature.
+/// Capabilities reported by the loaded sub-plugin instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
-    /// Non-destructive modulation is native (CLAP `PARAM_MOD`).
+    /// Non-destructive modulation is supported natively.
     pub modulation: bool,
     /// Modulation can be addressed per voice.
     pub poly_modulation: bool,
@@ -105,28 +93,18 @@ pub struct Capabilities {
     pub dynamic_params: bool,
 }
 
-/// How many voices an instrument has, when it will say (ARCHITECTURE.md §3.3).
-///
-/// CLAP's `voice-info` is the only place this comes from; VST3 has no
-/// equivalent, so a VST3 sub-plugin reports `None` rather than a guess.
-/// Read after loading and again whenever the plugin says it changed — Surge XT
-/// changes it when the patch's polyphony setting moves.
+/// Voice polyphony information reported by an instrument plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VoiceInfo {
     /// Voices the plugin will actually use with its current patch.
     pub count: u32,
     /// The most it could ever use. Never smaller than `count`.
     pub capacity: u32,
-    /// Whether two notes with the same key and channel may overlap. A host
-    /// that ends notes by key alone gets this wrong for the plugins that say
-    /// yes, which is why the flag exists at all.
+    /// Whether two notes with the same key and channel may overlap.
     pub overlapping_notes: bool,
 }
 
-/// Minimal stand-in for the `bitflags` crate.
-///
-/// Only a handful of ops are needed and this keeps `plugin-host-api`
-/// dependency-free, which matters because every other crate depends on it.
+/// Minimal stand-in for the `bitflags` crate without external dependencies.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! bitflags_lite {
@@ -212,23 +190,19 @@ mod tests {
     }
 }
 
-/// One audio bus, as the plugin describes it (§14.2).
+/// Audio bus description reported by the plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusInfo {
     /// The plugin's own name for it: "Main", "Sidechain", "Key".
     pub name: String,
     pub channels: u16,
-    /// True for everything the format marks auxiliary. A sidechain is aux; the
-    /// bus a plugin actually processes is not.
+    /// Indicates whether this bus is auxiliary (e.g., a sidechain or secondary output) rather than the main audio bus.
     pub is_aux: bool,
 }
 
-/// A plugin's whole I/O shape, read once after loading.
+/// Total audio and event I/O layout reported by a plugin.
 ///
-/// Discovered rather than declared (§14.2): what a plugin reports before
-/// negotiation is a wish, and the node's sockets have to match what it will
-/// actually accept. Returned in one call for the same reason as
-/// [`SubPluginMain::params`] — there is no per-bus getter anywhere (§4.1).
+/// Contains all input and output bus descriptions as well as MIDI/event capabilities.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IoLayout {
     pub inputs: Vec<BusInfo>,

@@ -1,7 +1,7 @@
-//! Audio buffer representation (ARCHITECTURE.md §4.3).
+//! Audio buffer representation.
 //!
-//! Flat, not a nested slice-of-slices: a nested slice cannot live in shared
-//! memory, so the nested form would silently close the door on ADR-6.
+//! Audio channels are stored in a contiguous, flat buffer rather than nested slices
+//! to ensure efficient memory layout and compatibility with shared memory buffers.
 
 /// How channels are arranged inside the flat backing store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -13,19 +13,15 @@ pub enum BufferLayout {
     Planar,
 }
 
-/// How many aux buses one plugin may be given in one direction (§14.11).
+/// Maximum number of auxiliary buses a plugin may be configured with in one direction.
 ///
-/// Aux means everything after the main bus: on the way in a sidechain, a
-/// second sidechain, a key input; on the way out a second stereo pair, a
-/// per-scene output. Fixed-size so [`AudioConfig`] stays `Copy` and carries no
-/// pointer, which is what lets it cross a process boundary unchanged (ADR-6).
+/// Auxiliary buses follow the main bus (e.g. sidechain inputs or secondary outputs).
+/// Using a fixed-size array keeps [`AudioConfig`] `Copy` without heap allocations.
 pub const MAX_AUX_BUSES: usize = 3;
 
-/// The aux buses of one plugin in one direction, by channel width.
+/// The auxiliary buses of one plugin in one direction, represented by their channel widths.
 ///
-/// Empty is the common case and the default: most plugins have one input bus,
-/// and a graph that wires nothing to a sidechain should not make the host
-/// negotiate one.
+/// Defaults to empty, indicating no auxiliary buses are active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuxBuses {
     widths: [u16; MAX_AUX_BUSES],
@@ -33,10 +29,7 @@ pub struct AuxBuses {
 }
 
 impl AuxBuses {
-    /// Take the first [`MAX_AUX_BUSES`] widths. Extra ones are dropped rather
-    /// than refused: the compiler has already checked the graph against the
-    /// same ceiling, so anything beyond it is a bug on this side, not the
-    /// user's.
+    /// Creates an [`AuxBuses`] instance from the provided channel widths, truncated to [`MAX_AUX_BUSES`].
     pub fn new(widths: &[u16]) -> AuxBuses {
         let mut out = AuxBuses::default();
         for &width in widths.iter().take(MAX_AUX_BUSES) {
@@ -68,8 +61,9 @@ impl AuxBuses {
     }
 }
 
-/// Fixed configuration handed to `activate`. Changing any of it requires a
-/// deactivate/activate cycle, which the trait shape enforces (§4.2).
+/// Fixed audio configuration provided when activating a plugin.
+///
+/// Changing these settings requires deactivating and reactivating the plugin.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioConfig {
     pub sample_rate: f64,
@@ -78,19 +72,15 @@ pub struct AudioConfig {
     /// Channels on the *main* input bus. Zero for an instrument.
     pub input_channels: u32,
     pub output_channels: u32,
-    /// Extra input buses beyond the main one — sidechains (§14.11).
+    /// Extra input buses beyond the main one (e.g., sidechain inputs).
     ///
-    /// Separate from `input_channels` rather than folded into a list of buses
-    /// because bus 0 is not like the others: it is the one a plugin processes,
-    /// and the rest are things it looks at.
+    /// Stored separately from `input_channels` because bus 0 is the primary input
+    /// processed by the plugin, while auxiliary buses serve as secondary inputs.
     pub aux_inputs: AuxBuses,
-    /// Extra output buses beyond the main one (§14.2).
+    /// Extra output buses beyond the main one (e.g., auxiliary or multi-out pairs).
     ///
-    /// The same asymmetry as the inputs, read the other way: bus 0 is the
-    /// plugin's output, and the rest are things it also produces — Surge XT's
-    /// per-scene pair, a drum machine's individual outs. Only the buses the
-    /// graph actually reads are asked for; the plugin's own extras beyond
-    /// them are left inactive so it need not compute them.
+    /// Stored separately from `output_channels`. Only requested auxiliary buses
+    /// are active to avoid unnecessary computation.
     pub aux_outputs: AuxBuses,
     /// True when the host is rendering faster than real time.
     pub offline: bool,
@@ -123,13 +113,11 @@ impl Default for AudioConfig {
     }
 }
 
-/// Borrowed view over the flat audio storage for one process call.
+/// Borrowed view over flat audio buffer memory for a single processing block.
 ///
-/// The input region holds the main bus first and then each aux bus, packed —
-/// so `input_channels` is the total and `aux_inputs` says where the joins are.
-/// The output region is the same shape. One region per direction rather than
-/// one per bus because a nested slice cannot live in shared memory (§4.3), and
-/// the buses are contiguous anyway.
+/// The input region contains the main bus followed contiguously by each auxiliary bus,
+/// where `input_channels` is the total channel count and `aux_inputs` defines the bus widths.
+/// The output region follows the same layout.
 pub struct AudioBuffers<'a> {
     input: &'a [f32],
     output: &'a mut [f32],
