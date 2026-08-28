@@ -37,9 +37,9 @@ pub struct WindowState {
 
 /// A top-level container window for hosting plugin editors.
 ///
-/// Deliberately owns no VST3 object. The teardown ordering rules live in
-/// [`crate::EditorWindow`], which owns both this and the view, so that the
-/// sequence is written once in one place.
+/// Deliberately owns no plugin object. The teardown ordering rules live with
+/// whoever owns both this and the plugin's view — `vst3-host-view`'s
+/// `EditorWindow` — so that the sequence is written once in one place.
 pub struct ContainerWindow {
     inner: imp::Window,
     state: Rc<WindowState>,

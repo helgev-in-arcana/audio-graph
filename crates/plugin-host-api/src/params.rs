@@ -229,7 +229,8 @@ pub struct BusInfo {
 /// Discovered rather than declared: what a plugin reports before negotiation is
 /// a wish, and the node's sockets have to match what it will actually accept.
 /// Returned in one call for the same reason as
-/// [`SubPluginMain::params`] — there is no per-bus getter anywhere.
+/// [`SubPluginMain::params`][crate::SubPluginMain::params] — there is no
+/// per-bus getter anywhere.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IoLayout {
     pub inputs: Vec<BusInfo>,
