@@ -1,25 +1,7 @@
-//! A CLAP host backend, in pure Rust.
+//! CLAP plugin hosting implementation in pure Rust.
 //!
-//! The same scope discipline as `vst3-host` (ARCHITECTURE.md §7): this crate
-//! knows how to load and run a CLAP plugin and nothing about *why*. Anything
-//! specific to hosting a plugin from inside another plugin lives in
-//! `subhost-adapter`, and the format-agnostic facade both backends sit behind
-//! is `plugin-host`.
-//!
-//! ADR-1 applies unchanged. `clap-sys` is a dependency-free set of `#[repr(C)]`
-//! declarations — the C header transcribed, with no C toolchain involved — so
-//! using it is the CLAP equivalent of using the `vst3` crate's bindings rather
-//! than a step away from pure Rust.
-//!
-//! Two structural differences from the VST3 backend are worth knowing before
-//! reading further:
-//!
-//! * **Buses are declared, not negotiated.** There is no `setBusArrangements`;
-//!   a port is the width it says it is. See `plugin::bind_ports`.
-//! * **The editor lives inside the instance.** CLAP's GUI is an extension on
-//!   the plugin rather than a separate object, so `ClapPlugin` owns its editor
-//!   and the §5.3 teardown order is guaranteed by its `Drop` rather than by the
-//!   caller declaring fields in the right sequence.
+//! Provides discovery, loading, instantiation, parameter management, audio/event
+//! processing, and GUI embedding for CLAP (CLever Audio Plug-in) format plugins.
 
 mod events;
 mod gui;
