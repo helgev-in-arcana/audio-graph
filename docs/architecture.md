@@ -10,12 +10,12 @@
 
 ### プラグインホスト抽象化層
 
-- [plugin-host-api](crates/plugin-host-api/README.md)
-- [host-window](crates/host-window/README.md)
-- [vst3-host](crates/vst3-host/README.md)
-- [vst3-host-view](crates/vst3-host-view/README.md)
-- [clap-host](crates/clap-host/README.md)
-- [plugin-host](crates/plugin-host/README.md)
+- [plugin-host-api](../crates/plugin-host-api/README.md)
+- [host-window](../crates/host-window/README.md)
+- [vst3-host](../crates/vst3-host/README.md)
+- [vst3-host-view](../crates/vst3-host-view/README.md)
+- [clap-host](../crates/clap-host/README.md)
+- [plugin-host](../crates/plugin-host/README.md)
 
 VST3とCLAPを共通化します。
 
@@ -24,21 +24,21 @@ VST3とCLAPを共通化します。
 
 ### 入れ子プラグイン汎用
 
-- [subhost-adapter](crates/subhost-adapter/README.md)
+- [subhost-adapter](../crates/subhost-adapter/README.md)
 
 入れ子プラグインのための機能群です。
 
 ### audio-graph実装
 
-- [audio-graph-engine](crates/audio-graph-engine/README.md)
-- [audio-graph-plugin](crates/audio-graph-plugin/README.md)
+- [audio-graph-engine](../crates/audio-graph-engine/README.md)
+- [audio-graph-plugin](../crates/audio-graph-plugin/README.md)
 
 `audio-graph-engine` がプラグインバックエンド処理を担当します。
 `audio-graph-plugin` がプラグインフロントエンド・ `nice-plug` を使ったプラグイン梱包を担当します。
 
 ### 開発用CLIツール
 
-- [host-cli](crates/host-cli/README.md)
+- [host-cli](../crates/host-cli/README.md)
 
 プラグインは「DAW に読み込んで手で操作する」以外の検証手段を持ちにくい領域です。
 そこで、DAW を立ち上げずに実物のプラグインを相手に検証できる CLI を同梱しています。
