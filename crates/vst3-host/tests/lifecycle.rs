@@ -50,7 +50,7 @@ const MAX_PARAMS_FOR_PROBE: usize = 200;
 const CANDIDATES: usize = 8;
 
 fn candidates() -> Vec<PathBuf> {
-    // Initialize COM STA apartment on test runner thread.
+    // Initialize COM STA apartment on test runner thread because plugins assume one exists.
     vst3_host::init_apartment();
     default_plugin_directories()
         .iter()

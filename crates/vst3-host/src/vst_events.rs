@@ -3,7 +3,8 @@
 //! Parameter updates and note events are converted into VST3 parameter change queues
 //! and event lists. Note that VST3 parameters hold a single normalized value, so
 //! per-voice parameter addressing and separate non-destructive modulation streams
-//! cannot be represented directly and are dropped rather than approximated as value changes.
+//! cannot be represented directly and are dropped rather than approximated as value changes
+//! (forwarding modulation as a value change would destroy the user's automation).
 
 use plugin_host_api::{
     Event as ApiEvent, EventSink, NoteEvent, NoteExpression, ParamEvent, TimeContext,
@@ -150,7 +151,8 @@ pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
         let Some(vst) = list.get(index) else { continue };
         let sample_offset = vst.sampleOffset.max(0) as u32;
 
-        // Forward note-off lifecycle events to the host event sink.
+        // Forward note-off lifecycle events to the host event sink. They are what the
+        // engine needs to release per-voice graph state.
         if vst.r#type == EventTypes_::kNoteOffEvent as u16 {
             let off = unsafe { vst.__field0.noteOff };
             sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
@@ -246,7 +248,8 @@ mod tests {
     #[test]
     fn sub_block_updates_keep_their_offsets_and_share_one_queue() {
         // Multiple parameter points across a block must land in a single queue
-        // with their sample offsets preserved.
+        // with their sample offsets preserved — collapsing them to the block start
+        // would make a fast LFO sound stepped.
         let changes = ParameterChanges::new(4, 64);
         let list = EventList::new(4);
         let events: Vec<ApiEvent> = (0..8)

@@ -1,7 +1,8 @@
 //! Host-side `IPlugFrame` implementation.
 //!
 //! Receives plugin-initiated resize requests via `IPlugFrame::resizeView` and records
-//! them to be applied during the next UI tick.
+//! them to be applied during the next UI tick. Resizing a window synchronously from a
+//! plugin callback re-enters the plugin while it is mid-call, which would crash.
 
 use std::cell::Cell;
 

@@ -7,7 +7,7 @@
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
-    // Initialize COM STA apartment on test runner thread.
+    // Initialize COM STA apartment on test runner thread because plugins assume one exists.
     vst3_host::init_apartment();
     default_plugin_directories()
         .iter()

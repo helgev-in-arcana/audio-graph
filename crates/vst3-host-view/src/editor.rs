@@ -6,6 +6,10 @@
 //! 2. Detach `IPlugFrame`
 //! 3. Release view COM reference
 //! 4. Destroy container window
+//!
+//! The teardown sequence is explicitly enforced because letting the OS destroy the
+//! parent and take the child with it tells the plugin nothing — it keeps posting timers
+//! and calling `resizeView` against a dead window, and crashes.
 
 use std::rc::Rc;
 
@@ -125,7 +129,8 @@ impl EditorWindow {
         if let Some(requested) = self.frame.take_requested_size() {
             self.window.set_client_size(requested);
             let mut rect = to_rect(requested);
-            // Notify the plugin of the updated size.
+            // Complete the resize round-trip: the plugin requested a size, the host resized
+            // the container, and now we must tell the plugin what size it actually got.
             unsafe { self.view.onSize(&mut rect) };
             return;
         }
