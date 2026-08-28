@@ -1,15 +1,8 @@
-//! What this wrapper writes into the DAW's project file (ARCHITECTURE.md §8.3).
+//! Serialized state representation stored in DAW project files and presets.
 //!
-//! The sub-plugin's own chunk is nested inside, opaque. The parts the wrapper
-//! owns — slot table, bindings, the node graph — are serialised separately and
-//! deliberately do *not* depend on the sub-plugin being present, so swapping
-//! the sub-plugin leaves everything else standing.
-//!
-//! The layout lives here rather than in `subhost-adapter` because it is this
-//! product's document: `graph` and `sub_block` mean nothing to a crate whose
-//! job is nesting one plugin inside another. That crate fills in the two parts
-//! it does own — the slots and the instances — through
-//! [`SubHostState`][subhost_adapter::SubHostState].
+//! Sub-plugin state chunks are nested opaquely. Wrapper-owned data structures
+//! (slot table, parameter bindings, node graph) are serialized independently
+//! so that sub-plugins can be reloaded or swapped without losing graph configuration.
 
 use serde::{Deserialize, Serialize};
 use subhost_adapter::{
@@ -19,38 +12,29 @@ use subhost_adapter::{
 /// Everything the wrapper writes into the DAW's project file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WrapperState {
-    /// Bumped when the layout changes incompatibly. Present from the start so
-    /// there is somewhere to branch when it does.
+    /// Incremented on breaking schema changes.
     pub version: u32,
     pub slots: Vec<Slot>,
-    /// Pre-M8 projects hold one sub-plugin here. Read on load and folded into
-    /// `instances`; never written any more (see [`WrapperState::instances`]).
+    /// Legacy single-sub-plugin reference for backwards compatibility with earlier state formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_plugin: Option<SubPluginRef>,
-    /// The pre-M8 sub-plugin's own opaque chunk.
+    /// Legacy single-sub-plugin state chunk for backwards compatibility.
     ///
-    /// Base64 rather than raw bytes because this lives inside a JSON document
-    /// that nice-plug persists as a string field.
+    /// Base64 encoded inside the JSON string persisted by the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_state: Option<String>,
-    /// The hosted sub-plugins, from M8 on (§14.1).
+    /// Hosted sub-plugin instances.
     ///
-    /// Empty in a pre-M8 project, where `sub_plugin` carries the single one
-    /// instead; [`instances`][WrapperState::instances] hides that difference
-    /// from every caller so there is one shape to handle rather than two.
+    /// In legacy project files where `sub_plugin` is set, [`instances`][WrapperState::instances]
+    /// transparently maps the single sub-plugin to instance 0.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_plugins: Vec<InstanceState>,
-    /// The node graph (§9), as its own JSON value.
+    /// The node graph, stored as a generic JSON value.
     ///
-    /// Held opaquely rather than as a `Graph` so that this crate — which is
-    /// about nesting one plugin inside another and knows nothing about node
-    /// graphs — does not grow a dependency on the engine to describe a field it
-    /// only ever passes through. It also means a project saved by a newer
-    /// version survives a round trip through an older one instead of losing the
-    /// patch.
+    /// Preserved as an opaque value so forward and backward schema versions survive round trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<serde_json::Value>,
-    /// Sub-block size for modulation, in samples (§9.2).
+    /// Sub-block modulation quantum in samples.
     #[serde(default = "default_sub_block")]
     pub sub_block: u32,
 }
@@ -96,12 +80,9 @@ impl WrapperState {
         }
     }
 
-    /// The hosted sub-plugins, whichever way the project spelled them.
+    /// The hosted sub-plugins across all instances, supporting both multi-instance and legacy formats.
     ///
-    /// A project saved before M8 has one in `sub_plugin`; one saved after has
-    /// any number in `sub_plugins`. Callers should not have to know which, so
-    /// the old shape is presented as instance 0 of the new one.
-    /// The parts `SubHost` owns, in the shape it wants them.
+    /// For legacy project files containing a single `sub_plugin`, maps the entry to instance 0.
     pub fn sub_host_state(&self) -> SubHostState {
         SubHostState {
             slots: self.slots.clone(),
@@ -113,9 +94,7 @@ impl WrapperState {
     pub fn set_sub_host_state(&mut self, state: SubHostState) {
         self.slots = state.slots;
         self.sub_plugins = state.instances;
-        // A project that came in with the pre-M8 single sub-plugin has been
-        // folded into `sub_plugins` by now, so the old fields would only be a
-        // second, staler copy of the same thing.
+        // When updating state, clear legacy single-plugin fields now represented in `sub_plugins`.
         self.sub_plugin = None;
         self.sub_state = None;
     }
@@ -168,8 +147,7 @@ mod tests {
 
     #[test]
     fn a_state_written_before_the_graph_existed_still_loads() {
-        // Projects saved by M3 and M4 have no `graph` and no `sub_block`. They
-        // must open with an empty graph and the default rate, not fail.
+        // States saved without a `graph` or `sub_block` should deserialize successfully with defaults.
         let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null}"#;
         let state: WrapperState = serde_json::from_str(json).unwrap();
         assert!(state.graph.is_none());
@@ -191,8 +169,7 @@ mod tests {
 
     #[test]
     fn a_state_with_no_sub_plugin_is_still_valid() {
-        // Bindings outlive the plugin they point at (§8.3), so this has to
-        // serialise cleanly.
+        // Parameter bindings and state remain valid even when no sub-plugin is loaded.
         let state = WrapperState::new(vec![Slot::default(); 2]);
         let json = serde_json::to_string(&state).unwrap();
         let back: WrapperState = serde_json::from_str(&json).unwrap();
@@ -202,11 +179,10 @@ mod tests {
 
     #[test]
     fn a_pre_m8_project_comes_back_in_the_new_shape() {
-        // `instances()` hides the old single-sub-plugin layout from callers;
-        // taking a round trip through `SubHost` must write the new one.
+        // Legacy single-sub-plugin layouts are migrated to multi-instance format upon loading.
         let json = r#"{"version":1,"slots":[],
                        "sub_plugin":{"format":"vst3","plugin_id":"AAAA",
-                                     "path_hint":"","display_name":"Thing"},
+                                      "path_hint":"","display_name":"Thing"},
                        "sub_state":"AAEC"}"#;
         let mut state: WrapperState = serde_json::from_str(json).unwrap();
         let carried = state.sub_host_state();

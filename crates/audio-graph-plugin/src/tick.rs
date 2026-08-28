@@ -1,42 +1,20 @@
-//! The wrapper's heartbeat: a periodic call onto the host's main thread, for
-//! as long as the plugin instance exists.
+//! The wrapper's background heartbeat: provides periodic calls onto the host's main thread.
 //!
-//! # Why this is not the editor's job
+//! Hosted plugins may request periodic timer ticks or schedule main-thread callbacks
+//! (e.g. for parameter rescanning, lazy state serialization, or GUI resizing). This
+//! ticking mechanism runs continuously throughout the lifetime of the plugin instance,
+//! ensuring sub-plugins are serviced even when the editor window is closed.
 //!
-//! CLAP does not treat the main-thread callback as a courtesy. A hosted plugin
-//! may ask its host for a periodic timer (`timer-support`) and may call
-//! `request_callback()` from anywhere, including the audio thread, and the
-//! host owes it an `on_main_thread` in return. A plugin that never gets either
-//! does not merely feel sluggish — it stops finishing whatever it deferred:
-//! parameter rescans, state that is written lazily, resize answers.
+//! # Thread dispatch
 //!
-//! Until now the only thing driving that was the `Deferred` tick the wrapper's
-//! own editor sets up when its window opens, so a project that loads and plays
-//! without anyone opening the wrapper's UI — the ordinary case, since
-//! `restore_state` loads every sub-plugin at project load — starved its
-//! sub-plugins for the whole session.
+//! A dedicated background thread handles timing intervals and posts tasks to the main
+//! thread via nice-plug's `execute_gui` (which maps to `request_callback()` under CLAP
+//! or the main message loop under VST3).
 //!
-//! # How it gets onto the main thread
+//! # Timing intervals
 //!
-//! A plain thread does the waiting, and hands the work over with nice-plug's
-//! `execute_gui`. That is the one route to the main thread that exists before
-//! any window does: under CLAP it becomes `request_callback()`, and under VST3
-//! it goes through the wrapper's own message-loop hook. A platform timer in
-//! `host-window` would have worked on Windows only — its non-Windows half is
-//! still a stub — and would have had to be written once per platform.
-//!
-//! The exception is VST3 on Linux, where nice-plug runs `execute_gui` tasks on
-//! a worker thread because X11 has no main thread to speak of. The tick checks
-//! before touching anything and skips rather than panicking; CLAP on Linux
-//! goes through `request_callback()` and is unaffected.
-//!
-//! # Cost
-//!
-//! A resident 60 Hz timer per instance is not free, and most instances are not
-//! doing anything that needs it. So the period is chosen by what the last tick
-//! found: [`BUSY_MS`] while a sub-plugin is loaded, [`IDLE_MS`] when none is.
-//! The idle rate still has to be brisk enough that the first tick after a
-//! plugin is loaded is not visible as a stall.
+//! When sub-plugins are loaded, ticks run at [`BUSY_MS`] (60 Hz). When no sub-plugins
+//! are active, the interval relaxes to [`IDLE_MS`] to minimize host UI thread overhead.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -98,8 +76,7 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
     state.pending.store(false, Ordering::Release);
 
     if !shared.on_main_thread() {
-        // VST3 on Linux; see the module comment. Nothing here is safe to do
-        // from here, and there is no other thread to hand it to.
+        // VST3 on Linux runs GUI callbacks on worker threads; skip safely.
         return;
     }
 
@@ -110,9 +87,7 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
         main.host.tick_editors();
         main.host.any_loaded()
     };
-    // As good a moment as any to free the programs the audio thread has handed
-    // back (§9.1). Nothing else on the main thread is guaranteed to run while
-    // a patch just sits there playing.
+    // Free superseded compiled graph programs returned by the audio thread.
     shared.reclaim();
 
     state

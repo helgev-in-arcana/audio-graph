@@ -1,4 +1,4 @@
-//! What the wrapper offers the sub-plugin as its host (ARCHITECTURE.md §7).
+//! Host context implementation provided by the wrapper to hosted sub-plugins.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -58,12 +58,9 @@ impl HostContext for WrapperHostContext {
     }
 
     fn param_edited(&self, id: ParamId, plain: f64) {
-        // Swallowed on purpose (§7.5). In Drive mode the wrapper is the sole
-        // authority for parameter values, so a notification that the
-        // sub-plugin's own GUI moved a knob has nothing to tell the DAW —
-        // forwarding it would create automation the user never asked for.
-        // Logged rather than dropped silently, because it is genuinely useful
-        // when working out why a value did not stick.
+        // Parameter edits from the sub-plugin GUI are not forwarded upstream
+        // because the wrapper graph acts as the authoritative source of parameter
+        // values. Logged for diagnostic purposes.
         log::trace!(
             "sub-plugin edited param {} to {plain} (not forwarded)",
             id.0

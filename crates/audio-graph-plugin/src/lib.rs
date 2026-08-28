@@ -1,10 +1,9 @@
 //! The wrapping plugin itself: one plugin to the DAW, a host on the inside.
 //!
-//! Two classes are exported from this one binary (ARCHITECTURE.md §6). The
-//! sub-plugin's kind is only known at runtime, but a plugin's own category is
-//! static, so the wrapper has to declare both up front: an effect with a stereo
-//! input, and an instrument without one. The implementation is shared; only the
-//! bus layout and the descriptor differ.
+//! Two plugin classes are exported from this single binary. The sub-plugin's kind
+//! is determined at runtime, but plugin format categories are static, so the
+//! wrapper declares both up front: an effect with a stereo input, and an instrument
+//! without one. Implementation is shared; only the bus layout and descriptor differ.
 
 mod config;
 mod editor;
@@ -57,14 +56,12 @@ macro_rules! wrapper_class {
 
             const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = $layouts;
 
-            // Note input on both forms. The effect needs it too: note
-            // expression is one of the sources the node graph will read (§9.3),
-            // and a plugin that declares no note input never receives them.
+            // Note input on both forms. The effect needs it as well because
+            // note events and per-note expressions are graph input sources.
             const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
 
-            // The sub-plugin is where sample-accurate parameter changes land,
-            // and the wrapper quantises to sub-blocks itself (§9.2). Letting
-            // the host split our buffer as well would fight that.
+            // The wrapper handles sub-block quantization for parameter automation,
+            // so sample-accurate buffer splitting from the host is disabled.
             const SAMPLE_ACCURATE_AUTOMATION: bool = false;
 
             // The editor is where a sub-plugin is chosen and its parameters
@@ -104,8 +101,7 @@ macro_rules! wrapper_class {
                 let latency = self.0.activate($kind, audio_io_layout, buffer_config);
                 match latency {
                     Some(samples) => {
-                        // §7.4: the DAW is told the sub-plugin's latency plus
-                        // ours, or the track sits misaligned.
+                        // Report the combined latency (wrapper plus sub-plugins) to the host.
                         context.set_latency_samples(samples);
                         true
                     }
@@ -149,11 +145,9 @@ macro_rules! wrapper_class {
 
 /// Stereo in, stereo out, plus one stereo sidechain the DAW can feed.
 ///
-/// The aux bus is fixed at compile time because VST3 cannot add one at runtime
-/// (§14.11) — the same reason the slot count is fixed (§8.1). One is enough for
-/// the shape this exists for: a compressor inside the graph keyed off another
-/// track. A patch that wires nothing to it costs the DAW an unused bus, which
-/// every host already deals with.
+/// The aux bus is declared statically at compile time because plugin formats like
+/// VST3 do not support adding audio buses dynamically at runtime. This provides a
+/// dedicated sidechain input for graph nodes.
 const FX_LAYOUTS: &[AudioIOLayout] = &[AudioIOLayout {
     main_input_channels: NonZeroU32::new(2),
     main_output_channels: NonZeroU32::new(2),
@@ -222,8 +216,6 @@ wrapper_class! {
     clap_features: &[ClapFeature::Instrument, ClapFeature::Stereo],
 }
 
-// §12's first open question, answered: nice-plug's export macros already take
-// several plugin types, so exporting both classes from one binary needs no
-// changes to nice-plug.
+// Export both the effect and instrument plugin classes from this binary.
 nice_export_vst3!(WrapperFx, WrapperInstrument);
 nice_export_clap!(WrapperFx, WrapperInstrument);

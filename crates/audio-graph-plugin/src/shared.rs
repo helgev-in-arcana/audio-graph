@@ -1,31 +1,14 @@
-//! State the editor and the audio path both need to reach.
+//! Shared state accessible by both the editor UI and the audio processing thread.
 //!
-//! The arrangement here is the answer to one question: what may the audio
-//! thread be made to wait for?
+//! State is partitioned by thread access patterns to prevent audio thread blocking:
 //!
-//! Until M5 the answer was "one lock around everything", and the audio thread
-//! declined it rather than waiting. That was honest for what it covered — the
-//! editor only ever took the lock to *load* a sub-plugin, which is rare, slow
-//! and audibly disruptive whatever we do. But the editor also took it sixty
-//! times a second to redraw and to tick the sub-plugin's window, and each of
-//! those was a chance for the audio thread to lose a block for no reason at
-//! all. A graph editor makes that far worse: dragging an LFO rate recompiles
-//! continuously, and an audio path that drops a block per edit would make the
-//! engine's own bugs indistinguishable from lock contention.
-//!
-//! So the state is split by how often it is touched rather than by what it is:
-//!
-//! - [`MainState`] — the sub-plugin's controller half, the graph, the editor's
-//!   own bookkeeping. Reached constantly, and only ever from the main thread,
-//!   so it needs no lock at all. `MainThread` turns that from a comment into a
-//!   runtime check.
-//! - [`AudioState`] — the live processor. Behind a mutex the audio thread only
-//!   ever *tries*, and which the main thread takes solely to start or stop a
-//!   sub-plugin. Swapping a plugin mid-playback glitches, which is the honest
-//!   cost of doing it at all, and nothing else contends.
-//! - The compiled [`Program`] — published through a [`Handoff`], which the
-//!   audio thread reads without any lock whatsoever (§9.1). This is the path
-//!   every graph edit takes, so it is the one that had to be free.
+//! - [`MainState`] — UI state, sub-plugin host controllers, and graph structure.
+//!   Accessed solely on the main thread without mutex synchronization.
+//! - [`AudioState`] — Active audio processors. Protected by a mutex that the audio
+//!   thread accesses via `try_lock()`, while the main thread locks it only during
+//!   plugin load, unload, or reset.
+//! - Compiled [`Program`] — Passed to the audio thread via lock-free [`Handoff`],
+//!   enabling real-time graph recompilation and hot-swapping without lock contention.
 
 use std::array;
 use std::cell::{RefCell, RefMut};
@@ -56,23 +39,15 @@ pub struct MainState {
     /// through an edit; the last program that compiled keeps running and the
     /// editor says why.
     pub compile_error: Option<String>,
-    /// How each sub-plugin has to be activated under the current program
-    /// (§14.11).
+    /// Bus configurations required for each sub-plugin instance under the current program.
     ///
-    /// Kept here rather than read back off the engine because the engine lives
-    /// on the audio side of the wrapper, and this is needed on the main thread
-    /// every time something is re-activated.
+    /// Maintained on the main thread for reactivation when routing changes.
     pub instance_io: Vec<InstanceIo>,
-    /// Which sub-plugin parameter each graph-driven lane drives (§14.12).
-    /// Read at activate, like the slot bindings, so a new socket only reaches
-    /// audio after a restart.
+    /// Which sub-plugin parameter each graph-driven lane targets.
     pub graph_params: Vec<ParamTarget>,
-    /// Which delay ring was last handed to the audio thread, and how long it
-    /// was (§14.5).
+    /// Tracked delay ring buffer allocations (node ID and size in samples) sent to the audio thread.
     ///
-    /// Only so the next publish can tell whether anything changed. A recompile
-    /// happens on every drag of every control, and allocating 700 kB each time
-    /// to replace a ring with an identical one would be silly.
+    /// Retained across recompilations to prevent redundant memory reallocations when delay lengths are unchanged.
     pub sized_rings: Vec<(NodeId, usize)>,
 }
 
@@ -94,12 +69,9 @@ pub struct Shared {
     main: MainThread<RefCell<MainState>>,
     audio: Mutex<AudioState>,
     programs: Handoff<Program>,
-    /// Sub-block size in samples (§9.2). An atomic rather than part of
-    /// `MainState` because the audio thread reads it every block and must not
-    /// have to ask anybody's permission.
+    /// Sub-block modulation quantum in samples.
     quantum: AtomicU32,
-    /// What the DAW is running at, so the editor can put the floor of §14.4 in
-    /// seconds on a delay node. Bits of an `f32`, the same trick `live` uses.
+    /// Host sample rate used for GUI calculations (e.g. delay times).
     sample_rate: AtomicU32,
     /// What each slot is actually worth after the graph has had its say.
     ///
@@ -254,10 +226,8 @@ impl Shared {
         match compile(&state.graph, SLOT_COUNT) {
             Ok(mut program) => {
                 state.compile_error = None;
-                // The delay rings are allocated here, on the main thread, and
-                // ride over inside the program (§14.5, §9.1). `sized_rings`
-                // remembers what was sent last time so an unchanged line is
-                // handed nothing rather than a fresh copy of what it has.
+                // Delay ring buffers are allocated on the main thread and transferred inside the program.
+                // `sized_rings` tracks previous allocations to avoid redundant allocations when unchanged.
                 state.sized_rings =
                     program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
                 // A graph edit can change which buses a sub-plugin needs —
@@ -290,8 +260,7 @@ impl Shared {
         self.load_into(0, path)
     }
 
-    /// Load a plugin into one instance slot and hand its ports to the node
-    /// that named it (§14.2).
+    /// Load a plugin into one instance slot and configure the node with its ports.
     ///
     /// The node is added first and the plugin arrives afterwards, which is why
     /// this takes a node id: a plugin takes hundreds of milliseconds to load,
@@ -306,13 +275,8 @@ impl Shared {
         resumed
     }
 
-    /// Give a patch that has no graph the one it was implicitly running.
-    ///
-    /// Everything saved before this commit relied on the wrapper passing audio
-    /// through by itself — no graph meant "input to output", and one sub-plugin
-    /// with no graph meant "through that plugin". Those paths are gone, so a
-    /// project reopened against this build would go silent unless the routing
-    /// it was already getting is drawn for it.
+    /// Ensure patches without an explicit graph configuration receive a default
+    /// audio pass-through patch.
     pub fn adopt_default_patch(&self) {
         {
             let mut state = self.main();
@@ -324,7 +288,7 @@ impl Shared {
             }
             state.graph = Graph::default_patch();
         }
-        // A single loaded sub-plugin was the pre-M8 patch: put it in the middle.
+        // If a sub-plugin is already loaded, wire it inline between audio in and out.
         if self.main().host.is_loaded(0) {
             let node = self.main().graph.add(
                 NodeKind::Plugin(Plugin {
@@ -372,12 +336,9 @@ impl Shared {
             return;
         };
         if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
-            // The parameter sockets are the user's, not the plugin's (§14.12):
-            // discovery replaces the buses and leaves the sockets alone. Which
-            // output buses have a socket is the user's too, for the same
-            // reason — but only once there is something for it to be a choice
-            // between. A node discovering its plugin for the first time takes
-            // the main bus and nothing else.
+            // Parameter sockets are user-configured: discovery updates audio and note buses
+            // while preserving existing parameter socket bindings. Which output buses have
+            // sockets is also preserved once configured; initial discovery defaults to the main bus.
             let params = std::mem::take(&mut ports.params);
             let shown = (!ports.audio_out_shown.is_empty()).then(|| ports.audio_out_shown.clone());
             *ports = discovered;

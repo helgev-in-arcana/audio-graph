@@ -84,19 +84,10 @@ pub struct PluginEntry {
 const POPUP_WIDTH: f32 = 540.0;
 const LIST_HEIGHT: f32 = 360.0;
 
-/// Whether the plugin list is split into FX and Instrument tabs.
+/// Whether the plugin list in the add-node menu is split into FX and Instrument tabs.
 ///
-/// Provisional, and there are two ways to take it back out:
-///
-/// * Set this to `false`. The tab row disappears and every plugin shows in one
-///   list again, because [`PluginTab::shows`] then says yes to everything.
-/// * Revert the commit that added it — "Split the plugin list into FX and
-///   Instrument tabs", `8d8254e` on the branch it landed on. It touches this
-///   file and nothing else, so the revert is clean.
-///
-/// Either way nothing underneath it moves: the kinds come from the scan cache
-/// ([`plugin_host::catalogue`]), which was added separately and is worth having
-/// whether or not the list is split by it.
+/// When `true`, plugins are separated by category (Effect vs. Instrument).
+/// When `false`, all plugins appear in a single unified list.
 const PLUGIN_TABS: bool = true;
 
 /// Which half of the plugin list the menu is showing.
@@ -134,8 +125,8 @@ impl PluginTab {
 /// a window — see the module comment on [`crate::editor`] for why that must not
 /// happen inside a draw callback.
 pub enum GraphAction {
-    /// Load `path` into `instance` and give `node` the sockets it turns out to
-    /// have (§14.2).
+    /// Load `path` into `instance` and configure `node` with the discovered
+    /// ports and buses.
     LoadPlugin {
         node: NodeId,
         instance: usize,
@@ -166,16 +157,15 @@ pub struct GraphContext<'a> {
     /// one. Shown on slot nodes so the graph reads as "drive the filter cutoff"
     /// rather than as "drive slot 12".
     pub bindings: &'a [(usize, String, bool)],
-    /// What the sub-plugin can accept (§3.3).
+    /// Whether the sub-plugin supports per-voice modulation.
     pub poly_modulation: bool,
     /// Why the graph on screen is not the graph being heard.
     pub error: Option<String>,
     /// The value each slot currently has after the graph has had its say.
     pub live: [f32; SLOT_COUNT],
-    /// The sub-block size and the sample rate, which together are the floor a
-    /// delay time cannot go below (§14.4). The editor shows it and holds the
-    /// control at it; the audio thread applies it again regardless, because
-    /// these two can change while a patch is loaded.
+    /// The sub-block size and the sample rate, which together define the minimum
+    /// delay time floor. The editor displays this and restricts control minimums;
+    /// the audio thread also clamps it dynamically.
     pub quantum: u32,
     pub sample_rate: f64,
 }
@@ -1434,8 +1424,8 @@ mod tests {
         assert_eq!(canvas.editor.zoom, 1.0);
     }
 
-    /// §14.16. The point under the pointer is the one that must not move, which
-    /// means the pan has to take up the difference.
+    /// The graph coordinate under the pointer remains stationary when zooming,
+    /// with the canvas pan adjusting accordingly.
     #[test]
     fn zooming_holds_the_point_under_the_pointer() {
         let mut canvas = Canvas::new();

@@ -1,15 +1,9 @@
-//! What the audio thread is and is not allowed to wait for.
+//! Concurrency and real-time invariants for the audio thread.
 //!
-//! ARCHITECTURE.md §9.1 and §12-5. The rule these tests exist to hold down is
-//! narrow and easy to break by accident: *routine* main-thread work — drawing
-//! the editor, ticking the sub-plugin's window, recompiling the graph on every
-//! frame of a drag — must not be able to make the audio thread miss a block.
-//! Rare heavy work — starting or stopping a sub-plugin — may, and does.
-//!
-//! Before M5 that distinction did not exist. One mutex covered everything, so
-//! having the editor open at all put a lock acquisition in the audio thread's
-//! path sixty times a second, and losing the race meant a block of audio passed
-//! through unprocessed. Audibly, a click. These tests are the difference.
+//! Routine main-thread operations (drawing the editor, ticking sub-plugin windows,
+//! recompiling the graph during editing) must never block the audio thread or cause
+//! dropped blocks. Heavy operations (such as loading or unloading sub-plugins) are
+//! permitted to block.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,10 +27,9 @@ impl HostContext for SilentHost {
     fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
 }
 
-/// Somewhere for a parameter chain to go.
+/// Helper to add a plugin node with a parameter port to the graph.
 ///
-/// `SlotOut` used to be it; a §14.12 parameter socket is, now. Its lane is the
-/// first one past the slot table, which is what `SINK_LANE` is.
+/// Maps the target parameter to the first lane after the slot table (`SINK_LANE`).
 fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::NodeId {
     graph.add(
         NodeKind::Plugin(Plugin {
@@ -162,9 +155,7 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
 
 #[test]
 fn drawing_the_editor_never_reaches_the_audio_lock() {
-    // The narrower version of the same claim, and the one that was actually
-    // wrong before M5: simply *having the editor open* used to contend, because
-    // the redraw and the sub-plugin's window tick both took the one lock.
+    // Verifies that routine GUI redraws and editor ticking do not contend on the audio lock.
     let shared = shared();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -207,8 +198,8 @@ fn drawing_the_editor_never_reaches_the_audio_lock() {
 
 #[test]
 fn the_old_program_is_freed_on_the_main_thread() {
-    // §9.1's other half. The audio thread must not run a destructor, so a
-    // superseded program has to travel back up before anything frees it.
+    // The audio thread must not run destructors; superseded programs are returned
+    // to the main thread for reclamation.
     let shared = shared();
     let mut engine = Engine::new();
 
