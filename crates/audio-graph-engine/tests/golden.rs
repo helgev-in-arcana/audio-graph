@@ -378,6 +378,9 @@ fn always_on_node() {
 // --- the patch format -----------------------------------------------------
 
 /// JSON patch fixture exercising serialization across all node kinds.
+/// This serves as a backward-compatibility contract with files users have already saved:
+/// if a refactoring changes how a node kind is serialized, the test will fail instead of
+/// silently making old patches unopenable.
 const EVERY_KIND: &str = r#"{
   "nodes": [
     {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},

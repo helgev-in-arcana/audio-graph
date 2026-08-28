@@ -585,6 +585,10 @@ mod tests {
     }
 
     /// Returns the register an op writes, if any.
+    ///
+    /// Operations like `DelayWrite`, `KeyStep`, and `KeyLatch` deliberately do not
+    /// write to registers. This omits an edge in the topological sort, thereby
+    /// preventing cycles from forming in feedback loops or self-modifying latches.
     fn writes(op: &Op) -> Option<Reg> {
         match *op {
             Op::Const { out, .. }

@@ -102,6 +102,8 @@ pub struct Engine {
     /// Node IDs associated with active LFO phases.
     phase_nodes: Vec<u32>,
     /// Parameter delay line ring buffers, indexed by line ID.
+    /// Uses `Vec<Vec<f64>>` to allow lock-free outer pointer swapping during program
+    /// swaps without copying large sample buffers.
     rings: Vec<Vec<f64>>,
     /// Current write head position per parameter delay line.
     ring_heads: Vec<usize>,
@@ -429,6 +431,9 @@ impl Engine {
     }
 
     /// Clears held notes and resets internal phase/delay head counters on host transport jump.
+    ///
+    /// This intentionally does NOT clear key switch latches, because latches should survive
+    /// transport jumps (e.g. seeking in the DAW timeline).
     pub fn reset(&mut self) {
         self.expressions = Expressions::default();
         self.keys_held = 0;
@@ -1034,6 +1039,8 @@ impl Engine {
                         MathOp::Multiply => a * b,
                         MathOp::Min => a.min(b),
                         MathOp::Max => a.max(b),
+                        // Clamping the exponent to at least 0.01 prevents yielding Infinity,
+                        // which can crash third-party plugins if fed to their parameters.
                         MathOp::Curve => a.clamp(0.0, 1.0).powf(b.clamp(0.01, 100.0)),
                     };
                 }

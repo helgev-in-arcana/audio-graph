@@ -63,12 +63,16 @@ pub enum Op {
         key: u8,
     },
     /// Advances latch `state` to the next of `count` positions when `key` is struck, wrapping around.
+    /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
+    /// the topological sort, preventing cycles.
     KeyStep {
         state: u16,
         key: u8,
         count: u16,
     },
     /// Sets latch `state` to `value` when `key` is struck.
+    /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
+    /// the topological sort, preventing cycles.
     KeyLatch {
         state: u16,
         key: u8,
@@ -113,6 +117,8 @@ pub enum Op {
         time_reg: Option<Reg>,
     },
     /// Write the current sub-block's value into a parameter delay line.
+    /// Deliberately does not write to a register to omit an edge in the topological
+    /// sort, thereby preventing cycles.
     DelayWrite {
         line: u16,
         a: Reg,

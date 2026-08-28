@@ -34,6 +34,11 @@ pub fn linear_to_db(linear: f64) -> f64 {
 ///
 /// Each input pair consists of an audio signal socket and an associated parameter gain socket.
 /// If a gain socket is unconnected, it falls back to its configured scalar gain.
+///
+/// The gains are integrated here rather than in a node of their own because a mix with
+/// one input is a gain, and the audio half needed a multiply anyway. `Math` is the
+/// parameter half's multiply and cannot touch a buffer. Two nodes that share
+/// every line of their implementation are one node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mix {
     pub channels: u16,

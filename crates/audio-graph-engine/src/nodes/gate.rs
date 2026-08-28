@@ -16,6 +16,10 @@ const OPEN_DB: f64 = 0.0;
 ///
 /// Passes audio through at unity gain (0 dB) when open, or silences it (-100 dB)
 /// when closed. If the control input is unconnected, it defaults to zero (closed).
+///
+/// **Bug:** Gating a loud signal can click because the switch is hard, happening
+/// at a chunk boundary. The proper fix, which is a ramp in the audio half,
+/// is not implemented yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gate {
     pub channels: u16,
@@ -81,6 +85,8 @@ impl Node for Gate {
         let lane = cx.lane(1);
         cx.consume(buf);
         // Allocate buffer and emit a mix operation scaling by the gated gain.
+        // The gate may well reuse the input buffer as the destination, making
+        // it an in-place scaling that costs no additional buffer.
         let out = cx.alloc(self.channels, readers)?;
         cx.emit(AudioOp::Mix {
             out,

@@ -319,6 +319,11 @@ impl Node for Plugin {
     }
 
     /// Formats the UI title showing instance index and loaded plugin name.
+    ///
+    /// The instance number stays on the front of it: two copies of the same
+    /// plugin are two nodes that would otherwise be titled identically,
+    /// and the number is also what the slot bindings outside the graph are
+    /// keyed on.
     #[cfg(feature = "ui")]
     fn ui_title(&self, cx: &NodeUi<'_>) -> String {
         match cx.instances.get(self.instance) {
@@ -489,6 +494,10 @@ impl Node for Plugin {
     }
 
     /// Tooltip label for adding an additional parameter input socket.
+    ///
+    /// A plugin node does not get a socket per parameter because some plugins
+    /// have thousands of them, so they are added one at a time and each one
+    /// picks what it drives from a dropdown.
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         Some("a socket for another parameter")

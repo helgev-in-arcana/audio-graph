@@ -46,7 +46,8 @@ pub struct Port {
     /// Indicates whether this socket represents a dynamically removable input group
     /// (e.g. mix bus inputs or plugin parameter ports).
     ///
-    /// Used by the UI to render removal controls for dynamic port sets.
+    /// Used by the UI to render removal controls for dynamic port sets. For the actual
+    /// logic determining how many sockets are removed, see [`NodeKind::remove_input`][crate::NodeKind::remove_input].
     pub removable: bool,
 }
 

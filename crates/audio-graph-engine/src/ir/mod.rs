@@ -33,6 +33,8 @@ pub const MAX_LATCHES: usize = 64;
 pub const MAX_DELAY_LINES: usize = 16;
 
 /// Maximum delay line depth for parameter delays, measured in sub-blocks.
+/// Pre-allocating to this maximum size prevents memory allocations on the
+/// audio thread when a user dynamically drags the delay time control.
 pub const MAX_DELAY_TAPS: usize = 4096;
 
 /// Maximum number of audio delay lines supported per program.

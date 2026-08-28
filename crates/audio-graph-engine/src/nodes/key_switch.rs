@@ -42,7 +42,8 @@ impl KeySwitchMode {
 ///
 /// Supports momentary (`Hold`), latching (`Select`), and sequential (`Toggle`) modes.
 /// Trigger keys can optionally be filtered out (`mute_keys`) so they do not produce sound
-/// downstream.
+/// downstream. Both halves of a muted key go, note-on and note-off alike. There is no
+/// sounding voice waiting for the release, so dropping it hangs nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeySwitch {
     pub mode: KeySwitchMode,

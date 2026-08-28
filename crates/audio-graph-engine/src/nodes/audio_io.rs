@@ -30,6 +30,8 @@ fn bus_port(name: &'static str, bus: usize, channels: u16) -> Port {
 }
 
 // Audio nodes emit audio processing operations without allocating parameter registers.
+// The audio pass walks the same topological order as the parameter pass and emits
+// their half.
 
 impl Node for AudioIn {
     fn title(&self) -> String {

@@ -35,7 +35,14 @@ pub struct DelayWrite {
 pub struct DelayRead {
     pub line: LineId,
     pub ty: PortType,
-    /// Maximum delay time in seconds allocated during activation.
+    /// The maximum delay time in seconds.
+    ///
+    /// A ring buffer is allocated during activation because allocating on the audio
+    /// thread is forbidden. Therefore, `max_time` cannot be automatable, as changing
+    /// it on the fly would require reallocating the buffer.
+    ///
+    /// Delay lines start with zero accumulated latency because a line is a cut,
+    /// not an edge.
     pub max_time: f64,
     pub time: f64,
 }

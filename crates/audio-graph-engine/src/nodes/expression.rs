@@ -48,7 +48,10 @@ impl Node for Expression {
         );
         if self.source.is_per_note() && !cx.poly_modulation {
             // When polyphonic modulation is unsupported, per-note expressions
-            // are flattened to monophonic values.
+            // are flattened to monophonic values. Per-voice sources are not
+            // greyed out because the graph is monophonic, so they still do
+            // something useful (they are just flattened). Informing the user
+            // is more useful than disabling a working control.
             ui.colored_label(egui::Color32::from_rgb(200, 160, 70), "newest note only")
                 .on_hover_text(
                     "the sub-plugin cannot take per-voice modulation, so every \

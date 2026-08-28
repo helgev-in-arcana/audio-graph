@@ -485,6 +485,8 @@ mod tests {
         });
         assert!(write.output_ports().is_empty());
         // The read node's input is the delay time parameter, not a signal edge.
+        // It expects a parameter input rather than a signal edge from the writer
+        // to keep cycles out of the topological sort.
         assert_eq!(read.input_ports().len(), 1);
         assert!(matches!(read.input_ports()[0].ty, PortType::Param));
     }

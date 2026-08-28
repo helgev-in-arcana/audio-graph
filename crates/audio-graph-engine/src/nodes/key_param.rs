@@ -36,6 +36,10 @@ impl KeyParamMode {
 /// Each value has an associated trigger key and input socket. If a value socket
 /// is unconnected, it falls back to its configured scalar value. When no note
 /// input is connected, the node outputs the first value.
+///
+/// Which value is chosen survives a recompile but not a reload: the first
+/// value is what the node reads until a key is struck, which is the honest
+/// answer for a control the DAW knows nothing about.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyParam {
     pub mode: KeyParamMode,
@@ -126,6 +130,8 @@ impl Node for KeyParam {
         };
 
         // Combine values into a single register selected by the current latch state.
+        // The latch holds a whole number, so a `>=` per value is an exact pick and
+        // costs one instruction each.
         let mut chosen = match first {
             Operand::Reg(reg) => reg,
             Operand::Value(value) => {

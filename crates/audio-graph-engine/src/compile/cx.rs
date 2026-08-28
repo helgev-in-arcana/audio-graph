@@ -257,6 +257,9 @@ impl<'a> ParamCx<'a> {
     }
 
     /// Returns the upstream note gate condition register feeding input `port`, if present.
+    ///
+    /// Returning a register allows a gate node to fold upstream gates into its own
+    /// condition, rather than forcing the audio thread to check a list of gates.
     pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
         let (_, socket, _) = trace_notes(self.graph, self.id, port);
         let socket = socket?;
@@ -338,6 +341,12 @@ impl Pool {
     }
 
     /// Allocates an audio buffer, avoiding any buffer in `avoid`.
+    ///
+    /// Plugins and `Mix` nodes must avoid certain buffers to prevent memory aliasing
+    /// and corruption. A plugin reads its input and writes its output; since a host
+    /// cannot safely assume a plugin supports in-place processing, we never alias
+    /// its input to its output. A `Mix` node accumulates into its first input, which
+    /// would corrupt the data for other readers if they shared the same buffer.
     fn alloc_avoiding(
         &mut self,
         channels: u16,
