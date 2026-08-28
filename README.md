@@ -3,10 +3,10 @@
 # AudioGraph
 
 **A _node-based_ Instrument / Effect plugin
-for VST3 and CLAP plugins.**
+for VST3 and CLAP plugins**
 
-**中でプラグインを読み込んで、ノードベースで音を弄れるプラグインです。**<br>
-**音の配線、パラメーターの配線、MIDIの配線すべてをノードで編集できます。**
+**中でプラグインを読み込んで、ノードベースで音を弄れるプラグイン**<br>
+**音、パラメーター、MIDIをすべてをノードで編集できます。**
 
 ![](./docs/example-screenshot.png)
 
@@ -41,63 +41,11 @@ cargo xtask bundle audio-graph-plugin --release
 
 `target/bundled/` に `AudioGraph.vst3` と `AudioGraph.clap` ができます。
 
-<div align="center">
+## [Architecture](docs/architecture.md)
 
----
+[![](docs/architecture.png)](docs/architecture.md)
 
----
-
-</div>
-
-## Architecture / Development
-
-```mermaid
-flowchart TD
-    plugin[audio-graph-plugin<br/>VST3/CLAP として外に出る層]
-    cli[host-cli]
-    adapter[subhost-adapter<br/>入れ子であることに固有の処理]
-    engine[audio-graph-engine<br/>グラフ・コンパイラ・IR]
-    host[plugin-host<br/>形式を畳むファサード]
-    api[plugin-host-api<br/>共通トレイトとデータモデル]
-    vst3[vst3-host]
-    vst3v[vst3-host-view]
-    clap[clap-host]
-    win[host-window]
-
-
-    api --> vst3
-    api --> clap
-
-    win --> clap
-    win --> vst3v
-
-
-    api --> host
-    clap --> host
-    vst3 --> host
-    vst3v --> host
-    win --> host
-
-    host --> engine
-
-    host --> adapter
-    engine --> adapter
-
-
-
-
-    host --> cli
-    engine --> cli
-    adapter --> cli
-
-    host --> plugin
-    engine --> plugin
-    adapter --> plugin
-```
-
-→[Development](docs/devlopment.md)
-
-## plugin-host — 単体で使えるホストライブラリ
+## plugin-host — xPlatformプラグインホストライブラリ
 
 副産物として、**Rust から VST3 / CLAP プラグインをホストするためのライブラリ**が
 `plugin-host` クレートとして手に入ります。形式は拡張子から決まり、コードに形式名は現れません。
@@ -127,8 +75,9 @@ plugin.deactivate(processor);
 - 動作確認ができているのは **Windows (x86_64)** のみです。
   - リリースに色んなビルドが並んでいますが、Windows (x86_64) 以外はビルドが通っているというだけの状態です。LinuxとmacOSはGUIまわりで動かないはずです。
   - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
-- VST2ネイティブ対応はライセンスの問題で不可能です。VST3化ツールなど使ってください。
-- コードベースは初期に生成コードで立ち上げた部分が残っており、私(@helgev-in-arcana)が設計・コード監査を進めています。上の §Architecture/Development は確認済みの設計です。
+- VST2ネイティブ対応はライセンスの問題で今後も不可能です。VST3化ツールなど使ってください。
+- このリポジトリはAI駆動で開発されており、私([@helgev-in-arcana](https://github.com/helgev-in-arcana))が設計・コード監査を進めています。<br>
+  §Architecture など、クレート/モジュ―ル構成、依存フローの構造は確認/リファクタが完了しています。
 
 ―――――――――――――――――――――――――――――――――――――――🚧🚧🚧
 
