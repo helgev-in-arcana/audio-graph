@@ -3,6 +3,24 @@
 The format-agnostic data model and traits both plugin backends implement. This
 crate is dependency-free, and every other crate in the workspace depends on it.
 
+## Responsibilities
+
+- The vocabulary both backends and every caller share: parameters, events, note
+  expressions, audio buffers, bus layouts, transport, capabilities, errors.
+- The traits a backend implements (`SubPluginMain`, `SubPluginProcessor`) and
+  the one a host implements (`HostContext`).
+- Staying dependency-free, because every other crate in the workspace depends on
+  this one.
+
+## Not this crate's job
+
+- **Loading anything.** There is no I/O here, no dynamic library handling, no
+  filesystem.
+- **Knowing which format is in play.** No VST3 or CLAP type appears in this
+  crate; `Format` itself lives in `plugin-host`.
+- **Nesting.** No transport forwarding, no latency arithmetic, no slot tables.
+- **Windows.** `host-window` owns those.
+
 ## Invariants
 
 ### The model is shaped after the richer format, not the intersection

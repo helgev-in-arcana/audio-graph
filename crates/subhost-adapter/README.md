@@ -17,6 +17,27 @@ document looks like, and hands those in (`SubHostConfig`, `SlotSchedule`,
 `SubHostState`). A different wrapper — a chain, a rack, a bare pair of plugins —
 makes different choices and gets the same crate.
 
+## Responsibilities
+
+- Loading, unloading and re-finding sub-plugins, and holding the loaded ones.
+- The slot table: the parameters the wrapper publishes to the DAW, and their
+  bindings to sub-plugin parameters.
+- The sub-block schedule those values travel in.
+- Forwarding the DAW's transport down and combining latency on the way up.
+- Turning slot and lane values into sample-accurate parameter events, merged in
+  order with the DAW's own, per chunk.
+- Note routing at the point where a stream's *name* becomes events.
+- Nesting one plugin's opaque state inside another's.
+
+## Not this crate's job
+
+- **Anything a standalone renderer or a scanner would also need.** That is
+  `plugin-host`. This crate is only the nesting.
+- **Anything AudioGraph-specific.** Slot counts, lane counts and the saved
+  document's shape are handed in by whatever wrapper is above.
+- **Scheduling audio.** The caller decides when each instance runs and what it
+  hears; this crate answers.
+
 ## Invariants
 
 ### `AudioInstances` is the line between scheduling and hosting
