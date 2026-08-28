@@ -1,8 +1,4 @@
-//! Just enough RIFF/WAVE to get audio in and out of the offline renderer.
-//!
-//! Hand-rolled rather than pulled in as a dependency: the renderer needs one
-//! layout (interleaved, 32-bit float or 16-bit PCM) and nothing else, and this
-//! is a development harness, not a shipped codec.
+//! RIFF/WAVE audio file reader and writer for the offline renderer.
 
 use std::io::Write;
 use std::path::Path;
@@ -10,8 +6,8 @@ use std::path::Path;
 pub struct Audio {
     pub sample_rate: f64,
     pub channels: u32,
-    /// Planar: channel 0's frames, then channel 1's, matching the layout the
-    /// host API uses so no transposition is needed at the boundary.
+    /// Planar: channel 0's frames, then channel 1's, matching the layout used
+    /// by the host API without requiring transposition at the boundary.
     pub samples: Vec<f32>,
     pub frames: usize,
 }
@@ -31,8 +27,7 @@ impl Audio {
         &self.samples[start..start + self.frames]
     }
 
-    /// Peak absolute sample across all channels — the cheapest "did anything
-    /// happen" check, which is what the milestone DoDs actually ask for.
+    /// Peak absolute sample across all channels.
     pub fn peak(&self) -> f32 {
         self.samples.iter().fold(0.0f32, |a, s| a.max(s.abs()))
     }
