@@ -11,8 +11,11 @@
 //!   -> setActive(true) -> setProcessing(true) -> process...
 //! ```
 //!
-//! [`Vst3Plugin`] represents the main-thread host interface, and calling `activate`
-//! transitions the plugin into audio-rate processing by returning a [`Vst3Processor`].
+//! Getting any of it out of order produces failures that surface much later, so
+//! the whole sequence lives in one place and is expressed through the two-trait
+//! split: [`Vst3Plugin`] is the main-thread half, and `activate` yields the
+//! audio-thread half by value, so a processor cannot exist before the sequence
+//! has run.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -58,7 +61,10 @@ use crate::vst_events;
 
 /// Per-block capacity limits for pre-allocated processing containers.
 ///
-/// Fixed limits ensure the audio thread never allocates during processing.
+/// Fixed rather than derived because they must be decided before any audio runs,
+/// and the sub-block quantiser bounds how many points a block can ever carry: at
+/// 16-sample sub-blocks a 4096-sample block yields 256 updates per parameter at
+/// most.
 const MAX_PARAM_QUEUES: usize = 512;
 const MAX_POINTS_PER_PARAM: usize = 512;
 const MAX_EVENTS_PER_BLOCK: usize = 2048;
@@ -109,8 +115,10 @@ pub struct Vst3Plugin {
 impl Vst3Plugin {
     /// Create and fully initialise the class `cid` from `module`.
     pub fn create(module: &Module, cid: Cid, context: Arc<dyn HostContext>) -> Result<Vst3Plugin> {
-        // Module-scoped: the factory retains the pointer given via setHostContext
-        // for the entire lifetime of the module.
+        // Module-scoped, not instance-scoped: the factory retains the pointer
+        // it is given via setHostContext for the module's whole lifetime. On
+        // Linux this is also where a plugin picks up the run loop, which has to
+        // outlive any editor.
         let host_app = module.host_application(Arc::clone(&context));
         let host_unknown = com_ref_ptr::<_, FUnknown>(&host_app);
 
@@ -130,7 +138,9 @@ impl Vst3Plugin {
         let handler = ComponentHandler::new(Arc::clone(&context));
         let (controller, controller_is_separate) =
             Self::create_controller(module, &component, host_unknown, &handler)?;
-        // Only establish connection points when the component and controller are distinct objects.
+        // Only meaningful between two distinct objects. A single object
+        // implementing both interfaces would be connected to itself, which
+        // plugins do not expect and at least one corrupts its heap over.
         let connection = if controller_is_separate {
             Self::connect(&component, controller.as_ref())
         } else {
@@ -223,7 +233,9 @@ impl Vst3Plugin {
         let cp_component = component.cast::<IConnectionPoint>()?;
         let cp_controller = controller.cast::<IConnectionPoint>()?;
 
-        // Connect the two connection points directly.
+        // Connected directly rather than through a relay object. A relay only
+        // earns its keep when the two halves live on different threads, which is
+        // an out-of-process concern rather than a present one.
         unsafe {
             cp_component.connect(cp_controller.as_ptr());
             cp_controller.connect(cp_component.as_ptr());
@@ -233,7 +245,10 @@ impl Vst3Plugin {
 
     /// Returns every bus declared by the plugin and note input/output capabilities.
     ///
-    /// Queried before activation to inspect default bus counts and capabilities.
+    /// Read before activation, so these are the plugin's *defaults* — what it
+    /// says it is before anyone negotiates with it. That is the right thing to
+    /// build sockets out of: the node has to offer a sidechain socket before the
+    /// graph can ask for one to be connected.
     pub fn io_layout(&self) -> plugin_host_api::IoLayout {
         use vst3::Steinberg::Vst::{BusDirections_, BusTypes_, MediaTypes_};
 
@@ -349,8 +364,14 @@ impl Vst3Plugin {
 
     /// Creates the plugin's editor view (`IPlugView`), if supported.
     ///
-    /// The caller takes ownership of the returned view pointer and is responsible
-    /// for managing its lifecycle.
+    /// Returns the raw `IPlugView`. That is deliberate: everything to do with
+    /// windows lives in `vst3-host-view`, and handing it the interface is the
+    /// whole seam between the two crates. `plugin-host-api` never sees it, so
+    /// the rule about backend types staying out of the shared API surface is
+    /// untouched.
+    ///
+    /// The caller owns the returned view and must tear it down in the required
+    /// order; `vst3_host_view::EditorWindow` does exactly that.
     pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
         let controller = self.controller.as_ref()?;
         // "editor" is the only view name VST3 defines.

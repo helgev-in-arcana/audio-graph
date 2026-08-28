@@ -1,14 +1,28 @@
 //! Shared state accessible by both the editor UI and the audio processing thread.
 //!
-//! State is partitioned by thread access patterns to prevent audio thread blocking:
+//! The arrangement here is the answer to one question: what may the audio
+//! thread be made to wait for?
+//!
+//! One lock around everything is honest for loading a sub-plugin, which is rare,
+//! slow and audibly disruptive whatever we do. But the editor also touches this
+//! state sixty times a second to redraw and to tick the sub-plugin's window, and
+//! each of those would be a chance for the audio thread to lose a block for no
+//! reason at all. A graph editor makes it worse: dragging an LFO rate recompiles
+//! continuously, and an audio path that drops a block per edit would make the
+//! engine's own bugs indistinguishable from lock contention.
+//!
+//! So the state is split by how often it is touched rather than by what it is:
 //!
 //! - [`MainState`] — UI state, sub-plugin host controllers, and graph structure.
-//!   Accessed solely on the main thread without mutex synchronization.
-//! - [`AudioState`] — Active audio processors. Protected by a mutex that the audio
-//!   thread accesses via `try_lock()`, while the main thread locks it only during
-//!   plugin load, unload, or reset.
-//! - Compiled [`Program`] — Passed to the audio thread via lock-free [`Handoff`],
-//!   enabling real-time graph recompilation and hot-swapping without lock contention.
+//!   Reached constantly, and only ever from the main thread, so it needs no lock
+//!   at all. `MainThread` turns that from a comment into a runtime check.
+//! - [`AudioState`] — the live processors, behind a mutex the audio thread only
+//!   ever *tries*, and which the main thread takes solely to start or stop a
+//!   sub-plugin. Swapping a plugin mid-playback glitches, which is the honest
+//!   cost of doing it at all, and nothing else contends.
+//! - The compiled [`Program`] — published through a [`Handoff`], which the audio
+//!   thread reads without any lock whatsoever. This is the path every graph edit
+//!   takes, so it is the one that had to be free.
 
 use std::array;
 use std::cell::{RefCell, RefMut};
@@ -41,13 +55,19 @@ pub struct MainState {
     pub compile_error: Option<String>,
     /// Bus configurations required for each sub-plugin instance under the current program.
     ///
-    /// Maintained on the main thread for reactivation when routing changes.
+    /// Kept here rather than read back off the engine because the engine lives
+    /// on the audio side of the wrapper, and this is needed on the main thread
+    /// every time something is re-activated.
     pub instance_io: Vec<InstanceIo>,
-    /// Which sub-plugin parameter each graph-driven lane targets.
+    /// Which sub-plugin parameter each graph-driven lane drives. Read at
+    /// activate, like the slot bindings, so a new socket only reaches audio
+    /// after a restart.
     pub graph_params: Vec<ParamTarget>,
     /// Tracked delay ring buffer allocations (node ID and size in samples) sent to the audio thread.
     ///
-    /// Retained across recompilations to prevent redundant memory reallocations when delay lengths are unchanged.
+    /// Only so the next publish can tell whether anything changed. A recompile
+    /// happens on every drag of every control, and allocating 700 kB each time
+    /// to replace a ring with an identical one would be silly.
     pub sized_rings: Vec<(NodeId, usize)>,
 }
 
@@ -74,7 +94,8 @@ pub struct Shared {
     /// Stored as a standalone atomic rather than in `MainState` because the audio
     /// thread reads it every block and must not have to acquire a lock to do so.
     quantum: AtomicU32,
-    /// Host sample rate used for GUI calculations (e.g. delay times).
+    /// What the DAW is running at, so the editor can show a delay's floor in
+    /// seconds. Bits of an `f32`, the same trick `live` uses.
     sample_rate: AtomicU32,
     /// What each slot is actually worth after the graph has had its say.
     ///
@@ -229,8 +250,11 @@ impl Shared {
         match compile(&state.graph, SLOT_COUNT) {
             Ok(mut program) => {
                 state.compile_error = None;
-                // Delay ring buffers are allocated on the main thread and transferred inside the program.
-                // `sized_rings` tracks previous allocations to avoid redundant allocations when unchanged.
+                // The delay rings are allocated here, on the main thread, and
+                // ride over inside the program, because the audio thread may
+                // not allocate. `sized_rings` remembers what was sent last time
+                // so an unchanged line is handed nothing rather than a fresh
+                // copy of what it already has.
                 state.sized_rings =
                     program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
                 // A graph edit can change which buses a sub-plugin needs —
@@ -278,6 +302,14 @@ impl Shared {
         resumed
     }
 
+    /// Give a patch that has no graph the one it was implicitly running.
+    ///
+    /// Patches saved when the wrapper passed audio through by itself relied on
+    /// "no graph" meaning "input to output", and one sub-plugin with no graph
+    /// meaning "through that plugin". Those implicit paths are gone, so such a
+    /// project would reopen silent unless the routing it was already getting is
+    /// drawn for it.
+    ///
     /// Ensure patches without an explicit graph configuration receive a default
     /// audio pass-through patch.
     pub fn adopt_default_patch(&self) {

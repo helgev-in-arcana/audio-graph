@@ -2,6 +2,10 @@
 //!
 //! These constants define AudioGraph's limits and are passed to
 //! [`SubHostConfig`][subhost_adapter::SubHostConfig].
+//!
+//! They live here rather than in `subhost-adapter` because they are AudioGraph's
+//! numbers, not facts about hosting a plugin inside another one: the adapter
+//! takes all three as configuration and never names one itself.
 
 use subhost_adapter::SubHostConfig;
 

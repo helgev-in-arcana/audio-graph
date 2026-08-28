@@ -1,7 +1,12 @@
 //! Development harness and diagnostic CLI for the plugin host.
 //!
+//! Stands in for a DAW during development: everything worth proving about the
+//! host — that a real plugin loads, enumerates, instantiates, and processes —
+//! is exercised from here without a DAW in the loop.
+//!
 //! Provides command-line tools to test plugin scanning, parameter reflection,
-//! offline rendering, bus configurations, state persistence, and node graph execution.
+//! offline rendering, bus configurations, state persistence, and node graph
+//! execution.
 
 mod fault;
 mod host;
@@ -16,7 +21,11 @@ use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
 use subhost_adapter::SubHostConfig;
 
-/// Configured resource ceilings for the subhost adapter and graph engine.
+/// The wrapper's ceilings, as `audio-graph-plugin` builds them.
+///
+/// Repeated rather than imported: this crate checks the engine and the adapter
+/// without linking the wrapper (and so without egui). Keep in step with
+/// `audio_graph_plugin::SUB_HOST`.
 const SUB_HOST: SubHostConfig = SubHostConfig {
     max_instances: 16,
     slot_count: 32,
@@ -79,11 +88,11 @@ fn usage() {
     eprintln!(
         "usage:
   Every PLUGIN argument may be a .vst3 or a .clap; the extension picks the
-  backend. ID is that format's own plugin id -- a VST3 class id in hex, or a
-  CLAP reverse-DNS name -- as printed by `scan` and `info`.
+  backend. ID is that format's own plugin id — a VST3 class id in hex, or a
+  CLAP reverse-DNS name — as printed by `scan` and `info`.
 
   host-cli dirs                     list the directories a scan covers, and the
-                                    config file they come from -- seeded on a
+                                    config file they come from — seeded on a
                                     first run from this OS's conventions, and
                                     editable from the wrapper's editor
   host-cli scan [DIR...]            load every module found and list its plugins
@@ -248,8 +257,10 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
 
 /// Displays the bus and note configuration declared by a plugin and maps them to node graph ports.
 ///
-/// Inspects declared audio inputs, outputs, and note handling prior to activation to display
-/// the default port layout.
+/// Read before activation, so this is the plugin's *default* shape rather than a
+/// negotiated one. A sidechain socket has to exist before the graph can ask for
+/// anything to be connected to it, so the default is the right thing to build
+/// sockets from — and the negotiation is re-checked at activate.
 fn cmd_buses(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -319,7 +330,7 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     // Reading the factory says what a module offers; only an instance can say
     // what it implements, because both formats answer that question through the
     // instance (`get_extension` / `queryInterface`). So one plugin is loaded —
-    // the one named, or the first -- rather than all of them: a module like
+    // the one named, or the first — rather than all of them: a module like
     // Airwindows Consolidated has hundreds of classes, and instantiating every
     // one to print the same list is not worth the wait.
     let (class, plugin) = render::load(path, wanted, std::sync::Arc::new(host::CliHost::new()))?;
@@ -344,7 +355,7 @@ implemented by {} ({}):",
     Ok(())
 }
 
-/// Repeatedly loads and unloads a plugin module to verify cleanup and detect memory leaks.
+/// The leak check: repeated load/unload must not grow or crash.
 fn cmd_churn(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("expected a path")?;
     let iterations: usize = args
@@ -406,7 +417,9 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     for p in params.iter().take(40) {
         let current = snapshot.get(p.id).unwrap_or(p.default);
         let text = plugin.param_to_text(p.id, current).unwrap_or_default();
-        // Optional VST3 unit/group hierarchy name containing the parameter.
+        // The module is the VST3 unit the parameter sits in — the tree a DAW
+        // shows when picking an automation lane. Printed because an accidental
+        // extra level there is invisible from the parameter list alone.
         let module = if p.module.is_empty() {
             String::new()
         } else {
@@ -480,7 +493,7 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
     // `--twice` asks whether a second instance in the *same* process plays the
     // same notes the same way. Several synths randomise oscillator phase from a
     // process-global generator, which makes them perfectly repeatable run to
-    // run and different instance to instance -- and therefore useless for any
+    // run and different instance to instance — and therefore useless for any
     // check that compares a graph against a hand-made chain.
     if twice {
         let again = render::render(
@@ -518,7 +531,9 @@ fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {
 
 /// Verifies state persistence by modifying a parameter, saving state, and restoring into a new instance.
 ///
-/// Tries multiple candidate parameters to ensure changes survive round-trip serialization.
+/// Several parameters are tried before giving up. A single failure says nothing:
+/// plugins refuse writes to some parameters, and recompute others from the
+/// transport on every block.
 fn cmd_state(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -690,8 +705,10 @@ fn pick_writable_param(plugin: &Plugin) -> Option<plugin_host::ParamInfo> {
 
 /// Verifies sample-accurate parameter automation timing.
 ///
-/// Renders two passes (baseline vs. stepped parameter change with sample offset)
-/// and compares output divergence to check timing accuracy.
+/// A parameter change carrying a `sample_offset` must take effect at that
+/// sample, not at the block boundary. Rendering twice and diffing is the only
+/// way to see that from outside: the plugin is a black box, so the evidence is
+/// *where* the two renders diverge.
 fn cmd_automate(args: &[String]) -> Result<(), String> {
     use plugin_host::{Event, ParamEvent, Target};
     use std::sync::Arc;
@@ -890,8 +907,9 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
 
 /// Opens and tears down a plugin editor in normal or reverse destruction order.
 ///
-/// Tests both closing the editor before destroying the instance, and dropping the
-/// entire instance while the editor is still open to verify clean teardown.
+/// The second order is the one that matters: some DAWs terminate a plugin
+/// without ever sending a close notification, so correctness cannot depend on a
+/// caller remembering to close the editor first.
 fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result<(), String> {
     use std::sync::Arc;
     use subhost_adapter::SubHost;
@@ -954,8 +972,11 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
 
 /// Runs lifecycle regression tests against every installed plugin module.
 ///
-/// Each module is tested in an isolated child process to ensure crashes or heap
-/// corruption in third-party binaries do not abort the overall sweep.
+/// Each module is probed in a *child process*. A third-party plugin that
+/// corrupts its own heap on teardown would otherwise take the whole sweep with
+/// it, and losing the results for the other fifty is not an acceptable way to
+/// learn that one of them is broken. It is also a small preview of why an
+/// out-of-process backend is worth having.
 fn cmd_sweep(args: &[String]) -> Result<(), String> {
     use std::process::Command;
 
@@ -1047,8 +1068,9 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
 
 /// Tests saving and restoring wrapper state to verify sub-plugin persistence.
 ///
-/// Saves state from an instance with a loaded sub-plugin, restores it into a fresh
-/// instance, and confirms the sub-plugin configuration is restored.
+/// Saves state from an instance with a loaded sub-plugin, restores it into a
+/// fresh instance, and confirms the sub-plugin came back. This is what a DAW
+/// does when a project is closed and opened again.
 fn cmd_nest(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1091,12 +1113,20 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
 
 /// Tests modulating a sub-plugin parameter using an LFO in the node graph.
 ///
-/// Renders audio twice (with and without LFO modulation injected into the saved
-/// wrapper state) and compares output envelopes to confirm modulation takes effect.
+/// The claim to demonstrate is "an LFO can wobble a sub-plugin's parameter", and
+/// it is not one the unit tests can make: they stop at the compiled program and
+/// the events it produces. What they cannot show is that those events, sent
+/// through the wrapper, through the nesting layer, into a real commercial
+/// plugin, come out the other side as a change in the audio.
+///
+/// So: render the same input twice through the same wrapper and the same
+/// sub-plugin, once with a graph driving the bound parameter and once without,
+/// and compare. The graph is injected into the wrapper's own saved state, which
+/// is exactly the route a project file takes.
 ///
 /// Usage:
 ///   AUDIO_GRAPH_SUB=...\RoughRider3.vst3 AUDIO_GRAPH_SUB_BIND=56 \
-///     cargo run -p host-cli -- graph target/AudioGraph.vst3 tone.wav
+///     cargo run -p host-cli — graph target/AudioGraph.vst3 tone.wav
 fn cmd_graph(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1312,7 +1342,11 @@ fn walk(
     }
 }
 
-/// Injects an LFO modulating the bound parameter slot into the saved wrapper state.
+/// Puts an LFO on the parameter `AUDIO_GRAPH_SUB_BIND` bound.
+///
+/// The sub-plugin becomes a node in the graph and the LFO drives one of its
+/// parameter sockets. Driving a *slot* instead would be the wrapper arguing with
+/// the host over who owns the automation lane.
 fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
@@ -1331,8 +1365,10 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
         .as_str()
         .unwrap_or("bound")
         .to_string();
-    // Read the sub-plugin reference from the modern `sub_plugins` list, falling
-    // back to legacy `sub_plugin` for older serialized formats.
+    // The wrapper saves its sub-plugins as a list; `sub_plugin` is the older
+    // single one, still read so an old project loads. Looking only at the old
+    // field left this reading `null` for every state the wrapper has written
+    // since.
     let reference = match value["sub_plugins"].as_array().and_then(|xs| xs.first()) {
         Some(entry) => entry["reference"].clone(),
         None => value["sub_plugin"].clone(),
@@ -1342,7 +1378,8 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
         .ok_or("the saved sub-plugin has no path")?
         .to_string();
 
-    // Discover actual ports from the plugin instance layout.
+    // Ports discovered from the plugin itself, so the node has the sockets it
+    // really has.
     let ports = {
         use std::sync::Arc;
         let (_, plugin) = render::load(Path::new(&path_hint), None, Arc::new(host::CliHost::new()))
@@ -2004,8 +2041,8 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
 /// `sidechain` asks a compressor to duck, which is a strong check but needs a
 /// plugin whose sidechain is (a) optional and (b) reached through one
 /// parameter. Plenty of plugins fail one of those and still read their aux bus
-/// -- the CLAP fixture always mixes it, Surge XT Effects hides the switch
-/// inside whichever effect is loaded -- so this asks the weaker question that
+/// — the CLAP fixture always mixes it, Surge XT Effects hides the switch
+/// inside whichever effect is loaded — so this asks the weaker question that
 /// applies to all of them: does wiring the aux bus change the output at all?
 ///
 /// Direction is not asserted. A compressor ducks, a mixer adds, a vocoder does
@@ -2375,7 +2412,7 @@ fn inject_sidechain(
         }));
     }
     if keyed {
-        // Port 1 of the compressor is its sidechain -- see `plugin_input_ports`.
+        // Port 1 of the compressor is its sidechain — see `plugin_input_ports`.
         links.push(serde_json::json!({ "from": 2, "from_port": 0, "to": 1, "to_port": 1 }));
     }
 
