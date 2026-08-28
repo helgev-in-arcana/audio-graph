@@ -1,8 +1,4 @@
-//! The facade, driven against whatever is actually on the machine.
-//!
-//! The CLAP half runs everywhere, because the fixture is built from this
-//! workspace. The VST3 half skips itself when no plugin is installed, which is
-//! the same convention `vst3-host`'s own tests use.
+//! Integration tests for the unified plugin host facade with CLAP and VST3 plugins.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,15 +17,7 @@ impl HostContext for TestHost {
     fn request_restart(&self, _reason: RestartReason) {}
 }
 
-/// The CLAP fixture, under a `.clap` name.
-///
-/// The facade infers the format from the extension and cargo's artefact is
-/// named `.dll`, so it is copied rather than renamed — the original belongs to
-/// cargo and the next build would replace it anyway.
-///
-/// Panics when the fixture is missing, for the reason spelled out in
-/// `clap-host/tests/fixture_plugin.rs`: skipping would make a green run mean
-/// nothing.
+/// Locates the built CLAP test fixture and copies it with a `.clap` extension.
 fn fixture_as_clap() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let build_dir = exe
@@ -53,8 +41,7 @@ fn fixture_as_clap() -> PathBuf {
         )
     });
 
-    // A distinct name per test binary, so two of them cannot copy over each
-    // other's file while the other has it loaded.
+    // Use a unique fixture name per test binary to avoid file collision.
     let target = build_dir.join("facade-fixture.clap");
     std::fs::copy(&source, &target).expect("the fixture can be copied");
     target
@@ -65,7 +52,7 @@ fn the_facade_loads_a_clap_by_path_alone() {
     plugin_host::init_thread();
     let path = fixture_as_clap();
 
-    // The extension is the only thing that says which backend answers.
+    // Infer format from the file extension.
     let classes = scan_module(&path).expect("scans");
     assert_eq!(classes.len(), 1);
     let class = classes[0].clone();
@@ -79,16 +66,13 @@ fn the_facade_loads_a_clap_by_path_alone() {
     assert_eq!(plugin.format(), Format::Clap);
     assert_eq!(SubPluginMain::params(&plugin).len(), 7);
     assert_eq!(SubPluginMain::io_layout(&plugin).inputs.len(), 2);
-    // A tick with no editor open must still be safe, since the caller is told
-    // to call it every frame regardless — CLAP's timers and main-thread
-    // callbacks run whether or not anything is on screen.
+    // Ticking without an open editor should execute cleanly.
     plugin.tick();
 
     assert!(plugin.has_editor());
     #[cfg(windows)]
     {
-        // The whole point of the facade: the same three calls, whichever format
-        // answered.
+        // Unified editor lifecycle calls.
         plugin.open_editor(std::ptr::null_mut()).expect("opens");
         assert!(plugin.editor_is_open());
         plugin.tick();
@@ -112,14 +96,11 @@ fn the_facade_loads_a_clap_by_path_alone() {
 fn the_facade_loads_an_installed_vst3() {
     plugin_host::init_thread();
 
-    // First module that yields a class. Some installed plugins are wrappers
-    // around a scanner and export nothing loadable, so this is a search rather
-    // than a first-hit assertion.
+    // Find first installed VST3 module exporting an instantiable audio class.
     let found = plugin_host::installed_modules()
         .into_iter()
         .filter(|(format, _)| *format == Format::Vst3)
-        // Known to corrupt its own heap on teardown, and excluded from
-        // `vst3-host`'s tests for the same reason.
+        // Exclude plugins known to crash on headless teardown in CI/test environments.
         .filter(|(_, path)| !path.ends_with("OTT.vst3"))
         .take(8)
         .find_map(|(_, path)| {
@@ -137,8 +118,7 @@ fn the_facade_loads_an_installed_vst3() {
         .expect("loads through the facade");
     assert_eq!(plugin.format(), Format::Vst3);
     assert_eq!(plugin.name(), class.name);
-    // Both backends answer the same question the same way; that is the facade's
-    // whole job.
+    // Verify facade query methods.
     let _ = SubPluginMain::io_layout(&plugin);
     let _ = SubPluginMain::capabilities(&plugin);
 }

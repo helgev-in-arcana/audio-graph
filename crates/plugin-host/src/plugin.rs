@@ -1,19 +1,13 @@
-//! One loaded sub-plugin, whatever format it came in.
+//! Loaded plugin instance abstraction over format-specific backends.
 //!
-//! [`Plugin`] implements [`SubPluginMain`] by delegating to whichever backend
-//! actually loaded it, so everything above this crate is written once. Three
-//! things are deliberately *not* delegated, because they are where the two
-//! formats differ in shape rather than in detail:
+//! [`Plugin`] implements [`SubPluginMain`] by delegating calls to the underlying
+//! VST3 or CLAP instance while managing lifecycle and format details:
 //!
-//! * **Module ownership.** A VST3 instance's vtables point into the module's
-//!   code, so the module has to outlive it. That is a rule the caller used to
-//!   have to know; here the module is a private field and the rule is the
-//!   struct's field order.
-//! * **The editor.** VST3 hands out an `IPlugView` the host attaches to a
-//!   window; CLAP has the editor as an extension on the instance itself. Both
-//!   are hidden behind `open_editor` / `close_editor` / `tick`.
-//! * **The `Drop` order.** §5.3's teardown sequence is the crash source, and it
-//!   is written here once for each backend rather than at every call site.
+//! - **Module lifetime:** Ensures the shared library module outlives the plugin instance.
+//! - **Editor management:** Unifies VST3 `IPlugView` and CLAP GUI extensions behind
+//!   `open_editor`, `close_editor`, and `tick`.
+//! - **Teardown sequence:** Manages destruction order so editor views and instances
+//!   are released before the module is unloaded.
 
 use std::sync::Arc;
 
@@ -31,27 +25,26 @@ pub struct Plugin {
     class: ClassInfo,
 }
 
-// The two variants differ in size by a few hundred bytes, because a
-// `ClapPlugin` carries its own event buffers. Boxing one of them would buy back
-// that difference at the cost of an indirection on every main-thread call and a
-// less obvious drop order — and a host holds at most a handful of these, one per
-// plugin node, none of them on a hot path.
+// The enum variants differ in size due to backend-specific event buffer storage.
+// Large enum variant warning is suppressed as instance count is typically small.
 #[allow(clippy::large_enum_variant)]
 enum Backend {
-    /// Field order **is** the teardown order (§5.3): the editor holds an
-    /// `IPlugView` created by the controller, which must be removed and
-    /// released before the controller terminates; and the instance's vtables
-    /// live in the module, which must not be unloaded first.
+    /// VST3 backend instance.
+    ///
+    /// Field order defines destruction order: the editor window holding the
+    /// `IPlugView` is dropped before the plugin controller and component, which
+    /// in turn are dropped before unloading the module shared library.
     Vst3 {
         editor: Option<vst3_host_view::EditorWindow>,
         plugin: vst3_host::Vst3Plugin,
-        /// Held, not used.
+        /// Held to keep the shared library loaded for the lifetime of the instance.
         #[allow(dead_code)]
         module: vst3_host::Module,
     },
-    /// CLAP needs no such care here: the instance owns its own editor, so the
-    /// order is guaranteed by `ClapPlugin::drop` rather than by this
-    /// declaration. The module still has to outlive the instance.
+    /// CLAP backend instance.
+    ///
+    /// The plugin instance manages its own editor extension and is dropped
+    /// before the underlying module shared library.
     Clap {
         plugin: clap_host::ClapPlugin,
         #[allow(dead_code)]
@@ -60,13 +53,10 @@ enum Backend {
 }
 
 impl Plugin {
-    /// Load a plugin from `path`, choosing `class_id` or the module's first
-    /// offering.
+    /// Loads a plugin from `path`, selecting the class matching `class_id` or the
+    /// first available class in the module.
     ///
-    /// The format comes from the extension. Passing `None` for `class_id` is
-    /// what a file browser does; passing `Some` is what restoring a saved
-    /// project does, because the id is the identity and the path only a hint
-    /// (§8.3).
+    /// Infers the format from the file extension.
     pub fn load(
         path: &std::path::Path,
         class_id: Option<&str>,
@@ -135,14 +125,9 @@ impl Plugin {
         &self.class.name
     }
 
-    /// The format's own names for what this plugin implements — CLAP extension
-    /// ids, or VST3 interface names.
+    /// Returns format-specific interface or extension identifiers implemented by this plugin.
     ///
-    /// The one place the facade hands back something format-specific on
-    /// purpose. It is a diagnostic for `host-cli info`, not something to branch
-    /// on: a caller that matched on these strings would be doing exactly what
-    /// ADR-12 confines to this crate. The strings are not stable and must never
-    /// be persisted.
+    /// Returns VST3 interface names or CLAP extension strings for diagnostic and inspection purposes.
     pub fn format_interfaces(&self) -> Vec<&'static str> {
         match &self.inner {
             Backend::Vst3 { plugin, .. } => plugin.interfaces(),
@@ -159,11 +144,9 @@ impl Plugin {
         }
     }
 
-    /// Open the sub-plugin's own editor in a top-level window (ADR-3).
+    /// Opens the plugin's graphical editor in a window.
     ///
-    /// `owner` is the window it should float above: the DAW's root window when
-    /// running as a plugin, null when standalone. An ownerless window is a peer
-    /// of the DAW's, so clicking in the DAW buries it.
+    /// `owner` is an optional native parent window handle to attach or float above.
     pub fn open_editor(&mut self, owner: *mut std::ffi::c_void) -> std::result::Result<(), String> {
         match &mut self.inner {
             Backend::Vst3 {
@@ -186,10 +169,9 @@ impl Plugin {
         }
     }
 
+    /// Closes the plugin's graphical editor window if open.
     pub fn close_editor(&mut self) {
         match &mut self.inner {
-            // Dropping the window runs the §5.3 sequence; there is no way to
-            // close one without it.
             Backend::Vst3 { editor, .. } => *editor = None,
             Backend::Clap { plugin, .. } => plugin.close_editor(),
         }
@@ -212,13 +194,10 @@ impl Plugin {
         }
     }
 
-    /// Drive the plugin for one UI tick.
+    /// Performs periodic main-thread maintenance for the plugin and editor.
     ///
-    /// Call from the host's UI thread, once per frame, whether or not an editor
-    /// is open. A plugin must not pump messages itself — the DAW is already
-    /// doing that — so this only handles the parts that are ours: applying
-    /// resizes, closing an editor the user dismissed, and, for CLAP, running
-    /// the main-thread callbacks and timers a plugin repaints from.
+    /// Should be called on the main UI thread once per frame to handle window resizing,
+    /// editor close requests, and background timer/task callbacks (e.g. for CLAP).
     pub fn tick(&mut self) {
         match &mut self.inner {
             Backend::Vst3 { editor, .. } => {
@@ -230,9 +209,6 @@ impl Plugin {
                     *editor = None;
                 }
             }
-            // Not conditional on an editor being open: CLAP's `on_main_thread`
-            // and its timers exist whether or not the plugin is showing
-            // anything, and a plugin starved of them stalls its own worker.
             Backend::Clap { plugin, .. } => plugin.tick(),
         }
     }

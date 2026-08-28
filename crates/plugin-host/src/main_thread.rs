@@ -1,17 +1,8 @@
-//! Holding a main-thread-only value inside a `Send` plugin.
+//! Thread-affinity container for values that must only be accessed on the thread that created them.
 //!
-//! Both plugin formats require a plugin object to be `Send` — the host may
-//! construct it on one thread and use it on another — while VST3 requires the
-//! *sub*-plugin's controller half to be touched only from the thread that owns
-//! the host's main loop. Those two rules are compatible in practice, because a
-//! DAW does its main-thread work on one thread throughout, but they are not
-//! compatible in the type system.
-//!
-//! Rather than sprinkle `unsafe impl Send` over the adapter and hope, the
-//! affinity is made into a value: [`MainThread`] carries the thread it was
-//! created on and checks every access. The unsafety is then confined here, with
-//! a runtime check that turns a violated invariant into a clear panic instead
-//! of a corrupted plugin.
+//! Enforces thread affinity at runtime to guarantee that main-thread-bound plugin objects
+//! (such as VST3 controllers) are only accessed from their owning thread, while allowing
+//! the containing structure to implement `Send` and `Sync` safely.
 
 use std::thread::ThreadId;
 
