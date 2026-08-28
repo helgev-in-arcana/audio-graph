@@ -1,73 +1,52 @@
-//! Slots: the wrapper's own parameters, and their bindings to sub-plugin ones.
+//! Automatable parameter slots and sub-plugin parameter bindings.
 //!
-//! ARCHITECTURE.md §8. The sub-plugin's parameters are deliberately *not*
-//! exposed to the DAW. The wrapper publishes a fixed set of slots instead, and
-//! each slot may be bound to one sub-plugin parameter. That indirection is what
-//! lets the sub-plugin be swapped without destroying the DAW's automation.
+//! The host wrapper publishes a fixed set of parameter slots to the host DAW.
+//! Each slot can bind to a sub-plugin parameter, decoupling DAW automation from
+//! sub-plugin identity and parameter order.
 
 use plugin_host::{ParamId, ParamInfo};
 use serde::{Deserialize, Serialize};
 
-/// Which sub-plugin parameter a slot drives.
+/// Binding descriptor connecting a parameter slot to a specific sub-plugin parameter.
 ///
-/// Identified by `(instance, plugin_id, param_id)` rather than by index:
-/// parameter *order* is not stable across plugin versions, and a binding that
-/// silently re-points at a different control after an update is worse than one
-/// that fails to resolve.
-///
-/// `instance` is what makes two copies of the same plugin two different
-/// targets. Without it a binding made against the second copy would also
-/// resolve against the first, and both would move together (§12-7).
+/// Uses stable identifiers `(instance, plugin_id, param_id)` rather than parameter indices
+/// so bindings remain robust across plugin parameter reordering and distinguish between
+/// multiple instances of the same plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
-    /// Which graph node's plugin this drives.
-    ///
-    /// Defaulted so a pre-M8 saved state, which had exactly one sub-plugin,
-    /// loads as a binding against instance 0 — which is what it was.
+    /// Target sub-plugin instance index (defaults to 0 for backwards compatibility).
     #[serde(default)]
     pub instance: u32,
-    /// The sub-plugin this binding was made against (VST3 CID as hex, §8.3).
+    /// Sub-plugin identifier string (e.g. VST3 class ID or CLAP plugin ID).
     pub plugin_id: String,
-    /// The parameter's stable id within that plugin.
+    /// Sub-plugin parameter ID.
     pub param_id: u32,
-    /// Remembered so an unresolved binding can still be shown meaningfully.
+    /// Display name of the parameter at the time of binding.
     pub param_name: String,
 }
 
-/// One slot, as the engine sees it.
+/// A published parameter slot, including user label and sub-plugin binding.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Slot {
-    /// User-supplied name. Hosts are not expected to honour a rename (§8.1).
+    /// User-assigned display name for the slot.
     pub name: Option<String>,
     pub binding: Option<Binding>,
 }
 
-/// The wrapper's slot table plus the resolution of each binding against the
-/// currently loaded sub-plugin.
+/// Table of published parameter slots and their resolved sub-plugin parameter targets.
 #[derive(Debug, Clone)]
 pub struct SlotTable {
-    /// How many slots the wrapper publishes.
-    ///
-    /// Fixed for a given wrapper because VST3 cannot add parameters at runtime
-    /// (§8.1), but the number itself is that wrapper's business: this crate
-    /// only ever sees an abstract table. Held separately from `slots.len()`
-    /// because [`load_state`][Self::load_state] takes a table of whatever
-    /// length the project was saved with and has to resize it back to this.
+    /// Number of slots published by the wrapper.
     count: usize,
     slots: Vec<Slot>,
-    /// Resolved target per slot, recomputed whenever the sub-plugin changes.
-    ///
-    /// Separate from `slots` because it is derived state: a binding survives
-    /// even when it cannot currently be resolved (§8.3), and conflating the two
-    /// is what would delete a user's work when a plugin fails to load.
+    /// Cached resolved targets for currently loaded sub-plugins.
     resolved: Vec<Option<ResolvedTarget>>,
 }
 
-/// A binding that currently points at a real parameter.
+/// Target parameter resolution details for audio-thread automation mapping.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResolvedTarget {
-    /// The instance the parameter belongs to. Carried through to the audio
-    /// thread so an event is delivered to the plugin it was bound against.
+    /// Target sub-plugin instance index.
     pub instance: u32,
     pub id: ParamId,
     pub min: f64,
@@ -75,7 +54,7 @@ pub struct ResolvedTarget {
 }
 
 impl ResolvedTarget {
-    /// Map a slot's 0..1 automation value onto the parameter's plain range.
+    /// Maps a normalized `0.0..=1.0` slot value to the parameter's native value range `[min, max]`.
     pub fn to_plain(&self, normalized: f64) -> f64 {
         self.min + normalized.clamp(0.0, 1.0) * (self.max - self.min)
     }
@@ -90,7 +69,7 @@ impl SlotTable {
         }
     }
 
-    /// How many slots this table publishes.
+    /// Returns the number of published slots.
     pub fn count(&self) -> usize {
         self.count
     }
@@ -103,7 +82,7 @@ impl SlotTable {
         self.slots.get(index)
     }
 
-    /// Bind a slot to a sub-plugin parameter, replacing any previous binding.
+    /// Binds a slot to a sub-plugin parameter and resolves its target range.
     pub fn bind(&mut self, index: usize, instance: u32, plugin_id: &str, param: &ParamInfo) {
         let Some(slot) = self.slots.get_mut(index) else {
             return;
@@ -139,12 +118,7 @@ impl SlotTable {
         self.resolved.get(index).copied().flatten()
     }
 
-    /// Every slot that currently drives something on `instance`, as
-    /// `(slot index, target)`.
-    ///
-    /// The audio thread takes this once per activate rather than walking the
-    /// table per block. Filtered per instance so each sub-plugin is handed only
-    /// the slots that were bound against it.
+    /// Returns all active `(slot_index, ResolvedTarget)` pairs bound to `instance`.
     pub fn active_targets(&self, instance: u32) -> Vec<(usize, ResolvedTarget)> {
         self.resolved
             .iter()
@@ -153,15 +127,9 @@ impl SlotTable {
             .collect()
     }
 
-    /// Re-resolve `instance`'s bindings against a newly loaded sub-plugin.
+    /// Re-resolves bindings targeting `instance` against a newly loaded sub-plugin's parameters.
     ///
-    /// Only bindings that name this instance are touched — the other instances'
-    /// resolutions are left exactly as they were, because loading a plugin into
-    /// one node must not disturb the parameters driving another.
-    ///
-    /// Bindings that do not match are *kept* and simply left unresolved, so
-    /// reloading the original plugin brings them back (§8.3). Deleting them
-    /// would turn a missing file into lost work.
+    /// Bindings that do not match the new plugin ID or parameter list remain stored as unresolved.
     pub fn resolve_against(&mut self, instance: u32, plugin_id: &str, params: &[ParamInfo]) {
         for (slot, resolved) in self.slots.iter().zip(self.resolved.iter_mut()) {
             let Some(binding) = slot.binding.as_ref().filter(|b| b.instance == instance) else {
@@ -183,8 +151,7 @@ impl SlotTable {
         }
     }
 
-    /// Drop one instance's resolutions without touching the bindings, for when
-    /// that sub-plugin is unloaded.
+    /// Clears resolved targets for `instance` while keeping configured bindings.
     pub fn unresolve(&mut self, instance: u32) {
         for resolved in self.resolved.iter_mut() {
             if resolved.is_some_and(|r| r.instance == instance) {
@@ -193,13 +160,12 @@ impl SlotTable {
         }
     }
 
-    /// Drop every resolution without touching the bindings, for when every
-    /// sub-plugin is unloaded.
+    /// Clears all resolved targets while keeping configured bindings.
     pub fn unresolve_all(&mut self) {
         self.resolved.iter_mut().for_each(|r| *r = None);
     }
 
-    /// Bindings that are held but do not currently point anywhere.
+    /// Returns a list of `(slot_index, &Binding)` pairs that are currently unresolved.
     pub fn unresolved(&self) -> Vec<(usize, &Binding)> {
         self.slots
             .iter()
@@ -213,11 +179,7 @@ impl SlotTable {
         self.slots.clone()
     }
 
-    /// Restore slots from saved state.
-    ///
-    /// A saved table from a different build may be shorter or longer; it is
-    /// resized rather than rejected, because refusing to load costs the user
-    /// their whole project.
+    /// Restores slot definitions from state, resizing to the configured slot count.
     pub fn load_state(&mut self, slots: Vec<Slot>) {
         self.slots = slots;
         self.slots.resize(self.count, Slot::default());
@@ -230,8 +192,7 @@ mod tests {
     use super::*;
     use plugin_host::ParamFlags;
 
-    /// What the AudioGraph wrapper publishes. Local to the tests: the crate
-    /// itself no longer names a number.
+    /// Test slot count constant.
     const SLOTS: usize = 32;
 
     fn param(id: u32, name: &str, min: f64, max: f64) -> ParamInfo {
@@ -258,8 +219,7 @@ mod tests {
 
     #[test]
     fn a_binding_survives_a_plugin_that_does_not_resolve_it() {
-        // The whole point of §8.3: a missing plugin must not delete the user's
-        // work, because reloading it has to bring the mapping back.
+        // Unresolved bindings are preserved so reloading the plugin restores them.
         let mut table = SlotTable::new(SLOTS);
         table.bind(3, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
 
@@ -284,8 +244,7 @@ mod tests {
         let mut table = SlotTable::new(SLOTS);
         table.bind(0, 0, "AAAA", &param(42, "Drive", 0.0, 10.0));
 
-        // A plugin update reorders its parameter list. Resolving by index would
-        // silently re-point the slot at whatever now sits in that position.
+        // Parameter reordering should not affect bindings matched by parameter ID.
         let reordered = [param(1, "Mix", 0.0, 1.0), param(42, "Drive", 0.0, 10.0)];
         table.resolve_against(0, "AAAA", &reordered);
 
@@ -296,9 +255,7 @@ mod tests {
 
     #[test]
     fn two_copies_of_one_plugin_are_two_different_targets() {
-        // §12-7. Keying a binding on the plugin id alone made the two copies
-        // indistinguishable: a slot bound to the second one also resolved
-        // against the first, so both moved together.
+        // Separate instances of the same plugin type resolve independently.
         let mut table = SlotTable::new(SLOTS);
         table.bind(0, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
         table.bind(1, 1, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
@@ -318,9 +275,7 @@ mod tests {
 
     #[test]
     fn loading_one_instance_leaves_the_others_resolved() {
-        // Loading a plugin into one node re-resolves that node's bindings. If
-        // it rewrote the whole table, the other nodes' parameters would stop
-        // being driven the moment anything else was loaded.
+        // Resolving bindings for one instance leaves other instances untouched.
         let mut table = SlotTable::new(SLOTS);
         table.bind(0, 0, "AAAA", &param(7, "Cutoff", 0.0, 1.0));
         table.bind(1, 1, "BBBB", &param(9, "Drive", 0.0, 1.0));

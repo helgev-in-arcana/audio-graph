@@ -1,45 +1,24 @@
-//! The contract between a host that schedules audio and the sub-plugins it runs.
+//! Audio processing interfaces and types for sub-plugin instances.
 //!
-//! A caller here owns a graph, a chain, a rack — something that decides *when*
-//! each sub-plugin runs and *what* it hears — but has no idea what is at the
-//! other end of one. Everything crossing this line is a flat slice or a `Copy`
-//! value, so it still works when the sub-plugin lives in another process
-//! (ADR-6). That is why notes cross as a *name* and a key mask rather than as a
-//! buffer: the caller routes without knowing what a note is, and this side is
-//! what turns the name into events.
+//! Defines the audio processing trait [`AudioInstances`], channel chunk layouts,
+//! note routing sources, and direct parameter targets using flat slices and copyable types.
 
 use plugin_host::AuxBuses;
 
-/// Where one instance's notes come from.
-///
-/// An identity rather than a buffer. The caller decides which instance hears
-/// which stream without knowing what a note is, and this side turns the name
-/// into events — which is also what keeps whatever the caller schedules from
-/// holding a pointer (ADR-6).
+/// Specifies the MIDI note event source for an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoteSource {
-    /// Nothing routed to this instance.
-    ///
-    /// It gets no notes at all — not the DAW's, not anyone's. Handing every
-    /// instance every event the DAW sent is the tempting default and the wrong
-    /// one: two synths then play in unison whatever the caller intended.
+    /// No note events are routed to this instance.
     #[default]
     None,
-    /// One of the wrapper's own note inputs from the DAW.
+    /// Route note events from the specified host DAW note bus.
     Daw { bus: u16 },
-    /// The same stream with note-ons held back.
-    ///
-    /// What a shut gate leaves. Blocking everything would be simpler and
-    /// wrong: a note that was already sounding when the gate closed would
-    /// never get its note-off, and a hung note outlives whatever caused it.
-    /// Letting the releases through costs nothing and means a gate can be
-    /// thrown mid-phrase without leaving wreckage.
+    /// Route only note-off / release events from the specified note bus, suppressing note-ons.
     DawReleases { bus: u16 },
 }
 
 impl NoteSource {
-    /// This source with its note-ons held back — see
-    /// [`NoteSource::DawReleases`]. Nothing is already nothing.
+    /// Returns a variant of this source that delivers only note release events.
     pub fn releases_only(self) -> NoteSource {
         match self {
             NoteSource::None => NoteSource::None,
@@ -50,17 +29,10 @@ impl NoteSource {
     }
 }
 
-/// What one instance hears for a chunk: a stream, and the keys taken out of it.
+/// Note source configuration and key-filtering mask for a sub-plugin instance.
 ///
-/// `mute` is a bitmask over MIDI keys 0..128 — bit `k` set means key `k` never
-/// reaches the plugin, note-on and note-off alike. Dropping both halves is
-/// what keeps it safe: the note-on was dropped too, so there is no sounding
-/// voice left waiting for its release, which is the opposite of the situation
-/// [`NoteSource::DawReleases`] exists for.
-///
-/// A mask rather than a list because it is copied per chunk and tested one bit
-/// per event, and because sixteen bytes is cheaper than a pointer plus the
-/// lifetime that would come with it (ADR-6).
+/// `mute` is a 128-bit mask corresponding to MIDI note numbers 0..127. If bit `k`
+/// is set, all note events for key `k` are suppressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NoteStream {
     pub source: NoteSource,
@@ -73,61 +45,38 @@ impl NoteStream {
     }
 }
 
-/// The shape of one chunk handed to a sub-plugin.
+/// Buffer layout and timing geometry for an audio processing chunk.
 ///
-/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses.
-/// The caller's pool has room for the longest block the host promised, but the
-/// channels inside a chunk sit at `frames` rather than at that maximum — so a
-/// short sub-block is a smaller buffer rather than a sparse one, and the slice
-/// can be handed straight to a sub-plugin without repacking.
+/// Channels are stored contiguously in planar format packed by `frames`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioChunk {
-    /// Channels in the input region: the main bus plus every aux bus.
+    /// Total number of input channels across main and aux buses.
     pub input_channels: u16,
-    /// Channels in the output region, counted the same way.
+    /// Total number of output channels across main and aux buses.
     pub output_channels: u16,
-    /// Where the joins in the input region are. Empty for the usual one-bus
-    /// plugin.
+    /// Auxiliary input bus channel layout.
     pub aux_inputs: AuxBuses,
-    /// Where the joins in the output region are. Empty in the same case.
+    /// Auxiliary output bus channel layout.
     pub aux_outputs: AuxBuses,
     pub frames: u32,
-    /// Where this chunk starts inside the block the DAW handed us.
-    ///
-    /// Zero when the caller runs a whole block at once. When it cuts the block
-    /// into sub-blocks instead, this is what lets the implementation cut the
-    /// block's events and automation down to the part this call covers, with
-    /// offsets rebased — without it, every chunk would be handed every event in
-    /// the block and a note would sound once per chunk.
+    /// Sample offset of this chunk within the current host audio block.
     pub offset: u32,
 }
 
 impl AudioChunk {
-    /// One output channel of a chunk, as a range into the flat buffer.
+    /// Returns the slice index range for the given output channel.
     pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
         let start = channel as usize * self.frames as usize;
         start..start + self.frames as usize
     }
 }
 
-/// Every sub-plugin a caller can run, addressed by index.
-///
-/// This is the one line between scheduling audio and hosting a plugin. The
-/// caller decides *when* each instance runs and *what* it hears; it has no idea
-/// what is at the other end, and does not learn whether it was a VST3 or a
-/// CLAP. Everything crossing back is a flat slice or a `Copy` value, so the
-/// arrangement still works when the sub-plugin is in another process (ADR-6).
+/// Audio processing interface for indexed sub-plugin instances.
 pub trait AudioInstances {
-    /// Run instance `instance` from `input` into `output`.
+    /// Processes audio and events for the specified sub-plugin instance.
     ///
-    /// The two slices never alias. `output` is written in full for the frames
-    /// the chunk covers; anything the implementation does not write is whatever
-    /// the pool held, so a plugin that produces nothing should clear it.
-    ///
-    /// `notes` says which note stream this instance hears. It is a name and a
-    /// key mask, not a buffer: the caller routes notes without knowing what one
-    /// is, and the implementation is what turns the name into events and drops
-    /// the keys the mask names.
+    /// Reads planar audio channels from `input`, writes planar channels to `output`,
+    /// and dispatches note events filtered according to `notes`.
     fn process(
         &mut self,
         instance: u32,
@@ -138,7 +87,7 @@ pub trait AudioInstances {
     );
 }
 
-/// An implementation that produces silence, for a wrapper with nothing loaded.
+/// An [`AudioInstances`] implementation that clears output buffers to silence.
 pub struct NoInstances;
 
 impl AudioInstances for NoInstances {
@@ -156,33 +105,21 @@ impl AudioInstances for NoInstances {
     }
 }
 
-/// How one instance has to be activated: the buses that will actually be fed to
-/// it.
-///
-/// A property of the arrangement rather than of the plugin — whether a
-/// sidechain is switched on depends on whether the caller wired anything to it.
-/// The caller is what knows this, which is why it comes in from that side; and
-/// changing it means the sub-plugin has to be deactivated and activated again.
+/// Audio bus activation configuration for a specific sub-plugin instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceIo {
     pub instance: u32,
-    /// Main input bus width. Zero for an instrument.
+    /// Channel count of the main input bus (0 for instrument plugins without audio inputs).
     pub input_channels: u16,
-    /// Aux input buses, in order. Only the ones the caller wired.
+    /// Channel counts for active auxiliary input buses.
     pub aux_inputs: Vec<u16>,
-    /// Main output bus width.
+    /// Channel count of the main output bus.
     pub output_channels: u16,
-    /// Aux output buses, in order. Only as far as the caller reads them, so a
-    /// plugin's third output is absent when only the second is wired.
+    /// Channel counts for active auxiliary output buses.
     pub aux_outputs: Vec<u16>,
 }
 
-/// One sub-plugin parameter the caller drives directly.
-///
-/// The other way in. A [`Slot`][crate::Slot] is the DAW's lane and is published
-/// to it, so there is a fixed number of those; this is not limited the same way
-/// because nothing outside the caller has to name it. Both arrive on the same
-/// schedule and the merge does not care which is which — see [`SlotSchedule`][crate::SlotSchedule].
+/// Target identifier for a sub-plugin parameter driven directly by the audio graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamTarget {
     pub instance: u32,

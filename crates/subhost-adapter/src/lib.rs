@@ -1,22 +1,9 @@
-//! Everything specific to hosting a plugin from *inside* another plugin.
+//! Hosting sub-plugins inside another plugin.
 //!
-//! Defined by subtraction: if a standalone offline renderer or a plugin scanner
-//! would still need a piece of code, it belongs in `plugin-host`, not here.
-//! What is left is the nesting itself — forwarding the DAW's transport down,
-//! combining latency on the way up, publishing slots the DAW can automate and
-//! binding them to the sub-plugin's own parameters, nesting one plugin's state
-//! inside another's, and deciding what to do with the sub-plugin's edit
-//! notifications.
-//!
-//! Defined by subtraction the other way too: nothing here knows what AudioGraph
-//! is. The wrapper above decides how many slots to publish, how many lanes a
-//! sub-block carries and what its saved document looks like, and hands those in
-//! ([`SubHostConfig`], [`SlotSchedule`], [`SubHostState`]); a different wrapper
-//! — a chain, a rack, a bare pair of plugins — makes different choices and gets
-//! the same crate. [`AudioInstances`] is where that line is drawn: a caller
-//! schedules
-//! audio and says which instance hears what, and everything crossing back is a
-//! flat slice or a `Copy` value.
+//! Provides the sub-hosting adapter layer: forwarding transport, combining
+//! latency, publishing automatable parameter slots and binding them to
+//! sub-plugin parameters, managing nested sub-plugin state, and scheduling
+//! audio processing across multiple sub-plugin instances.
 
 mod host;
 mod instances;
@@ -34,11 +21,10 @@ pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
 pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};
 
-/// How the wrapper reports its own latency to the DAW.
+/// Latency reported by the wrapper to the host DAW.
 ///
-/// §7.4: the DAW must be told the sub-plugin's latency plus whatever the
-/// wrapper adds, and a change from below has to be propagated upward rather
-/// than absorbed — a host that is not told will leave the track misaligned.
+/// Combines the sub-plugin's reported latency with any additional latency
+/// introduced by the wrapper so the host DAW can perform latency compensation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LatencyReport {
     pub sub_plugin: u32,
@@ -66,8 +52,7 @@ mod tests {
 
     #[test]
     fn latency_saturates_rather_than_wrapping() {
-        // A plugin reporting a nonsense latency should not make the wrapper
-        // report a tiny one, which is what a wrapping add would do.
+        // Prevent arithmetic overflow if a sub-plugin reports an extreme latency value.
         let report = LatencyReport {
             sub_plugin: u32::MAX,
             wrapper: 64,
