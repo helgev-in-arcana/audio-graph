@@ -1,16 +1,20 @@
-//! What a node is handed while the parameter half is being compiled.
+//! Node compilation contexts for parameter and audio execution pipelines.
 //!
-//! Every local the old single loop kept — the register counter, the op list,
-//! the lane books — is a field here, and every closure it defined is a method.
-//! That is the whole change: a node's arm used to reach into the loop's
-//! variables, and now it asks for what it needs. It cannot see another node's
-//! registers, cannot renumber a lane, and cannot append to `ops` out of turn.
+//! Provides [`ParamCx`], [`AudioCx`], and [`DeclareCx`], handed to nodes during
+//! the compilation passes. They handle register allocation, instruction
+//! emission, audio buffer lifecycle and note routing.
 //!
-//! The order in which these methods are called is still what decides register
-//! and lane numbering, and that is deliberate: the audio thread indexes both
-//! without checking, so the numbering has to come from somewhere
-//! deterministic. It comes from the topological order, and from the order of
-//! the calls inside each node.
+//! Every local a single compile loop would keep — the register counter, the op
+//! list, the lane books — is a field on one of these, and every closure it
+//! would define is a method. That is what stops a node's arm from reaching into
+//! the loop's variables: it cannot see another node's registers, cannot
+//! renumber a lane, and cannot append to `ops` out of turn.
+//!
+//! **The order in which these methods are called is what decides register and
+//! lane numbering.** That is deliberate: the audio thread indexes both without
+//! checking, so the numbering has to come from somewhere deterministic. It
+//! comes from the topological order, and from the order of the calls inside
+//! each node.
 
 use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
@@ -21,8 +25,8 @@ use crate::ir::{
     MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
 };
 
-/// Where a note gate's lane is filed, so it cannot collide with the lane of an
-/// input socket of the same number.
+/// Offset added to an output socket index when filing a note gate's lane, so it
+/// cannot collide with the lane of an input socket of the same number.
 ///
 /// A lane is keyed by `(node, socket)` and every other user of one means an
 /// *input* socket by it. A gate belongs to an output, and a node has both.
@@ -30,19 +34,15 @@ use crate::ir::{
 /// was.
 const OUTPUT_SOCKET: u8 = 128;
 
-/// Walk up a note chain from `(node, port)` to whatever makes the notes.
+/// Walks up a note chain from `(node, port)` to whatever makes the notes.
 ///
-/// Returns the source, and the gate socket nearest the reader — nearest
-/// because each gate already folds the ones above it into its own condition,
-/// so the closest one is the whole answer.
+/// Returns the source, the gate socket nearest the reader, and the accumulated
+/// key mute mask. Nearest, because each gate already folds the ones above it
+/// into its own condition, so the closest one is the whole answer.
 fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>, u128) {
     let mut at = graph.source_of(node, port);
     let mut gate = None;
-    // Every node on the way may take keys out; they are unioned because a
-    // stream that passed two key switches has lost both sets of keys.
     let mut mute = 0u128;
-    // Bounded by the node count: every step moves to a node upstream of the
-    // last, and `check_links` has already refused a cycle.
     for _ in 0..=graph.nodes.len() {
         let Some((from, from_port)) = at else {
             return (NoteSource::None, gate, mute);
@@ -54,8 +54,6 @@ fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(No
             return (source, gate, mute);
         }
         let Some(input) = node.kind.note_passthrough(from_port) else {
-            // Something with a notes output that neither makes notes nor
-            // passes them on. Nothing to route.
             return (NoteSource::None, gate, mute);
         };
         mute |= node.kind.note_mute(from_port);
@@ -68,6 +66,7 @@ use crate::nodes::NodeKind;
 use crate::port::PortType;
 use subhost_adapter::{InstanceIo, NoteSource, ParamTarget};
 
+/// What a node is handed while the parameter half is being compiled.
 pub(crate) struct ParamCx<'a> {
     graph: &'a Graph,
     lines: &'a [Line],
@@ -121,7 +120,7 @@ impl<'a> ParamCx<'a> {
         }
     }
 
-    /// Say which node the calls that follow belong to.
+    /// Says which node the calls that follow belong to.
     pub(crate) fn begin(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -157,9 +156,8 @@ impl<'a> ParamCx<'a> {
 
     /// Like [`ParamCx::input`], but an unconnected socket reads as zero.
     ///
-    /// The identity element for each operator would be a slightly nicer
-    /// answer, but "nothing plugged in reads as zero" is one rule instead of
-    /// six.
+    /// The identity element for each operator would be a slightly nicer answer,
+    /// but "nothing plugged in reads as zero" is one rule instead of six.
     pub(crate) fn input_or_zero(&mut self, port: u8) -> Result<Reg, CompileError> {
         match self.input(port) {
             Some(reg) => Ok(reg),
@@ -170,16 +168,17 @@ impl<'a> ParamCx<'a> {
     /// Whether anything is wired to input `port`.
     ///
     /// For the sockets that carry no register — a notes port — where
-    /// [`ParamCx::input`] cannot tell "nothing wired" from "wired to
-    /// something that binds no register".
+    /// [`ParamCx::input`] cannot tell "nothing wired" from "wired to something
+    /// that binds no register".
     pub(crate) fn has_input(&self, port: u8) -> bool {
         self.graph.source_of(self.id, port).is_some()
     }
 
     /// A register holding zero, for an input nobody has connected yet.
+    ///
+    /// Reused across the program if one was already needed: constants are free
+    /// to run but not free to hold, and a wide graph can want a lot of them.
     pub(crate) fn zero(&mut self) -> Result<Reg, CompileError> {
-        // Reuse one if this graph already needed it. Constants are free to run
-        // but not free to hold, and a wide graph can want a lot of them.
         if let Some(&Op::Const { out, .. }) = self
             .ops
             .iter()
@@ -194,7 +193,7 @@ impl<'a> ParamCx<'a> {
 
     // --- emitting ---------------------------------------------------------
 
-    /// Book the next register. The call order is what decides the numbering.
+    /// Books the next register. The call order is what decides the numbering.
     pub(crate) fn alloc(&mut self) -> Result<Reg, CompileError> {
         if self.next_reg >= MAX_REGISTERS {
             return Err(CompileError::TooLarge {
@@ -211,12 +210,12 @@ impl<'a> ParamCx<'a> {
         self.ops.push(op);
     }
 
-    /// Emit an op that runs after every other op in the program.
+    /// Emits an op that runs after every other op in the program.
     ///
-    /// Only delay writes use this, and §14.4 is why: where a `DelayWrite` lands
-    /// in the topological order is not determined when nothing downstream reads
-    /// the line, and "sometimes a sub-block earlier" is not a semantics anyone
-    /// can reason about. Putting every write at the end makes one rule — a read
+    /// Only delay writes use this. Where a `DelayWrite` lands in the
+    /// topological order is not determined when nothing downstream reads the
+    /// line, and "sometimes a sub-block earlier" is not a semantics anyone can
+    /// reason about. Putting every write at the end makes one rule — a read
     /// sees the line as it stood at the end of the previous sub-block — and
     /// that rule belongs to the compiler rather than to the delay node, which
     /// is why it is spelled out here rather than there.
@@ -224,7 +223,7 @@ impl<'a> ParamCx<'a> {
         self.deferred.push(op);
     }
 
-    /// Say that this node's output `port` is the value in `reg`.
+    /// Says that this node's output `port` is the value in `reg`.
     ///
     /// Keyed by socket rather than by node: a plugin node has one per bus.
     pub(crate) fn bind_output(&mut self, port: u8, reg: Reg) {
@@ -233,7 +232,7 @@ impl<'a> ParamCx<'a> {
 
     // --- the scarce, numbered things --------------------------------------
 
-    /// Book this node a slot in the LFO state table.
+    /// Books this node a slot in the LFO state table.
     ///
     /// The table is what survives a program swap, so that recompiling — which
     /// happens on every drag of every knob — does not restart an oscillator.
@@ -249,7 +248,7 @@ impl<'a> ParamCx<'a> {
         Ok(state)
     }
 
-    /// Book this node a latch, which is what survives a program swap — see
+    /// Books this node a latch, which is what survives a program swap — see
     /// [`Op::KeyToggle`][crate::Op::KeyToggle].
     pub(crate) fn latch(&mut self) -> Result<u16, CompileError> {
         if self.latch_nodes.len() >= MAX_LATCHES {
@@ -263,7 +262,7 @@ impl<'a> ParamCx<'a> {
         Ok(state)
     }
 
-    /// Where `line` ended up in the program's numbering.
+    /// Returns the compiled program index for `line`.
     pub(crate) fn line_index(&self, line: LineId) -> u16 {
         self.lines
             .iter()
@@ -281,7 +280,7 @@ impl<'a> ParamCx<'a> {
         Ok(())
     }
 
-    /// Drive one of a sub-plugin's own parameters from `reg` (§14.12).
+    /// Drives one of a sub-plugin's own parameters from `reg`.
     ///
     /// Two sockets naming one parameter is a patch the user can draw; the last
     /// one to compile wins, which at least is a rule rather than an accident of
@@ -315,10 +314,9 @@ impl<'a> ParamCx<'a> {
     /// The gate condition on the note chain feeding this node's input `port`,
     /// if there is one upstream.
     ///
-    /// A gate node asks for this so it can fold the gates above it into its
-    /// own condition: two gates in series pass notes only when both are open,
-    /// and one register saying so is cheaper than the audio half carrying a
-    /// list.
+    /// A gate node asks for this so it can fold the gates above it into its own
+    /// condition: two gates in series pass notes only when both are open, and
+    /// one register saying so is cheaper than the audio half carrying a list.
     pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
         let (_, socket, _) = trace_notes(self.graph, self.id, port);
         let socket = socket?;
@@ -328,23 +326,23 @@ impl<'a> ParamCx<'a> {
             .map(|&(_, reg)| reg)
     }
 
-    /// Say that the notes leaving this node's output `port` pass only while
+    /// Says that the notes leaving this node's output `port` pass only while
     /// `reg` is 1.
     ///
-    /// Booked as an audio lane, because the audio half is where the decision
-    /// is applied and the two halves run at different rates (§14.5).
+    /// Booked as an audio lane, because the audio half is where the decision is
+    /// applied and the two halves run at different rates.
     pub(crate) fn bind_note_gate(&mut self, port: u8, reg: Reg) -> Result<(), CompileError> {
         self.note_gates.push(((self.id, port), reg));
         self.drive_audio(OUTPUT_SOCKET + port, reg)
     }
 
-    /// Carry the value in `reg` across to the audio half, as this node's
-    /// control on socket `port` (§14.5, §14.12).
+    /// Carries the value in `reg` across to the audio half, as this node's
+    /// control on socket `port`.
     ///
-    /// A range of lane numbers of its own, past the slot table and past the
-    /// parameter lanes, so that each consumer reads only what it understands:
-    /// the sub-plugin adapter never sees one of these, and the audio half never
-    /// sees a parameter.
+    /// These get a range of lane numbers of their own, past the slot table and
+    /// past the parameter lanes, so that each consumer reads only what it
+    /// understands: the sub-plugin adapter never sees one of these, and the
+    /// audio half never sees a parameter.
     pub(crate) fn drive_audio(&mut self, port: u8, reg: Reg) -> Result<(), CompileError> {
         let socket = (self.id, port);
         let lane = match self.audio_lanes.iter().find(|&&(s, _)| s == socket) {
@@ -369,16 +367,17 @@ impl<'a> ParamCx<'a> {
 /// One node's audio output, once it has been emitted.
 struct Produced {
     node: NodeId,
-    /// Which of the node's output sockets this is. Only a plugin node has
-    /// more than one (§14.2); everything else produces port 0.
+    /// Which of the node's output sockets this is. Only a plugin node has more
+    /// than one; everything else produces port 0.
     port: u8,
     buf: Buf,
     /// Samples of delay accumulated on the way here. Two of these arriving at
-    /// one `Mix` with different values is what §14.6 exists to fix.
+    /// one `Mix` with different values is what latency compensation exists to
+    /// fix: without it the short branch runs ahead and the two phase-cancel.
     latency: u32,
 }
 
-/// Hands out audio buffers and takes them back (§14.7).
+/// Hands out audio buffers and takes them back.
 ///
 /// A linear-scan register allocator, with the one wrinkle that buffers have a
 /// width: a stereo buffer cannot stand in for a mono one, so the free list is
@@ -417,12 +416,12 @@ impl Pool {
 
     /// Like `alloc`, but never returns one of `avoid`.
     ///
-    /// Two callers need this and for different reasons. A plugin reads its
-    /// input and writes its output, and whether those may be the same memory is
-    /// a question about the plugin's internals that a host has no way to ask,
-    /// so it is never asked. A `Mix` may accumulate into its first input, but
-    /// the moment it does, that buffer stops holding what the *other* inputs
-    /// expect to be summed with — so all but the first are off limits.
+    /// Two callers need this, for different reasons. A plugin reads its input
+    /// and writes its output, and whether those may be the same memory is a
+    /// question about the plugin's internals that a host has no way to ask, so
+    /// it is never asked. A `Mix` may accumulate into its first input, but the
+    /// moment it does, that buffer stops holding what the *other* inputs expect
+    /// to be summed with — so all but the first are off limits.
     ///
     /// Implemented by parking the buffers rather than by filtering, so there is
     /// exactly one place that knows how a free buffer is chosen.
@@ -447,7 +446,7 @@ impl Pool {
         self.widths[buf as usize]
     }
 
-    /// One of `buf`'s readers has run.
+    /// Decrements the pending reader count for `buf`.
     fn consume(&mut self, buf: Buf) {
         let slot = &mut self.pending[buf as usize];
         *slot = slot.saturating_sub(1);
@@ -461,7 +460,7 @@ impl Pool {
 /// deal with. Buffers are expensive enough to reuse, so they are handed out by
 /// a pool rather than counted off; a node may say which buffers a new one must
 /// *not* be ([`AudioCx::alloc_avoiding`]); and what a node produces carries an
-/// accumulated latency, which is what §14.6 lines up at a merge.
+/// accumulated latency, which is what a merge has to line up.
 pub(crate) struct AudioCx<'a> {
     graph: &'a Graph,
     lines: &'a [Line],
@@ -472,7 +471,7 @@ pub(crate) struct AudioCx<'a> {
     /// input nobody wired, which is silence rather than an error — the same
     /// rule the param half uses.
     sources: Vec<Option<(Buf, u32)>>,
-    /// How many links leave this node, over all its output sockets.
+    /// Total number of connections leaving this node across all output ports.
     readers: usize,
     /// Channel width of this node's first output socket, or 0 if it has none.
     out_width: u16,
@@ -484,9 +483,6 @@ pub(crate) struct AudioCx<'a> {
     instances: Vec<InstanceIo>,
     latency: u32,
     compensators: u16,
-    /// Audio lines are numbered among themselves: their rings are a scarcer
-    /// resource than a param line's, so they get their own ceiling and their
-    /// own index space.
     audio_lines: Vec<LineId>,
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
@@ -519,8 +515,12 @@ impl<'a> AudioCx<'a> {
         }
     }
 
-    /// Say which node the calls that follow belong to, and work out what is
+    /// Says which node the calls that follow belong to, and works out what is
     /// wired into it.
+    ///
+    /// Audio lines are numbered among themselves: their rings are a scarcer
+    /// resource than a param line's, so they get their own ceiling and their
+    /// own index space.
     pub(crate) fn begin(&mut self, id: NodeId, kind: &NodeKind) {
         self.id = id;
         self.sources = kind
@@ -549,8 +549,8 @@ impl<'a> AudioCx<'a> {
     pub(crate) fn finish(mut self) -> Audio {
         self.ops.append(&mut self.deferred);
 
-        // §14.9. An audio line with both halves present closes a loop, and then
-        // every plugin in the program has to run at sub-block granularity.
+        // An audio line with both halves present closes a loop, and then every
+        // plugin in the program has to run at sub-block granularity.
         let looped = self
             .lines
             .iter()
@@ -628,14 +628,14 @@ impl<'a> AudioCx<'a> {
             .map(|&(_, lane)| lane)
     }
 
-    /// How notes reach this node's input `port` (§14.10).
+    /// How notes reach this node's input `port`.
     ///
     /// `None` when nothing is connected, which is the answer that makes an
     /// unwired instrument silent rather than making it play whatever the DAW
     /// happened to send. Only `NoteIn` produces notes today; a plugin's own
-    /// note output would need the engine to carry event buffers, and that is
-    /// M9. What sits between the source and here — gates — comes back as a
-    /// lane number for the audio half to read each chunk.
+    /// note output would need the engine to carry event buffers. What sits
+    /// between the source and here — gates — comes back as a lane number for
+    /// the audio half to read each chunk.
     pub(crate) fn note_route(&self, port: u8) -> NoteRoute {
         let (source, socket, mute) = trace_notes(self.graph, self.id, port);
         let gate = socket.and_then(|(node, out_port)| {
@@ -653,7 +653,7 @@ impl<'a> AudioCx<'a> {
         self.pool.alloc(channels, readers)
     }
 
-    /// Like [`AudioCx::alloc`], but never returns one of `avoid`.
+    /// Allocates an audio buffer, avoiding any buffer in `avoid`.
     pub(crate) fn alloc_avoiding(
         &mut self,
         channels: u16,
@@ -667,7 +667,7 @@ impl<'a> AudioCx<'a> {
         self.pool.width_of(buf)
     }
 
-    /// One of `buf`'s readers has run.
+    /// Decrements the pending reader count for `buf`.
     pub(crate) fn consume(&mut self, buf: Buf) {
         self.pool.consume(buf);
     }
@@ -678,7 +678,7 @@ impl<'a> AudioCx<'a> {
         self.ops.push(op);
     }
 
-    /// Emit an op that runs after every other op in the program.
+    /// Emits an op that runs after every other op in the chunk.
     ///
     /// Only delay writes use this, for the reason the param half holds its
     /// writes back: within one chunk every read must see the line as it stood
@@ -688,7 +688,7 @@ impl<'a> AudioCx<'a> {
         self.deferred.push(op);
     }
 
-    /// Say what this node leaves in `buf` on its output socket `port`, and how
+    /// Says what this node leaves in `buf` on its output socket `port`, and how
     /// much delay it has accumulated getting there.
     pub(crate) fn produce(&mut self, port: u8, buf: Buf, latency: u32) {
         self.produced.push(Produced {
@@ -699,13 +699,13 @@ impl<'a> AudioCx<'a> {
         });
     }
 
-    /// Report a path that reaches the DAW, so the wrapper can tell it how far
-    /// behind the audio is (§14.6).
+    /// Reports a path that reaches the DAW, so the wrapper can tell it how far
+    /// behind the audio is.
     pub(crate) fn report_latency(&mut self, latency: u32) {
         self.latency = self.latency.max(latency);
     }
 
-    /// Delay one branch of a merge so it lines up with the latest one.
+    /// Delays one branch of a merge so it lines up with the latest one.
     ///
     /// The alternative to doing this is the two branches phase-cancelling, so
     /// running out of compensators is refused rather than skipped.
@@ -728,7 +728,8 @@ impl<'a> AudioCx<'a> {
         Ok(())
     }
 
-    /// Say how a sub-plugin instance has to be activated (§14.11).
+    /// Says how a sub-plugin instance has to be activated: which buses, how
+    /// wide.
     pub(crate) fn declare_instance(&mut self, io: InstanceIo) {
         self.instances.push(io);
     }
@@ -739,7 +740,7 @@ impl<'a> AudioCx<'a> {
     ///
     /// `delay_nodes` grows alongside, so index `i` always names the writer of
     /// the line at `audio_lines[i]` — that pairing is what lets a program swap
-    /// keep the ring contents (§14.5).
+    /// keep the ring contents.
     pub(crate) fn audio_line(&mut self, line: LineId) -> Result<u16, CompileError> {
         if let Some(index) = self.audio_lines.iter().position(|&l| l == line) {
             return Ok(index as u16);
@@ -762,7 +763,7 @@ impl<'a> AudioCx<'a> {
         Ok((self.audio_lines.len() - 1) as u16)
     }
 
-    /// Ask that line `index`'s ring be long enough for `seconds`.
+    /// Asks that line `index`'s ring be long enough for `seconds`.
     ///
     /// Several reads may share a line — that is a multi-tap delay — and the
     /// ring has to be long enough for the furthest of them.
@@ -778,10 +779,9 @@ impl<'a> AudioCx<'a> {
 ///
 /// One pass over the graph, in which a node says what it needs that the
 /// compiler has to know about *before* it starts emitting: today that is delay
-/// lines, and nothing else. The pass exists so the compiler can stop
-/// recognising node kinds — it used to find the two halves of a delay line by
-/// matching on `DelayWrite` and `DelayRead` itself, which is exactly the kind
-/// of knowledge this refactoring is moving out of it.
+/// lines, and nothing else. The pass exists so the compiler does not have to
+/// recognise node kinds — it would otherwise have to find the two halves of a
+/// delay line by matching on `DelayWrite` and `DelayRead` itself.
 ///
 /// Deliberately in graph order rather than topological order: line numbering
 /// comes from where the writers sit in the patch, and a `DelayRead` compiled
@@ -807,7 +807,7 @@ impl DeclareCx {
         self.lines
     }
 
-    /// Say that this node is one end of delay line `line`, carrying `ty`.
+    /// Says that this node is one end of delay line `line`, carrying `ty`.
     ///
     /// A line with reads but no write is not an error: it reads silence, which
     /// is what a half-drawn patch should do. A line with a write and no read is
@@ -820,9 +820,6 @@ impl DeclareCx {
         ty: PortType,
         writes: bool,
     ) -> Result<(), CompileError> {
-        // A note delay line would have to store events, not values, and the
-        // param ring stores one `f64` per sub-block. Refusing is the honest
-        // answer; compiling it would drop every note in silence.
         if matches!(ty, PortType::Note) {
             return Err(CompileError::NotYet {
                 what: "note delay lines",

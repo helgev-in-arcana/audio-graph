@@ -109,12 +109,8 @@ fn the_host_forwards_what_the_plugin_asks_for() {
 /// A `.clap` on Windows and Linux *is* the shared library, so the artifact is
 /// loadable as it stands and nothing has to be copied or renamed.
 ///
-/// **Panics rather than skipping when it is missing.** `cargo test` does not
-/// build another package's `cdylib` — a dependency only pulls in its `rlib` —
-/// so a skip here would be a green run that tested nothing, which is the exact
-/// failure ADR-13 exists to prevent. Build the workspace first; CHECKS.md says
-/// so, and unlike an installed third-party plugin this artifact can always be
-/// there.
+/// **Panics rather than skipping when it is missing:** cargo does not build another
+/// package's `cdylib` on its own.
 pub fn fixture_path() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     // .../target/<profile>/deps/<test>.exe
@@ -134,8 +130,7 @@ pub fn fixture_path() -> PathBuf {
         .unwrap_or_else(|| {
             panic!(
                 "clap-test-plugin is not in {}.\n\
-                 Run `cargo build --workspace` before `cargo test --workspace`: \
-                 cargo does not build another package's cdylib on its own.",
+                 Run `cargo build --workspace` before `cargo test --workspace`.",
                 build_dir.display()
             )
         })
@@ -155,9 +150,7 @@ fn the_backend_drives_a_real_clap_module() {
     assert!(class.features.iter().any(|f| f == "audio-effect"));
     assert!(!class.is_instrument(), "the fixture is an effect");
 
-    // ADR-7: a second handle onto the same path must not run the entry point
-    // again. The fixture counts, and the count is checked below through the
-    // fact that everything still works after the second handle is dropped.
+    // Verify that a second handle to the same module path does not re-initialize the entry point.
     {
         let again = Module::open(&path).expect("the same module opens twice");
         assert_eq!(again.classes().unwrap().len(), 1);
@@ -174,8 +167,7 @@ fn the_backend_drives_a_real_clap_module() {
     assert_eq!(params.len(), 7, "{params:#?}");
 
     let gain = params.iter().find(|p| p.id == PARAM_GAIN).expect("gain");
-    // Plain values with a real range, straight from the plugin — the whole
-    // point of ADR-4's data model, and nothing is normalised on the way.
+    // Verify raw parameter range as reported by the plugin.
     assert_eq!((gain.min, gain.max, gain.default), (0.0, 2.0, 1.0));
     assert_eq!(gain.name, "Gain");
     assert!(gain.flags.contains(ParamFlags::AUTOMATABLE));
@@ -200,7 +192,7 @@ fn the_backend_drives_a_real_clap_module() {
         "the note port speaks the CLAP dialect"
     );
 
-    // Formatting is delegated to the plugin, units and all (§4.1).
+    // Formatting is delegated to the plugin.
     assert_eq!(
         SubPluginMain::param_to_text(&plugin, PARAM_GAIN, 1.5).as_deref(),
         Some("1.50 x")
@@ -221,12 +213,9 @@ fn the_backend_drives_a_real_clap_module() {
     assert_eq!(io.inputs[0].name, "Main");
     assert!(!io.inputs[0].is_aux);
     assert_eq!(io.inputs[1].name, "Sidechain");
-    assert!(
-        io.inputs[1].is_aux,
-        "the sidechain is the aux socket (§14.2)"
-    );
+    assert!(io.inputs[1].is_aux, "the sidechain is an auxiliary socket");
     assert_eq!(io.aux_inputs().len(), 1);
-    assert_eq!(io.outputs.len(), 2, "main plus the aux output of §14.2");
+    assert_eq!(io.outputs.len(), 2, "main plus auxiliary output");
     assert_eq!(io.outputs[1].name, "Aux Out");
     assert!(io.outputs[1].is_aux);
     assert_eq!(io.main_input_channels(), 2);
@@ -295,8 +284,7 @@ fn the_backend_drives_a_real_clap_module() {
         let status = processor.process(&mut buffers, &[], &context_time, &mut sink);
         assert_eq!(status, ProcessStatus::Continue);
     }
-    // out = in * gain. An unwired sidechain contributed nothing, which is what
-    // §14.11 is about — the port exists, and it was silent.
+    // out = in * gain. Verify that an unwired sidechain input remains silent.
     assert!(
         output.iter().all(|&s| (s - 0.5).abs() < 1e-6),
         "unwired sidechain leaked: {:?}",
@@ -439,7 +427,7 @@ fn the_backend_drives_a_real_clap_module() {
     };
     let mut processor = SubPluginMain::activate(&mut plugin, config).expect("activates with aux");
 
-    // The input region is main-then-aux, packed (§4.3).
+    // The input region is main-then-aux, packed.
     let mut input = vec![0.0f32; (FRAMES * 4) as usize];
     input[..(FRAMES * 2) as usize].fill(0.5);
     input[(FRAMES * 2) as usize..].fill(1.0);
@@ -520,8 +508,6 @@ fn the_backend_drives_a_real_clap_module() {
         assert!(plugin.editor_is_open());
     }
 
-    // Dropped with the editor still open — §5.3's dangerous path, where the
-    // DAW destroys the instance without ever saying "close". If the sequence
-    // were wrong this is where it would fault.
+    // Verify dropping plugin with editor still open executes clean teardown.
     drop(plugin);
 }

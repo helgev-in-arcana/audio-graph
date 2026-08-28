@@ -1,8 +1,8 @@
-//! The sub-plugin as the wrapper sees it.
+//! Sub-plugin lifecycle and hosting abstraction.
 //!
-//! Splits along the same seam as the backend (§4.2): [`SubHost`] is the
-//! main-thread half that loads, binds and saves, and it hands out a
-//! [`SubHostProcessor`] for the audio thread.
+//! Separates main-thread operations ([`SubHost`] for loading, parameter binding,
+//! state persistence, and editor management) from real-time audio-thread processing
+//! ([`SubHostProcessor`] and [`SubHostProcessors`]).
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -21,48 +21,44 @@ use crate::state::{InstanceState, SubHostState};
 
 pub use crate::state::SubPluginRef;
 
-/// The loaded sub-plugin, plus the slot table that drives it.
+/// Main-thread manager for loaded sub-plugin instances and their parameter slot bindings.
 ///
-/// The VST3 objects are main-thread only, which the outer plugin cannot express
-/// in its own type — see [`MainThread`].
+/// Plugin objects are restricted to the main thread and wrapped in [`MainThread`].
 pub struct SubHost {
     config: SubHostConfig,
-    /// One entry per instance the caller may address. Sparse: an entry stays
-    /// empty when whatever owned it has gone, because the caller names an
-    /// instance by index and renumbering would repoint every one of them.
+    /// Sparse list of loaded sub-plugin instances indexed by instance ID.
+    /// Empty entries stay empty rather than being closed up: callers name an
+    /// instance by index, so renumbering would repoint every one of them.
     instances: Vec<Option<MainThread<Loaded>>>,
     slots: SlotTable,
     context: Arc<dyn HostContext>,
-    /// Each instance's latency at its last activate, cached so the DAW can be
-    /// answered without touching a plugin. The caller needs these too, to line
-    /// up parallel paths.
+    /// Latency in samples for each instance as of its last activation, cached
+    /// so the DAW can be answered without touching a plugin. Callers that run
+    /// instances in parallel need these to line the paths up.
     latencies: Vec<u32>,
 }
 
-/// The ceilings a wrapper is built with.
+/// Configuration limits and buffer sizing parameters for a sub-host.
 ///
-/// All three are the wrapper's numbers rather than this crate's. They are
-/// ceilings rather than guidance because everything below is preallocated: the
-/// instance table and the buffer pool are sized at activate, and `process` may
-/// not grow either.
+/// These are ceilings rather than guidance: everything below is preallocated.
+/// The instance table and the event buffers are sized at activate, and
+/// `process` may not grow either, because it runs on the audio thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubHostConfig {
-    /// How many sub-plugins one wrapper may host. Known before the user starts
-    /// working, because callers name an instance by index.
+    /// Maximum number of sub-plugin instances that may be hosted.
     pub max_instances: usize,
-    /// How many slots the wrapper publishes to the DAW (§8).
+    /// Number of parameter slots published to the host DAW.
     pub slot_count: usize,
-    /// How many values one sub-block of the schedule carries — the slots plus
-    /// whatever else the caller packs alongside them. See [`SlotSchedule`].
+    /// Number of values carried per sub-block in the [`SlotSchedule`]: the
+    /// slots plus whatever else the caller packs alongside them.
     pub lanes: usize,
 }
 
-/// One loaded sub-plugin, plus how it was found.
+/// A loaded sub-plugin instance and its reference metadata.
 ///
-/// The §5.3 teardown order — editor before instance, instance before module —
-/// used to be spelled out here as field order. It now lives inside
-/// `plugin_host::Plugin`, which owns all three and is the same shape for both
-/// formats, so there is one place to get it right instead of one per caller.
+/// Teardown order — editor before instance, instance before module — lives
+/// inside `plugin_host::Plugin`, which owns all three, so dropping this struct
+/// is enough to get it right.
 struct Loaded {
     plugin: Plugin,
     reference: SubPluginRef,
@@ -83,8 +79,8 @@ impl SubHost {
         self.config
     }
 
-    /// Highest instance index in use, plus one. Not a count: the middle may be
-    /// empty.
+    /// Upper bound on active instance indices: the length of the sparse
+    /// instance list, not a count of what is loaded — the middle may be empty.
     pub fn instance_count(&self) -> usize {
         self.instances.len()
     }
@@ -103,7 +99,7 @@ impl SubHost {
             .map(MainThread::get_mut)
     }
 
-    /// Grow the table so `instance` can be written to.
+    /// Expands the instance table if needed to accommodate `instance`.
     fn reserve(&mut self, instance: usize) -> Result<(), String> {
         if instance >= self.config.max_instances {
             let max = self.config.max_instances;
@@ -116,11 +112,12 @@ impl SubHost {
         Ok(())
     }
 
-    /// Every instance's latency, indexed the way the caller indexes them.
+    /// Returns the cached latency in samples for all instances, indexed by
+    /// instance ID.
     ///
     /// A caller that runs instances in parallel needs these to line the paths
-    /// up, and one that runs them in a loop needs them to know how short the
-    /// loop may be.
+    /// up; one that runs them in a loop needs them to know how short the loop
+    /// may be.
     pub fn latencies(&self) -> &[u32] {
         &self.latencies
     }
@@ -137,7 +134,7 @@ impl SubHost {
         self.at(instance).is_some()
     }
 
-    /// Whether anything at all is loaded.
+    /// Returns `true` if at least one sub-plugin instance is loaded.
     pub fn any_loaded(&self) -> bool {
         self.instances.iter().any(Option::is_some)
     }
@@ -146,49 +143,48 @@ impl SubHost {
         self.latencies.get(instance).copied().unwrap_or(0)
     }
 
-    /// What is loaded, for display and for saving.
+    /// Returns the reference metadata for the loaded sub-plugin at `instance`.
     pub fn reference(&self, instance: usize) -> Option<&SubPluginRef> {
         self.at(instance).map(|l| &l.reference)
     }
 
-    /// What the loaded sub-plugin can accept (§3.3).
+    /// Returns the capabilities of the loaded sub-plugin at `instance`.
     ///
-    /// The default — everything false — is also the honest answer when nothing
-    /// is loaded: a graph cannot send per-voice modulation to a plugin that is
+    /// Defaults to all-false when nothing is loaded, which is also the honest
+    /// answer: a graph cannot send per-voice modulation to a plugin that is
     /// not there.
     pub fn capabilities(&self, instance: usize) -> plugin_host::Capabilities {
         self.at(instance)
             .map_or_else(Default::default, |l| l.plugin.capabilities())
     }
 
-    /// Hand one instance its own opaque state blob.
+    /// Restores an opaque state blob to the specified sub-plugin instance.
     ///
     /// For a harness that wants a plugin to open with a particular patch
-    /// already in it — a DAW does this through the normal state path.
+    /// already in it; a DAW does this through the normal state path instead.
     pub fn load_sub_state(&mut self, instance: usize, blob: &[u8]) -> Result<(), String> {
         let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
         loaded.plugin.load_state(blob).map_err(|e| e.to_string())?;
-        // The other half of the rule in `save_state`: a plugin may finish
-        // taking the blob on a main-thread callback, and until then it still
-        // reports its old values.
+        // A plugin may finish taking the blob on a main-thread callback, and
+        // until it runs it still reports its old values. Same rule as in
+        // `save_state`.
         loaded.plugin.tick();
         Ok(())
     }
 
-    /// The plugin's buses and note capability, for building a node's sockets
-    /// (§14.2). Empty when nothing is loaded, which draws as a node with no
-    /// sockets rather than as an error.
+    /// Returns the audio bus layout and note support for the sub-plugin at
+    /// `instance`, for building a node's sockets. Empty when nothing is
+    /// loaded, which draws as a node with no sockets rather than as an error.
     pub fn io_layout(&self, instance: usize) -> plugin_host::IoLayout {
         self.at(instance)
             .map(|l| SubPluginMain::io_layout(&l.plugin))
             .unwrap_or_default()
     }
 
-    /// The lowest instance index nothing is loaded into.
+    /// Returns the lowest unused instance index below `max_instances`.
     ///
-    /// Reused rather than always-increasing so that dropping one sub-plugin and
-    /// adding another does not walk off the end of
-    /// [`max_instances`][SubHostConfig::max_instances].
+    /// Reused rather than always-increasing, so that dropping one sub-plugin
+    /// and adding another does not walk off the end of `max_instances`.
     pub fn free_instance(&self) -> Option<usize> {
         (0..self.config.max_instances).find(|&i| !self.is_loaded(i))
     }
@@ -200,15 +196,16 @@ impl SubHost {
         }
     }
 
-    /// Load a sub-plugin, choosing `class_id` or the module's first offering.
+    /// Loads a sub-plugin into the given instance slot.
     ///
-    /// Replaces whatever was loaded. Slot *bindings* are kept and re-resolved
-    /// against the new plugin, so swapping a plugin for a newer version of
-    /// itself keeps every mapping (§8.3).
+    /// If a plugin was previously loaded at this instance, it is replaced.
+    /// Existing slot bindings are preserved and re-resolved against the new
+    /// plugin, so swapping a plugin for a newer version of itself keeps every
+    /// mapping.
     ///
-    /// The format is the path's business, not the caller's: `plugin-host`
-    /// reads it off the extension, so a `.clap` and a `.vst3` arrive here the
-    /// same way and nothing below this line branches on which it was.
+    /// The format follows from the path: `plugin-host` reads it off the
+    /// extension, so a `.clap` and a `.vst3` arrive here the same way and
+    /// nothing below this line branches on which it was.
     pub fn load(
         &mut self,
         instance: usize,
@@ -227,8 +224,8 @@ impl SubHost {
             display_name: class.name.clone(),
         };
 
-        // Unload only after the new one is known good, so a failed load leaves
-        // the user with what they had rather than with nothing.
+        // Only after the new one is known good, so a failed load leaves the
+        // user with what they had rather than with nothing.
         self.unload(instance);
         self.slots.resolve_against(
             instance as u32,
@@ -240,7 +237,8 @@ impl SubHost {
     }
 
     pub fn unload(&mut self, instance: usize) {
-        // Dropping the entry drops the editor first — see the note on `Loaded`.
+        // Dropping the entry tears down editor, instance and module in that
+        // order — see the note on `Loaded`.
         if let Some(slot) = self.instances.get_mut(instance) {
             *slot = None;
         }
@@ -258,16 +256,16 @@ impl SubHost {
         self.slots.unresolve_all();
     }
 
-    /// Re-find a sub-plugin whose recorded path no longer exists.
+    /// Attempts to resolve a sub-plugin reference to an existing file path.
     ///
-    /// Projects move between machines, and a plugin folder that differs by one
-    /// directory should not cost the user their patch. The class id is the
-    /// authority; the path is only a hint (§8.3).
+    /// Projects move between machines, and a plugin folder that differs by
+    /// one directory should not cost the user their patch: the class id is the
+    /// authority and the recorded path is only a hint.
     pub fn resolve_reference(reference: &SubPluginRef) -> Option<PathBuf> {
-        // A reference saved before CLAP existed has no format tag worth
-        // trusting beyond `"vst3"`, and one saved by a newer build might name a
-        // format this build does not have. Both are "not found" rather than an
-        // error, which is what the caller already handles.
+        // An unrecognised format tag is "not found" rather than an error,
+        // which is what the caller already handles: a reference saved before
+        // CLAP existed has no format tag worth trusting, and one saved by a
+        // newer build might name a format this build does not have.
         let format = Format::from_tag(&reference.format)?;
         plugin_host::resolve_reference(&plugin_host::PluginRef {
             format,
@@ -281,17 +279,16 @@ impl SubHost {
         self.at(instance).map(|l| l.plugin.class())
     }
 
-    /// Open the sub-plugin's own editor in a top-level window (§5.1).
+    /// Opens the sub-plugin's editor GUI in a separate top-level window.
     ///
     /// Not composited into the wrapper's own editor: a native child window
     /// cannot be composited over a GPU surface, so a separate window is the
-    /// only workable arrangement — and it is the arrangement that keeps ADR-6
-    /// open, since a child process can create its own window with no
-    /// cross-process embedding involved.
+    /// only workable arrangement.
+    ///
     /// `owner` is the window the sub-plugin's editor should float above: the
     /// DAW's root window when running as a plugin, null when standalone. An
-    /// ownerless window is a peer of the DAW's, so clicking in the DAW buries
-    /// it — which is what this argument exists to prevent.
+    /// ownerless window is a peer of the DAW's, so clicking in the DAW would
+    /// bury it — which is what this argument exists to prevent.
     pub fn open_editor(
         &mut self,
         instance: usize,
@@ -301,15 +298,14 @@ impl SubHost {
         loaded.plugin.open_editor(owner)
     }
 
-    /// Close the sub-plugin's editor, running the §5.3 sequence.
+    /// Closes the editor window for the sub-plugin at `instance`.
     pub fn close_editor(&mut self, instance: usize) {
         if let Some(loaded) = self.at_mut(instance) {
             loaded.plugin.close_editor();
         }
     }
 
-    /// Close every open sub-editor. Used on teardown, where §5.3's ordering
-    /// matters and no caller should have to remember which ones were open.
+    /// Closes all open sub-plugin editor windows.
     pub fn close_all_editors(&mut self) {
         for instance in 0..self.instances.len() {
             self.close_editor(instance);
@@ -320,25 +316,19 @@ impl SubHost {
         self.at(instance).is_some_and(|l| l.plugin.editor_is_open())
     }
 
-    /// Drive every loaded sub-plugin for one UI tick.
+    /// Drives main-thread processing and UI callbacks for all loaded
+    /// sub-plugins.
     ///
-    /// Call from the host's UI thread, every frame, whether or not any editor
-    /// is open — a CLAP plugin's main-thread callbacks and timers run through
-    /// here too, and one starved of them stalls. A plugin must not pump
-    /// messages itself, since the DAW is already doing that; this only handles
-    /// the parts that are ours.
+    /// Call from the host's UI thread every frame, whether or not any editor
+    /// is open: a plugin's main-thread callbacks and timers run through here
+    /// too, and one starved of them stalls. `save_state`, `load_state` and
+    /// `load_sub_state` additionally tick around the plugin themselves, since
+    /// a callback missed there costs data rather than responsiveness.
     ///
-    /// The wrapper keeps that contract from the plugin instance rather than
-    /// from its editor: `audio-graph-plugin`'s `tick` module owns a thread that
-    /// posts this onto the host's main thread for as long as the instance
-    /// exists, whether or not any window is open. `save_state`, `load_state`
-    /// and `load_sub_state` additionally tick around the plugin themselves,
-    /// since a callback missed there costs data rather than responsiveness.
-    ///
-    /// One platform is still short: VST3 on Linux, where nice-plug runs those
-    /// posts on a worker thread rather than a main thread, so the tick declines
-    /// to do anything. CLAP on Linux goes through `request_callback()` and is
-    /// fine. See ROADMAP.md.
+    /// One platform is still short: on VST3 under Linux the underlying host
+    /// posts these onto a worker thread rather than a main thread, so the tick
+    /// declines to do anything. CLAP under Linux goes through
+    /// `request_callback()` and is fine.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {
@@ -347,7 +337,7 @@ impl SubHost {
         }
     }
 
-    /// Bind a slot to one of a loaded plugin's parameters.
+    /// Binds a slot index to a parameter on the loaded sub-plugin at `instance`.
     pub fn bind_slot(
         &mut self,
         instance: usize,
@@ -365,17 +355,16 @@ impl SubHost {
         Ok(())
     }
 
-    /// Everything driving one instance's parameters, as the audio thread
-    /// wants it: `(lane, target)`.
+    /// Resolves all parameter targets for a given instance into
+    /// `(lane_index, ResolvedTarget)` pairs.
     ///
-    /// Two sources, one shape. The slot table is the DAW's automation lanes,
+    /// Two sources, one shape: the slot table is the DAW's automation lanes,
     /// and the lanes past it are whatever else the caller drives directly. The
-    /// merge in `SubHostProcessor::process` does not care which is which, and
-    /// that is the point.
+    /// merge in `SubHostProcessor::process` does not care which is which.
     fn targets_for(&self, instance: usize, direct: &[ParamTarget]) -> Vec<(usize, ResolvedTarget)> {
-        // Only the slots bound against *this* instance. Handing every instance
-        // the whole table would make one slot drive the same parameter on every
-        // copy (§12-7).
+        // Only the slots bound against *this* instance. Handing every
+        // instance the whole table would make one slot drive the same
+        // parameter on every copy.
         let mut targets = self.slots.active_targets(instance as u32);
         let params = self.params(instance);
         for (lane, target) in direct.iter().enumerate() {
@@ -384,8 +373,8 @@ impl SubHost {
             }
             let Some(info) = params.iter().find(|p| p.id.0 == target.param) else {
                 // The parameter went away with a plugin update. The socket
-                // stays in the graph, the same way an unresolved binding stays
-                // in the slot table (§8.3).
+                // stays in the graph, the same way an unresolved binding
+                // stays in the slot table.
                 continue;
             };
             targets.push((
@@ -401,16 +390,17 @@ impl SubHost {
         targets
     }
 
-    /// Enter the processing phase, activating every loaded instance.
+    /// Activates all loaded sub-plugins for audio processing.
     ///
     /// All or nothing: if one instance refuses the configuration, the ones
     /// already activated are wound back rather than left running, because a
     /// half-activated set is a state no later call knows how to handle.
     ///
-    /// `io` says how each instance has to be activated — which buses, how wide.
-    /// It comes from the caller rather than from the plugin, because whether a
-    /// sidechain is switched on depends on whether anything was wired to it. An
-    /// instance `io` does not mention is activated with `config` as it stands.
+    /// `io` specifies per-instance audio bus configurations (main and aux
+    /// channels). It comes from the caller rather than from the plugin,
+    /// because whether a sidechain is switched on depends on whether anything
+    /// was wired to it. An instance `io` does not mention is activated with
+    /// `config` as it stands.
     pub fn activate(
         &mut self,
         config: AudioConfig,
@@ -432,14 +422,13 @@ impl SubHost {
                 processors.push(None);
                 continue;
             }
-            // Worked out before the plugin is borrowed for activation,
-            // because it reads both the slot table and the plugin's own
-            // parameter list.
+            // Before the plugin is borrowed for activation, because this
+            // reads both the slot table and the plugin's parameter list.
             let targets = self.targets_for(instance, direct);
             let Some(loaded) = self.at_mut(instance) else {
                 unreachable!("checked just above")
             };
-            // What this instance needs, if the graph routes audio to it.
+            // Apply per-instance bus configuration overrides if specified.
             let config = match io.iter().find(|e| e.instance as usize == instance) {
                 Some(entry) => AudioConfig {
                     input_channels: u32::from(entry.input_channels),
@@ -487,13 +476,12 @@ impl SubHost {
         }
     }
 
-    /// Collect everything that goes into the DAW's project file (§8.3).
+    /// Serializes sub-host state, including slot configuration and opaque
+    /// state from all loaded sub-plugins.
     ///
     /// Takes `&mut self` so it can tick first. A plugin is entitled to fold
     /// recent edits into what it serialises on one of its own main-thread
-    /// callbacks rather than immediately, and until the wrapper ticks
-    /// unconditionally (see `tick_editors`) this is the only thing that runs
-    /// them before a save. CHOWTapeModel does exactly that; without the tick it
+    /// callbacks rather than immediately; without the tick, such a plugin
     /// saves the values it held before the last edit.
     pub fn save_state(&mut self) -> SubHostState {
         let mut state = SubHostState {
@@ -507,7 +495,7 @@ impl SubHost {
             let Some(loaded) = self.at(instance) else {
                 continue;
             };
-            // The wrapper's own state is still worth saving even when a plugin
+            // The wrapper's own state is still worth saving when a plugin
             // will not give up its own: losing the graph and the bindings as
             // well would turn one plugin's failure into a lost project.
             let bytes = match loaded.plugin.save_state() {
@@ -526,11 +514,10 @@ impl SubHost {
         state
     }
 
-    /// Restore from saved state, reloading the sub-plugin if it can be found.
+    /// Restores sub-host state, attempting to locate and reload each saved sub-plugin instance.
     ///
-    /// Returns a description of anything that could not be restored, rather
-    /// than an error: a missing sub-plugin must not stop the rest of the patch
-    /// from loading.
+    /// Returns a list of diagnostic messages rather than an error: a missing
+    /// sub-plugin must not stop the rest of the patch from loading.
     pub fn load_state(&mut self, state: &SubHostState) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
@@ -560,8 +547,8 @@ impl SubHost {
                             ));
                         }
                         // As in `load_sub_state`. This is the path a project
-                        // open takes, and it runs with the wrapper's own editor
-                        // closed, so nothing else would tick these plugins.
+                        // open takes, and it runs with the wrapper's own
+                        // editor closed, so nothing else would tick these.
                         loaded.plugin.tick();
                     }
                 }
@@ -576,46 +563,41 @@ impl SubHost {
     }
 }
 
-/// How many of the DAW's own events one block is expected to carry.
+/// Default incoming event capacity used to preallocate event scratch buffers.
 ///
-/// Only used to size the merge buffer. Overshooting costs a few kilobytes;
-/// undershooting would cost events, so it is generous.
+/// Overshooting costs a few kilobytes; undershooting would cost events, so it
+/// is generous.
 const INCOMING_EVENT_CAPACITY: usize = 1024;
 
-/// Audio-thread half of the adapter.
+/// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
     processor: Box<dyn SubPluginProcessor>,
-    /// Slot index and the parameter it drives, captured at activate so the
-    /// audio thread never walks the slot table.
+    /// Parameter targets and their schedule lane indices, captured at
+    /// activate so the audio thread never walks the slot table.
     targets: Vec<(usize, ResolvedTarget)>,
-    /// Last value sent per slot, so an unchanged slot costs no event.
-    ///
-    /// Starts as NaN so the first block always sends: NaN compares unequal to
-    /// everything, including itself.
+    /// Cached normalized values previously sent to sub-plugin parameters to deduplicate events.
+    /// Initialized to `f64::NAN` so the initial values are always dispatched.
     last_sent: Vec<f64>,
     /// Reused event buffer. Sized at activate; `process` must not allocate.
     scratch: Vec<Event>,
 }
 
 impl SubHostProcessor {
-    /// Run one block through the sub-plugin.
+    /// Processes an audio buffer through the sub-plugin for the specified sample chunk.
     ///
-    /// `slots` carries the wrapper's slot values in 0..1 at each sub-block
-    /// boundary (§9.2) — the DAW's automation, with anything the node graph
-    /// drives written over it. Turning those into parameter events is this
-    /// function's whole job: which slot is bound to which parameter, what the
-    /// parameter's plain range is, and which values are worth sending at all.
+    /// Merges incoming host events and parameter automation values from
+    /// `slots` into a sample-accurate event stream dispatched to the
+    /// sub-plugin. The two streams are merged in offset order because a
+    /// sub-plugin is entitled to assume its input events are sorted, and
+    /// several real ones misbehave quietly rather than loudly when they
+    /// are not.
     ///
-    /// The two streams are merged in offset order. A sub-plugin is entitled to
-    /// assume its input events are sorted, and several real ones misbehave
-    /// quietly rather than loudly when they are not.
-    ///
-    /// `chunk` is the part of the block this call covers (§14.9). It is the
-    /// whole block unless an audio delay line put the program on sub-block
-    /// granularity, in which case this runs once per sub-block and each call
-    /// must be handed *its own* events, rebased: a note at sample 40 belongs to
-    /// the chunk starting at 32, at offset 8, and to no other. Handing every
-    /// chunk the whole block would replay every note once per chunk.
+    /// `chunk` is the part of the block this call covers: the whole block
+    /// unless an audio delay line put the program on sub-block granularity, in
+    /// which case this runs once per sub-block and each call must be handed
+    /// *its own* events, rebased — a note at sample 40 belongs to the chunk
+    /// starting at 32, at offset 8, and to no other. Handing every chunk the
+    /// whole block would replay every note once per chunk.
     pub fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,
@@ -626,24 +608,24 @@ impl SubHostProcessor {
         out_events: &mut EventSink,
     ) -> ProcessStatus {
         self.scratch.clear();
-        // Everything before the chunk has already been sent, on an earlier
-        // call; everything after it belongs to a later one.
+        // Everything before the chunk was sent on an earlier call;
+        // everything after it belongs to a later one.
         let events = slice(events, &chunk);
         let mut next_note = 0;
 
         for index in 0..slots.blocks() {
             let offset = slots.offset(index);
             // Rows outside this chunk are another call's business. The last
-            // chunk of a block is short whenever the block is not a multiple of
-            // the quantum, so `<` on the end is what keeps the boundary row out
-            // of both calls' way rather than in both.
+            // chunk of a block is short whenever the block is not a multiple
+            // of the quantum, so `<` on the end is what keeps the boundary row
+            // out of both calls' way rather than in both.
             if offset < chunk.start || offset >= chunk.end.max(chunk.start + 1) {
                 continue;
             }
             let offset = offset - chunk.start;
 
-            // Anything the DAW sent that lands before this boundary goes first,
-            // so the stream stays sorted.
+            // Anything the DAW sent that lands before this boundary goes
+            // first, so the stream stays sorted.
             while next_note < events.len()
                 && events[next_note].sample_offset() - chunk.start < offset
             {
@@ -660,9 +642,9 @@ impl SubHostProcessor {
                 let Some(&normalized) = values.get(slot) else {
                     continue;
                 };
-                // Unchanged slots cost nothing. Resending would waste the
-                // sub-plugin's parameter queue and, worse, retrigger smoothing
-                // on plugins that ramp towards every incoming point.
+                // Resending would waste the sub-plugin's parameter queue
+                // and, worse, retrigger smoothing on plugins that ramp
+                // towards every incoming point.
                 if self.last_sent[slot] == normalized {
                     continue;
                 }
@@ -692,24 +674,22 @@ impl SubHostProcessor {
 
     pub fn reset(&mut self) {
         self.processor.reset();
-        // Force a resend: after a reset the sub-plugin's idea of its parameters
-        // is no longer something we can assume.
+        // After a reset the sub-plugin's idea of its parameters is no longer
+        // something we can assume, so force a resend.
         self.last_sent.iter_mut().for_each(|v| *v = f64::NAN);
     }
 }
 
-/// Every instance's audio-thread half, indexed the way the caller indexes them.
+/// Collection of audio-thread processors for all loaded sub-plugin instances.
 ///
-/// Sparse for the same reason [`SubHost`]'s own table is: the caller names an
-/// instance by index, so an empty slot has to stay empty rather than be closed
-/// up and renumber everything after it.
+/// Entries are indexed by instance ID to match the sparse layout of
+/// [`SubHost`], and stay sparse for the same reason: the caller names an
+/// instance by index.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
-    /// The block's events with the note-ons taken out, for an instance behind
-    /// a shut note gate (§14.10).
-    ///
-    /// Owned here, and sized at activate, because the audio thread may not
-    /// allocate (§9.1) and a filtered stream has to live somewhere while the
+    /// Event buffer for filtering note streams (e.g. note-off only for closed
+    /// gates). Owned here and sized at activate, because the audio thread may
+    /// not allocate and a filtered stream has to live somewhere while the
     /// sub-plugin reads it.
     gated: Vec<Event>,
 }
@@ -729,12 +709,13 @@ impl SubHostProcessors {
         }
     }
 
-    /// Attach the per-block context that
-    /// [`AudioInstances`][crate::AudioInstances] does not carry.
+    /// Binds block-level context (slot schedule, incoming events, transport
+    /// context) to produce a [`BoundInstances`] processor for the duration of
+    /// a block.
     ///
-    /// A caller runs `process(instance, ...)` with nothing but buffers, because
-    /// it has no reason to know that a plugin has events or a transport
-    /// position. Everything else one needs is fixed for the whole block, so it
+    /// A caller runs `process(instance, ...)` with nothing but buffers,
+    /// because it has no reason to know that a plugin has events or a
+    /// transport position. Everything else is fixed for the whole block, so it
     /// is attached here and the borrow lasts exactly that long.
     pub fn bind<'a>(
         &'a mut self,
@@ -753,7 +734,7 @@ impl SubHostProcessors {
     }
 }
 
-/// [`SubHostProcessors`] with one block's worth of context attached.
+/// Audio-thread sub-plugin processors bound to a block's schedule and event context.
 pub struct BoundInstances<'a> {
     processors: &'a mut SubHostProcessors,
     slots: &'a SlotSchedule,
@@ -771,25 +752,24 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         output: &mut [f32],
         chunk: crate::instances::AudioChunk,
     ) {
-        // Destructured rather than reached through twice: the scratch and the
-        // processor are different fields, and saying so is what lets both be
-        // borrowed at once.
+        // Destructured rather than reached through twice: the scratch and
+        // the processor are different fields, and saying so is what lets both
+        // be borrowed at once.
         let SubHostProcessors { entries, gated } = &mut *self.processors;
         let Some(processor) = entries.get_mut(instance as usize).and_then(Option::as_mut) else {
             // A node whose plugin failed to load, or was deleted while the
             // audio thread held this program. Silence is the only honest
-            // answer, and passing the input through would be worse: the user
-            // would hear the graph working when it is not.
+            // answer; passing the input through would let the user hear the
+            // graph working when it is not.
             for ch in 0..chunk.output_channels {
                 output[chunk.channel(ch)].fill(0.0);
             }
             return;
         };
 
-        // The input region holds the main bus and then each aux bus, packed
-        // (§14.11); `aux_inputs` is what tells the backend where the joins
-        // are. Both regions are already packed at `frames`, which is the layout
-        // `AudioBuffers` wants, so nothing is repacked here.
+        // Both regions hold the main bus and then each aux bus, packed at
+        // `frames`, which is the layout `AudioBuffers` wants; `aux_inputs`
+        // tells the backend where the joins are. Nothing is repacked here.
         let mut buffers = AudioBuffers::new(
             input,
             output,
@@ -800,15 +780,16 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
-        // §14.10. The engine routes a *name*; turning it into events is this
-        // side's job. A node with nothing wired to its notes port hears
-        // nothing — which is the whole point, since before M8.3 every instance
-        // was handed every event and two synths played in unison.
+        // The engine routes a note *name*; turning it into events is this
+        // side's job, and an instance with nothing wired to its notes port has
+        // to hear nothing — otherwise every instance gets every event and two
+        // synths play in unison.
+        //
         // A shut gate holds the note-ons back and lets everything else
         // through, so a note that was sounding when it closed still gets its
-        // note-off. Filtered into scratch reserved at activate, never grown.
-        // A key switch's own keys are dropped outright, both halves: the
-        // note-on went too, so there is no voice left waiting for the release.
+        // note-off. A key switch's own keys are dropped outright, both halves:
+        // the note-on went too, so no voice is left waiting for the release.
+        // Filtered into scratch reserved at activate, never grown.
         let events: &[Event] = match notes.source {
             crate::instances::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
             source @ (crate::instances::NoteSource::Daw { bus: 0 }
@@ -842,7 +823,8 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
     }
 }
 
-/// Whether `mask` names this event's key — see `NoteStream::mute`.
+/// Returns `true` if the event is a note event whose MIDI key bit is set in
+/// `mask` — see `NoteStream::mute`.
 ///
 /// Anything without a key of its own passes: a control change carries the
 /// whole channel, and swallowing it because a key switch sits upstream would
@@ -857,21 +839,23 @@ fn muted(event: &Event, mask: u128) -> bool {
     }
 }
 
-/// The events landing inside `chunk`.
+/// Returns the slice of events falling within the sample offset range of
+/// `chunk`.
 ///
 /// The stream is sorted, so this is a range rather than a filter — which is
-/// what makes it free of allocation and of any per-event work at all on the
-/// blocks where every event falls in the first chunk.
+/// what makes it free of allocation, and free of any per-event work at all on
+/// the blocks where every event falls in the first chunk.
 fn slice<'a>(events: &'a [Event], chunk: &Range<u32>) -> &'a [Event] {
     let start = events.partition_point(|e| e.sample_offset() < chunk.start);
     let end = events.partition_point(|e| e.sample_offset() < chunk.end);
     &events[start..end.max(start)]
 }
 
-/// Append, unless the buffer is full.
+/// Appends an event to the scratch buffer unless it is full.
 ///
-/// Dropping an event is bad; growing a `Vec` inside an audio callback is worse,
-/// and the capacity reserved at activate is the worst case plus a wide margin.
+/// Dropping an event is bad; growing a `Vec` inside an audio callback is
+/// worse, and the capacity reserved at activate is the worst case plus a wide
+/// margin.
 fn push(scratch: &mut Vec<Event>, event: Event) {
     if scratch.len() < scratch.capacity() {
         scratch.push(event);
@@ -902,8 +886,7 @@ mod tests {
         fn reset(&mut self) {}
     }
 
-    /// The AudioGraph wrapper's numbers, local to the tests: the crate itself
-    /// no longer names one.
+    /// Test configuration constants for slot and lane counts.
     const SLOTS: usize = 32;
     const LANES: usize = SLOTS + 64 + 16;
 
@@ -971,9 +954,7 @@ mod tests {
 
     #[test]
     fn an_unchanged_slot_sends_nothing_after_the_first_block() {
-        // Sending 32 redundant events every block would waste the sub-plugin's
-        // parameter queue and, worse, retrigger smoothing on plugins that ramp
-        // on every incoming point.
+        // Unchanged slot values should not produce redundant parameter events.
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(1),
@@ -1027,11 +1008,8 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty());
     }
 
-    /// §14.9. A program with an audio feedback loop runs once per sub-block,
-    /// and each of those calls is a `process` of its own. An event belongs to
-    /// exactly one of them, at an offset measured from *that* call's start —
-    /// handing every chunk the whole block would sound each note once per
-    /// chunk, and at offsets past the end of a 32-sample buffer.
+    /// Verifies that events are routed only to the sub-block chunk containing their timestamp,
+    /// with offsets rebased relative to chunk start.
     #[test]
     fn a_chunk_hears_only_its_own_events_rebased() {
         let (mut p, seen) = harness(Vec::new());
@@ -1073,8 +1051,7 @@ mod tests {
         assert_eq!(notes, vec![8], "once, in the second chunk, at offset 8");
     }
 
-    /// The parameter side of the same cut: a slot boundary belongs to the chunk
-    /// that contains it, and its offset is rebased too.
+    /// Verifies that slot automation boundaries are dispatched to the containing chunk with rebased offsets.
     #[test]
     fn a_chunk_sends_only_its_own_slot_boundaries() {
         let target = ResolvedTarget {
@@ -1115,8 +1092,7 @@ mod tests {
 
     #[test]
     fn a_moving_slot_is_sent_once_per_sub_block_with_an_offset() {
-        // The point of §9.2: a value that changes within a block reaches the
-        // sub-plugin as several timed events, not as one at offset zero.
+        // Sub-block automation changes are dispatched as sample-accurate events across the block.
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
@@ -1203,8 +1179,7 @@ mod tests {
 
     #[test]
     fn a_binding_kept_across_a_swap_still_maps_correctly() {
-        // §8.3 in one check: bindings are by id, so a plugin that reorders its
-        // parameters between versions still drives the right control.
+        // Bindings match by parameter ID rather than position.
         let mut table = SlotTable::new(SLOTS);
         let param = ParamInfo {
             id: ParamId(42),
@@ -1231,9 +1206,7 @@ mod tests {
         );
     }
 
-    /// §14.10, the other half: the engine names a source, and this is where the
-    /// name becomes events. Before M8.3 both instances were handed the same
-    /// list, so a second synth played along whatever the graph said.
+    /// Verifies that only instances routed to a note source receive note events.
     #[test]
     fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
         use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};
@@ -1285,9 +1258,7 @@ mod tests {
         );
     }
 
-    /// A shut note gate holds the note-ons back and lets everything else
-    /// through, so a note that was sounding when it closed still gets its
-    /// note-off. Blocking the lot would leave it hanging for ever.
+    /// Verifies that a gated note stream filters out note-on events while delivering note-offs.
     #[test]
     fn a_shut_note_gate_still_delivers_the_releases() {
         use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};

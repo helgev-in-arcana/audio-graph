@@ -51,8 +51,7 @@ impl Node for Lfo {
             waveform: self.waveform,
             rate: match self.rate {
                 Rate::Hz(hz) => RateSpec::Hz(hz.max(0.0)),
-                // Zero beats per cycle would be an infinitely fast LFO; treat
-                // it as "does not move" rather than as NaN.
+                // Zero beats per cycle is treated as a stationary (zero frequency) LFO.
                 Rate::Beats(beats) if beats > 0.0 => RateSpec::CyclesPerBeat(1.0 / beats),
                 Rate::Beats(_) => RateSpec::CyclesPerBeat(0.0),
             },
@@ -115,9 +114,7 @@ impl Lfo {
                 waveform: Waveform::Sine,
                 rate: Rate::Hz(1.0),
                 phase: 0.0,
-                // Centred on 0.5 with a half swing fills 0..1 exactly, which is
-                // the range a slot wants; anything else needs a Range map and
-                // would make a freshly dropped LFO look broken.
+                // Default depth and offset swing across the normalized [0.0, 1.0] range.
                 depth: 0.5,
                 offset: 0.5,
             },

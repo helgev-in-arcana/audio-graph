@@ -29,21 +29,13 @@ impl HostContext for SilentHost {
 
 /// Plugins this test will not instantiate.
 ///
-/// Mostly not a judgement on them — they are simply the wrong shape for an
-/// unattended test. Sampler and amp-sim hosts scan multi-gigabyte content
-/// libraries or put up an authorisation dialog on their first instantiation,
-/// and either one stops the run dead with no output.
+/// Sampler and amp-sim hosts scan multi-gigabyte content libraries or display
+/// authorization dialogs during first instantiation, which would stall headless tests.
 ///
-/// Chroma is here for a sharper reason: it puts a **top-level window** on screen
-/// during instantiation, before any host has asked for an editor, and that
-/// window stops responding unless somebody pumps the message loop. A host that
-/// merely instantiates it — a plugin scanner, this test — hangs. It is the same
-/// plugin whose editor faults on first paint (ARCHITECTURE §13), and the two are
-/// probably the same underlying assumption: that it is running inside a DAW that
-/// is already pumping.
+/// Chroma creates a top-level window during instantiation prior to host UI initialization,
+/// requiring an active message pump to avoid deadlocks.
 ///
-/// `AUDIO_GRAPH_TEST_SUB` overrides the search entirely when a specific plugin
-/// is wanted.
+/// `AUDIO_GRAPH_TEST_SUB` overrides the search entirely when a specific plugin is wanted.
 const AVOID: &[&str] = &[
     "AmpliTube",
     "BBC Symphony",
@@ -60,8 +52,7 @@ const CANDIDATES: usize = 6;
 
 /// A plugin to test against, chosen from whatever is installed.
 ///
-/// Not a fixed name: this has to run on a machine with a different set of
-/// plugins from the one it was written on. Anything with parameters will do.
+/// Discovers any installed plugin with parameters to avoid machine-specific test fixtures.
 fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
     let mut tried = 0;
     for path in candidate_paths() {
@@ -90,7 +81,8 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
 }
 
 fn candidate_paths() -> Vec<std::path::PathBuf> {
-    // A test thread is not an initialised STA and plugins assume one (§13).
+    // Initialize COM/STA apartment state on Windows.
+    // A test thread is not an initialized STA, but plugins assume one.
     plugin_host::init_thread();
     if let Ok(explicit) = std::env::var("AUDIO_GRAPH_TEST_SUB") {
         return vec![std::path::PathBuf::from(explicit)];
@@ -181,8 +173,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
 
 /// Somewhere for a parameter chain to go.
 ///
-/// `SlotOut` used to be it; a §14.12 parameter socket is, now, and its lane is
-/// `SINK_LANE` — the first one past the slot table.
+/// Helper to create a plugin node with a parameter port targeting `SINK_LANE`.
 fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::NodeId {
     use audio_graph_engine::{ParamPort, Plugin, PluginPorts};
     graph.add(
@@ -203,11 +194,7 @@ fn param_sink(graph: &mut audio_graph_engine::Graph) -> audio_graph_engine::Node
 /// The lane `param_sink`'s parameter is driven through.
 const SINK_LANE: usize = SLOT_COUNT;
 
-/// The other half of what the editor does now: build a graph, publish it, and
-/// check the audio thread ends up driving the slot instead of the DAW.
-///
-/// Needs no plugin: everything from the canvas down to the compiled program is
-/// format-agnostic, which is the point of §9.
+/// Verifies that an editor-constructed graph publishes and drives parameters in the engine.
 #[test]
 fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
     use audio_graph_engine::{BlockContext, Engine, Lfo, Math, MathOp, NodeKind, Rate, Waveform};
@@ -367,8 +354,7 @@ fn adoption_leaves_an_existing_graph_alone() {
     assert_eq!(shared.main().graph, before);
 }
 
-/// The graph has to survive being saved and reopened, including when the
-/// sub-plugin it was built against is not there (§8.3).
+/// Verify that graph structure and parameters survive state serialization round trips.
 #[test]
 fn a_graph_survives_the_state_round_trip() {
     use audio_graph_engine::{Constant, Graph, NodeKind};
@@ -409,12 +395,8 @@ fn a_graph_survives_the_state_round_trip() {
     );
 }
 
-/// The M8.4 editor path, end to end against a real plugin: add a plugin node,
-/// discover its sockets, add a parameter socket, and drive it from the graph.
-///
-/// This is what replaced the slot table as the way a parameter gets driven
-/// (§14.12), so it is worth checking against something that really has
-/// parameters rather than only in the compiler's own tests.
+/// End-to-end integration test: add a plugin node, discover its sockets, add a parameter
+/// socket, and drive it from the graph against a real installed plugin.
 #[test]
 fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
     use audio_graph_engine::{AudioOut, Constant, NodeKind, Plugin, PluginPorts};
@@ -470,7 +452,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     );
     assert!(
         ports.params.is_empty(),
-        "parameter sockets are the user's choice, not the plugin's (§14.12)"
+        "parameter sockets are user-configured, not created automatically by the plugin"
     );
 
     // "+ param" on the node, then a Constant wired into it. Port order is
@@ -514,12 +496,12 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     assert_eq!(
         state.graph_params.len(),
         1,
-        "the wired socket should have become a lane (§14.12)"
+        "the wired socket should have become a parameter lane"
     );
     assert_eq!(state.graph_params[0].instance, 1);
     assert_eq!(state.graph_params[0].param, first.id.0);
     assert!(
         state.instance_io.iter().any(|i| i.instance == 1),
-        "the plugin node should be activated with its own bus layout (§14.11)"
+        "the plugin node should be activated with its discovered bus layout"
     );
 }

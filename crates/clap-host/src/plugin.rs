@@ -65,11 +65,7 @@ use crate::module::{ClassInfo, Module, ModuleInner};
 use crate::stream::{InStream, OutStream};
 use crate::util::from_char_array;
 
-/// Per-block ceilings for the pre-allocated event buffers.
-///
-/// Fixed rather than derived, for the same reason as the VST3 backend's: they
-/// have to be decided before any audio runs, and the sub-block quantiser
-/// (§14.9) bounds how many points one block can carry.
+/// Ceilings for the pre-allocated event buffers per block.
 const MAX_EVENTS_PER_BLOCK: usize = 2048;
 
 /// How long a parameter's formatted text may be.
@@ -126,8 +122,7 @@ pub struct ClapPlugin {
     ports: PortLayout,
     note_inputs: usize,
     note_outputs: usize,
-    /// True when the plugin's note input speaks CLAP's own dialect, which is
-    /// what per-voice work needs (§3.2).
+    /// True when the plugin's note input speaks CLAP's own dialect.
     clap_notes: bool,
 
     ext_params: *const clap_plugin_params,
@@ -143,8 +138,7 @@ pub struct ClapPlugin {
     /// computing; see `set_port_activation`.
     ext_ports_activation: *const clap_plugin_audio_ports_activation,
 
-    /// The editor lives here rather than in the caller, so `destroy` cannot run
-    /// before the GUI is torn down no matter what the caller forgets (§5.3).
+    /// The plugin's embedded GUI editor instance, if open.
     editor: Option<ClapEditor>,
 
     active: Cell<bool>,
@@ -306,7 +300,7 @@ impl ClapPlugin {
         &self.params
     }
 
-    /// The plugin's declared buses and note capability (§14.2).
+    /// The plugin's declared audio buses and note capability.
     pub fn io_layout(&self) -> IoLayout {
         let bus = |p: &Port| BusInfo {
             name: p.name.clone(),
@@ -333,7 +327,7 @@ impl ClapPlugin {
         !self.ext_gui.is_null() && unsafe { crate::gui::can_resize(self.plugin, self.ext_gui) }
     }
 
-    /// Open the plugin's own editor in a top-level window (ADR-3).
+    /// Open the plugin's own editor in a top-level window.
     ///
     /// `owner` is the window it should float above: the DAW's root window when
     /// running as a plugin, null when standalone.
@@ -358,8 +352,6 @@ impl ClapPlugin {
     }
 
     pub fn close_editor(&mut self) {
-        // Dropping runs the §5.3 sequence; there is no way to close one without
-        // it.
         self.editor = None;
     }
 
@@ -430,10 +422,7 @@ impl ClapPlugin {
             self.editor = None;
         }
 
-        // `restart`, `process` and `audio_ports` are deliberately not acted on
-        // here: they mean deactivate/activate, and only the owner of the audio
-        // graph knows when that is safe. The context was told when the request
-        // arrived (see `host.rs`), which is the path §7.4 describes.
+        // `restart`, `process` and `audio_ports` are forwarded to the host context.
     }
 
     /// Tell the plugin which of its ports the graph actually wired.
@@ -584,8 +573,7 @@ impl SubPluginMain for ClapPlugin {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Probed, not fixed: this is the format that actually has these, and
-        // which of them a given plugin offers is per-parameter (§3.3).
+        // Probed based on parameters and port dialects.
         let any = |flag: ParamFlags| self.params.iter().any(|p| p.flags.contains(flag));
         Capabilities {
             modulation: any(ParamFlags::MODULATABLE),
@@ -739,9 +727,7 @@ impl SubPluginMain for ClapPlugin {
             context: "clap_plugin::activate is null".into(),
             code: 0,
         })?;
-        // A minimum of one frame, not of `max_block_size`: the sub-block
-        // quantiser hands out short blocks (§14.9), and a plugin told its
-        // minimum is 512 is entitled to refuse them.
+        // Activate with minimum block size of 1 frame up to max_block_size.
         if !unsafe { activate(self.plugin, config.sample_rate, 1, config.max_block_size) } {
             return Err(HostError::UnsupportedBusConfig(format!(
                 "the plugin refused {} Hz with blocks up to {} frames",
@@ -804,8 +790,7 @@ impl SubPluginMain for ClapPlugin {
 
 impl Drop for ClapPlugin {
     fn drop(&mut self) {
-        // The editor goes first — see the field comment. Explicit rather than
-        // left to field order, because the order *is* the contract (§5.3).
+        // The editor is closed before instance destruction.
         self.editor = None;
 
         if self.active.get() {
@@ -850,8 +835,8 @@ fn bind_ports(ports: &PortLayout, config: &AudioConfig) -> Result<BindingPlan> {
     let mut inputs = Vec::with_capacity(ports.inputs.len());
     let mut silence_channels = 0usize;
 
-    // The caller's input region is the main bus followed by each aux bus,
-    // packed (§4.3), so the offsets are cumulative in that order.
+    // The caller's input region is the main bus followed by each aux bus, packed,
+    // so the offsets are cumulative in that order.
     let mut caller_offset = 0usize;
     let mut aux = config.aux_inputs.iter();
     for (index, port) in ports.inputs.iter().enumerate() {
@@ -966,8 +951,10 @@ pub struct ClapProcessor {
     steady_time: i64,
 }
 
-// SAFETY: CLAP designates `process` as the audio-thread call, and the two-trait
-// split of §4.2 is what guarantees only this half ever crosses to that thread.
+// SAFETY: CLAP designates `process` as the audio-thread call; the whole point
+// of splitting the main-thread and processor halves into two traits is that
+// only this half crosses to that thread, and it is never shared with the
+// main thread while it lives.
 unsafe impl Send for ClapProcessor {}
 
 impl ClapProcessor {
@@ -1116,9 +1103,7 @@ impl SubPluginProcessor for ClapProcessor {
                 buffers.clear_output();
                 ProcessStatus::Error
             }
-            // Sleep is the format's "silent, and it will stay that way until
-            // something arrives" — exactly what `Silent` means (§4.2). The
-            // other statuses all mean the tail is still running.
+            // Sleep indicates the plugin has completed rendering all audio tails.
             CLAP_PROCESS_SLEEP => ProcessStatus::Silent,
             _ => ProcessStatus::Continue,
         }
@@ -1137,8 +1122,8 @@ impl SubPluginProcessor for ClapProcessor {
 fn empty_buffer(channels: u16) -> clap_audio_buffer {
     clap_audio_buffer {
         data32: std::ptr::null_mut(),
-        // 32-bit only. Every plugin must support it, and the graph's own
-        // buffers are `f32` (§4.3), so offering 64 would only add a conversion.
+        // 32-bit float audio buffers. The graph's own buffers are f32, so offering
+        // 64-bit would only add a conversion.
         data64: std::ptr::null_mut(),
         channel_count: u32::from(channels),
         latency: 0,
@@ -1255,10 +1240,7 @@ unsafe fn read_voice_info(
     })
 }
 
-/// Read the plugin's parameter list into the core's model.
-///
-/// No conversion: CLAP is already plain values with an explicit range, which is
-/// the shape ADR-4 chose for exactly this reason.
+/// Read the plugin's parameter list into the host parameter model.
 ///
 /// # Safety
 /// `plugin` must be live; `ext` may be null.
@@ -1293,10 +1275,7 @@ unsafe fn read_params(
             raw.flags & CLAP_PARAM_IS_READONLY != 0,
         );
         flags.set(ParamFlags::BYPASS, raw.flags & CLAP_PARAM_IS_BYPASS != 0);
-        // Deliberately not CLAP's own `IS_AUTOMATABLE`: the wrapper writes a
-        // parameter through events either way, and a plugin that marks a
-        // control non-automatable but modulatable is still drivable (ADR-5).
-        // What the flag gates in the UI is whether a socket is offered.
+        // Map parameter automation and modulation flags.
         flags.set(
             ParamFlags::AUTOMATABLE,
             raw.flags & CLAP_PARAM_IS_AUTOMATABLE != 0,
@@ -1434,7 +1413,7 @@ mod tests {
             ..AudioConfig::default()
         };
         let plan = bind_ports(&stereo_effect(), &config).expect("bind");
-        // The caller's input region is main-then-aux, packed (§4.3).
+        // The caller's input region is main-then-aux, packed.
         assert_eq!(plan.inputs[0].1, Binding::Caller(0));
         assert_eq!(plan.inputs[1].1, Binding::Caller(2));
         assert_eq!(plan.silence_channels, 0);

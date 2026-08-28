@@ -1,16 +1,10 @@
-//! Translating between the core's event model and VST3's.
+//! Translation between host engine event types and VST3 event representations.
 //!
-//! This is where §3.4's degradation table actually happens. Two losses are
-//! structural rather than incidental:
-//!
-//! * `Modulate` cannot be expressed. VST3 parameters hold one value, so a
-//!   modulation has nowhere to live alongside the base value. v1 only uses
-//!   Drive mode (ADR-5), which emits `SetValue`, so this costs nothing today.
-//! * Voice-addressed targets collapse to global for the same reason.
-//!
-//! Both are dropped rather than approximated: a modulation silently applied as
-//! a value change would destroy the user's automation, which is worse than not
-//! happening at all.
+//! Parameter updates and note events are converted into VST3 parameter change queues
+//! and event lists. Note that VST3 parameters hold a single normalized value, so
+//! per-voice parameter addressing and separate non-destructive modulation streams
+//! cannot be represented directly and are dropped rather than approximated as value changes
+//! (forwarding modulation as a value change would destroy the user's automation).
 
 use plugin_host_api::{
     Event as ApiEvent, EventSink, NoteEvent, NoteExpression, ParamEvent, TimeContext,
@@ -123,9 +117,8 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
         }
         // NoteEnd travels plugin-to-host only; sending one would be meaningless.
         NoteEvent::NoteEnd { .. } => return None,
-        // Raw MIDI has no VST3 event type. Channel messages that matter
-        // (pitch bend, CC) reach a plugin through parameters instead, via
-        // IMidiMapping, which is a M2 concern rather than an event one.
+        // Raw MIDI bytes do not map directly to VST3 events; standard MIDI controllers
+        // are routed through parameter changes via IMidiMapping.
         NoteEvent::Midi { .. } => return None,
     }
 
@@ -158,8 +151,8 @@ pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
         let Some(vst) = list.get(index) else { continue };
         let sample_offset = vst.sampleOffset.max(0) as u32;
 
-        // Only note lifecycle events are forwarded: they are what the engine
-        // needs to release per-voice graph state (§9).
+        // Forward note-off lifecycle events to the host event sink. They are what the
+        // engine needs to release per-voice graph state.
         if vst.r#type == EventTypes_::kNoteOffEvent as u16 {
             let off = unsafe { vst.__field0.noteOff };
             sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
@@ -254,10 +247,9 @@ mod tests {
 
     #[test]
     fn sub_block_updates_keep_their_offsets_and_share_one_queue() {
-        // What section 9.2's quantiser emits: many points for one parameter
-        // across a block. They must land in a single queue with their offsets
-        // intact — collapsing them to the block start is the failure that
-        // makes a fast LFO sound stepped.
+        // Multiple parameter points across a block must land in a single queue
+        // with their sample offsets preserved — collapsing them to the block start
+        // would make a fast LFO sound stepped.
         let changes = ParameterChanges::new(4, 64);
         let list = EventList::new(4);
         let events: Vec<ApiEvent> = (0..8)

@@ -1,18 +1,15 @@
-//! Opening a sub-plugin's editor, and closing it in the right order.
+//! VST3 plugin editor window hosting and lifecycle management.
 //!
-//! ARCHITECTURE.md §5.3 identifies teardown as the crash source, so the whole
-//! sequence lives here rather than being spread across callers:
+//! Enforces proper attachment and teardown sequencing for hosted `IPlugView` instances:
 //!
-//! ```text
-//! IPlugView::removed()   -> tell the plugin its parent is going away
-//! release the view       -> drop our reference
-//! destroy the container  -> only now is the HWND allowed to die
-//! ```
+//! 1. `IPlugView::removed()` to notify the plugin that the parent window is closing
+//! 2. Detach `IPlugFrame`
+//! 3. Release view COM reference
+//! 4. Destroy container window
 //!
-//! The tempting alternative — let the OS destroy the parent and take the
-//! child with it — tells the plugin nothing. It keeps posting timers and
-//! calling `resizeView` against a dead window, and crashes some time later
-//! somewhere unrelated.
+//! The teardown sequence is explicitly enforced because letting the OS destroy the
+//! parent and take the child with it tells the plugin nothing — it keeps posting timers
+//! and calling `resizeView` against a dead window, and crashes.
 
 use std::rc::Rc;
 
@@ -25,9 +22,8 @@ use host_window::{ContainerWindow, Size};
 
 /// A sub-plugin editor in its own top-level window.
 ///
-/// Dropping this runs the full teardown sequence, so there is no way to get it
-/// wrong by forgetting a step — including on the path that matters most, where
-/// the DAW destroys the wrapper without ever telling us to close the editor.
+/// Dropping this runs the full teardown sequence, ensuring child views are properly
+/// released before the parent window handle is destroyed.
 pub struct EditorWindow {
     /// Declared first so it is dropped first. `Drop` runs the sequence
     /// explicitly anyway; the ordering here is the belt to that's braces.
@@ -119,9 +115,6 @@ impl EditorWindow {
     }
 
     /// Whether the user clicked the window's close button.
-    ///
-    /// The window records the request rather than acting on it, so the owner
-    /// decides when the teardown sequence runs (§5.3).
     pub fn close_requested(&self) -> bool {
         self.window.close_requested()
     }
@@ -136,8 +129,8 @@ impl EditorWindow {
         if let Some(requested) = self.frame.take_requested_size() {
             self.window.set_client_size(requested);
             let mut rect = to_rect(requested);
-            // The round trip §5.2 describes: the plugin asks, the host resizes,
-            // the host tells the plugin what it actually got.
+            // Complete the resize round-trip: the plugin requested a size, the host resized
+            // the container, and now we must tell the plugin what size it actually got.
             unsafe { self.view.onSize(&mut rect) };
             return;
         }
@@ -175,10 +168,7 @@ impl EditorWindow {
 
 impl Drop for EditorWindow {
     fn drop(&mut self) {
-        // The case §5.3 calls the more dangerous one: the DAW destroys the
-        // plugin instance while the editor is still open, sometimes without any
-        // close notification first. Running the sequence from `Drop` means that
-        // path is covered by construction rather than by remembering.
+        // Enforce proper teardown sequencing when the editor is dropped.
         self.close();
         // `frame` is dropped after the view has been told to forget it.
         let _ = &self.frame;

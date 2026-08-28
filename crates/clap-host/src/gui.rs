@@ -1,18 +1,19 @@
-//! A CLAP sub-plugin's editor, in its own top-level window.
+//! Container and lifecycle management for CLAP plugin GUI editors.
 //!
-//! ADR-3 and ARCHITECTURE.md §5.3 apply unchanged — a separate window, and a
-//! teardown order written down once — but CLAP states the sequence more plainly
-//! than VST3 does:
+//! Handles creating, attaching, resizing, and cleanly destroying embedded plugin
+//! editor views within a top-level container window. Enforces the strict
+//! lifecycle order required by CLAP:
 //!
-//! ```text
-//! gui.create(api, floating=false) -> gui.set_scale -> gui.set_parent(window)
-//!   -> gui.set_size / get_size -> gui.show
-//! ... and back out:
-//! gui.hide -> gui.destroy -> destroy the container window
-//! ```
+//! 1. `gui.create(api, floating = false)`
+//! 2. `gui.set_scale`
+//! 3. `gui.set_parent(window)`
+//! 4. `gui.set_size` / `gui.get_size`
+//! 5. `gui.show`
 //!
-//! The dangerous half is the same one: destroying the container first leaves the
-//! plugin drawing into a window that no longer exists.
+//! Teardown order:
+//! 1. `gui.hide`
+//! 2. `gui.destroy`
+//! 3. Destroy container window
 
 use clap_sys::ext::gui::{clap_plugin_gui, clap_window, clap_window_handle};
 use clap_sys::plugin::clap_plugin;
@@ -72,9 +73,7 @@ impl ClapEditor {
         // type has no editor we can show, and finding out after creating a
         // window means unwinding it again.
         let supported = ext.is_api_supported.is_some_and(|f| unsafe {
-            // `false` is "embedded", which is the only mode ADR-3 uses: a
-            // floating window would be the plugin's own, and then the host
-            // could not own the teardown order.
+            // Check support for embedded window mode.
             f(plugin, WINDOW_API.as_ptr(), false)
         });
         if !supported {
@@ -245,9 +244,7 @@ impl ClapEditor {
 
 impl Drop for ClapEditor {
     fn drop(&mut self) {
-        // §5.3's more dangerous path: the DAW destroys the instance with the
-        // editor still open, sometimes with no close notification at all.
-        // Running the sequence from `Drop` covers it by construction.
+        // Ensure proper teardown sequence is always executed on drop.
         self.close();
     }
 }

@@ -1,19 +1,21 @@
-//! The compiled form: a flat list of instructions over a register file.
+//! Compiled intermediate representation: a flat sequence of instructions over register files and audio buffers.
 //!
-//! This is what crosses to the audio thread. It holds no `Rc`, no `Box<dyn>`,
-//! no map lookups and no pointers back into the edit graph — running it is a
-//! straight walk down a `Vec` writing `f64`s into a slice. Everything that
-//! could have been a decision has already been made by the compiler, which is
-//! the whole point of §9.1: the audio thread does not think, it executes.
+//! A [`Program`] is what crosses to the audio thread. It holds no `Rc`, no
+//! `Box<dyn>`, no map lookups and no pointers back into the edit graph —
+//! running it is a straight walk down a `Vec` writing `f64`s into a slice.
+//! Everything that could have been a decision has already been made by the
+//! compiler: the audio thread does not think, it executes.
 //!
 //! A `Program` is immutable once built. The per-instance state that changes as
-//! it runs — LFO phases — lives in [`Engine`][crate::Engine] instead, so
-//! swapping a program does not reset an oscillator mid-note.
+//! it runs — LFO phases, delay ring contents, latches — lives in
+//! [`Engine`][crate::Engine] instead, so swapping a program does not reset an
+//! oscillator mid-note.
 //!
-//! Nothing in this module may reach back into the edit side: no `use` of
+//! **Nothing in this module may reach back into the edit side**: no `use` of
 //! `graph`, `nodes` or `port` appears here or in its children. That is what
 //! keeps a `Program` a value rather than a view onto a graph, and it is what
-//! ADR-6 relies on to make an out-of-process backend a substitution.
+//! would let an out-of-process backend be a substitution rather than a
+//! rewrite.
 
 mod audio_op;
 mod op;
@@ -23,15 +25,16 @@ pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute};
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};
 
-/// Identifies one node, for the whole life of a patch.
+/// Unique identifier for a node, persistent across graph recompilations.
 ///
-/// Defined here rather than with the graph because a `Program` carries a few
-/// of them: an LFO's phase and a delay line's ring are matched to their node
-/// across a swap, so that recompiling — which happens on every drag of every
-/// control — does not restart an oscillator or empty a delay (§14.5).
+/// Defined here rather than with the graph because a `Program` carries a few of
+/// them: an LFO's phase, a delay line's ring and a latch are matched to their
+/// node across a swap, so that recompiling — which happens on every drag of
+/// every control — does not restart an oscillator, empty a delay or forget which
+/// way a switch was thrown.
 pub type NodeId = u32;
 
-/// How many sub-plugin parameters one graph may drive directly (§14.12).
+/// How many sub-plugin parameters one graph may drive directly.
 ///
 /// A ceiling for the same reason the register count is one: the schedule that
 /// carries these to the audio thread is allocated at activate, and a graph that
@@ -47,49 +50,48 @@ pub const MAX_GRAPH_PARAMS: usize = 64;
 pub const MAX_REGISTERS: usize = 256;
 pub const MAX_LFOS: usize = 64;
 
-/// How many latches one program may have — one per key-switch node (§9.1
-/// again: the table is allocated once and never resized).
+/// How many latches one program may have — one per key-switch node. A ceiling
+/// because the table is allocated once and never resized.
 pub const MAX_LATCHES: usize = 64;
 pub const MAX_DELAY_LINES: usize = 16;
 
 /// How far back a param delay line can read, in sub-blocks.
 ///
-/// A param line stores one value per sub-block (§9.2), so this is a time only
-/// once the sample rate and the quantum are known: 4096 sub-blocks is 2.7 s at
-/// 48 kHz with the default quantum of 32, and 1.4 s at the finest quantum of
-/// 16. The ring is preallocated for it, because §9.1 forbids allocating in
-/// `process` and the alternative — sizing from the longest delay in the graph —
-/// would mean a reallocation every time the user drags the time control.
+/// A param line stores one value per sub-block, so this is a time only once the
+/// sample rate and the quantum are known: 4096 sub-blocks is 2.7 s at 48 kHz
+/// with the default quantum of 32, and 1.4 s at the finest quantum of 16. The
+/// ring is preallocated for it, because the audio thread may not allocate and
+/// the alternative — sizing from the longest delay in the graph — would mean a
+/// reallocation every time the user drags the time control.
 pub const MAX_DELAY_TAPS: usize = 4096;
 
-/// How many *audio* delay lines one program may have, and how far back one can
-/// read.
+/// How many *audio* delay lines one program may have.
 ///
 /// Counted apart from [`MAX_DELAY_LINES`] because an audio line costs a ring of
-/// samples rather than a ring of sub-block values. The length is what a line
-/// may be *asked* for, not what it costs: each ring is allocated from its
-/// node's `max_time` (§14.5), so a 250 ms delay costs 250 ms. 10 s is the
-/// ceiling because something has to bound `max_time`, and a delay longer than
-/// that is a looper rather than a delay.
+/// samples rather than a ring of sub-block values.
 pub const MAX_AUDIO_DELAY_LINES: usize = 8;
+/// How far back an audio delay line may be *asked* to read, in seconds.
+///
+/// Not what it costs: each ring is allocated from its node's `max_time`, so a
+/// 250 ms delay costs 250 ms. This is the ceiling because something has to bound
+/// `max_time`, and a delay longer than it is a looper rather than a delay.
 pub const MAX_AUDIO_DELAY_SECONDS: f64 = 10.0;
 
 /// Lanes past the slot table that carry something the *audio* half reads: a
-/// delay time (§14.5) or a gain.
+/// delay time or a gain.
 ///
-/// Same mechanism as §14.12 and a disjoint range of lane numbers, so the
-/// evaluator writes one exactly the way it writes a slot and the adapter,
+/// Same mechanism as the parameter lanes and a disjoint range of lane numbers,
+/// so the evaluator writes one exactly the way it writes a slot and the adapter,
 /// which only knows about parameters, never sees one.
 pub const MAX_AUDIO_LANES: usize = 16;
 
 /// How many parallel paths one program may compensate, and by how much.
 ///
-/// Both are preallocated (§9.1), so both are ceilings rather than guidance. A
-/// graph that wants more is refused with a message rather than served with an
-/// allocation inside `process`. The length is about 680 ms at 48 kHz, which
-/// covers the linear-phase and look-ahead plugins that make compensation
-/// necessary in the first place; the count is the number of *compensated*
-/// branches, not of buffers, and a merge of two paths needs one.
+/// Both are preallocated, so both are ceilings rather than guidance. The length
+/// is about 680 ms at 48 kHz, which covers the linear-phase and look-ahead
+/// plugins that make compensation necessary in the first place; the count is the
+/// number of *compensated* branches, not of buffers, and a merge of two paths
+/// needs one.
 pub const MAX_COMPENSATORS: usize = 8;
 pub const MAX_COMPENSATION: usize = 32_768;
 
@@ -97,10 +99,10 @@ pub const MAX_COMPENSATION: usize = 32_768;
 /// grow.
 pub const MAX_BUFFERS: usize = 64;
 
-/// Widest single bus the engine moves around. Stereo throughout (§14.8).
+/// Widest single bus the engine moves around. Stereo throughout.
 pub const MAX_CHANNELS: usize = 2;
 
-/// Widest *buffer*, which is not the same thing (§14.11).
+/// Widest *buffer*, which is not the same thing.
 ///
 /// A plugin's input region holds its main bus and then each aux bus packed into
 /// one run, so it is as wide as all of them together. Every buffer in the pool
@@ -111,86 +113,83 @@ pub const MAX_BUFFER_CHANNELS: usize = MAX_CHANNELS * (1 + MAX_AUX_BUSES);
 
 pub use plugin_host::MAX_AUX_BUSES;
 
-/// A graph, compiled.
+/// A compiled execution program representing an audio and control graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
-    /// Topologically ordered: every `Op` reads only registers already written.
+    /// Topologically ordered scalar operations. Every `Op` reads only registers already written.
     pub ops: Vec<Op>,
     pub registers: usize,
     /// Which lane each output drives, and where its value ends up. Sorted by
     /// lane, and at most one entry per lane.
     ///
-    /// Lanes below `slot_count` are the DAW's own automation and the graph
-    /// never writes them (§8); what lands here is a parameter lane (§14.12) or
-    /// an audio lane (§14.5).
+    /// Lanes below `slot_count` are the DAW's own automation and the graph never
+    /// writes them; what lands here is a parameter lane or an audio lane.
     pub outputs: Vec<(u16, Reg)>,
     /// Audio line index → how many samples per channel its ring holds.
     ///
     /// From the node's `max_time` and the sample rate, so a line costs what it
-    /// was asked for (§14.5). The compiler cannot fill it in — it does not know
-    /// the sample rate — so the main thread does, in `size_rings`.
+    /// was asked for. The compiler cannot fill it in — it does not know the
+    /// sample rate — so the main thread does, in `size_rings`.
     pub audio_ring_len: Vec<usize>,
     /// Rings for the lines whose length has changed, allocated on the main
-    /// thread and handed over with the program (§9.1, §9.4).
+    /// thread and handed over with the program.
     ///
     /// Empty — the usual case — means "keep the ones you have". A recompile
-    /// happens on every drag of every control, and reallocating 700 kB each
-    /// time to hand back something the same size would be silly.
+    /// happens on every drag of every control, and reallocating 700 kB each time
+    /// to hand back something the same size would be silly.
     pub audio_rings: Vec<Vec<f32>>,
-    /// Audio line index → the longest a read on it asks for, in seconds.
+    /// Maximum delay duration in seconds per audio delay line.
     pub audio_ring_seconds: Vec<f64>,
     /// Audio line index → the `DelayWrite` node it belongs to.
     ///
     /// Separate from `delay_nodes`: audio lines are numbered among themselves,
-    /// because their rings are a scarcer resource than a param line's
-    /// (`MAX_AUDIO_DELAY_LINES`). Carried across a swap for the same reason.
+    /// because their rings are a scarcer resource than a param line's. Carried
+    /// across a swap so the ring contents survive.
     pub audio_delay_nodes: Vec<NodeId>,
     /// Line index → the `DelayWrite` node it belongs to.
     ///
-    /// Carried across a swap for the same reason as `lfo_nodes`: §14.5. A
-    /// feedback loop that emptied itself every time the user nudged an
-    /// unrelated control would not be usable.
+    /// Carried across a swap for the same reason as `lfo_nodes`: a feedback loop
+    /// that emptied itself every time the user nudged an unrelated control would
+    /// not be usable.
     pub delay_nodes: Vec<NodeId>,
-    /// The audio half, in order (§14.9).
+    /// Audio processing operations in topological execution order.
     pub audio_ops: Vec<AudioOp>,
-    /// Which sub-plugin parameter each graph-driven lane drives (§14.12).
+    /// Which sub-plugin parameter each graph-driven lane drives.
     ///
     /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
     /// evaluator writes it exactly the way it writes a slot and needs to know
     /// nothing about parameters. Sorted by instance, then by parameter.
     pub param_targets: Vec<ParamTarget>,
-    /// The first lane number that carries something the *audio* half reads
-    /// (§14.5): `slot_count + MAX_GRAPH_PARAMS`.
+    /// The first lane number that carries something the *audio* half reads:
+    /// `slot_count + MAX_GRAPH_PARAMS`.
     ///
     /// The evaluator needs it to know which of its outputs are 0..1 parameters
     /// and which are not. A gain is decibels and a delay time is seconds;
-    /// clamping either of those to 0..1 turns a -100 dB mute into unity gain,
-    /// which is exactly what it used to do.
+    /// clamping either of those to 0..1 turns a -100 dB mute into unity gain.
     pub audio_lane_base: u16,
-    /// How each plugin instance has to be activated (§14.11).
+    /// How each plugin instance has to be activated.
     ///
     /// Derived from the graph, not from the plugin: whether a sidechain bus is
     /// switched on depends on whether anything is wired to it. Sorted by
     /// instance.
     pub instances: Vec<InstanceIo>,
-    /// Channel width of each buffer in the pool, by index.
+    /// Channel width of each buffer in the audio pool.
     pub buffers: Vec<u16>,
-    /// How often `audio_ops` runs (§14.9).
+    /// Execution granularity for audio operations (sub-block vs whole block).
     pub chunking: Chunking,
-    /// What the wrapper should report to the DAW as its own latency: the
-    /// longest path from an input to an output, after compensation (§14.6).
+    /// What the wrapper should report to the DAW as its own latency: the longest
+    /// path from an input to an output, after compensation.
     pub latency: u32,
     /// Latch index → the node it belongs to.
     ///
-    /// Carried across a swap for the same reason `lfo_nodes` is: a key switch
-    /// that forgot which way it was thrown every time the user nudged an
-    /// unrelated control would be unusable.
+    /// Carried across a swap: a key switch that forgot which way it was thrown
+    /// every time the user nudged an unrelated control would be unusable.
     pub latch_nodes: Vec<NodeId>,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
-    /// of every knob — does not restart the oscillators. Without it, editing
-    /// an unrelated node would put a click in the middle of a slow LFO sweep.
+    /// of every knob — does not restart the oscillators. Without it, editing an
+    /// unrelated node would put a click in the middle of a slow LFO sweep.
     pub lfo_nodes: Vec<NodeId>,
 }
 
@@ -218,19 +217,18 @@ impl Program {
         }
     }
 
-    /// Give each audio delay line a ring as long as its node asked for
-    /// (§14.5).
+    /// Gives each audio delay line a ring as long as its node asked for.
     ///
-    /// Main thread only — it allocates, and that is the point: the audio
-    /// thread must never do it (§9.1), and only this side knows both the
-    /// graph's `max_time` and the DAW's sample rate. The rings ride over
-    /// inside the program, so they arrive at exactly the moment the line
-    /// numbering they belong to does.
+    /// Main thread only — it allocates, and that is the point: the audio thread
+    /// must never do it, and only this side knows both the graph's `max_time`
+    /// and the DAW's sample rate. The rings ride over inside the program, so
+    /// they arrive at exactly the moment the line numbering they belong to
+    /// does.
     ///
     /// `previous` is what the last call returned. A line already holding a ring
     /// of the right length gets an empty entry, which the engine reads as "keep
-    /// the one you have" — otherwise every drag of every control would hand
-    /// over a fresh 700 kB to replace something identical.
+    /// the one you have" — otherwise every drag of every control would hand over
+    /// a fresh 700 kB to replace something identical.
     ///
     /// Returns what it decided, for the next call to compare against.
     pub fn size_rings(
@@ -265,13 +263,13 @@ impl Program {
         want
     }
 
-    /// Whether the graph drives `lane` — a parameter lane (§14.12) or an
-    /// audio lane (§14.5), since the slot lanes below them are the DAW's.
+    /// Whether the graph drives `lane` — a parameter lane or an audio lane,
+    /// since the slot lanes below them are the DAW's.
     pub fn drives_lane(&self, lane: usize) -> bool {
         u16::try_from(lane).is_ok_and(|l| self.outputs.iter().any(|&(o, _)| o == l))
     }
 
-    /// Whether running this program would do nothing observable.
+    /// Returns true if running this program produces no observable outputs or audio operations.
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.audio_ops.is_empty()
     }

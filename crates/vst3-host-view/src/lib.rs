@@ -1,15 +1,7 @@
-//! Sub-plugin editor windows.
+//! VST3 plugin editor window hosting and frame management.
 //!
-//! Split out from `vst3-host` because it is the part that disappears when the
-//! backend is used for anything else — an offline renderer or a scanner needs
-//! none of it (ARCHITECTURE.md §2). It is also, per ADR-3, the piece that moves
-//! wholesale into the child process if ADR-6 is ever triggered, since a child
-//! process would create its own top-level window and no cross-process window
-//! embedding would be needed at all.
-//!
-//! Three concerns, one per module: the container window, the `IPlugFrame` the
-//! plugin talks back through, and the ordering rules that keep teardown from
-//! crashing.
+//! Provides top-level window embedding for VST3 `IPlugView` instances, `IPlugFrame`
+//! handling for host resize notifications, and lifecycle management.
 
 mod editor;
 mod frame;

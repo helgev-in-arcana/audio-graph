@@ -1,22 +1,15 @@
-//! A CLAP plugin that exists so `clap-host` can be tested against a real one.
+//! A deterministic CLAP test plugin implementation for integration testing `clap-host`.
 //!
-//! Not a product and not in the dependency graph of anything shipped: it is
-//! built as a `.clap` and loaded through the same path a third-party plugin
-//! takes — `clap_entry`, factory, `create_plugin`, `init`, extensions,
-//! `activate`, `process` — so the backend is exercised end to end rather than
-//! against a mock of itself.
+//! Exposes standard CLAP entry points and extensions (parameters, audio/note ports,
+//! state save/restore, voice info, render mode, latency, and GUI) with predictable
+//! numeric behavior to allow exact assertions in test fixtures:
 //!
-//! Its behaviour is chosen to make assertions exact:
-//!
-//! * `out = in * gain + offset`, so a test can predict every sample.
-//! * The sidechain input is *added* at a fixed 0.5, so a test can tell whether
-//!   an unwired aux port really was silent (§14.11 is about exactly this).
-//! * A note on emits a constant, not a tone, so note routing can be checked
-//!   without a spectrum.
-//! * Latency is a parameter, so the host's latency plumbing has something to
-//!   report.
-//! * State is the four parameter values, so a save/load round trip is
-//!   verifiable rather than opaque.
+//! * `out = in * gain + offset`
+//! * Sidechain input is added with a fixed gain factor ([`SIDECHAIN_GAIN`])
+//! * Note-on events add a constant level ([`NOTE_LEVEL`])
+//! * Auxiliary output carries scaled output ([`AUX_OUTPUT_GAIN`])
+//! * Latency is configurable via parameter
+//! * State serializes all parameter values into a binary blob
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -117,12 +110,10 @@ pub const SIDECHAIN_GAIN: f32 = 0.5;
 /// What one held note adds to every output sample.
 pub const NOTE_LEVEL: f32 = 0.25;
 
-/// What the second output bus carries, relative to the first.
+/// Output scaling factor applied to the secondary (auxiliary) output bus.
 ///
-/// The fixture has two outputs so the multi-output routing of §14.2 has
-/// something deterministic to bind to. Negative and not a power of two, so a
-/// host that read the wrong bus, summed the two, or copied one over the other
-/// cannot land on this by accident.
+/// This value (-0.75) is negative and not a power of two, so a host that read
+/// the wrong bus cannot land on this value by accident.
 pub const AUX_OUTPUT_GAIN: f32 = -0.75;
 
 /// Counts live instances, so a test can prove `destroy` actually runs.
@@ -201,10 +192,9 @@ pub(crate) struct Instance {
     /// [`PARAM_RENDER_MODE`]. Realtime is the value a fresh instance has,
     /// which is what CLAP says too.
     render_mode: i32,
-    /// Declared last so it drops last, which is the wrong order on purpose:
-    /// the host is required to call `gui.destroy` before the instance goes, and
-    /// a fixture that cleaned up after a host that forgot would hide the bug
-    /// §5.3 exists to catch.
+    /// GUI state for the plugin instance. Declared last so it drops last, which is the wrong
+    /// order on purpose — it verifies the host calls `gui.destroy` first. Cleaning it up
+    /// automatically would hide lifecycle bugs.
     gui: gui::Gui,
 }
 
@@ -265,8 +255,7 @@ pub static clap_entry: clap_plugin_entry = clap_plugin_entry {
     get_factory: Some(entry_get_factory),
 };
 
-/// Counts `init`/`deinit` so a test can prove the host balances them exactly
-/// once per module however many handles it opens (ADR-7).
+/// Counts `init`/`deinit` invocations to verify balanced lifecycle initialization.
 static ENTRY_DEPTH: AtomicU32 = AtomicU32::new(0);
 
 /// How many times `clap_entry.init` has been called without a matching
@@ -818,8 +807,7 @@ static EXT_AUDIO_PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports {
 };
 
 unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, _is_input: bool) -> u32 {
-    // Two of each: the inputs for the aux/sidechain path of §14.11, the
-    // outputs for the extra-output-bus path of §14.2.
+    // Two ports in each direction: main stereo pair and auxiliary stereo pair.
     2
 }
 

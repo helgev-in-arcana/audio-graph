@@ -1,7 +1,4 @@
 //! Loading a VST3 module and enumerating the classes it offers.
-//!
-//! This is M0: on its own it is a working plugin scanner, with no notion of
-//! instantiation, audio, or the nested-wrapper use case.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -55,10 +52,7 @@ impl ClassInfo {
         self.category == Self::AUDIO_MODULE
     }
 
-    /// Whether the class declares itself an instrument.
-    ///
-    /// Matters because the wrapper's own category is static while the
-    /// sub-plugin's is not, which is why two wrapper classes are exported (§6).
+    /// Whether the class declares itself as an instrument or synth in its subcategories.
     pub fn is_instrument(&self) -> bool {
         self.subcategories
             .split('|')
@@ -222,9 +216,8 @@ impl Module {
             vendor: from_char8(&raw.vendor),
             url: from_char8(&raw.url),
             email: from_char8(&raw.email),
-            // `FactoryFlags` は Windows で `c_int`、他で `c_uint` と符号が違う。
-            // どちらからも損なわずに広げられる i64 で突き合わせれば、
-            // プラットフォームごとの分岐もキャストの重複も要らない。
+            // FactoryFlags signedness differs between Windows (c_int) and other platforms (c_uint);
+            // widening to i64 enables a unified bitmask check without platform-specific casts.
             unicode: raw.flags as i64 & kUnicode as i64 != 0,
         })
     }

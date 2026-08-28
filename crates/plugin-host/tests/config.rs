@@ -1,10 +1,14 @@
-//! The plugin folders: seeded, edited, re-read, and reaching a scan.
+//! Tests for plugin directory and pinning configuration management.
 //!
-//! One test function on purpose. The config is process-wide state behind a
-//! single cache, and `AUDIO_GRAPH_CONFIG` — the override that keeps this off
-//! the real profile of whoever runs the suite — is process-wide too. A second
-//! `#[test]` in this binary would run beside this one and they would fight over
-//! both.
+//! Verifies default directory seeding, persistence, modification timestamp reload,
+//! legacy alias compatibility, and pinning operations.
+//!
+//! This file holds exactly one `#[test]`, and that is load-bearing: the test
+//! sets `AUDIO_GRAPH_CONFIG` with `std::env::set_var`, which is only sound
+//! while no other thread is running. Cargo builds each integration-test file
+//! as its own binary but runs the tests within one file on parallel threads,
+//! so a second test added here would make the `set_var` below unsound. Add
+//! further config tests as a new file instead.
 
 use std::path::PathBuf;
 
@@ -17,8 +21,9 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     std::fs::create_dir_all(&dir).expect("a temp directory can be made");
     let file = dir.join("config.json");
 
-    // SAFETY: set before anything in this binary reads the config, and this is
-    // the only test in it — see the module comment.
+    // SAFETY: no other thread is running. This is the only test in this
+    // binary (see the module comment), and the variable is set before
+    // anything here reads the config.
     unsafe { std::env::set_var("AUDIO_GRAPH_CONFIG", &file) };
 
     // First run: no file, so the conventional folders are written into one.
@@ -78,9 +83,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         1
     );
 
-    // An emptied list stays empty. "Scan nothing" is a thing a user may ask
-    // for, so re-seeding keys off the file being absent, never off the list
-    // being short.
+    // An emptied list is preserved and not re-seeded.
     config::store(&config::Config::default()).expect("saving works");
     assert!(
         config::directories().is_empty(),
@@ -88,16 +91,13 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     );
     assert!(plugin_host::plugin_directories().is_empty());
 
-    // ...and the button that puts the conventions back does so.
+    // Restore defaults appends conventional directories.
     config::restore_defaults().expect("saving works");
     assert_eq!(config::directories(), expected);
 
-    // A change made by another process — written straight to the file, behind
-    // the cache's back — is noticed by its modification time.
+    // External modifications are detected by timestamp comparison.
     let other = dir.join("elsewhere");
     std::fs::create_dir_all(&other).expect("a subdirectory can be made");
-    // Stamps have coarse resolution on some filesystems, so make sure the
-    // rewrite lands on a different one rather than testing the clock.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         &file,
@@ -113,8 +113,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         "a config changed underneath us is re-read"
     );
 
-    // A file from the first build of this feature, when the field was called
-    // `extra_directories`, still loads.
+    // Backwards compatibility with the legacy `extra_directories` field.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(
         &file,
@@ -130,8 +129,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         "a file from before pinning loads with nothing pinned"
     );
 
-    // Pinning is by full path, saved, and asked for as a state rather than as a
-    // toggle: pinning what is already pinned leaves one entry, not two.
+    // Pinning operates on exact module paths and is idempotent.
     let plugin = dir.join("Raum.vst3");
     assert!(config::set_pinned(&plugin, true).expect("a temp profile is writable"));
     assert!(config::set_pinned(&plugin, true).expect("a temp profile is writable"));
@@ -149,9 +147,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     config::set_pinned(&plugin, false).expect("a temp profile is writable");
     assert!(config::pinned().is_empty());
 
-    // Malformed content is not fatal, and — the part that matters — is not
-    // mistaken for a missing file, which would throw the user's list away and
-    // re-seed over it.
+    // Malformed JSON content falls back to empty defaults without overwriting.
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(&file, "{ this is not json").expect("the file is writable");
     assert!(

@@ -1,9 +1,4 @@
-//! Translating between the core event model (§3.2) and CLAP's own.
-//!
-//! This is the cheapest translation in the project, and deliberately so: the
-//! core's model was shaped after CLAP (ADR-4), so almost every variant maps
-//! one-for-one. Nothing is lost in this direction — it is the VST3 backend that
-//! has to degrade.
+//! Translating between the core event model and CLAP event structures.
 
 use std::ffi::c_void;
 
@@ -342,8 +337,7 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
                 sample_offset: header.time,
             })
         }
-        // The one output event that actually matters for the graph: it is how
-        // per-voice state learns a voice is gone (§3.2).
+        // The output event that notifies the host when a voice has ended.
         CLAP_EVENT_NOTE_END => {
             let e = unsafe { raw.note };
             Event::Note(NoteEvent::NoteEnd {
@@ -405,8 +399,8 @@ pub(crate) struct InputEvents {
 }
 
 impl InputEvents {
-    /// Reserve room for `capacity` events. `process` may not grow this (§9.1),
-    /// so anything past the ceiling is dropped rather than allocated for.
+    /// Reserve room for `capacity` events. New events beyond capacity are dropped
+    /// to avoid allocations on real-time threads.
     pub(crate) fn new(capacity: usize) -> InputEvents {
         InputEvents {
             raw: clap_input_events {
@@ -741,8 +735,7 @@ mod tests {
 
     #[test]
     fn targets_survive_the_trip() {
-        // The whole reason the core model is CLAP-shaped (ADR-4): per-voice
-        // addressing has to come back as what it went in as.
+        // Verify that per-voice and per-channel addressing round-trips accurately.
         for target in [
             Target::Global,
             Target::NoteId(11),

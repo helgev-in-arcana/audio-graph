@@ -2,16 +2,10 @@
 //!
 //! Hooks Windows Vectored Exception Handling (VEH) to report crash address,
 //! module offset, exception type, registers, instruction bytes, and stack trace
-//! when a native fault occurs.
+//! when a native fault occurs in loaded plugin binaries.
 //!
-//! A plugin's own faults are not Rust panics — an access violation or an integer
-//! divide by zero does not unwind, so `catch_unwind` never sees them and the
-//! process simply disappears. This is how we find out *where*.
-//!
-//! The handler is purely observational: it always returns
-//! `EXCEPTION_CONTINUE_SEARCH`, so a plugin that raises and handles its own SEH
-//! exception still works — it just prints a dump on the way past. Frames appear
-//! as `Module.vst3+0x312bb7`, which is what a disassembler wants.
+//! The handler logs diagnostic information and returns `EXCEPTION_CONTINUE_SEARCH`
+//! so that normal exception routing continues unimpeded.
 
 #[cfg(windows)]
 pub fn install_crash_handler() {

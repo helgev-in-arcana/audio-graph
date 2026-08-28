@@ -30,27 +30,28 @@ pub fn linear_to_db(linear: f64) -> f64 {
     }
 }
 
-/// Sum several audio inputs of the same width into one, each at its own
-/// gain (in decibels).
+/// Sums multiple audio inputs of matching channel width, applying per-input gain in decibels.
 ///
 /// The only way two audio sources reach one destination. An input takes one
-/// link everywhere in this graph, so mixing is a node rather than a rule —
-/// and being a node is what lets the compiler see the merge and line the
-/// paths up (§14.6).
+/// link everywhere in this graph, so mixing is a node rather than a rule — and
+/// being a node is what lets the compiler see the merge and line the paths up.
 ///
-/// The gains are here rather than in a node of their own because a mix with
-/// one input *is* a gain, and the audio half needed a multiply anyway: a
-/// feedback delay whose loop gain is 0 dB never decays, and `Math` is the
-/// param half's multiply and cannot touch a buffer. Two nodes that share
+/// Each input pair is an audio signal socket and a parameter gain socket beside
+/// it. If a gain socket is unconnected, its configured scalar gain is used, the
+/// same rule `Math`'s `b` follows.
+///
+/// The gains are integrated here rather than in a node of their own because a
+/// mix with one input *is* a gain, and the audio half needed a multiply anyway:
+/// a feedback delay whose loop gain is 0 dB never decays, and `Math` is the
+/// parameter half's multiply and cannot touch a buffer. Two nodes that share
 /// every line of their implementation are one node.
-///
-/// Each gain has a socket of its own, after the audio inputs; the number
-/// here is what is used while that socket is unconnected, the same rule
-/// `Math`'s `b` follows. Missing entries are 0.0 dB (unity gain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mix {
     pub channels: u16,
     pub inputs: u8,
+    /// Fallback gain in decibels per input, used while that input's gain socket
+    /// is unconnected. A missing entry is 0.0 dB, so an empty vector is unity —
+    /// which is what a mix did before it had gains at all.
     #[serde(default)]
     pub gains: Vec<f64>,
 }
@@ -60,9 +61,9 @@ impl Node for Mix {
         "Mix".into()
     }
 
-    /// Each input next to its own gain, rather than all the signals followed
-    /// by all the gains: they are one row of one control on screen, and a
-    /// socket list that does not read that way makes the user count.
+    /// Each input next to its own gain, rather than all the signals followed by
+    /// all the gains: they are one row of one control on screen, and a socket
+    /// list that does not read that way makes the user count.
     fn input_ports(&self) -> Vec<Port> {
         (0..self.inputs)
             .flat_map(|i| {
@@ -95,12 +96,11 @@ impl Node for Mix {
         )]
     }
 
-    /// A mix's gains are params, so the param half is where their lanes are
-    /// booked; the scaling itself is the audio half's.
+    // A mix's gains are params, so the param half is where their lanes are
+    // booked; the scaling itself is the audio half's.
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         for i in 0..self.inputs {
-            // Signal, gain, signal, gain: the gain for input `i` is the socket
-            // right after it.
+            // Gain for input `i` corresponds to the parameter port at index `2 * i + 1`.
             let port = 2 * i + 1;
             if let Some(reg) = cx.input(port) {
                 cx.drive_audio(port, reg)?;
@@ -110,7 +110,7 @@ impl Node for Mix {
     }
 
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
-        // §14.6, the merge point: every branch waits for the latest one or they
+        // The merge point: every branch waits for the latest one or they
         // phase-cancel.
         let arrive = cx
             .sources()
@@ -132,8 +132,7 @@ impl Node for Mix {
             }
             inputs.push(MixIn {
                 buf,
-                // Signal, gain, signal, gain: the gain for input `port` is the
-                // socket right after it.
+                // Associate each audio buffer with its corresponding gain lane.
                 lane: cx.lane((2 * port + 1) as u8),
                 gain: self
                     .gains
@@ -146,10 +145,9 @@ impl Node for Mix {
         for input in &inputs {
             cx.consume(input.buf);
         }
-        // The first input may be reused as the destination — that is what makes
-        // the mix an accumulate rather than a copy — but the rest may not, or
-        // the sum would be built out of a buffer that has already been written
-        // over.
+        // The first input may be reused as the destination — that is what
+        // makes the mix an accumulate rather than a copy — but the rest may
+        // not, or the sum would be built out of a buffer already written over.
         let avoid: Vec<Buf> = inputs.iter().skip(1).map(|i| i.buf).collect();
         let out = cx.alloc_avoiding(self.channels, cx.readers(), &avoid)?;
         cx.emit(AudioOp::Mix { out, inputs });
@@ -188,9 +186,8 @@ impl Node for Mix {
         })
     }
 
-    /// Eight is the ceiling the old spinner had, and nothing below it has
-    /// changed: past that a mix is a wall of sockets and a second Mix reads
-    /// better than a taller one.
+    /// Eight is the ceiling: past that a mix is a wall of sockets, and a second
+    /// Mix reads better than a taller one.
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         (self.inputs < 8).then_some("another input")
@@ -221,11 +218,11 @@ impl Node for Mix {
 impl Mix {
     /// One entry, called what it is.
     ///
-    /// There was a second, "Gain", which was this node starting with one
-    /// input — true to how the node works, and no help at all: picking Gain
-    /// and watching a node called Mix appear reads as the menu having handed
-    /// over the wrong thing. Taking an input off a Mix is how you get a gain,
-    /// and the node says so on the row where it happens.
+    /// There was a second, "Gain", which was this node starting with one input
+    /// — true to how the node works, and no help at all: picking Gain and
+    /// watching a node called Mix appear reads as the menu having handed over
+    /// the wrong thing. Taking an input off a Mix is how you get a gain, and the
+    /// node says so on the row where it happens.
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, Mix)> {
         vec![(
             "Mix",

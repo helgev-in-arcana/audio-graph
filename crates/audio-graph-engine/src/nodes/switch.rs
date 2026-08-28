@@ -8,7 +8,7 @@ use crate::nodes::widgets::{NodeUi, fallback};
 use crate::port::Port;
 
 /// How many values one switch may choose between. A `Mix`'s ceiling, for a
-/// `Mix`'s reason.
+/// `Mix`'s reason: past it the node is a wall of sockets.
 #[cfg(feature = "ui")]
 const MAX_VALUES: usize = 8;
 
@@ -16,9 +16,9 @@ const MAX_VALUES: usize = 8;
 /// thresholds.
 ///
 /// The parameter half's answer to a switch. `Math` can express a crossfade and
-/// `RangeMap` a curve, but neither can say "this value below, that value
-/// above" without a chain of three nodes that reads as arithmetic rather than
-/// as a decision — and a decision is what the user is making.
+/// `RangeMap` a curve, but neither can say "this value below, that value above"
+/// without a chain of three nodes that reads as arithmetic rather than as a
+/// decision — and a decision is what the user is making.
 ///
 /// Every value has a socket of its own, so a switch can pick between *signals*
 /// as easily as between numbers; the number on the row is what is used while
@@ -48,9 +48,9 @@ pub struct Switch {
 /// What a `Switch` may be read from, old shape or new.
 ///
 /// Before it grew a ladder, a switch was two values and one threshold. A patch
-/// saved then still says `off`, `on` and `threshold`, and it means the
-/// two-value ladder that says the same thing — so it is read as one rather
-/// than as a node with no values at all.
+/// saved then still says `off`, `on` and `threshold`, and it means the two-value
+/// ladder that says the same thing — so it is read as one rather than as a node
+/// with no values at all.
 #[derive(Deserialize)]
 struct SwitchWire {
     #[serde(default)]
@@ -150,10 +150,10 @@ impl Node for Switch {
                 out
             }
         };
-        // One `Select` per rung, each overriding the last where the control
-        // has reached it. Written this way round — later rungs on the outside
-        // — the last threshold the control has passed is the one that wins,
-        // which is what a ladder reads as.
+        // One `Select` per rung, each overriding the last where the control has
+        // reached it. Written this way round — later rungs on the outside —
+        // the last threshold the control has passed is the one that wins, which
+        // is what a ladder reads as.
         for index in 1..self.values.len() {
             let next = cx.alloc()?;
             cx.emit(Op::Select {
@@ -169,8 +169,8 @@ impl Node for Switch {
         Ok(())
     }
 
-    /// The value each socket stands in for, and the threshold that picks it,
-    /// on the row of the socket they belong to.
+    /// The value each socket stands in for, and the threshold that picks it, on
+    /// the row of the socket they belong to.
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,
@@ -249,9 +249,9 @@ impl Switch {
 mod tests {
     use super::*;
 
-    /// A patch saved when a switch was two values and one threshold still
-    /// means what it meant. Reading it as a node with no values would empty
-    /// the socket its links point at.
+    /// A patch saved when a switch was two values and one threshold still means
+    /// what it meant. Reading it as a node with no values would empty the socket
+    /// its links point at.
     #[test]
     fn the_old_two_value_shape_reads_as_a_two_rung_ladder() {
         let old = r#"{"threshold": 0.6, "off": 0.2, "on": 0.9}"#;
@@ -260,8 +260,8 @@ mod tests {
         assert_eq!(switch.thresholds, vec![0.6]);
     }
 
-    /// And the ports are where the links expect them: control, then a socket
-    /// per value.
+    /// And the ports are where the links expect them: control, then a socket per
+    /// value.
     #[test]
     fn the_old_shape_keeps_its_socket_order() {
         let old = r#"{"threshold": 0.5, "off": 0.0, "on": 1.0}"#;

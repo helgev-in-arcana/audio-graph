@@ -17,14 +17,15 @@ const MAX_WAYS: usize = 8;
 /// What a key switch does with the keys it watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeySwitchMode {
-    /// Each output speaks while its own key is held. Several at once is
-    /// allowed and is how a layer is added by holding a key down.
+    /// Each output speaks while its own key is held. Several at once is allowed
+    /// and is how a layer is added by holding a key down.
     Hold,
-    /// The last key struck leaves its output open and shuts the others. A
-    /// bank of switches, latching.
+    /// The last key struck leaves its output open and shuts the others. A bank
+    /// of switches, latching.
     Select,
     /// One key — the first output's — moving the stream on to the next output
-    /// each time it is struck, and round to the first again at the end.
+    /// each time it is struck, and round to the first again at the end. For when
+    /// there is no room on the keyboard for a key per way.
     Toggle,
 }
 
@@ -44,30 +45,29 @@ impl KeySwitchMode {
     }
 }
 
-/// Route notes by a key switch: keys played to steer the rest, rather than to
-/// sound.
+/// Routes MIDI note streams to different destinations by key switch: keys
+/// played to steer the rest, rather than to sound.
 ///
 /// One output per destination, each with the key that opens it on its own row,
 /// because a key belongs to the output it steers — a list of keys somewhere
 /// else on the node is a thing to match up by counting.
 ///
-/// The three modes are the three ways players use one. `Hold` is momentary:
-/// the layer speaks while the key is down, which is what a foot-switch does
-/// with hands instead. `Select` is a latching bank — tap a key, that
-/// destination stays chosen. `Toggle` is the one-key version of `Select`, for
-/// when there is no room on the keyboard for a key per way.
+/// The three modes are the three ways players use one. `Hold` is momentary: the
+/// layer speaks while the key is down, which is what a foot-switch does with
+/// hands instead. `Select` is a latching bank. `Toggle` is the one-key version
+/// of `Select`.
 ///
 /// Where a `Select` or a `Toggle` stands survives a recompile, so editing an
 /// unrelated node does not quietly move the routing back.
 ///
-/// The switching keys are taken out of the stream by default, because a key
-/// played to steer is not a key played to sound and a sampler handed one will
-/// answer with whatever is mapped there. Clearing `mute_keys` puts them back
-/// for the patch that wants the switch audible — a key that both selects a
-/// layer and plays it is a real technique, just not the common one.
+/// Supports momentary (`Hold`), latching (`Select`), and sequential (`Toggle`) modes.
+/// The switching keys are taken out of the stream by default (`mute_keys`),
+/// because a key played to steer is not a key played to sound and a sampler
+/// handed one will answer with whatever is mapped there. Clearing it puts them
+/// back, for the patch where a key both selects a layer and plays it.
 ///
 /// Both halves of a muted key go, note-on and note-off alike. There is no
-/// sounding voice waiting for the release, so dropping it hangs nothing; that
+/// sounding voice waiting for the release, so dropping it hangs nothing — that
 /// is the difference between this and a shut gate, which must let releases
 /// through.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,10 +76,11 @@ pub struct KeySwitch {
     /// One key per output, in socket order. Empty is a node the user has not
     /// finished building; it routes nothing.
     pub keys: Vec<u8>,
-    /// Whether the switching keys are taken out of the stream on the way
-    /// out. On by default, and defaulted rather than required so a patch
-    /// saved before the field existed reads as muted — which is the answer it
-    /// would have wanted, and the one it will hear from a fresh node.
+    /// Whether the switching keys are taken out of the stream on the way out.
+    ///
+    /// On by default, and defaulted rather than required so a patch saved before
+    /// the field existed reads as muted — which is the answer it would have
+    /// wanted, and the one it will hear from a fresh node.
     #[serde(default = "muted")]
     pub mute_keys: bool,
 }
@@ -110,15 +111,15 @@ impl Node for KeySwitch {
             .collect()
     }
 
-    /// Every output carries the same stream; which of them are open is the
-    /// whole of what this node decides.
+    /// Every output carries the same stream; which of them are open is the whole
+    /// of what this node decides.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         (usize::from(port) < self.keys.len()).then_some(0)
     }
 
-    /// The keys this switch answers to, swallowed on the way out unless the
-    /// user asked for them. Keys past 127 cannot be set from the UI and would
-    /// not fit the mask, so they are simply not counted.
+    /// The keys this switch answers to, swallowed on the way out unless the user
+    /// asked for them. Keys past 127 cannot be set from the UI and would not fit
+    /// the mask, so they are simply not counted.
     fn note_mute(&self, port: u8) -> u128 {
         if !self.mute_keys || usize::from(port) >= self.keys.len() {
             return 0;
@@ -191,12 +192,11 @@ impl Node for KeySwitch {
             &KeySwitchMode::ALL,
             KeySwitchMode::label,
         );
-        // "switching keys" rather than "switch keys": the second reads as
-        // the keys belonging to a mute switch, which is a thing that exists.
-        // The box is checked in the ordinary case because the node is doing
-        // something — taking events out of the stream — and a filter nobody
-        // asked for should be visible in the node rather than implied by an
-        // empty box.
+        // "switching keys" rather than "switch keys": the second reads as the
+        // keys belonging to a mute switch, which is a thing that exists. The box
+        // is checked in the ordinary case because the node is doing something —
+        // taking events out of the stream — and a filter nobody asked for
+        // should be visible in the node rather than implied by an empty box.
         changed |= ui
             .checkbox(&mut self.mute_keys, "mute switching keys")
             .on_hover_text(
@@ -250,7 +250,7 @@ impl Node for KeySwitch {
     }
 }
 
-/// Multiply a gate condition by whatever gate is already on the chain, so
+/// Multiplies a gate condition by whatever gate is already on the chain, so
 /// gates in series pass notes only when every one of them is open.
 fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> {
     let Some(upstream) = cx.upstream_note_gate(0) else {
@@ -266,8 +266,8 @@ fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> 
     Ok(both)
 }
 
-/// The default for [`KeySwitch::mute_keys`], as a function because serde
-/// cannot spell `true` any other way.
+/// The default for [`KeySwitch::mute_keys`], as a function because serde cannot
+/// spell `true` any other way.
 fn muted() -> bool {
     true
 }

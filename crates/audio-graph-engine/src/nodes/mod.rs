@@ -1,15 +1,15 @@
-//! The node set (§9.3 for the v1 core, §14 for the M8 additions).
+//! Graph node definitions and common trait interface.
 //!
 //! One file per node. Everything a node *is* — its settings, its sockets, its
-//! title, and in time the code the compiler emits for it — belongs in that
-//! file, so that adding a node is reading one example rather than finding
-//! four places that already mention every other node.
+//! title, and the code the compiler emits for it — belongs in that file, so
+//! that adding a node is reading one example rather than finding four places
+//! that already mention every other node.
 //!
-//! [`NodeKind`] stays an enum, and stays the only way a node reaches the rest
-//! of the crate. That is what keeps the exhaustiveness check, the derived
-//! `Serialize` / `Deserialize` / `PartialEq`, and static dispatch: a node is
-//! not a `Box<dyn …>` here, it is a variant carrying its own struct. The arms
-//! below are the whole cost of that, and they are one line each.
+//! [`NodeKind`] stays an enum, and stays the only way a node reaches the rest of
+//! the crate. That is what keeps the exhaustiveness check, the derived
+//! `Serialize` / `Deserialize` / `PartialEq`, and static dispatch: a node is not
+//! a `Box<dyn …>` here, it is a variant carrying its own struct. The delegating
+//! arms are the whole cost of that, and they are one line each.
 
 #[cfg(feature = "ui")]
 pub mod widgets;
@@ -52,54 +52,52 @@ use serde::{Deserialize, Serialize};
 
 /// What every node is, in one declaration.
 ///
-/// Before this existed, the answer to "what does a node have to do" was
-/// spread over four `match` statements in three crates, and the only way to
-/// find out was to add a variant and read the compiler's complaints. Now it is
-/// here, and a new node is one file that implements this.
+/// Defines port layout, compilation hooks for the parameter and audio passes,
+/// note routing behaviour, and optional UI rendering callbacks. A new node is
+/// one file that implements this.
 ///
 /// The defaults are the point of most of it. A `Constant` has no audio half, a
 /// `Math` declares nothing, and only `NoteIn` is a source of notes — so those
 /// nodes say nothing about any of it, and what is left in their files is what
 /// makes them different from each other.
 ///
-/// [`NodeKind`] stays an enum and keeps delegating through `for_kind!`. That
-/// is deliberate, and ADR-14 records the trade: an enum keeps the
-/// exhaustiveness check, the derived `Serialize`/`Deserialize`/`PartialEq`,
-/// and static dispatch, at the cost of one line per node in the macro. A
-/// `Box<dyn Node>` would buy third-party nodes and cost all four — plus a
-/// public contract for the patch format, a receptacle for unknown kinds, and a
-/// validation pass over `Program`, since an outside node could emit an
-/// instruction stream the engine indexes without checking.
+/// **Why an enum and not `Box<dyn Node>`.** [`NodeKind`] keeps delegating
+/// through `for_kind!` on purpose: an enum keeps the exhaustiveness check, the
+/// derived `Serialize`/`Deserialize`/`PartialEq`, and static dispatch, at the
+/// cost of one line per node in that macro. Trait objects would buy third-party
+/// nodes and cost all four — plus a public contract for the patch format, a
+/// receptacle for unknown kinds, and a validation pass over `Program`, since an
+/// outside node could emit an instruction stream the engine indexes without
+/// checking.
 ///
-/// Not in here: `catalogue_defaults`, which returns `Self` and so would make
-/// the trait un-object-safe for no gain — and which is not one-per-node
+/// Not in this trait: `catalogue_defaults`, which returns `Self` and so would
+/// make the trait un-object-safe for no gain — and which is not one-per-node
 /// anyway, since `Mix` offers itself twice.
 pub(crate) trait Node {
     fn title(&self) -> String;
     fn input_ports(&self) -> Vec<Port>;
     fn output_ports(&self) -> Vec<Port>;
 
-    /// Say what has to be booked before anything is emitted — today, delay
+    /// Says what has to be booked before anything is emitted — today, delay
     /// lines. Runs over the whole graph before either half compiles.
     fn declare(&self, cx: &mut DeclareCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
     }
 
-    /// Emit the parameter half (§9.2).
+    /// Compiles parameter processing operations into the parameter context.
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
     }
 
-    /// Emit the audio half (§14.9).
+    /// Compiles audio processing operations into the audio context.
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
     }
 
-    /// The note stream a plugin wired to this node's output plays from, if
-    /// this node is a source of notes at all (§14.10).
+    /// Identifies the note stream originating from this node, if it is a note source.
     fn note_identity(&self) -> Option<NoteSource> {
         None
     }
@@ -107,10 +105,10 @@ pub(crate) trait Node {
     /// Which of this node's inputs the notes leaving output `port` came in
     /// through, for a node that passes notes on rather than making them.
     ///
-    /// This is what lets a note stream be routed through several nodes and
-    /// still be found: the compiler walks up the chain socket by socket until
-    /// something answers [`Node::note_identity`]. A node that answers neither
-    /// is the end of the walk, and a plugin behind it hears nothing.
+    /// This is what lets a note stream be routed through several nodes and still
+    /// be found: the compiler walks up the chain socket by socket until
+    /// something answers [`Node::note_identity`]. A node that answers neither is
+    /// the end of the walk, and a plugin behind it hears nothing.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         let _ = port;
         None
@@ -120,20 +118,20 @@ pub(crate) trait Node {
     /// `port` — bit `k` set means key `k` does not go on.
     ///
     /// A key switch's own keys are the case: they are played to steer, not to
-    /// sound, and by default the thing being steered should never hear them.
-    /// The mask is collected while the compiler walks the chain, so several
-    /// switches in series each swallow their own.
+    /// sound, and by default the thing being steered should never hear them. The
+    /// mask is collected while the compiler walks the chain, so several switches
+    /// in series each swallow their own.
     fn note_mute(&self, port: u8) -> u128 {
         let _ = port;
         0
     }
 
-    /// Draw this node's own controls, inside the frame the canvas laid out.
+    /// Draws this node's own controls, inside the frame the canvas laid out.
     /// Returns whether anything changed.
     ///
-    /// What is left here is what belongs to the *node*: an LFO's waveform, a
-    /// slot picker, a bus number. Anything that stands in for one socket
-    /// belongs on that socket's row instead — see [`Node::input_control`].
+    /// What belongs here is what belongs to the *node*: an LFO's waveform, a
+    /// slot picker, a bus number. Anything that stands in for one socket belongs
+    /// on that socket's row instead — see [`Node::input_control`].
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         let _ = (ui, cx);
@@ -142,9 +140,9 @@ pub(crate) trait Node {
 
     /// The title as the canvas shows it.
     ///
-    /// Separate from [`Node::title`] because a plugin node's name is the name
-    /// of what is loaded in it, and this crate has no idea what that is until
-    /// the wrapper hands it over.
+    /// Separate from [`Node::title`] because a plugin node's name is the name of
+    /// what is loaded in it, and this crate has no idea what that is until the
+    /// wrapper hands it over.
     #[cfg(feature = "ui")]
     fn ui_title(&self, cx: &widgets::NodeUi<'_>) -> String {
         let _ = cx;
@@ -169,8 +167,8 @@ pub(crate) trait Node {
     /// `Math`'s `b`, a `Mix`'s gain, a delay's time — and were two rows apart
     /// until they were drawn together. `connected` says whether anything is
     /// wired in; a fallback wraps itself in [`widgets::fallback`] to grey out
-    /// when it is, while a control that still applies with a link in place
-    /// (a plugin's choice of *which* parameter) ignores it.
+    /// when it is, while a control that still applies with a link in place (a
+    /// plugin's choice of *which* parameter) ignores it.
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,
@@ -187,8 +185,8 @@ pub(crate) trait Node {
     /// socket's own row and right up against the socket.
     ///
     /// The mirror of [`Node::input_control`], and there for the same reason: a
-    /// key switch's key belongs to the output it steers, and a node-wide list
-    /// of keys somewhere else is a thing to match up by counting.
+    /// key switch's key belongs to the output it steers, and a node-wide list of
+    /// keys somewhere else is a thing to match up by counting.
     #[cfg(feature = "ui")]
     fn output_control(
         &mut self,
@@ -200,8 +198,8 @@ pub(crate) trait Node {
         false
     }
 
-    /// The output side's [`Node::add_input_label`], and drawn the same way —
-    /// as a "+", though against the edge the output sockets are on.
+    /// The output side's [`Node::add_input_label`], and drawn the same way — as
+    /// a "+", though against the edge the output sockets are on.
     #[cfg(feature = "ui")]
     fn add_output_label(&self) -> Option<&'static str> {
         None
@@ -212,22 +210,19 @@ pub(crate) trait Node {
     #[cfg(feature = "ui")]
     fn add_output(&mut self) {}
 
-    /// Take away output `port`, and say how many sockets went with it.
+    /// Takes away output `port`, and says how many sockets went with it.
     #[cfg(feature = "ui")]
     fn remove_output(&mut self, port: u8) -> u8 {
         let _ = port;
         0
     }
 
-    /// The label for the button that gives this node another input, or `None`
-    /// where the sockets are fixed. Drawn on the node's last row.
     /// What the button that grows this node's inputs should say it adds, or
     /// `None` for a node whose inputs are fixed — or already at its ceiling.
     ///
-    /// The button itself is drawn as "+", because it sits under the row it
-    /// makes more of and the word was the wider half of it. This is the
-    /// tooltip, so it reads as a thing rather than as a label: "another
-    /// input", not "+ input".
+    /// The button itself is drawn as "+", because it sits under the row it makes
+    /// more of and the word was the wider half of it. This is the tooltip, so it
+    /// reads as a thing rather than as a label: "another input", not "+ input".
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         None
@@ -238,9 +233,9 @@ pub(crate) trait Node {
     #[cfg(feature = "ui")]
     fn add_input(&mut self) {}
 
-    /// Take away the input group beginning at `port`, and say how many sockets
-    /// went with it — the canvas needs the count to slide the links into the
-    /// sockets after it down by that much.
+    /// Takes away the input group beginning at `port`, and says how many
+    /// sockets went with it — the canvas needs the count to slide the links in
+    /// the sockets after it down by that much.
     #[cfg(feature = "ui")]
     fn remove_input(&mut self, port: u8) -> u8 {
         let _ = port;
@@ -254,11 +249,11 @@ use subhost_adapter::NoteSource;
 
 /// One node's identity and settings.
 ///
-/// Each variant is a newtype over the struct of the same name. That spelling
-/// is not cosmetic: `{"Lfo": {"waveform": …}}` is exactly what a struct
-/// variant wrote, so patches saved before the split reopen unchanged, and it
-/// is what lets a node's whole implementation move into its own file without
-/// the enum having to know any of it.
+/// Each variant is a newtype over the struct of the same name. That spelling is
+/// not cosmetic: `{"Lfo": {"waveform": …}}` is exactly what a struct variant
+/// wrote, so patches saved before the split reopen unchanged, and it is what
+/// lets a node's whole implementation move into its own file without the enum
+/// having to know any of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
     Constant(Constant),
@@ -269,7 +264,7 @@ pub enum NodeKind {
     RangeMap(RangeMap),
     Switch(Switch),
 
-    // --- M8 (§14) ---
+    // --- Audio & MIDI Nodes ---
     AudioIn(AudioIn),
     AudioOut(AudioOut),
     /// Carries nothing, so it stays a unit variant: see [`NoteIn`].
@@ -283,15 +278,16 @@ pub enum NodeKind {
     KeyParam(KeyParam),
     DelayRead(DelayRead),
 }
-/// Run `$body` against whichever node the kind is carrying.
+
+/// Runs `$body` against whichever node the kind is carrying.
 ///
-/// The one place the eighteen variants are listed. Every delegating method
-/// below is one line through here, so adding a node means adding an arm here
-/// and nothing else in this file — and the exhaustiveness check still makes
-/// forgetting it a compile error rather than a silent no-op.
+/// The one place every variant is listed. Every delegating method below is one
+/// line through here, so adding a node means adding an arm here and nothing else
+/// in this file — and the exhaustiveness check still makes forgetting it a
+/// compile error rather than a silent no-op.
 ///
-/// `NoteIn` carries nothing and so has nothing to bind; the arm makes one on
-/// the spot, which is free.
+/// `NoteIn` carries nothing and so has nothing to bind; the arm makes one on the
+/// spot, which is free.
 macro_rules! for_kind {
     ($kind:expr, $node:ident => $body:expr) => {
         match $kind {
@@ -324,8 +320,8 @@ impl NodeKind {
     /// This kind's input sockets, in order. Empty for a source node.
     ///
     /// Returns owned ports because a plugin node's sockets depend on what the
-    /// plugin turned out to have (§14.2) and so cannot be a static slice. Every
-    /// caller is on the main thread — the audio thread sees only a `Program`.
+    /// plugin turned out to have, and so cannot be a static slice. Every caller
+    /// is on the main thread — the audio thread sees only a `Program`.
     pub fn input_ports(&self) -> Vec<Port> {
         for_kind!(self, node => node.input_ports())
     }
@@ -344,8 +340,7 @@ impl NodeKind {
         for_kind!(self, node => node.declare(cx))
     }
 
-    /// The note stream a plugin wired to this node's output plays from, if it
-    /// is a source of notes at all (§14.10).
+    /// Identifies the note stream originating from this node, if it is a note source.
     pub(crate) fn note_identity(&self) -> Option<NoteSource> {
         for_kind!(self, node => node.note_identity())
     }
@@ -361,12 +356,12 @@ impl NodeKind {
         for_kind!(self, node => node.note_mute(port))
     }
 
-    /// Emit this node's parameter-half instructions (§9.2).
+    /// Compiles parameter processing operations.
     pub(crate) fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         for_kind!(self, node => node.compile(cx))
     }
 
-    /// Emit this node's audio-half instructions (§14.9).
+    /// Compiles audio processing operations.
     pub(crate) fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         for_kind!(self, node => node.compile_audio(cx))
     }
@@ -439,10 +434,6 @@ impl NodeKind {
     /// The label of this node's "another input" button, if it has one.
     #[cfg(feature = "ui")]
     pub fn add_input_label(&self) -> Option<&'static str> {
-        // Delegated like everything else rather than listed here. The list was
-        // two arms and a `_ => None`, which is a place to forget a node — and
-        // the fourth node to grow inputs was duly forgotten until its button
-        // did not appear.
         for_kind!(self, node => node.add_input_label())
     }
 
@@ -461,10 +452,9 @@ impl NodeKind {
 
 /// Which half of the graph a node belongs to, for the "add a node" menu.
 ///
-/// The menu had grown to a wall of buttons in which "Param Map" sat beside
-/// "MIDI In", and the only way to find anything was to read all of it. These
-/// three are the three kinds of wire the editor has, so they are the three
-/// piles a reader is already sorting the nodes into.
+/// These three are the three kinds of wire the editor has, so they are the three
+/// piles a reader is already sorting the nodes into. Without them the menu is a
+/// wall of buttons in which "Param Map" sits beside "MIDI In".
 ///
 /// A node is filed by what it is *for*, not by every socket it owns: a gate
 /// takes a parameter to decide with, but it is an audio node because audio is

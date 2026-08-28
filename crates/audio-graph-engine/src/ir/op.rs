@@ -1,4 +1,6 @@
-//! The parameter half of the instruction set (§9.2).
+//! Parameter instruction set and evaluation primitives.
+//!
+//! Contains the scalar operations the parameter engine executes each sub-block.
 //!
 //! The payload enums a node's settings reduce to — [`Waveform`], [`MathOp`],
 //! [`ExprSource`] — live here rather than next to the node that offers them,
@@ -11,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// An index into the register file.
 pub type Reg = u16;
 
-/// A math operand: either another node's output or the node's own constant.
+/// A math operand: either another node's output register or an immediate constant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operand {
     Reg(Reg),
@@ -34,7 +36,7 @@ pub enum Op {
         out: Reg,
         value: f64,
     },
-    /// Read the DAW's automation for a slot.
+    /// Read the host automation value for a slot.
     Slot {
         out: Reg,
         slot: u16,
@@ -53,11 +55,11 @@ pub enum Op {
         out: Reg,
         source: ExprSource,
     },
-    /// One of two operands, chosen by where `control` sits against
-    /// `threshold`: `high` at the threshold and above, `low` below it.
+    /// One of two operands, chosen by where `control` sits against `threshold`:
+    /// `high` at the threshold and above, `low` below it.
     ///
-    /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which
-    /// a gate wired from `Expression`'s `Gate` does — switches.
+    /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which a
+    /// gate wired from `Expression`'s `Gate` does — switches.
     Select {
         out: Reg,
         control: Reg,
@@ -67,46 +69,49 @@ pub enum Op {
     },
     /// 1 while `key` is held, 0 otherwise.
     ///
-    /// The one thing the graph could not ask about a note stream: `Expression`
-    /// answers for the newest note whatever it was, and a key switch is a
-    /// question about one particular key regardless of what has been played
-    /// since.
+    /// The one thing the graph could not otherwise ask about a note stream:
+    /// `Expression` answers for the newest note whatever it was, and a key
+    /// switch is a question about one particular key regardless of what has been
+    /// played since.
     KeyHeld {
         out: Reg,
         key: u8,
     },
-    /// Move a latch on to the next of `count` positions each time `key` is
-    /// struck, wrapping at the end.
+    /// Advances latch `state` to the next of `count` positions when `key` is
+    /// struck, wrapping around. One key cycling a switch, which with `count` of
+    /// 2 is a plain toggle.
     ///
-    /// One key cycling a switch, which with `count` of 2 is a plain toggle.
-    /// Writes no register: the value is read back by a [`Op::Latch`] or an
-    /// [`Op::LatchIs`], because the latch is what survives a program swap and
-    /// a register does not.
+    /// The value is read back by an [`Op::Latch`] or an [`Op::LatchIs`], because
+    /// the latch is what survives a program swap and a register does not.
+    /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
+    /// the topological sort, preventing cycles.
     KeyStep {
         state: u16,
         key: u8,
         count: u16,
     },
-    /// Set a latch to `value` when `key` is struck.
+    /// Sets latch `state` to `value` when `key` is struck.
     ///
     /// Several of these on one latch is a bank of key switches: the last key
     /// pressed wins, which is what a bank of switches does.
+    /// Like `DelayWrite`, this deliberately does not write to a register to omit an edge in
+    /// the topological sort, preventing cycles.
     KeyLatch {
         state: u16,
         key: u8,
         value: f64,
     },
-    /// Read a latch, or `initial` if nothing has set it yet.
+    /// Read latch `state`, or `initial` if unset.
     Latch {
         out: Reg,
         state: u16,
         initial: f64,
     },
-    /// 1 when a latch holds `value`, 0 otherwise.
+    /// 1 when latch `state` holds `value`, 0 otherwise.
     ///
-    /// What makes a bank of switches exclusive: each position asks whether it
-    /// is the one selected, and exactly one of them can be. `initial` is what
-    /// an unset latch counts as, so an untouched bank still has a position.
+    /// What makes a bank of switches exclusive: each position asks whether it is
+    /// the one selected, and exactly one of them can be. `initial` is what an
+    /// unset latch counts as, so an untouched bank still has a position.
     LatchIs {
         out: Reg,
         state: u16,
@@ -128,25 +133,22 @@ pub enum Op {
         out_span: f64,
         clamp: bool,
     },
-    /// Read from a delay line, `time` seconds back (§14.4).
+    /// Read from a parameter delay line, `time` seconds back.
     ///
-    /// `time_reg`, when present, is the register the time control is wired to
-    /// and overrides `time` (§14.5).
-    ///
-    /// Clamped at run time to at least one sub-block, which is the floor of
-    /// §14.4 expressed in the param domain. The compiler cannot do it: the
-    /// floor depends on the sample rate and the quantum, and it knows neither.
+    /// When `time_reg` is present, its value overrides `time`.
+    /// The delay duration is clamped at run time to at least one sub-block: a
+    /// read that could see the current sub-block's own write would close a loop
+    /// with no delay in it. The compiler cannot do the clamping — the floor
+    /// depends on the sample rate and the quantum, and it knows neither.
     DelayRead {
         out: Reg,
         line: u16,
         time: f64,
         time_reg: Option<Reg>,
     },
-    /// Write this sub-block's value into a delay line.
-    ///
-    /// Emitted after everything feeding it, like any other op — but nothing
-    /// reads its result, so no register is involved and no edge exists for the
-    /// topological sort to follow back.
+    /// Write the current sub-block's value into a parameter delay line.
+    /// Deliberately does not write to a register to omit an edge in the topological
+    /// sort, thereby preventing cycles.
     DelayWrite {
         line: u16,
         a: Reg,
@@ -185,11 +187,11 @@ impl Waveform {
 
 /// Which per-note controller a node reads.
 ///
-/// v1 reduces polyphony away: each source keeps the most recent value from any
-/// note. The graph is monophonic, so a per-voice value would have nowhere to
-/// go. `Capabilities.poly_modulation` is what will decide whether the *voice*
-/// level ever becomes reachable, and the editor already greys these out when
-/// the sub-plugin cannot accept per-note modulation.
+/// The graph is monophonic, so polyphony is reduced away: each source keeps the
+/// most recent value from any note, because a per-voice value would have nowhere
+/// to go. `Capabilities.poly_modulation` is what will decide whether the *voice*
+/// level ever becomes reachable, and the editor already greys these out when the
+/// sub-plugin cannot accept per-note modulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExprSource {
     Pressure,
@@ -199,11 +201,11 @@ pub enum ExprSource {
     Vibrato,
     Volume,
     Pan,
-    /// Velocity of the most recent note-on, 0..1.
+    /// Velocity of the most recent note-on event, scaled to 0..1.
     Velocity,
-    /// 1 while any note is held, 0 otherwise.
+    /// 1.0 while any note is currently held, 0.0 otherwise.
     Gate,
-    /// The most recent note's key, scaled to 0..1 across the MIDI range.
+    /// Key number of the most recent note, normalized to 0..1 across the MIDI range.
     KeyTrack,
 }
 
@@ -236,9 +238,9 @@ impl ExprSource {
         }
     }
 
-    /// Whether this source comes from a per-note controller rather than from
-    /// the note itself. These are the ones a sub-plugin without per-note
-    /// modulation cannot meaningfully receive.
+    /// Whether this source comes from a per-note controller rather than from the
+    /// note itself. These are the ones a sub-plugin without per-note modulation
+    /// cannot meaningfully receive.
     pub fn is_per_note(self) -> bool {
         !matches!(
             self,
@@ -254,7 +256,7 @@ pub enum MathOp {
     Multiply,
     Min,
     Max,
-    /// `a^b` on a 0..1 input — the curve control of §9.3.
+    /// `a^b` on a 0..1 input — the curve control.
     Curve,
 }
 

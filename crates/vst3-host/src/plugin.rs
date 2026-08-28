@@ -1,6 +1,6 @@
-//! Instantiating a VST3 class and driving it — M1 and M2.
+//! Instantiating and driving a VST3 plugin instance.
 //!
-//! The lifecycle VST3 demands is long and order-sensitive:
+//! The VST3 lifecycle is sequence-sensitive:
 //!
 //! ```text
 //! createInstance(IComponent) -> initialize(host)
@@ -11,10 +11,11 @@
 //!   -> setActive(true) -> setProcessing(true) -> process...
 //! ```
 //!
-//! Getting any of it out of order produces failures that surface much later,
-//! so the whole sequence lives in one place and is expressed through the
-//! two-trait split of §4.2: [`Vst3Plugin`] is the main-thread half, and
-//! `activate` yields the audio-thread half by value.
+//! Getting any of it out of order produces failures that surface much later, so
+//! the whole sequence lives in one place and is expressed through the two-trait
+//! split: [`Vst3Plugin`] is the main-thread half, and `activate` yields the
+//! audio-thread half by value, so a processor cannot exist before the sequence
+//! has run.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -58,12 +59,12 @@ use crate::stream::MemoryStream;
 use crate::util::{from_char16, to_char16};
 use crate::vst_events;
 
-/// Per-block limits for the pre-allocated processing containers.
+/// Per-block capacity limits for pre-allocated processing containers.
 ///
-/// Fixed rather than derived because they must be decided before any audio
-/// runs, and the sub-block quantiser (§9.2) bounds how many points a block can
-/// ever carry: at 16-sample sub-blocks a 4096-sample block yields 256 updates
-/// per parameter at most.
+/// Fixed rather than derived because they must be decided before any audio runs,
+/// and the sub-block quantiser bounds how many points a block can ever carry: at
+/// 16-sample sub-blocks a 4096-sample block yields 256 updates per parameter at
+/// most.
 const MAX_PARAM_QUEUES: usize = 512;
 const MAX_POINTS_PER_PARAM: usize = 512;
 const MAX_EVENTS_PER_BLOCK: usize = 2048;
@@ -116,8 +117,8 @@ impl Vst3Plugin {
     pub fn create(module: &Module, cid: Cid, context: Arc<dyn HostContext>) -> Result<Vst3Plugin> {
         // Module-scoped, not instance-scoped: the factory retains the pointer
         // it is given via setHostContext for the module's whole lifetime. On
-        // Linux this is also where a plugin picks up the run loop, and §5.4
-        // wants that source to outlive any editor.
+        // Linux this is also where a plugin picks up the run loop, which has to
+        // outlive any editor.
         let host_app = module.host_application(Arc::clone(&context));
         let host_unknown = com_ref_ptr::<_, FUnknown>(&host_app);
 
@@ -139,7 +140,7 @@ impl Vst3Plugin {
             Self::create_controller(module, &component, host_unknown, &handler)?;
         // Only meaningful between two distinct objects. A single object
         // implementing both interfaces would be connected to itself, which
-        // plugins do not expect and OTT, for one, corrupts its heap over.
+        // plugins do not expect and at least one corrupts its heap over.
         let connection = if controller_is_separate {
             Self::connect(&component, controller.as_ref())
         } else {
@@ -233,8 +234,8 @@ impl Vst3Plugin {
         let cp_controller = controller.cast::<IConnectionPoint>()?;
 
         // Connected directly rather than through a relay object. A relay only
-        // earns its keep when the two halves live on different threads, which
-        // is an IPC-era concern (ADR-6), not a v1 one.
+        // earns its keep when the two halves live on different threads, which is
+        // an out-of-process concern rather than a present one.
         unsafe {
             cp_component.connect(cp_controller.as_ptr());
             cp_controller.connect(cp_component.as_ptr());
@@ -242,12 +243,12 @@ impl Vst3Plugin {
         Some((cp_component, cp_controller))
     }
 
-    /// Every bus the plugin declares, plus whether it takes notes (§14.2).
+    /// Returns every bus declared by the plugin and note input/output capabilities.
     ///
     /// Read before activation, so these are the plugin's *defaults* — what it
-    /// says it is before anyone negotiates with it. That is the right thing for
-    /// building sockets out of: the node has to offer a sidechain socket before
-    /// the graph can ask for one to be connected.
+    /// says it is before anyone negotiates with it. That is the right thing to
+    /// build sockets out of: the node has to offer a sidechain socket before the
+    /// graph can ask for one to be connected.
     pub fn io_layout(&self) -> plugin_host_api::IoLayout {
         use vst3::Steinberg::Vst::{BusDirections_, BusTypes_, MediaTypes_};
 
@@ -361,16 +362,16 @@ impl Vst3Plugin {
         &self.params
     }
 
-    /// Create the plugin's editor view, if it has one.
+    /// Creates the plugin's editor view (`IPlugView`), if supported.
     ///
     /// Returns the raw `IPlugView`. That is deliberate: everything to do with
-    /// windows lives in `vst3-host-view` (§2), and handing it the interface is
-    /// the whole seam between the two crates. `plugin-host-api` never sees it,
-    /// so the rule in §4.1 about backend types staying out of the API surface
-    /// is untouched.
+    /// windows lives in `vst3-host-view`, and handing it the interface is the
+    /// whole seam between the two crates. `plugin-host-api` never sees it, so
+    /// the rule about backend types staying out of the shared API surface is
+    /// untouched.
     ///
-    /// The caller owns the returned view and must tear it down in the order
-    /// §5.3 lays out; `vst3_host_view::EditorWindow` does exactly that.
+    /// The caller owns the returned view and must tear it down in the required
+    /// order; `vst3_host_view::EditorWindow` does exactly that.
     pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
         let controller = self.controller.as_ref()?;
         // "editor" is the only view name VST3 defines.
@@ -402,9 +403,8 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Fixed, not probed: VST3 has one value per parameter, so there is no
-        // non-destructive modulation and no per-voice addressing to discover
-        // (§3.4). Note expression is a different matter and is present.
+        // VST3 parameters hold a single normalized value without non-destructive modulation.
+        // Note expression support is queried from the controller interface.
         Capabilities {
             modulation: false,
             poly_modulation: false,
@@ -669,12 +669,10 @@ pub struct Vst3Processor {
     /// buffers. Sized once, never grown.
     input_ptrs: Vec<*mut f32>,
     output_ptrs: Vec<*mut f32>,
-    /// One descriptor per bus the plugin *declares*, active or not (§14.11).
+    /// Descriptors for each bus declared by the plugin (active or inactive).
     ///
-    /// Not one per bus we use: `numInputs` counts declared buses, and a plugin
-    /// that trusts it will read every entry. Ours declares a sidechain, and
-    /// handing it one entry is how this was found. Built at activate with the
-    /// widths fixed, so a block only refreshes the pointers.
+    /// `numInputs` and `numOutputs` count all declared buses. Inactive buses have
+    /// zero channels and null channel buffers.
     input_buses: Vec<vst3::Steinberg::Vst::AudioBusBuffers>,
     output_buses: Vec<vst3::Steinberg::Vst::AudioBusBuffers>,
 
@@ -768,13 +766,8 @@ impl SubPluginProcessor for Vst3Processor {
             *slot = unsafe { output_raw.add(channel * frame_len) };
         }
 
-        // One `AudioBusBuffers` per *declared* bus, pointing into the one flat
-        // run (§14.11). An inactive bus keeps zero channels and a null pointer,
-        // which is what an unconnected bus looks like — but it still gets an
-        // entry, because `numInputs` counts declared buses and a plugin that
-        // trusts the count will read every one. Only the pointers are refreshed
-        // here: the array and the widths were fixed at activate, because
-        // `process` may not allocate.
+        // Refresh channel buffer pointers for each active declared bus.
+        // Inactive buses retain zero channels and null buffers.
         let mut at = 0usize;
         for bus in self.input_buses.iter_mut() {
             let width = bus.numChannels.max(0) as usize;
@@ -862,12 +855,9 @@ fn empty_bus(bus: &DeclaredBus) -> vst3::Steinberg::Vst::AudioBusBuffers {
     }
 }
 
-/// What one declared bus should be handed in `ProcessData` (§14.11).
+/// Channel configuration for a declared bus in `ProcessData`.
 ///
-/// Every bus a plugin *declares* needs an entry, active or not — that is what
-/// `numInputs` counts, and a plugin reading past the array is what it costs to
-/// be clever about it. Zero channels means the bus is declared but not switched
-/// on, which is what an unconnected bus looks like to a plugin.
+/// A channel count of zero indicates an inactive/unconnected bus.
 #[derive(Debug, Clone, Copy)]
 struct DeclaredBus {
     channels: usize,
@@ -891,15 +881,12 @@ fn setup_buses(
         match channels {
             0 => 0,
             1 => SpeakerArr::kMono,
-            // v1 is stereo-only (§11); wider requests are asked for as stereo
-            // and the result is verified below rather than assumed.
+            // Channel counts above 1 are negotiated as stereo.
             _ => SpeakerArr::kStereo,
         }
     };
 
-    // Every input bus is named in one call: VST3 negotiates the whole
-    // arrangement at once, and asking about the main bus alone leaves a plugin
-    // believing its sidechain is whatever it defaulted to (§14.11).
+    // Negotiate all main and auxiliary input arrangements in a single pass.
     let mut inputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_inputs.len());
     if config.input_channels > 0 {
         inputs.push(arrangement(config.input_channels));
@@ -907,9 +894,7 @@ fn setup_buses(
     for width in config.aux_inputs.iter() {
         inputs.push(arrangement(u32::from(width)));
     }
-    // The same on the way out: the graph may read a plugin's extra output
-    // buses (§14.2), and a bus nobody reads is left out of the negotiation so
-    // the plugin need not compute it.
+    // Negotiate main and auxiliary output arrangements.
     let mut outputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_outputs.len());
     if config.output_channels > 0 {
         outputs.push(arrangement(config.output_channels));
@@ -1031,9 +1016,7 @@ fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
         }
 
         let stepped = raw.stepCount > 0;
-        // VST3 speaks normalised 0..1; the core speaks plain (§3.1). The
-        // controller's own converter is the only correct source for the range,
-        // since the mapping can be non-linear.
+        // The edit controller provides the authoritative plain value range.
         let (min, max) = if stepped {
             (0.0, raw.stepCount as f64)
         } else {
@@ -1050,8 +1033,7 @@ fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
         flags.set(ParamFlags::READONLY, raw.flags & F::kIsReadOnly != 0);
         flags.set(ParamFlags::BYPASS, raw.flags & F::kIsBypass != 0);
         flags.set(ParamFlags::AUTOMATABLE, raw.flags & F::kCanAutomate != 0);
-        // No MODULATABLE / POLY_MODULATABLE: VST3 has one value per parameter,
-        // so neither exists in this backend (§3.4).
+        // VST3 represents single parameter values without modulation metadata.
 
         out.push(ParamInfo {
             id: ParamId(raw.id),

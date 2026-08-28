@@ -1,41 +1,36 @@
-//! The ceilings this wrapper is built with.
+//! Capacity limits and configuration constants for the wrapper plugin.
+//!
+//! These constants define AudioGraph's limits and are passed to
+//! [`SubHostConfig`][subhost_adapter::SubHostConfig].
 //!
 //! They live here rather than in `subhost-adapter` because they are AudioGraph's
 //! numbers, not facts about hosting a plugin inside another one: the adapter
-//! takes all three as a [`SubHostConfig`][subhost_adapter::SubHostConfig] and
-//! never names one itself.
+//! takes all three as configuration and never names one itself.
 
 use subhost_adapter::SubHostConfig;
 
-/// How many slots the wrapper publishes to the DAW (ARCHITECTURE.md §4.6).
+/// Number of parameter slots the wrapper publishes to the host DAW.
 ///
-/// Fixed because VST3 cannot add parameters at runtime. CLAP can, and will, but
-/// nothing below this line sees anything but an abstract slot table.
+/// Fixed at compile time because formats such as VST3 cannot add parameters at runtime.
+/// Host automation drives these abstract slots, which the user can bind to sub-plugin parameters.
 pub const SLOT_COUNT: usize = 32;
 
-/// How many plugin nodes one patch may hold (§4.4).
+/// Maximum number of plugin nodes (sub-plugin instances) a single patch may hold.
 ///
-/// A ceiling rather than guidance: the graph names an instance by index and the
-/// buffer pool is sized at activate, so the number has to be known before the
-/// user starts drawing.
+/// Serves as a fixed ceiling so that instance indexing and buffer pools can be
+/// sized during activation before nodes are created.
 pub const MAX_INSTANCES: usize = 16;
 
-/// How many values one sub-block of the schedule carries (§4.6).
+/// Total number of automation and control lanes carried per schedule sub-block.
 ///
-/// The DAW's slots, then one lane per sub-plugin parameter the graph drives
-/// directly, then one per audio-side control it automates — a delay time or a
-/// Mix gain. One buffer rather than three because they are produced by the same
-/// evaluator pass and consumed by the same merge: the evaluator writes a lane
-/// exactly the way it writes a slot, and nothing below the compiler has to know
-/// which is which.
-///
-/// The ranges are disjoint and fixed, which is what lets each consumer read only
-/// its own: the sub-plugin adapter never sees a delay time or a gain, and the
-/// audio half never sees a parameter.
+/// Includes DAW parameter slots, graph-driven sub-plugin parameter lanes, and
+/// audio-side control lanes (such as delay times or mix gains). Storing all lanes
+/// in a single contiguous buffer allows a unified evaluation pass with disjoint,
+/// fixed index ranges for each consumer.
 pub const LANES: usize =
     SLOT_COUNT + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES;
 
-/// What every `SubHost` in this wrapper is built with.
+/// Configuration used to initialize each [`SubHost`][subhost_adapter::SubHost] in this wrapper.
 pub const SUB_HOST: SubHostConfig = SubHostConfig {
     max_instances: MAX_INSTANCES,
     slot_count: SLOT_COUNT,

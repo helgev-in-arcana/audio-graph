@@ -1,20 +1,13 @@
-//! Compiled-program snapshots, kept as a safety net for refactoring.
+//! Golden snapshots of compiled programs for regression testing.
 //!
-//! `Program` derives `Debug` and `PartialEq`, so the whole compiler output —
-//! instruction order, register numbers, buffer numbers, lane assignments — can
-//! be pinned by pretty-printing it. That is deliberately more than the unit
-//! tests in `compile.rs` and `audio.rs` assert: those check the properties that
-//! are *meant* to hold, and this checks that nothing else moved either.
+//! Snapshot tests compare compiled [`Program`] outputs (including instruction order,
+//! register allocations, buffer indices, and lane mappings) against expected
+//! golden fixtures in `tests/golden/`.
 //!
-//! A failure here is not automatically a bug. It says "the emitted program
-//! changed"; whether that change was intended is a judgement. When it was,
-//! re-bless with:
-//!
+//! Golden snapshots can be regenerated using:
 //! ```text
 //! BLESS_GOLDEN=1 cargo test -p audio-graph-engine --test golden
 //! ```
-//!
-//! and read the diff in `git diff` before committing it.
 
 use std::path::PathBuf;
 
@@ -85,8 +78,7 @@ fn stereo_plugin(instance: usize, latency: u32) -> NodeKind {
     })
 }
 
-/// Somewhere for a parameter chain to go: a plugin node with one parameter
-/// socket and nothing else. `SlotOut` used to play this part.
+/// Helper creating a parameter sink plugin node with one parameter socket.
 fn param_sink(graph: &mut Graph) -> NodeId {
     graph.add(
         NodeKind::Plugin(Plugin {
@@ -374,7 +366,7 @@ fn latency_compensation() {
     check("latency_compensation", &graph);
 }
 
-/// §14.14: kept only because the user said so.
+/// Verifies compilation of a node explicitly marked always_on.
 #[test]
 fn always_on_node() {
     let mut graph = Graph::new();
@@ -385,12 +377,10 @@ fn always_on_node() {
 
 // --- the patch format -----------------------------------------------------
 
-/// One patch mentioning every node kind there is, held as a literal.
-///
-/// This is the contract with the files users have already saved: if a
-/// refactoring changes how a kind is spelled on disk, this fails rather than
-/// silently making old patches unopenable. `compile.rs`'s
-/// `a_pre_m8_patch_still_loads` covers the older shape; this one covers today's.
+/// JSON patch fixture exercising serialization across all node kinds.
+/// This serves as a backward-compatibility contract with files users have already saved:
+/// if a refactoring changes how a node kind is serialized, the test will fail instead of
+/// silently making old patches unopenable.
 const EVERY_KIND: &str = r#"{
   "nodes": [
     {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},

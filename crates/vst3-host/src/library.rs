@@ -1,13 +1,7 @@
 //! Platform dynamic-library loading and VST3 bundle layout.
 //!
-//! This is the one part of the C++ SDK (`VST3::Hosting::Module`) that is
-//! genuinely tedious to reproduce (ADR-2); everything above it is easier in
-//! Rust than in C++.
-//!
-//! A `.vst3` is either a plain shared library with that extension (still common
-//! on Windows) or a bundle directory laid out as
-//! `Name.vst3/Contents/<arch>/Name.<ext>`. Both are handled here so nothing
-//! above this module ever branches on it.
+//! Handles loading `.vst3` binaries, whether laid out as a standalone shared
+//! library or as a bundle directory (`Name.vst3/Contents/<arch>/Name.<ext>`).
 
 use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
@@ -276,8 +270,8 @@ mod imp {
             let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
                 HostError::ModuleLoad(format!("path has interior nul: {}", path.display()))
             })?;
-            // RTLD_LOCAL so a plugin's symbols cannot collide with the host's
-            // or another plugin's — the very failure that would trigger ADR-6.
+            // RTLD_LOCAL ensures plugin symbols do not pollute the host or
+            // collide with other plugins' symbol tables.
             let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if h.is_null() {
                 let msg = unsafe {

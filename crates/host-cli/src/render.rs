@@ -1,4 +1,4 @@
-//! Offline rendering — the M1 acceptance check, run without a DAW.
+//! Offline audio rendering utilities for plugin testing.
 
 use std::path::Path;
 use std::sync::Arc;

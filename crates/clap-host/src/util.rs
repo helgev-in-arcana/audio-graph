@@ -1,7 +1,4 @@
-//! C-string helpers.
-//!
-//! CLAP is a C API: everything the plugin says arrives as a NUL-terminated
-//! `char*` of unknown provenance, and everything the host says has to be one.
+//! C-string decoding and string conversion helpers.
 
 use std::ffi::{CStr, c_char};
 

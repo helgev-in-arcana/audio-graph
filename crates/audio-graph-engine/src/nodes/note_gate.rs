@@ -7,24 +7,10 @@ use crate::nodes::Node;
 use crate::nodes::widgets::NodeUi;
 use crate::port::{Port, PortType};
 
-/// Pass notes on or hold them back, by where a control sits against a
-/// threshold.
+/// Gates a MIDI note stream based on whether a parameter control value meets a threshold.
 ///
-/// The note half's answer to [`Gate`][crate::Gate], and it works quite
-/// differently underneath, because notes are not a buffer: this crate routes
-/// the *name* of a note source and lets the wrapper turn it into events
-/// (§14.10). So the gate is not something that happens to a stream — it is a
-/// note on the route, carried to the plugin at the end of it and applied when
-/// the events are handed over.
-///
-/// Shut means note-ons are held back and everything else still passes, so a
-/// note that was already sounding gets its note-off and the gate can be thrown
-/// mid-phrase without leaving a hung note behind. It also means a shut gate
-/// does not cut a sounding note short; that is a release, not a mute, and
-/// muting the audio is what [`Gate`][crate::Gate] is for.
-///
-/// An unwired control reads as zero, so a gate nobody has wired is shut — the
-/// same way round as the audio gate, and for the same reason.
+/// When closed, note-on events are blocked while note-off and other MIDI events
+/// are allowed through to avoid stuck notes. Unconnected control inputs default to zero (closed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoteGate {
     /// Notes pass at this value and above — or below it, with `invert`.
@@ -60,9 +46,7 @@ impl Node for NoteGate {
             low: Operand::Value(low),
             high: Operand::Value(high),
         });
-        // Gates in series pass notes only when every one of them is open, and
-        // multiplying the conditions is how that becomes one register — which
-        // is what the audio half reads, so it never has to carry a list.
+        // Combine this gate condition with any upstream note gate condition via multiplication.
         let condition = match cx.upstream_note_gate(0) {
             Some(upstream) => {
                 let both = cx.alloc()?;

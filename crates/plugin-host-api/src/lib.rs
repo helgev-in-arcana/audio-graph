@@ -1,12 +1,16 @@
 //! Format-agnostic plugin hosting API.
 //!
-//! ARCHITECTURE.md §3 / ADR-4: the data model here is deliberately shaped after
-//! CLAP (the richer format). VST3 backends *degrade* to it; the model is never
-//! narrowed to the intersection of the two formats.
+//! Provides a unified data model and trait definitions for hosting audio
+//! plugins across different plugin formats (such as CLAP and VST3).
 //!
-//! ARCHITECTURE.md §4: nothing that cannot cross a process boundary may appear
-//! in a public signature here — no `ComPtr`, no raw pointers, no references or
-//! `Arc` in payloads, no single-shot getters.
+//! Two rules shape everything here, and `README.md` in this crate spells out
+//! why:
+//!
+//! * The model is shaped after CLAP, the richer format. VST3 backends
+//!   *degrade* to it; it is never narrowed to the intersection of the two.
+//! * Nothing that cannot cross a process boundary may appear in a public
+//!   signature — no `ComPtr`, no raw pointers, no references or `Arc` in
+//!   payloads, no single-shot getters.
 
 mod buffers;
 mod events;
@@ -24,7 +28,7 @@ pub use traits::{HostContext, ProcessStatus, RestartReason, SubPluginMain, SubPl
 /// Errors surfaced across the host API boundary.
 ///
 /// Deliberately a flat, owned enum: it must be serializable across an IPC
-/// boundary (ADR-6) without dragging backend types along.
+/// boundary without dragging backend types along.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostError {
     /// The module (bundle / DLL / .so) could not be loaded.

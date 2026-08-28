@@ -1,4 +1,4 @@
-//! The wrapper's own audio buses (§14).
+//! Audio input and output nodes for host DAW audio buses.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,14 +23,15 @@ pub struct AudioOut {
     pub channels: u16,
 }
 
-/// Bus 0 is the signal path; the rest are aux, and are drawn as such (§14.11).
+/// Constructs a port for an audio bus, marking non-zero bus indices as auxiliary ports.
 fn bus_port(name: &'static str, bus: usize, channels: u16) -> Port {
     let port = Port::new(name, PortType::Audio { channels });
     if bus == 0 { port } else { port.aux() }
 }
 
-// Audio nodes carry no param register at all. The audio pass walks the same
-// order again and emits their half (§14.9).
+// Audio nodes emit audio processing operations without allocating parameter registers.
+// The audio pass walks the same topological order as the parameter pass and emits
+// their half.
 
 impl Node for AudioIn {
     fn title(&self) -> String {
@@ -80,8 +81,7 @@ fn bus_control(ui: &mut egui::Ui, bus: &mut usize) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label("bus");
-        // One-based on screen: the DAW calls them "Main" and "Sidechain", not
-        // "0" and "1".
+        // Display as 1-based index (1: Main, 2: Sidechain).
         let mut shown = *bus as u32 + 1;
         if ui
             .add(egui::DragValue::new(&mut shown).range(1..=2))

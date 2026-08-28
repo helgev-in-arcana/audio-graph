@@ -1,14 +1,15 @@
-//! The traits every backend implements (ARCHITECTURE.md §4).
+//! Core traits for plugin hosting backends.
 //!
 //! Two rules drive the shape here:
 //!
-//! * Nothing that cannot cross a process boundary appears in a signature, so
-//!   an out-of-process backend (ADR-6) is a drop-in replacement rather than a
-//!   rewrite. That is why there are no single-shot getters and no `Arc`s.
-//! * Main-thread and audio-thread surfaces are *different traits*, so calling
-//!   `process` on an inactive plugin is a compile error rather than a rule in a
-//!   document. `activate` hands out the processor by value; you cannot hold one
-//!   without having activated.
+//! * Nothing that cannot cross a process boundary appears in a signature, so an
+//!   out-of-process backend is a drop-in replacement rather than a rewrite.
+//!   That is why there are no single-shot getters and no `Arc`s.
+//! * Main-thread and audio-thread surfaces are *different traits*
+//!   ([`SubPluginMain`] and [`SubPluginProcessor`]), so calling `process` on an
+//!   inactive plugin is a compile error rather than a rule in a document.
+//!   `activate` hands out the processor by value; you cannot hold one without
+//!   having activated.
 
 use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
@@ -31,7 +32,7 @@ pub enum ProcessStatus {
 /// `vst3-host` never builds an `IHostApplication` of its own — it is injected
 /// through this trait. That keeps "forwarded from the DAW" out of the core's
 /// vocabulary entirely, so a standalone scanner and the nested wrapper are
-/// expressed by the same types (§7).
+/// expressed by the same types.
 ///
 /// All methods are called on the main thread.
 pub trait HostContext: Send + Sync {
@@ -43,7 +44,7 @@ pub trait HostContext: Send + Sync {
     fn request_restart(&self, reason: RestartReason);
 
     /// The plugin's reported latency changed. `subhost-adapter` combines this
-    /// with the wrapper's own latency and reports the sum to the DAW (§7.4).
+    /// with the wrapper's own latency and reports the sum to the DAW.
     fn latency_changed(&self, samples: u32) {
         let _ = samples;
         self.request_restart(RestartReason::Latency);
@@ -51,9 +52,8 @@ pub trait HostContext: Send + Sync {
 
     /// The sub-plugin edited a parameter from its own GUI.
     ///
-    /// v1 swallows this — in Drive mode the wrapper is the sole authority for
-    /// values, so there is nothing to forward to the DAW (§7.5) — but it is
-    /// still logged.
+    /// Swallowed today: the wrapper is the sole authority for values, so there
+    /// is nothing to forward to the DAW. It is still logged.
     fn param_edited(&self, id: ParamId, plain: f64) {
         let _ = (id, plain);
     }
@@ -78,8 +78,8 @@ pub enum RestartReason {
 /// Deliberately not `Send`: both VST3 and CLAP pin these calls to the thread
 /// that created the instance.
 pub trait SubPluginMain {
-    /// Full parameter list. Batched by construction — there is no
-    /// `param(id)` accessor anywhere in this API (§4.1).
+    /// Full parameter list. Batched by construction — there is no `param(id)`
+    /// accessor anywhere in this API.
     fn params(&self) -> &[ParamInfo];
 
     fn capabilities(&self) -> Capabilities;
@@ -94,11 +94,11 @@ pub trait SubPluginMain {
         None
     }
 
-    /// The plugin's buses and whether it takes notes (§14.2).
+    /// The plugin's audio buses and note input/output layout.
     ///
-    /// Read after loading and used to build the node's sockets. Batched for
-    /// the same reason as `params`: one round trip, so an out-of-process
-    /// backend is not a per-bus conversation (§4.1).
+    /// Read after loading and used to build the node's sockets. Batched for the
+    /// same reason as `params`: one round trip, so an out-of-process backend is
+    /// not a per-bus conversation.
     fn io_layout(&self) -> IoLayout;
 
     /// Current values of every parameter, in one round trip.
@@ -126,7 +126,7 @@ pub trait SubPluginMain {
 
     /// Enter the processing phase, yielding the audio-thread half.
     ///
-    /// Ownership transfer is the point: while the processor exists, the
+    /// Ownership transfer ensures that while the processor exists, the
     /// configuration cannot be changed.
     fn activate(&mut self, config: AudioConfig) -> Result<Box<dyn SubPluginProcessor>>;
 

@@ -1,4 +1,4 @@
-//! Running work on the next turn of somebody else's message loop.
+//! Mechanism for deferring execution to the next turn of the platform message loop.
 //!
 //! A GUI toolkit's draw callback is not a safe place to create, show or destroy
 //! a window. Those calls dispatch messages synchronously, and the message lands
@@ -14,16 +14,16 @@
 //! ```
 //!
 //! The rule that follows is simple and applies to every toolkit, not just this
-//! one: **the draw callback may only record what the user asked for.** This
-//! type is where the recorded work goes. A message-only window takes a posted
-//! message, and by the time its handler runs, the frame is over and the toolkit
-//! is no longer inside itself.
+//! one: **the draw callback may only record what the user asked for.**
+//! [`Deferred`] is where the recorded work goes. A message-only window takes a
+//! posted message, and by the time its handler runs the frame is over and the
+//! toolkit is no longer inside itself.
 //!
-//! It carries one-shot work only. The periodic tick the sub-plugin's window
-//! needs (§5.2) used to live here as well, on a Win32 timer, which quietly
-//! meant no tick at all on the platforms whose backend is still a stub. It
-//! belongs to the plugin instance now, which reaches the main thread through
-//! its host rather than through a window — see `audio-graph-plugin`'s `tick`.
+//! It carries one-shot work only. The periodic tick a sub-plugin's window needs
+//! used to live here as well, on a Win32 timer, which quietly meant no tick at
+//! all on the platforms whose backend is still a stub. It belongs to the plugin
+//! instance now, which reaches the main thread through its host rather than
+//! through a window — see `audio-graph-plugin`'s `tick`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

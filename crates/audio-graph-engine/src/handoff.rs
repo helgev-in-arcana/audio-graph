@@ -1,22 +1,12 @@
-//! Giving the audio thread a new value without it ever blocking or freeing.
+//! Lock-free and allocation-free communication channel for passing compiled programs to the audio thread.
 //!
-//! ARCHITECTURE.md §9.1 asks for two things at once: the audio thread must
-//! swap in a newly compiled `Program` without taking a lock, and the old one
-//! must be reclaimed on the UI thread rather than dropped in the callback.
-//! A plain `AtomicPtr` gives the first and not the second — whoever swaps the
-//! new pointer in ends up holding the old one, and on the audio thread that
-//! means a `free` inside `process`.
+//! Provides a single-producer single-consumer channel where the audio thread can
+//! swap in a newly compiled `Program` without acquiring locks or allocating/freeing memory.
+//! Replaced programs are returned back to the main thread via dedicated return slots to be
+//! safely deallocated on the non-realtime thread.
 //!
-//! So the traffic goes both ways. One slot carries values down to the audio
-//! thread; a small fixed set of slots carries the displaced ones back up. The
-//! audio thread checks it has somewhere to *put* the old value before it takes
-//! the new one, which turns the only failure mode — the return slots being
-//! full — into "keep running the current program for one more block". That is
-//! the correct behaviour anyway: an edit arriving a millisecond late is not
-//! something anyone can hear, and it costs nothing to be exactly right about
-//! it rather than nearly right.
-//!
-//! Single producer (the main thread), single consumer (the audio thread).
+//! If the return slots are full, the audio thread declines taking the new program and
+//! continues running the existing program until return slots are reclaimed.
 
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};

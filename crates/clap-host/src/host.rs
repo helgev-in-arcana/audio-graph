@@ -1,14 +1,8 @@
-//! The `clap_host` a plugin is handed, and the extensions it can ask us for.
+//! Host implementation and extension vtables provided to hosted CLAP plugins.
 //!
-//! CLAP inverts VST3's arrangement: instead of one `IHostApplication` that
-//! answers `queryInterface`, the host publishes a `get_extension` function and
-//! a set of small vtables. The tables are pure function pointers, so they are
-//! `static`; only the per-instance state below is allocated.
-//!
-//! Scope discipline is the same as `vst3-host`'s (ARCHITECTURE.md §7): nothing
-//! here decides *policy*. Every request from a plugin is either recorded for the
-//! owner to act on at a safe moment, or forwarded to the injected
-//! [`plugin_host_api::HostContext`].
+//! Provides the `clap_host` struct and static extension tables (`clap_host_params`,
+//! `clap_host_gui`, `clap_host_latency`, etc.) required by plugins, forwarding notifications
+//! and restart requests to [`plugin_host_api::HostContext`].
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -61,10 +55,7 @@ const MIN_TIMER_PERIOD_MS: u32 = 8;
 thread_local! {
     /// Non-zero while this thread is inside `clap_plugin::process`.
     ///
-    /// This is the whole of the `clap.thread-check` answer for the audio side.
-    /// A counter rather than a flag because a sub-plugin's `process` can run
-    /// inside our own (§14.9), and the inner call must not clear the outer
-    /// call's mark on the way out.
+    /// Tracks recursion depth so nested process calls do not prematurely clear the audio thread mark.
     static AUDIO_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -458,9 +449,7 @@ unsafe extern "C" fn params_clear(
     _param_id: clap_id,
     _flags: clap_param_clear_flags,
 ) {
-    // Nothing to clear: v1 is Drive mode (ADR-5), so the wrapper is the sole
-    // authority for every value and holds no automation or modulation of its
-    // own that a plugin could ask it to drop.
+    // No-op: the host manages parameter values directly.
 }
 
 unsafe extern "C" fn params_request_flush(host: *const clap_host) {
@@ -492,10 +481,7 @@ static HOST_STATE: clap_host_state = clap_host_state {
 };
 
 unsafe extern "C" fn mark_dirty(_host: *const clap_host) {
-    // The wrapper saves the sub-plugin's blob whenever the DAW asks it for
-    // state (§8.3); there is no separate dirty flag to set. Forwarding it as an
-    // edit would be wrong — `param_edited` names a parameter, and this call
-    // does not.
+    // Plugin state is queried directly on save; no separate dirty flag is tracked.
 }
 
 // --- clap.gui -------------------------------------------------------------
@@ -611,8 +597,6 @@ unsafe extern "C" fn audio_ports_flag_supported(_host: *const clap_host, _flag: 
 unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, _flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
         shim.audio_ports.store(true, Ordering::Release);
-        // The graph builds a node's sockets from the bus layout (§14.2), so
-        // this is a structural change and not just a restart.
         shim.context.request_restart(RestartReason::IoConfig);
     }
 }
@@ -625,9 +609,7 @@ static HOST_NOTE_PORTS: clap_host_note_ports = clap_host_note_ports {
 };
 
 unsafe extern "C" fn note_supported_dialects(_host: *const clap_host) -> clap_note_dialect {
-    // CLAP notes carry a note id, which is what per-voice work needs (§3.2);
-    // MIDI is offered as well because a plugin that speaks only MIDI is common
-    // and the core model has a raw-MIDI event for exactly this.
+    // Both CLAP note dialect (with note IDs) and raw MIDI dialect are supported.
     CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI
 }
 

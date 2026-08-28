@@ -1,9 +1,7 @@
 //! Loading a `.clap` module and enumerating the plugins it offers.
 //!
-//! The CLAP counterpart of `vst3-host::module`, and structurally the same
-//! shape: a reference-counted handle onto one loaded library, cached by path so
-//! the entry point runs exactly once (ADR-7), plus a batched read of everything
-//! a scanner wants to know.
+//! Provides a reference-counted handle onto a loaded CLAP library module, cached by path
+//! to ensure entry points are initialized exactly once per module.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,8 +26,7 @@ use crate::util::from_cstr;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassInfo {
     /// The plugin's reverse-DNS identity, e.g. `com.surge-synth-team.surge-xt`.
-    /// Stable across versions and machines; this is what a saved binding
-    /// records (ARCHITECTURE.md §8.3).
+    /// Stable across versions and systems.
     pub id: String,
     pub name: String,
     pub vendor: String,
@@ -42,9 +39,6 @@ pub struct ClassInfo {
 
 impl ClassInfo {
     /// Whether the plugin declares itself an instrument.
-    ///
-    /// Matters for the same reason as its VST3 twin: the wrapper's own category
-    /// is static while the sub-plugin's is not (§6).
     pub fn is_instrument(&self) -> bool {
         self.features
             .iter()
@@ -107,10 +101,8 @@ impl Drop for ModuleInner {
 thread_local! {
     /// Modules already loaded on this thread, keyed by canonical path.
     ///
-    /// `clap_entry.init` must be balanced exactly once per module no matter how
-    /// many times a host asks for it — the same rule VST3's `InitDll` has, and
-    /// the same reason ADR-7 exists. `Weak`, so a module is genuinely unloaded
-    /// once nothing refers to it.
+    /// Ensures `clap_entry.init` is balanced once per module. Uses `Weak` so modules
+    /// are unloaded when no live references remain.
     static LOADED: RefCell<HashMap<PathBuf, Weak<ModuleInner>>> =
         RefCell::new(HashMap::new());
 }
@@ -281,8 +273,7 @@ unsafe fn describe(desc: *const clap_plugin_descriptor) -> Option<ClassInfo> {
     }
     let id = unsafe { from_cstr(d.id) };
     if id.is_empty() {
-        // The id is the identity a binding is saved against (§8.3). A plugin
-        // without one cannot be found again, so it is not offerable.
+        // Plugins without a unique ID cannot be identified and are ignored.
         return None;
     }
     Some(ClassInfo {

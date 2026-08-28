@@ -3,6 +3,7 @@ name = "host-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 
 [dependencies]
 plugin-host.workspace = true

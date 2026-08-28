@@ -3,6 +3,7 @@ name = "audio-graph-plugin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 
 [lib]
 crate-type = ["lib", "cdylib"]

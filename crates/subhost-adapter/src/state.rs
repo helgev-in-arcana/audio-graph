@@ -1,30 +1,33 @@
-//! Naming a sub-plugin, and nesting its state inside the wrapper's.
+//! State serialization types and helpers for hosted sub-plugins.
 //!
-//! What a wrapper saves is its own business — which slots it publishes, what a
-//! patch looks like. What is *not* its own business is the sub-plugin's chunk:
-//! it is opaque, it has to survive a round trip unread, and the reference that
-//! says which plugin to reload has to outlive that plugin going missing. Those
-//! are the pieces here.
+//! What a wrapper saves is its own business — which slots it publishes, what
+//! a patch looks like. What is *not* its own business is the sub-plugin's
+//! chunk: it is opaque, it has to survive a round trip unread, and the
+//! reference that says which plugin to reload has to outlive that plugin going
+//! missing. Those are the pieces here, plus the base64 the text round trip
+//! needs.
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies which sub-plugin to reload.
+/// Persistent reference identifying a sub-plugin to load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubPluginRef {
-    /// `"vst3"` today; the field exists so a CLAP reference (M6) is additive.
+    /// Plugin format identifier (e.g. `"vst3"`, `"clap"`). A field rather
+    /// than an assumption, so adding a format stays additive.
     pub format: String,
-    /// Authoritative identity: the VST3 class id in its platform-independent
-    /// hex form, so a project moves between machines and operating systems.
+    /// Authoritative identity: a VST3 class id in its platform-independent
+    /// hex form, or a CLAP plugin id, so a project moves between machines and
+    /// operating systems.
     pub plugin_id: String,
-    /// Where it was last found. A *hint* only — plugin folders differ between
-    /// machines, so a missing path triggers a search by `plugin_id` rather than
-    /// a failure.
+    /// Where it was last found. A *hint* only: plugin folders differ between
+    /// machines, so a missing path triggers a search by `plugin_id` rather
+    /// than a failure.
     pub path_hint: String,
     /// For showing the user what is missing when it cannot be found.
     pub display_name: String,
 }
 
-/// One hosted sub-plugin, as saved.
+/// Serialized state for a single sub-plugin instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceState {
     /// Which plugin node this belongs to. Stored rather than implied by
@@ -32,11 +35,8 @@ pub struct InstanceState {
     /// renumber the ones after it.
     pub instance: usize,
     pub reference: SubPluginRef,
-    /// The sub-plugin's own opaque chunk.
-    ///
-    /// Base64 rather than raw bytes because a wrapper's saved state is usually
-    /// a text document, and a chunk that has to survive one unread cannot be
-    /// carried as bytes in it.
+    /// The sub-plugin's own opaque chunk. Base64 rather than raw bytes
+    /// because a wrapper's saved state is usually a text document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 }
@@ -47,24 +47,26 @@ impl InstanceState {
     }
 }
 
-/// What a [`SubHost`][crate::SubHost] saves and restores.
+/// State container for all slots and sub-plugin instances in a
+/// [`SubHost`][crate::SubHost].
 ///
-/// Not itself a saved document: a wrapper owns its own file format — a version
-/// number, whatever patch it holds — and this is only the part of it that this
-/// crate can fill in and read back. Keeping the two apart is what lets a
-/// wrapper lay its file out however it likes, and lets a project written by a
-/// newer build survive a round trip through an older one.
+/// Not itself a saved document: a wrapper owns its own file format — a
+/// version number, whatever patch it holds — and this is only the part of it
+/// that this crate can fill in and read back. Keeping the two apart is what
+/// lets a wrapper lay its file out however it likes, and lets a project
+/// written by a newer build survive a round trip through an older one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubHostState {
     pub slots: Vec<crate::slots::Slot>,
     pub instances: Vec<InstanceState>,
 }
 
-/// Minimal standard base64. Written out rather than taken as a dependency:
-/// it is thirty lines, and this is the only place the project needs it.
+/// Encodes raw bytes into standard base64 string format.
 ///
-/// Public because a wrapper's own state has the same problem this solves: an
-/// opaque chunk, in a text document.
+/// Written out rather than taken as a dependency: it is thirty lines, and this
+/// is the only place the project needs it. Public because a wrapper's own
+/// state has the same problem this solves — an opaque chunk in a text
+/// document.
 pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -92,6 +94,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes a base64-encoded string into raw bytes, returning `None` if the input is invalid.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     fn value(c: u8) -> Option<u32> {
         Some(match c {
@@ -146,8 +149,9 @@ mod tests {
 
     #[test]
     fn base64_rejects_garbage_instead_of_returning_nonsense() {
-        // A corrupted project should surface as "sub-plugin state unreadable",
-        // not as a chunk of wrong bytes handed to a third-party plugin.
+        // A corrupted project should surface as "sub-plugin state
+        // unreadable", not as a chunk of wrong bytes handed to a third-party
+        // plugin.
         assert_eq!(base64_decode("!!!!"), None);
         assert_eq!(base64_decode("abc"), None);
     }

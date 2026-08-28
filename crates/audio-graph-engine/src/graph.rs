@@ -1,15 +1,17 @@
-//! The edit graph: what the user draws, and what gets saved.
+//! Mutable edit graph data structures and operations.
+//!
+//! What the user draws, and what gets saved.
 //!
 //! Deliberately dumb. It stores nodes and links and nothing else — no cached
 //! ordering, no resolved pointers, no execution state. Everything the audio
 //! thread needs is derived by [`compile`][crate::compile] into a flat
-//! [`Program`][crate::Program]. That split is ARCHITECTURE.md §9.1, and it is
-//! what makes it safe for this type to be edited freely: a half-finished graph
-//! with a dangling link or a cycle is a perfectly ordinary thing for a user to
-//! have on screen, and none of it can reach the audio thread.
+//! [`Program`][crate::Program]. That split is what makes it safe for this type
+//! to be edited freely: a half-finished graph with a dangling link or a cycle is
+//! a perfectly ordinary thing for a user to have on screen, and none of it can
+//! reach the audio thread.
 //!
 //! Nothing here knows what a VST3 is. A node reads a slot and a node writes a
-//! slot; what a slot is bound to is the outer layer's business (§8).
+//! slot; what a slot is bound to is the outer layer's business.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,32 +35,28 @@ pub struct Node {
     ///
     /// The compiler keeps only what feeds an output, which is right for every
     /// node whose whole purpose is the value it hands on — and wrong for an
-    /// analyser, whose purpose is the side effect of having run. There is no
-    /// way to tell the two apart from the graph, so the user says which it is.
+    /// analyser, whose purpose is the side effect of having run. There is no way
+    /// to tell the two apart from the graph, so the user says which it is.
     #[serde(default)]
     pub always_on: bool,
     pub kind: NodeKind,
 }
 
 /// A connection from one node's output port to another node's input port.
-///
-/// Before M8 every node had exactly one output, so a link only had to name the
-/// destination socket. A plugin node has as many outputs as the plugin turned
-/// out to have buses (§14.2), so both ends are numbered now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
     pub from: NodeId,
-    /// Which of `from`'s outputs. Absent in pre-M8 patches, where it was
-    /// always the only one.
+    /// Which of `from`'s outputs. Absent in patches written when every node had
+    /// exactly one output, where it was always the only one.
     #[serde(default)]
     pub from_port: u8,
     pub to: NodeId,
-    /// Which of `to`'s inputs. Named `input` before M8.
+    /// Which of `to`'s inputs. Named `input` in older patches.
     #[serde(alias = "input")]
     pub to_port: u8,
 }
 
-/// The whole patch.
+/// The complete node graph patch.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -76,11 +74,11 @@ impl Graph {
     /// The patch a new instance starts with: the main input wired straight to
     /// the main output, drawn.
     ///
-    /// The wrapper used to pass audio through whenever no graph was running,
-    /// which meant the most common routing of all was the one thing the canvas
-    /// never showed. Making it two nodes and a link costs nothing and keeps the
-    /// rule simple: **what you hear is what is drawn** — an empty canvas is
-    /// silence, not a bypass.
+    /// The wrapper could pass audio through whenever no graph is running, which
+    /// would make the most common routing of all the one thing the canvas never
+    /// shows. Making it two nodes and a link costs nothing and keeps the rule
+    /// simple: **what you hear is what is drawn** — an empty canvas is silence,
+    /// not a bypass.
     pub fn default_patch() -> Graph {
         let mut graph = Graph::new();
         let input = graph.add(
@@ -119,11 +117,11 @@ impl Graph {
 
     /// Add both halves of a delay line, on a line nothing else is using.
     ///
-    /// One call because they are one thing to the user (§14.4): the split into
-    /// a writer and a reader is what keeps a cycle out of the topological sort,
-    /// not something anyone sat down wanting. They are still two nodes, and can
-    /// be moved apart, deleted separately, or joined by further reads — a
-    /// second read on the same line is a multi-tap delay.
+    /// One call because they are one thing to the user: the split into a writer
+    /// and a reader is what keeps a cycle out of the topological sort, not
+    /// something anyone sat down wanting. They are still two nodes, and can be
+    /// moved apart, deleted separately, or joined by further reads — a second
+    /// read on the same line is a multi-tap delay.
     ///
     /// Returns `(write, read)`.
     pub fn add_delay(&mut self, ty: PortType, pos: [f32; 2]) -> (NodeId, NodeId) {
@@ -133,8 +131,6 @@ impl Graph {
             NodeKind::DelayRead(DelayRead {
                 line,
                 ty,
-                // Long enough for an echo, short enough that the control is
-                // usable without zooming in on it.
                 max_time: 2.0,
                 time: 0.25,
             }),
@@ -179,8 +175,8 @@ impl Graph {
     /// Whether these two sockets may be joined.
     ///
     /// The editor asks this to decide what to draw; [`connect`][Self::connect]
-    /// asks it again so that a caller which does not ask cannot make a graph
-    /// the compiler would have to reject.
+    /// asks it again so that a caller which does not ask cannot make a graph the
+    /// compiler would have to reject.
     pub fn can_connect(&self, from: NodeId, from_port: u8, to: NodeId, to_port: u8) -> bool {
         if from == to {
             return false;
@@ -190,10 +186,10 @@ impl Graph {
             self.input_type(to, to_port),
         ) {
             // Audio joins audio whatever the widths are; the compiler adapts
-            // them explicitly (§14.11). The strict rule this replaces made a
-            // real plugin's sidechain unreachable -- RoughRider3's is mono and
-            // everything that would feed it is stereo -- and refusing the link
-            // taught the user nothing, because nothing in the graph converts.
+            // them explicitly. The strict rule this replaces made a real
+            // plugin's mono sidechain unreachable from a stereo graph, and
+            // refusing the link taught the user nothing, because nothing in the
+            // graph converts.
             (Some(PortType::Audio { .. }), Some(PortType::Audio { .. })) => true,
             (Some(a), Some(b)) => a == b,
             _ => false,
@@ -208,8 +204,8 @@ impl Graph {
 
     /// Connect two sockets, replacing whatever already fed that input.
     ///
-    /// An input takes one link. Feeding it two would need a mixing rule, and
-    /// an explicit Add node says what a hidden rule would only imply.
+    /// An input takes one link. Feeding it two would need a mixing rule, and an
+    /// explicit Mix node says what a hidden rule would only imply.
     ///
     /// A mismatched or non-existent pair is ignored rather than reported: the
     /// editor has already decided what it will let the user drag onto what, and
@@ -236,8 +232,8 @@ impl Graph {
     ///
     /// The sliding is the whole point. A link names its socket by index, so
     /// taking a socket out from the middle — one of a `Mix`'s inputs, one of a
-    /// plugin node's parameter sockets — silently re-points every link after
-    /// it unless they are moved with it. `prune` cannot repair that: the links
+    /// plugin node's parameter sockets — silently re-points every link after it
+    /// unless they are moved with it. `prune` cannot repair that: the links
     /// still land on sockets of the right type, just the wrong ones.
     ///
     /// The node itself has already shrunk by the time this is called; all that
@@ -258,9 +254,9 @@ impl Graph {
 
     /// The mirror of [`Graph::drop_inputs`], for a node that lost an output.
     ///
-    /// Same rule from the other end: the links leaving the sockets that went
-    /// are cut, and every later socket's links slide down so they still mean
-    /// the socket they meant before.
+    /// Same rule from the other end: the links leaving the sockets that went are
+    /// cut, and every later socket's links slide down so they still mean the
+    /// socket they meant before.
     pub fn drop_outputs(&mut self, node: NodeId, first: u8, count: u8) {
         if count == 0 {
             return;
@@ -286,10 +282,11 @@ impl Graph {
     /// Drop links whose endpoints no longer exist, and inputs a node lost when
     /// its kind changed. Called after loading a graph that may predate an edit
     /// somewhere else.
+    ///
     /// Also drops links whose ends stopped agreeing on a type — which is what
-    /// happens when a sub-plugin is swapped for one with a different bus layout
-    /// (§14.2). A patch that loses a few wires is better than one that refuses
-    /// to make a sound until every wire is right.
+    /// happens when a sub-plugin is swapped for one with a different bus layout.
+    /// A patch that loses a few wires is better than one that refuses to make a
+    /// sound until every wire is right.
     pub fn prune(&mut self) {
         self.migrate_plugin_outputs();
         let ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
@@ -310,19 +307,19 @@ impl Graph {
             .max(ids.iter().copied().max().map_or(0, |m| m + 1));
     }
 
-    /// Give a plugin node saved before `audio_out_shown` existed the sockets
-    /// it was actually using.
+    /// Give a plugin node saved before `audio_out_shown` existed the sockets it
+    /// was actually using.
     ///
     /// Every output bus had a socket then, which is what an empty
     /// `audio_out_shown` still means — the alternative, reading it as "none",
-    /// would cut every link on the way in. But honouring it literally reopens
-    /// Kontakt as a node with sixty-four output sockets, which is the wall
-    /// this field exists to take down. So the patch keeps the buses it wired,
-    /// plus the main one, and loses the rest.
+    /// would cut every link on the way in. But honouring it literally reopens a
+    /// multi-out sampler as a node with sixty-four output sockets, which is the
+    /// wall that field exists to take down. So the patch keeps the buses it
+    /// wired, plus the main one, and loses the rest.
     ///
     /// The link indices move with them: the socket for bus 5 is port 1 once
-    /// buses 1 to 4 have no socket, and a link still pointing at port 5 would
-    /// be pruned two lines later.
+    /// buses 1 to 4 have no socket, and a link still pointing at port 5 would be
+    /// pruned two lines later.
     pub fn migrate_plugin_outputs(&mut self) {
         for node in &mut self.nodes {
             let NodeKind::Plugin(plugin) = &mut node.kind else {
@@ -412,9 +409,10 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A patch saved before `audio_out_shown` existed keeps the buses it
-    /// wired and loses the rest — which is the difference between reopening
-    /// Kontakt as a node and reopening it as a column of sixty-four sockets.
+    /// A patch saved before `audio_out_shown` existed keeps the buses it wired
+    /// and loses the rest — which is the difference between reopening a
+    /// multi-out sampler as a node and reopening it as a column of sixty-four
+    /// sockets.
     #[test]
     fn an_old_patch_keeps_only_the_output_buses_it_wired() {
         let mut graph = Graph::new();
@@ -511,12 +509,12 @@ mod tests {
     }
 
     /// Audio joins audio whatever the widths are, and the compiler adapts them
-    /// explicitly (§14.11).
+    /// explicitly.
     ///
     /// This reverses an earlier rule. Refusing the link read well until a real
-    /// plugin turned up whose sidechain is mono — RoughRider3's is — with
-    /// nothing in the graph able to convert. Refusing then taught the user
-    /// nothing and left the socket unusable.
+    /// plugin turned up whose sidechain is mono, with nothing in the graph able
+    /// to convert. Refusing then taught the user nothing and left the socket
+    /// unusable.
     #[test]
     fn audio_of_different_widths_still_connects() {
         let mut graph = Graph::new();
@@ -569,9 +567,9 @@ mod tests {
             time: 0.5,
         });
         assert!(write.output_ports().is_empty());
-        // The read has one input, but it is the delay time (§14.5) and it is a
-        // param — never the line's own signal, which is what would make an edge
-        // between the halves and put a cycle back into the graph.
+        // The read node's input is the delay time parameter, not a signal edge.
+        // It expects a parameter input rather than a signal edge from the writer
+        // to keep cycles out of the topological sort.
         assert_eq!(read.input_ports().len(), 1);
         assert!(matches!(read.input_ports()[0].ty, PortType::Param));
     }
@@ -599,7 +597,7 @@ mod tests {
     }
 
     /// A sub-plugin swapped for one with fewer buses leaves links pointing at
-    /// sockets that no longer exist, or that changed type (§14.2). Those wires
+    /// sockets that no longer exist, or that changed type. Those wires
     /// go; the rest of the patch stays.
     #[test]
     fn swapping_a_plugin_drops_only_the_links_that_stopped_making_sense() {
@@ -754,8 +752,8 @@ mod tests {
         );
     }
 
-    /// Patches written before M8 name the destination socket `input` and have
-    /// no source socket at all, because every node had exactly one output.
+    /// Patches written when every node had exactly one output name the
+    /// destination socket `input` and carry no source socket at all.
     #[test]
     fn a_pre_m8_patch_still_loads() {
         let json = r#"{
