@@ -1,10 +1,10 @@
-//! Finding plugins, and describing what a module contains.
+//! Plugin discovery and module inspection.
 //!
 //! Everything here is format-agnostic on the outside: one list of directories,
-//! one list of modules, one `ClassInfo`. The differences the two backends have
-//! — a VST3 module exports several classes of which only some are instantiable,
-//! a CLAP module exports plugins and nothing else — are resolved on this side of
-//! the boundary rather than by the caller.
+//! one list of modules, one [`ClassInfo`]. The differences the two backends
+//! have — a VST3 module exports several classes of which only some are
+//! instantiable, a CLAP module exports plugins and nothing else — are resolved
+//! on this side of the boundary rather than by the caller.
 
 use std::path::{Path, PathBuf};
 
@@ -12,32 +12,32 @@ use plugin_host_api::Result;
 
 use crate::format::{FORMATS, Format};
 
-/// One plugin a module offers.
+/// Information describing a single plugin class exported by a module.
 ///
 /// The union of what the two formats say about themselves, narrowed to what a
 /// browser and a saved binding actually need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassInfo {
     pub format: Format,
-    /// Stable identity, and the authority a saved binding is resolved by
-    /// (§8.3). A VST3 class id in platform-independent hex, or a CLAP
-    /// reverse-DNS id — opaque either way.
+    /// Stable identity, and the authority a saved binding is resolved by. A
+    /// VST3 class id in platform-independent hex, or a CLAP reverse-DNS id —
+    /// opaque either way.
     pub id: String,
     pub name: String,
     pub vendor: String,
     pub version: String,
-    /// The format's own classification, joined with `|`: VST3 subcategories, or
-    /// CLAP feature tags. For display and filtering only.
+    /// The format's own classification, joined with `|`: VST3 subcategories,
+    /// or CLAP feature tags. For display and filtering only.
     pub category: String,
     pub is_instrument: bool,
     /// The module it was found in.
     pub path: PathBuf,
 }
 
-/// Where a plugin was last found, as saved into a project.
+/// Serialized reference used to locate a plugin across sessions and machines.
 ///
 /// The path is a hint and the id is the authority, because plugin folders
-/// differ between machines (§8.3).
+/// differ between machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRef {
     pub format: Format,
@@ -76,13 +76,12 @@ pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
 /// Every directory a scan should look in, as the user's settings have it.
 ///
 /// [`crate::config`] is the whole answer, not an addition to
-/// [`default_plugin_directories`] — the conventional folders are written into
+/// [`default_plugin_directories`]: the conventional folders are written into
 /// the settings the first time they are read, and are the user's to keep or
 /// remove from then on.
 ///
 /// Each directory is paired with every format, because the user pointed at a
-/// folder of plugins and not at a folder of VST3s — the same rule the CLI
-/// applies to a directory given on the command line.
+/// folder of plugins and not at a folder of VST3s.
 ///
 /// Directories that do not exist are dropped: a folder can be on a drive that
 /// is not plugged in today, and a scan should be quiet about that rather than
@@ -104,7 +103,7 @@ pub fn plugin_directories() -> Vec<(Format, PathBuf)> {
     out
 }
 
-/// Modules of `format` in `dir` and one level below it.
+/// Returns all plugin modules of the given `format` found in `dir` or its immediate subdirectories.
 pub fn find_modules(format: Format, dir: &Path) -> Vec<PathBuf> {
     match format {
         Format::Vst3 => vst3_host::find_modules(dir),
@@ -128,7 +127,7 @@ pub fn installed_modules() -> Vec<(Format, PathBuf)> {
     out
 }
 
-/// Load `path` far enough to list what it offers, then unload it.
+/// Inspects `path` to list exported plugin classes and unloads the module.
 ///
 /// The format is taken from the extension; a path that is neither is an error
 /// rather than a guess.
@@ -179,11 +178,12 @@ pub fn scan_module_as(format: Format, path: &Path) -> Result<Vec<ClassInfo>> {
     }
 }
 
-/// Re-find a plugin whose recorded path no longer exists.
+/// Resolves a saved [`PluginRef`] to an existing module path.
 ///
 /// The id is the authority and the path only a hint, so a project that moved
-/// between machines still opens (§8.3). Loads each candidate module to ask it,
-/// which is why the hint is tried first.
+/// between machines still opens. Each candidate module has to be loaded to be
+/// asked, which is why `path_hint` is tried first and the directory search is
+/// the fallback.
 pub fn resolve_reference(reference: &PluginRef) -> Option<PathBuf> {
     if reference.path_hint.exists()
         && scan_module_as(reference.format, &reference.path_hint)

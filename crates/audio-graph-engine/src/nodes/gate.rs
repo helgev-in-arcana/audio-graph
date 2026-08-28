@@ -7,29 +7,19 @@ use crate::nodes::Node;
 use crate::nodes::widgets::NodeUi;
 use crate::port::{Port, PortType};
 
-/// Silence below -100 dB, which is what `db_to_linear` reads as a mute.
-///
-/// A gate is a `Mix` of one whose gain the parameter half switches, so
-/// "closed" has to be spelled in the units the lane carries.
+/// Gain level in decibels when the gate is closed (-100 dB represents mute).
 const CLOSED_DB: f64 = -100.0;
+/// Gain level in decibels when the gate is open (0 dB represents unity gain).
 const OPEN_DB: f64 = 0.0;
 
-/// Pass audio through or silence it, by where a control sits against a
-/// threshold.
+/// Gates an audio signal based on whether a parameter control value meets a threshold.
 ///
-/// A `Mix` with one input is already a gain, and a gain of -100 dB is already
-/// silence — so the whole of this node is the parameter half deciding which of
-/// the two the gain is. That is deliberate: a second way of scaling a buffer
-/// would be a second place for the mix rules to drift.
+/// Passes audio through at unity gain (0 dB) when open, or silences it (-100 dB)
+/// when closed. If the control input is unconnected, it defaults to zero (closed).
 ///
-/// The switch is hard, at chunk boundaries. Under `WholeBlock` chunking that
-/// is once per block the DAW hands us, so gating a loud signal can click; the
-/// honest fix is a ramp in the audio half, and it is not here yet.
-///
-/// An unwired control reads as zero, like every other empty parameter socket,
-/// which means a gate nobody has wired is shut rather than open. That is the
-/// safe way round: a gate that passed everything until wired would look like
-/// it was not working, and then like it had broken.
+/// **Bug:** Gating a loud signal can click because the switch is hard, happening
+/// at a chunk boundary. The proper fix, which is a ramp in the audio half,
+/// is not implemented yet.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gate {
     pub channels: u16,
@@ -64,8 +54,7 @@ impl Node for Gate {
         )]
     }
 
-    /// The decision is a parameter, so it is made here; the audio half only
-    /// applies the gain it lands on.
+    // Evaluates the gate state as a parameter and routes the resulting gain to the audio pass.
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let control = cx.input_or_zero(1)?;
         let (low, high) = if self.invert {
@@ -81,8 +70,7 @@ impl Node for Gate {
             low: Operand::Value(low),
             high: Operand::Value(high),
         });
-        // On the control's own socket, so the audio half finds it the way a
-        // `Mix` finds a gain (§14.5).
+        // Drive the audio lane associated with the gate control socket.
         cx.drive_audio(1, out)
     }
 
@@ -96,9 +84,9 @@ impl Node for Gate {
         };
         let lane = cx.lane(1);
         cx.consume(buf);
-        // May well come back as `buf` itself, which makes the gate a scaling
-        // in place and costs no buffer at all — the same case a `Mix` of one
-        // hits.
+        // Allocate buffer and emit a mix operation scaling by the gated gain.
+        // The gate may well reuse the input buffer as the destination, making
+        // it an in-place scaling that costs no additional buffer.
         let out = cx.alloc(self.channels, readers)?;
         cx.emit(AudioOp::Mix {
             out,

@@ -1,11 +1,4 @@
 //! Platform dynamic-library loading and CLAP bundle layout.
-//!
-//! The same job `vst3-host::library` does, and deliberately not shared with it:
-//! the two formats disagree about what a plugin file *is* (CLAP is a plain
-//! shared library everywhere except macOS, where it is a bundle) and about the
-//! entry point's name and signature. The part that would be shared — three
-//! calls to `LoadLibraryEx`/`dlopen` — is smaller than the abstraction that
-//! would hide the differences.
 
 use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
@@ -162,8 +155,7 @@ mod imp {
             let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
                 HostError::ModuleLoad(format!("path has interior nul: {}", path.display()))
             })?;
-            // RTLD_LOCAL so a plugin's symbols cannot collide with the host's
-            // or another plugin's — the very failure that would trigger ADR-6.
+            // RTLD_LOCAL so plugin symbols cannot collide across libraries.
             let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if h.is_null() {
                 let msg = unsafe {

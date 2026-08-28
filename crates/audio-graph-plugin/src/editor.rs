@@ -1,40 +1,31 @@
-//! The wrapper's own editor: pick a sub-plugin, bind its parameters to slots.
+//! The wrapper's GUI editor: hosts the node graph canvas and plugin management.
 //!
-//! Deliberately plain. Its job is to make the two things a user cannot
-//! otherwise do — choosing a sub-plugin, and deciding which of its parameters
-//! the DAW's automation lanes drive — possible at all, and to make them visible
-//! while checking the wrapper in a real DAW. It is not the eventual UI; §9's
-//! node graph (§9) sits alongside it on its own tab: the slot table says
-//! *which* sub-plugin parameter a lane drives, the graph says what drives
-//! the lane.
+//! The editor provides a visual graph interface where users can load sub-plugins,
+//! wire audio, note, and parameter signals, and configure modulation settings.
 //!
 //! # The draw callback records; it does not act
 //!
-//! Every button here pushes a [`Command`] and returns. Nothing that loads a
-//! plugin, opens a window or resizes one happens inside `ui()`.
+//! Every button here pushes a [`Command`] and returns. Operations that load a
+//! plugin, open a window, or resize one are not executed directly inside `ui()`.
 //!
-//! That is not tidiness. egui-baseview holds a `RefCell` borrow across the draw
-//! callback, and all of those operations dispatch Win32 messages synchronously.
-//! The message arrives back inside egui-baseview while the borrow is still live
-//! and the process dies — not a panic that unwinds, a
-//! `STATUS_STACK_BUFFER_OVERRUN`, because it happens inside a callback that
-//! cannot unwind. Clicking "Open plugin GUI" took the host down with it.
+//! egui-baseview holds a `RefCell` borrow across the draw callback, and platform
+//! window operations dispatch messages synchronously. If an incoming message
+//! re-enters baseview while the borrow is active, a panic or process termination
+//! occurs.
 //!
-//! So the commands go to [`plugin_host::Deferred`], which runs them on the
-//! next turn of the DAW's message loop, once the frame is over. The
-//! sub-plugin window's periodic tick, which answers `resizeView` by resizing a
-//! window, is the same kind of work and is likewise kept out of the draw
-//! callback — it runs from the plugin instance's own tick (`crate::tick`),
-//! which keeps going whether or not this editor is open.
+//! Commands are therefore posted to [`plugin_host::Deferred`], which executes them
+//! on the next turn of the host DAW's message loop after the frame completes.
+//! Periodic sub-plugin window maintenance and resize handling run from the plugin's
+//! background ticking mechanism (`crate::tick`), keeping them independent of the
+//! draw callback.
 //!
 //! # Threads
 //!
-//! `NiceEguiApp` is `Send` because baseview runs the UI on its own thread under
-//! X11. On Windows and macOS it runs on the caller's thread, which for a plugin
-//! editor is the DAW's main thread — the same thread the sub-plugin's VST3
-//! objects are pinned to. The main-thread-only pieces are held in
-//! [`MainThread`], which asserts the owning thread on every access, so an X11
-//! port fails loudly and immediately rather than corrupting anything quietly.
+//! `NiceEguiApp` is `Send` because baseview runs the UI on its own thread on some
+//! platforms (e.g. X11). On Windows and macOS it runs on the caller's thread (the
+//! DAW's main thread), which is where sub-plugin COM/C++ objects are bound.
+//! Main-thread-only components are wrapped in [`MainThread`], asserting thread
+//! affinity on access.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,16 +33,16 @@ use std::sync::Arc;
 use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
+use plugin_host::MainThread;
 use plugin_host::ParamInfo;
-use subhost_adapter::MainThread;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;
 
-/// Something the user asked for, to be carried out once the frame is over.
+/// Action requested by the UI to be executed after the current frame finishes.
 enum Command {
-    /// A plugin node was added: load into `instance` and give `node` the
-    /// sockets the plugin turns out to have (§14.2).
+    /// A plugin node was added: load into `instance` and configure `node` with
+    /// the discovered ports and buses.
     LoadPlugin {
         node: audio_graph_engine::NodeId,
         instance: usize,
@@ -60,23 +51,18 @@ enum Command {
     UnloadInstance(usize),
     OpenSub(usize),
     CloseSub(usize),
-    /// The graph changed: recompile, publish, save.
+    /// The graph structure or parameters changed: recompile, publish, and save state.
     ///
-    /// Editing the graph itself happens inline — it touches no window, so
-    /// none of the reentrancy above applies — but the work that *follows* an
-    /// edit is worth doing once per frame rather than once per mouse-move.
+    /// Graph mutations occur inline on the main thread, while the downstream work
+    /// (recompilation and serialization) is deferred to run once per frame.
     GraphEdited,
     SetQuantum(u32),
 }
 
-/// What the editor draws, refreshed from [`Shared`] rather than read through
-/// the lock while drawing.
+/// Snapshot of state used by the editor during drawing, refreshed from [`Shared`].
 ///
-/// Two reasons. Drawing straight from the lock means a frame that cannot take
-/// it has nothing to draw, and replacing the whole UI with a "busy" line for one
-/// frame is exactly the flicker it looks like. And the parameter list can run to
-/// thousands of entries — copying it every frame to satisfy the borrow checker
-/// is work nobody asked for.
+/// Drawing from a snapshot avoids holding locks during render passes and avoids
+/// re-cloning large parameter lists every frame when no change has occurred.
 #[derive(Default)]
 struct View {
     /// The [`Shared::generation`] the vectors below were built from.
@@ -87,17 +73,17 @@ struct View {
     params: Vec<ParamInfo>,
     /// `(index, parameter name, currently resolved)`.
     slots: Vec<(usize, String, bool)>,
-    /// One entry per instance slot, for the plugin nodes to draw themselves
-    /// from.
+    /// One entry per instance slot, used by plugin nodes for rendering.
     instances: Vec<crate::graph_ui::InstanceView>,
     free_instance: Option<usize>,
-    /// Whether the sub-plugin can take per-voice modulation (§3.3).
+    /// Whether the sub-plugin supports per-voice modulation.
     poly_modulation: bool,
 }
 
-/// What the last command did, or why it did not.
+/// Status message from the last executed command.
 ///
-/// Shared rather than owned because the command runs after the frame that asked
+/// Shared behind a mutex so deferred command execution results can reach the UI
+/// on the subsequent frame.
 /// for it, and its result has to reach the next frame somehow.
 #[derive(Default, Clone)]
 struct Status(Arc<std::sync::Mutex<String>>);
@@ -122,10 +108,8 @@ pub struct WrapperEditor {
     /// Populated on first use, refreshed on demand.
     ///
     /// Listed by filename from disk and classified from the scan cache, which
-    /// is what makes the list appear at once: opening 30 plugins to draw it
-    /// would take seconds and, as M2 found, some of them crash and at least one
-    /// hangs. The opening happens on `scan`'s thread, and what it learns lands
-    /// here when it is done.
+    /// allows the list to appear immediately. Full module opening and classification
+    /// runs asynchronously on a background scan thread to avoid stalling the UI.
     entries: Vec<crate::graph_ui::PluginEntry>,
     scanned: bool,
     /// A scan running on its own thread, if one is. Never more than one: a
@@ -199,7 +183,7 @@ impl WrapperEditor {
         self.view.params = state.host.params(0).to_vec();
 
         self.view.free_instance = state.host.free_instance();
-        self.view.instances = (0..subhost_adapter::MAX_INSTANCES)
+        self.view.instances = (0..crate::config::MAX_INSTANCES)
             .map(|i| crate::graph_ui::InstanceView {
                 loaded: state.host.is_loaded(i),
                 name: state
@@ -281,9 +265,8 @@ impl WrapperEditor {
     /// Start bringing the scan cache up to date, on a thread of its own.
     ///
     /// Off the UI thread because it loads third-party code: a plugin that takes
-    /// a second to open — or, as M2 found, hangs — must not take the editor
-    /// with it. Nothing is shared with it but the channel; it works from the
-    /// cache file and hands back what it found.
+    /// time to open or hangs must not block the editor UI. Nothing is shared with
+    /// it but the channel; it works from the cache file and hands back what it found.
     fn start_scan(&mut self) {
         if self.scan.is_some() {
             return;
@@ -292,8 +275,7 @@ impl WrapperEditor {
         match std::thread::Builder::new()
             .name("audio-graph plugin scan".into())
             .spawn(move || {
-                // Every thread that loads a plugin needs this, and this one
-                // loads all of them (§13).
+                // Initialize COM/threading prerequisites for loading plugins on this thread.
                 plugin_host::init_thread();
                 let _ = tx.send(plugin_host::catalogue::refresh());
             }) {
@@ -635,8 +617,8 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
             } => {
                 match shared.load_into(instance, &path) {
                     Ok(()) => status.set(format!("loaded {}", path.display())),
-                    // Not fatal: the node stays, with no sockets and saying so,
-                    // the same way an unresolved binding stays (§8.3).
+                    // Failure is not fatal: the node remains with no sockets and an error state,
+                    // preserving graph connectivity.
                     Err(e) => status.set(format!("load failed: {e}")),
                 }
                 // Either way — a plugin that failed to load has no buses, and
@@ -720,11 +702,9 @@ impl NiceEguiApp for WrapperEditor {
             Ok(deferred) => self.deferred = Some(MainThread::new(deferred)),
             Err(e) => log::warn!("audio-graph: {e}"),
         }
-        // No tick is set up here. The sub-plugin's window needs one to answer
-        // its resize requests and to notice the user closing it (§5.2), and so
-        // does a CLAP sub-plugin's main-thread callback — but both have to keep
-        // happening while this window is shut, so the plugin instance owns that
-        // timer now (see `crate::tick`).
+        // Periodic ticking is handled at the plugin instance level rather than by the
+        // editor window, ensuring sub-plugin resize requests and main-thread callbacks
+        // continue operating even when the editor window is closed (see `crate::tick`).
         Ok(())
     }
 

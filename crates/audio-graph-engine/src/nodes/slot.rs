@@ -1,16 +1,6 @@
-//! The way into the wrapper's slot table (§8).
+//! Wrapper slot automation input node.
 //!
-//! One node, reading what the DAW is automating. It does not know what the
-//! slot is bound to — that is the outer layer's business, and it is what
-//! keeps this crate free of any idea of a plugin parameter.
-//!
-//! There was a second node here, `SlotOut`, which drove a slot from the graph
-//! and so took it away from the DAW. It is gone: a slot the graph writes is a
-//! lane the DAW is still drawing automation into, and the two fought — with
-//! the graph winning silently, which is the worst way for that argument to
-//! end. Everything it could do, editing the node that reads the slot already
-//! does, and §14.12's parameter sockets are the honest route from the graph
-//! to a sub-plugin parameter.
+//! Reads normalized [0.0, 1.0] automation values from the host DAW's automation slots.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +11,7 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, slot_picker};
 use crate::port::Port;
 
-/// The DAW's automation for one wrapper slot, 0..1.
+/// Reads normalized [0.0, 1.0] automation for a wrapper slot from the DAW.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotIn {
     pub slot: usize,

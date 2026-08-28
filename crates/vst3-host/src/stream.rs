@@ -1,9 +1,7 @@
-//! An `IBStream` backed by a byte vector.
+//! An `IBStream` implementation backed by an in-memory byte vector.
 //!
-//! VST3 passes state through a stream rather than a buffer, so both saving and
-//! loading need one of these. Memory-backed is the right shape here: the
-//! wrapper embeds the sub-plugin's chunk inside its own state (§8.3), so the
-//! bytes have to end up in our hands anyway.
+//! VST3 passes component and controller state via stream interfaces (`IBStream`).
+//! MemoryStream provides an in-memory stream cursor for saving and restoring state blobs.
 
 use std::cell::RefCell;
 use std::ffi::c_void;

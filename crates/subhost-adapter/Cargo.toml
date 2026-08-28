@@ -3,11 +3,12 @@ name = "subhost-adapter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 
 [dependencies]
-audio-graph-engine.workspace = true
-plugin-host-api.workspace = true
 plugin-host.workspace = true
 log.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
 serde_json.workspace = true

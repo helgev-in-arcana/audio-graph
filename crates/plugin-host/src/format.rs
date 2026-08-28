@@ -1,8 +1,8 @@
-//! Which plugin format a path, an identity or an instance belongs to.
+//! Plugin format identification and path resolution.
 
 use std::path::Path;
 
-/// The plugin formats this host can load.
+/// Supported plugin formats that can be loaded by this host.
 ///
 /// An enum rather than a trait object: the set is closed, both variants are
 /// compiled in, and the exhaustiveness check is what guarantees that adding a
@@ -33,7 +33,7 @@ impl<'de> serde::Deserialize<'de> for Format {
 pub const FORMATS: [Format; 2] = [Format::Vst3, Format::Clap];
 
 impl Format {
-    /// The file extension a module of this format carries.
+    /// The standard file extension for this format.
     pub fn extension(self) -> &'static str {
         match self {
             Format::Vst3 => vst3_host::VST3_EXTENSION,
@@ -44,7 +44,7 @@ impl Format {
     /// The short tag written into saved state and shown in the UI.
     ///
     /// Stable: it is persisted in the DAW's project file, so renaming one of
-    /// these breaks every existing project (ARCHITECTURE.md §8.3).
+    /// these breaks every existing project.
     pub fn tag(self) -> &'static str {
         match self {
             Format::Vst3 => "vst3",
@@ -56,11 +56,11 @@ impl Format {
         FORMATS.into_iter().find(|f| f.tag() == tag)
     }
 
-    /// Infer the format from a module path's extension.
+    /// Infer the format from a module path's file extension.
     ///
     /// The extension *is* the format for both: a `.vst3` and a `.clap` are
-    /// distinguished by nothing else, since on Windows and Linux both are plain
-    /// shared libraries.
+    /// distinguished by nothing else, since on Windows and Linux both are
+    /// plain shared libraries.
     pub fn from_path(path: &Path) -> Option<Format> {
         let ext = path.extension()?.to_str()?;
         FORMATS

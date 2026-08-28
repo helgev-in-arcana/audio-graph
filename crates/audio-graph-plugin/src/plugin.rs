@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
+use crate::state::WrapperState;
 use audio_graph_engine::{BlockContext, Engine, Graph};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SLOT_COUNT, SlotSchedule, SubHost, WrapperState};
+use subhost_adapter::{SlotSchedule, SubHost};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -31,10 +33,10 @@ pub struct Wrapper {
     /// different sub-plugin at any moment; see [`crate::shared`].
     shared: Arc<Shared>,
 
-    /// The node graph, running (§9). Holds its own program; the editor
-    /// publishes new ones through `shared`.
+    /// The active node graph engine. Holds its own compiled program; the editor
+    /// publishes updates through `shared`.
     engine: Engine,
-    /// Slot values at each sub-block boundary (§9.2).
+    /// Slot and parameter values evaluated at each sub-block boundary.
     schedule: SlotSchedule,
 
     /// Scratch reused every block; `process` must not allocate.
@@ -64,13 +66,13 @@ impl Default for Wrapper {
     fn default() -> Self {
         let context = Arc::new(WrapperHostContext::new());
         let params = WrapperParams::new();
-        let shared = Shared::new(SubHost::new(context.clone()), params.clone());
+        let shared = Shared::new(SubHost::new(context.clone(), SUB_HOST), params.clone());
         Wrapper {
             params,
             context,
             shared,
             engine: Engine::new(),
-            schedule: SlotSchedule::new(0, subhost_adapter::DEFAULT_QUANTUM),
+            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
@@ -154,10 +156,10 @@ impl Wrapper {
                     Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
                     None => {}
                 }
-                for problem in self.shared.main().host.load_state(&state) {
-                    // Not fatal by design (§8.3): a sub-plugin that cannot be
-                    // found must not stop the project from opening, and the
-                    // bindings are kept so reinstalling it brings them back.
+                for problem in self.shared.main().host.load_state(&state.sub_host_state()) {
+                    // Not fatal by design: a sub-plugin that cannot be found
+                    // must not stop the project from opening, and the bindings
+                    // are kept so reinstalling it brings them back.
                     log::warn!("audio-graph: {problem}");
                 }
             }
@@ -167,18 +169,15 @@ impl Wrapper {
         self.shared.publish_graph();
         // Publish it back even when nothing was restored. A project saved
         // without the editor ever being opened would otherwise store the empty
-        // string, and then the defaults it was running under -- the sub-block
-        // size among them -- would not be in the file at all.
+        // string, and then the defaults it was running under — the sub-block
+        // size among them — would not be in the file at all.
         self.shared.store_state();
     }
 
-    /// Load a sub-plugin named by the environment, for development only.
+    /// Load a sub-plugin specified via environment variables, used for headless development and testing.
     ///
-    /// Until M4 there is no editor, so there is no way for a user to choose a
-    /// sub-plugin — which would make it impossible to test the nesting in a
-    /// real DAW, the one thing M3 is supposed to demonstrate. `AUDIO_GRAPH_SUB`
-    /// names a `.vst3` to load, and `AUDIO_GRAPH_SUB_BIND` optionally gives a
-    /// parameter id for slot 0 so automation can be checked too.
+    /// `AUDIO_GRAPH_SUB` specifies a `.vst3` or `.clap` path to load, and `AUDIO_GRAPH_SUB_BIND`
+    /// optionally specifies a parameter ID for slot 0.
     ///
     /// Only consulted when nothing was restored from state, so it can never
     /// override a real project.
@@ -253,8 +252,8 @@ impl Wrapper {
             WrapperKind::Instrument => 0,
         };
         // The wrapper's own input buses: the main one, then whatever the DAW
-        // gave us for aux (§14.11). An `AudioIn` node names a bus by index into
-        // this, so it is what the engine has to be told about.
+        // gave us for aux. An `AudioIn` node names a bus by index into this, so
+        // it is what the engine has to be told about.
         self.daw_inputs = std::iter::once(input_channels)
             .filter(|&c| c > 0)
             .chain(layout.aux_input_ports.iter().map(|c| c.get()))
@@ -270,12 +269,12 @@ impl Wrapper {
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
-        self.schedule = SlotSchedule::new(max_block, self.shared.quantum());
-        // The graph's audio buffers (§14.7). Sized for the ceilings rather than
-        // for the current patch, so a recompile never asks for memory.
+        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum());
+        // The graph's audio buffers, sized for the ceilings rather than for the
+        // current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
-        // The editor needs it to show a delay's floor in seconds (§14.4). It
-        // never reaches the audio path this way — that gets the rate from the
+        // The editor needs it to show a delay's floor in seconds. It never
+        // reaches the audio path this way — that gets the rate from the
         // transport, block by block.
         self.shared.set_sample_rate(config.sample_rate);
 
@@ -306,8 +305,8 @@ impl Wrapper {
         match state.host.activate(audio_config, &io, &graph_params) {
             Ok(processor) => {
                 // What to report depends on how the audio is routed. A graph
-                // knows its own longest path (§14.6); the direct path is one
-                // plugin, so its latency is the plugin's.
+                // knows its own longest path; the direct path is one plugin, so
+                // its latency is the plugin's.
                 let latency = self.engine.latency().max(state.host.sub_latency(0));
                 drop(state);
                 self.shared.audio().processor = Some(processor);
@@ -379,10 +378,10 @@ impl Wrapper {
             None => return pass_through(buffer, self.kind),
         };
         // Nothing loaded is not the same as nothing to do: a patch can be a
-        // delay line and a mix with no sub-plugin anywhere in it (§14.4), and
-        // passing the input through would be exactly the invisible route
-        // §14.13 got rid of. The graph runs either way; a plugin node with no
-        // plugin behind it produces silence, which `NoNodes` is.
+        // delay line and a mix with no sub-plugin anywhere in it, and passing
+        // the input through would be exactly the invisible route the graph
+        // exists to make visible. The graph runs either way; a plugin node with
+        // no plugin behind it produces silence, which `NoInstances` is.
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
@@ -402,15 +401,15 @@ impl Wrapper {
             .report_slots(self.schedule.block(self.schedule.blocks() - 1));
 
         // nice-plug hands out per-channel slices; the host API wants one flat
-        // planar block (§4.3), so the copy is the price of a boundary that can
-        // later become shared memory.
+        // planar block, so the copy is the price of a boundary that could later
+        // become shared memory.
         let frame_len = frames as usize;
         let input_channels = match self.kind {
             WrapperKind::Effect => channels.min(2),
             WrapperKind::Instrument => 0,
         };
         // The main bus first, then each aux bus, packed — the same layout a
-        // plugin's input region uses (§14.11).
+        // plugin's input region uses.
         let mut at = 0usize;
         {
             let slices = buffer.as_slice_immutable();
@@ -458,15 +457,15 @@ impl Wrapper {
 
         self.out_events.clear();
         let status = if self.engine.has_audio() {
-            // The graph decides where the audio goes and which plugins see it
-            // (§14). Sub-plugins are reached through `AudioNodes`, so the
-            // engine still knows nothing about what a plugin is.
+            // The graph decides where the audio goes and which plugins see it.
+            // Sub-plugins are reached through `AudioInstances`, so the engine
+            // still knows nothing about what a plugin is.
             let mut loaded;
-            let mut empty = audio_graph_engine::NoNodes;
-            let nodes: &mut dyn audio_graph_engine::AudioNodes = match processor {
+            let mut empty = subhost_adapter::NoInstances;
+            let nodes: &mut dyn subhost_adapter::AudioInstances = match processor {
                 Some(processor) => {
                     loaded =
-                        processor.nodes(&self.schedule, &self.events, &time, &mut self.out_events);
+                        processor.bind(&self.schedule, &self.events, &time, &mut self.out_events);
                     &mut loaded
                 }
                 None => &mut empty,
@@ -477,9 +476,9 @@ impl Wrapper {
                     quantum: self.schedule.quantum(),
                     sample_rate: transport.sample_rate as f64,
                     // The same buffer the parameter lanes ride in. The audio
-                    // half reads only the delay-time range out of it (§14.5).
+                    // half reads only its own range of lane numbers out of it.
                     lanes: self.schedule.rows(),
-                    lanes_per_row: subhost_adapter::LANES,
+                    lanes_per_row: LANES,
                 },
                 &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
@@ -526,14 +525,13 @@ impl Wrapper {
         }
     }
 
-    /// Latency the sub-plugin asked to change since the last check (§7.4).
+    /// Latency the sub-plugin asked to change since the last check.
     pub fn take_latency_change(&self) -> Option<u32> {
         self.context.take_latency_change()
     }
 }
 
-/// Fill the sub-block schedule: the DAW's automation, with the graph's outputs
-/// written over the slots it drives (§9.2).
+/// Fill the sub-block schedule with host automation and graph evaluation outputs.
 ///
 /// Note events are folded into the engine as the sub-block boundaries pass
 /// them, so a modulator reading pressure sees the value that was current at
@@ -561,8 +559,9 @@ fn run_graph(
 
     if !engine.has_program() {
         // Nothing to evaluate. One value per slot for the whole block is
-        // exactly the shape the wrapper produced before M5, so a project with
-        // no graph behaves identically — including sending no more events.
+        // exactly the shape the wrapper produced before it had a graph, so a
+        // project with no graph behaves identically — including sending no more
+        // events.
         schedule.fill(daw_slots);
         return;
     }
@@ -584,9 +583,9 @@ fn run_graph(
         };
         let values = schedule.block_mut(index);
         // The DAW's automation fills the slot lanes; the rest are the graph's
-        // own parameter lanes (§14.12) and start from nothing. Zeroing rather
-        // than leaving the previous sub-block's values means a lane the graph
-        // stops driving stops sending, instead of repeating a stale value.
+        // own parameter lanes and start from nothing. Zeroing rather than
+        // leaving the previous sub-block's values means a lane the graph stops
+        // driving stops sending, instead of repeating a stale value.
         let slots = daw_slots.len().min(values.len());
         values[..slots].copy_from_slice(&daw_slots[..slots]);
         values[slots..].fill(0.0);
@@ -617,11 +616,10 @@ fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
     ProcessStatus::Normal
 }
 
-/// nice-plug's note events into the host API's.
+/// Convert nice-plug note events into plugin_host note and expression events.
 ///
-/// Everything the graph can read has to arrive here first. Before M5 only note
-/// on and off were forwarded, because note expression was a §9.3 source with
-/// nothing yet to consume it; now there is.
+/// Forwards note-on, note-off, voice termination, and per-note expressions (pressure,
+/// volume, pan, tuning, vibrato, brightness) to the engine.
 fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
     use plugin_host::NoteExpression as Expr;
 
@@ -744,9 +742,9 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             brightness,
         ),
         // CCs, pitch bend and sysex still go nowhere. They are host-level MIDI
-        // rather than per-note expression, and the v1 node set (§9.3) has no
-        // source that reads them; forwarding them to the sub-plugin blindly
-        // would be a separate decision about MIDI routing.
+        // rather than per-note expression, and no node reads them; forwarding
+        // them to the sub-plugin blindly would be a separate decision about
+        // MIDI routing.
         _ => return None,
     })
 }
@@ -757,12 +755,10 @@ mod tests {
     use audio_graph_engine::{
         Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,
     };
-    use subhost_adapter::LANES;
 
-    /// Somewhere for a parameter chain to go.
+    /// Helper to create a sub-plugin node with a parameter port for testing.
     ///
-    /// `SlotOut` used to be it; a §14.12 parameter socket is, now. Its lane is
-    /// the first one past the slot table, which is what `SINK_LANE` is.
+    /// The parameter lane is mapped immediately following the host slot table (`SINK_LANE`).
     fn param_sink(graph: &mut Graph) -> audio_graph_engine::NodeId {
         graph.add(
             NodeKind::Plugin(Plugin {
@@ -782,17 +778,13 @@ mod tests {
     /// The lane `param_sink`'s parameter is driven through.
     const SINK_LANE: usize = SLOT_COUNT;
 
-    /// A schedule carries more than the DAW's slots (§14.12), and `run_graph`
-    /// fills the difference itself.
-    ///
-    /// Worth its own test because nothing else goes through this function: the
-    /// engine's tests drive it directly with a slot-sized slice, so widening
-    /// the schedule broke only the real audio path, and only in a DAW.
+    /// Verifies that `run_graph` populates both DAW slot lanes and graph parameter
+    /// lanes across the full schedule width.
     #[test]
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
         let mut engine = Engine::new();
-        let mut schedule = SlotSchedule::new(512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32);
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.

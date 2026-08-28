@@ -1,9 +1,6 @@
-//! `clap_istream` / `clap_ostream` over an in-memory blob.
+//! In-memory stream adaptors for CLAP `clap_istream` and `clap_ostream`.
 //!
-//! State in the core model is an opaque `Vec<u8>` (§3), and CLAP asks for it
-//! through a stream, so this is the whole of the adaptation. Both directions
-//! must handle short reads and writes: the format explicitly allows a plugin to
-//! ask for more than it gets and to loop.
+//! Converts between opaque binary state buffers and CLAP's stream interfaces.
 
 use std::ffi::c_void;
 

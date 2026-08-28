@@ -1,9 +1,7 @@
-//! The `HostContext` the CLI injects into the backend.
+//! Implementation of [`HostContext`] for the CLI harness.
 //!
-//! `vst3-host` never builds one of these itself (§7), so this is what a
-//! standalone renderer supplies; `subhost-adapter` will later supply a
-//! different one that forwards to the DAW. Both are the same type to the
-//! backend, which is the point of the injection.
+//! Provides a host context that records notifications (such as restart requests,
+//! latency changes, and parameter edits) into an in-memory log for diagnostic inspection.
 
 use std::sync::Mutex;
 
@@ -19,11 +17,7 @@ impl CliHost {
         CliHost::default()
     }
 
-    /// Everything the plugin asked of the host during the run.
-    ///
-    /// Recorded rather than acted on: a renderer has no editor to restart and
-    /// no DAW to notify, and seeing *what was requested* is the diagnostic the
-    /// harness exists to provide.
+    /// Returns and clears all recorded host notifications.
     pub fn take_log(&self) -> Vec<String> {
         std::mem::take(&mut self.log.lock().unwrap())
     }

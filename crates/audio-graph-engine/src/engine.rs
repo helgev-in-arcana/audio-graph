@@ -1,68 +1,73 @@
-//! Running a `Program`, on the audio thread.
+//! Realtime audio engine execution runtime.
 //!
-//! The rules this file exists to keep (§9.1): no allocation, no locking, no
-//! `Drop` of anything the main thread gave us. Every buffer is sized once in
+//! Executes compiled [`Program`] instructions on the audio thread.
+//!
+//! The rules this file exists to keep: no allocation, no locking, and no `Drop`
+//! of anything the main thread gave us. Every buffer is sized once in
 //! [`Engine::new`] against the compiler's ceilings, so adopting a new program
 //! is a pointer swap and a short loop, never a resize.
 //!
-//! It also holds the state that must *survive* a swap — LFO phases and the
-//! current note expression values. Recompiling happens on every drag of every
-//! control, and an oscillator that restarted each time would make the editor
-//! unusable for exactly the thing an LFO is for.
+//! It also holds the state that must *survive* a swap — LFO phases, delay ring
+//! contents, latch registers, the current note expression values.
+//! Recompiling happens on every drag of every control, and an oscillator that
+//! restarted each time would make the editor unusable for exactly the thing an
+//! LFO is for.
 //!
 //! Outside of its own tests, nothing here mentions `graph` or a node kind, and
 //! that is the thread boundary rather than an accident: what reaches this side
-//! is a `Program` and nothing else. A `use crate::graph::…` appearing above
+//! is a [`Program`] and nothing else. A `use crate::graph::…` appearing above
 //! the `#[cfg(test)]` line is the signal that something has leaked across.
 
-use plugin_host_api::{NoteEvent, NoteExpression};
+use plugin_host::{NoteEvent, NoteExpression};
 
 use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteStream, Op, Operand, Program, RateSpec, Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, Op, Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
+use subhost_adapter::{AudioChunk, AudioInstances};
 
-/// How many `DelayRead` taps one program may have.
+/// Maximum number of `DelayRead` taps supported in a single program.
 ///
-/// More than one read may share a line — that is a multi-tap delay, and it
-/// falls out of §14.4 for free — so this is not `MAX_AUDIO_DELAY_LINES`. The
-/// engine keeps one number per tap: where its read pointer was at the end of
-/// the last chunk, so the next one can ramp rather than jump (§14.5).
+/// More than one read may share a line — that is a multi-tap delay, and it falls
+/// out of splitting a delay into a write and a read for free — so this is not
+/// `MAX_AUDIO_DELAY_LINES`. The engine keeps one number per tap: where its read
+/// pointer was at the end of the last chunk, so the next one can ramp rather
+/// than jump.
 pub const MAX_AUDIO_TAPS: usize = 16;
 
-/// No ring currently holds this line. Not a valid index into `rings`.
+/// Sentinel indicating that no ring buffer currently holds this delay line.
 const NOT_PRESENT: usize = usize::MAX;
 
-/// What the graph is being evaluated against for one sub-block.
+/// Context for evaluating one parameter sub-block.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockContext {
     pub sample_rate: f64,
     pub tempo_bpm: f64,
-    /// How many samples this evaluation covers. Phases advance by this much
-    /// afterwards, which is what makes the sub-block rate (§9.2) a property of
-    /// the caller rather than of the engine.
+    /// Number of audio frames processed during this evaluation. Phases advance
+    /// by this much afterwards, which is what makes the sub-block rate a
+    /// property of the caller rather than of the engine.
     pub frames: u32,
 }
 
-/// What one whole block of audio is being evaluated against.
+/// Context for evaluating one whole block of audio.
 ///
-/// The lanes are the same buffer §14.12 fills for parameters: one row of values
+/// The lanes are the same buffer the parameter side fills: one row of values
 /// per sub-block boundary. The audio half reads only its own range of lane
-/// numbers out of it (delay times, §14.5), and passes the rest through
-/// untouched — it does not know what a parameter is.
+/// numbers out of it — delay times, and the like — and passes the rest through
+/// untouched. It does not know what a parameter is.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioContext<'a> {
     pub frames: u32,
-    /// The sub-block size, in samples. Chunk boundaries are computed from it
+    /// Sub-block chunk size in frames. Chunk boundaries are computed from it
     /// the same way the wrapper's slot schedule does, so chunk `i` and lane row
     /// `i` cover the same samples.
     pub quantum: u32,
     pub sample_rate: f64,
     pub lanes: &'a [f64],
-    /// How many lanes one row holds.
+    /// Number of lanes per sub-block row.
     pub lanes_per_row: usize,
 }
 
@@ -76,10 +81,9 @@ impl AudioContext<'_> {
 
 /// The per-note controllers, flattened to one value each.
 ///
-/// v1 is monophonic (see [`ExprSource`]): the graph has one value per source,
-/// and the newest note wins. Nothing here assumes it will stay that way — the
-/// wrapper feeds note events in, and a per-voice engine would feed the same
-/// events into more of these.
+/// Monophonic: the graph has one value per source, and the newest note wins.
+/// Nothing here assumes it will stay that way — the wrapper feeds note events
+/// in, and a per-voice engine would feed the same events into more of these.
 #[derive(Debug, Clone, Copy)]
 struct Expressions {
     /// Indexed by `NoteExpression as usize`.
@@ -114,89 +118,6 @@ fn expression_index(kind: NoteExpression) -> usize {
     }
 }
 
-/// The shape of one chunk handed to a sub-plugin.
-///
-/// Planar and packed at `frames`, which is the same layout `AudioBuffers` uses
-/// (§4.3). The pool has room for the longest block the host promised, but the
-/// channels inside a chunk sit at `frames` rather than at that maximum — so a
-/// short sub-block is a smaller buffer rather than a sparse one, and the slice
-/// can be handed straight to a sub-plugin without repacking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioChunk {
-    /// Channels in the input region: the main bus plus every aux bus (§14.11).
-    pub input_channels: u16,
-    /// Channels in the output region, counted the same way (§14.2).
-    pub output_channels: u16,
-    /// Where the joins in the input region are. Empty for the usual one-bus
-    /// plugin.
-    pub aux_inputs: plugin_host_api::AuxBuses,
-    /// Where the joins in the output region are. Empty in the same case.
-    pub aux_outputs: plugin_host_api::AuxBuses,
-    pub frames: u32,
-    /// Where this chunk starts inside the block the DAW handed us.
-    ///
-    /// Zero for the whole block under [`Chunking::WholeBlock`]. Under
-    /// `SubBlock` it is what lets the implementation cut the block's events and
-    /// automation down to the part this call covers, with offsets rebased —
-    /// without it, every chunk would be handed every event in the block and a
-    /// note would sound once per chunk (§14.9, §14.10).
-    pub offset: u32,
-}
-
-impl AudioChunk {
-    /// One output channel of a chunk, as a range into the flat buffer.
-    pub fn channel(&self, channel: u16) -> std::ops::Range<usize> {
-        let start = channel as usize * self.frames as usize;
-        start..start + self.frames as usize
-    }
-}
-
-/// How the engine runs a sub-plugin.
-///
-/// The engine schedules audio but has no idea what is at the other end of a
-/// plugin node — this crate does not know what a VST3 is, and after M6 it will
-/// not know what a CLAP is either (§7). Everything crossing this boundary is a
-/// flat slice or a `Copy` value, for the same reason as §4.1: it has to still
-/// work when the plugin is in another process (ADR-6).
-pub trait AudioNodes {
-    /// Run instance `instance` from `input` into `output`.
-    ///
-    /// The two slices never alias. `output` is written in full for the frames
-    /// the chunk covers; anything the implementation does not write is whatever
-    /// the pool held, so a plugin that produces nothing should clear it.
-    ///
-    /// `notes` says which note stream this instance hears (§14.10). It is a
-    /// name and a key mask, not a buffer: the engine routes notes without
-    /// knowing what one is, and the implementation is what turns the name into
-    /// events and drops the keys the mask names.
-    fn process(
-        &mut self,
-        instance: u32,
-        notes: NoteStream,
-        input: &[f32],
-        output: &mut [f32],
-        chunk: AudioChunk,
-    );
-}
-
-/// An implementation that produces silence, for a wrapper with nothing loaded.
-pub struct NoNodes;
-
-impl AudioNodes for NoNodes {
-    fn process(
-        &mut self,
-        _instance: u32,
-        _notes: NoteStream,
-        _input: &[f32],
-        output: &mut [f32],
-        chunk: AudioChunk,
-    ) {
-        for ch in 0..chunk.output_channels {
-            output[chunk.channel(ch)].fill(0.0);
-        }
-    }
-}
-
 pub struct Engine {
     program: Option<Box<Program>>,
     registers: Vec<f64>,
@@ -210,32 +131,34 @@ pub struct Engine {
     /// Which node each phase belongs to, mirrored from the program so the swap
     /// can match old state to new without touching the old program again.
     phase_nodes: Vec<u32>,
-    /// One ring per delay line, each `MAX_DELAY_TAPS` sub-blocks long (§14.5).
+    /// One ring per parameter delay line, each `MAX_DELAY_TAPS` sub-blocks long.
     ///
     /// A `Vec<Vec<f64>>` rather than one flat buffer specifically so that a
     /// program swap can reorder the lines by swapping the outer entries, which
     /// moves pointers instead of 32 kB of samples.
     rings: Vec<Vec<f64>>,
-    /// Where the next write goes, per line.
+    /// Current write head position per parameter delay line.
     ring_heads: Vec<usize>,
-    /// Which `DelayWrite` node each ring belongs to. Same role as `phase_nodes`.
+    /// Which `DelayWrite` node each ring belongs to. Same role as
+    /// `phase_nodes`.
     ring_nodes: Vec<u32>,
-    /// Scratch for reordering `rings` on a swap, so the swap allocates nothing.
+    /// Scratch for reordering `rings` on a swap, so the swap allocates
+    /// nothing.
     ring_order: Vec<usize>,
-    /// The audio buffer pool (§14.7), one `MAX_CHANNELS * max_frames` region
-    /// per buffer index. Sized by [`prepare`][Engine::prepare], which is the
-    /// only place in this type that allocates.
+    /// The audio buffer pool, one `MAX_CHANNELS * max_frames` region per buffer
+    /// index. Sized by [`prepare`][Engine::prepare], which is the only place in
+    /// this type that allocates.
     pool: Vec<f32>,
     /// Frames one buffer's channel holds. Zero until `prepare`.
     stride: usize,
-    /// Channel width of each of the wrapper's own input buses, main first
-    /// (§14.11). Set by `prepare`, because it is fixed for as long as the DAW
-    /// keeps us activated.
+    /// Channel width of each of the wrapper's own input buses, main first. Set
+    /// by `prepare`, because it is fixed for as long as the DAW keeps us
+    /// activated.
     daw_inputs: Vec<u16>,
-    /// One ring per audio delay line, as long as the node asked for (§14.5).
+    /// One ring per audio delay line, as long as the node asked for.
     ///
     /// Allocated on the main thread and carried in on the program, because this
-    /// thread may not allocate (§9.1) and only that side knows both the graph's
+    /// thread may not allocate and only that side knows both the graph's
     /// `max_time` and the sample rate. Split per line for the same reason the
     /// param rings are: a program swap reorders them by moving pointers.
     audio_rings: Vec<Vec<f32>>,
@@ -247,10 +170,10 @@ pub struct Engine {
     audio_ring_order: Vec<usize>,
     /// Where each tap's read pointer stood at the end of the last chunk, in
     /// samples. NaN means "no previous", which is what a fresh program leaves
-    /// behind and what makes the first chunk after a swap jump rather than
-    /// sweep from wherever the old patch happened to be.
+    /// behind and what makes the first chunk after a swap jump rather than sweep
+    /// from wherever the old patch happened to be.
     tap_distance: Vec<f64>,
-    /// Rings for delay compensation (§14.6), one per compensated path.
+    /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
     expressions: Expressions,
@@ -264,11 +187,12 @@ pub struct Engine {
     /// Which keys have been struck since the last [`Engine::run`]. Cleared at
     /// the end of it, so an op sees each note-on exactly once.
     keys_struck: u128,
-    /// One value per latch, or NaN for a latch nothing has set yet (§14.10).
+    /// One value per latch, or NaN for a latch nothing has set yet.
     latches: Vec<f64>,
     /// Which node each latch belongs to, so a program swap can carry it over.
     latch_nodes: Vec<u32>,
-    /// Scratch for that swap, sized once so the swap itself allocates nothing.
+    /// Scratch for that swap, sized once so the swap itself allocates
+    /// nothing.
     latch_carry: Vec<(u32, f64)>,
     rng: u32,
 }
@@ -308,11 +232,12 @@ fn copy_ring(from: &[f32], from_len: usize, to: &mut [f32], to_len: usize, head:
     *head = keep % to_len;
 }
 
-/// Four-point cubic Hermite, the interpolator §14.5 asks for.
+/// Four-point cubic Hermite, the interpolator a modulated delay asks for.
 ///
 /// Linear interpolation loses audible high end while the delay time is moving,
 /// and an all-pass interpolator misbehaves under exactly the modulation this
-/// exists to support. `x` is the fraction between `y1` and `y2`.
+/// exists to support. `x` is the fractional
+/// offset between `y1` and `y2`.
 fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, x: f32) -> f32 {
     let c1 = 0.5 * (y2 - y0);
     let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
@@ -424,10 +349,9 @@ impl Engine {
         self.program.as_ref().is_some_and(|p| !p.is_empty())
     }
 
-    /// Pick up a newly compiled program, if one is waiting.
+    /// Picks up a newly compiled program if one is waiting in the handoff channel.
     ///
-    /// Returns whether anything changed. Non-blocking and non-allocating: the
-    /// old program goes back to the main thread to be freed (§9.1).
+    /// Returns `true` if a new program was adopted. Realtime-safe: does not allocate or lock.
     pub fn adopt(&mut self, handoff: &Handoff<Program>) -> bool {
         // Remember which node each running phase belongs to *before* the swap;
         // afterwards the old program is gone.
@@ -446,8 +370,7 @@ impl Engine {
         let next = self.program.as_ref().expect("take reported a swap");
 
         for (i, &node) in next.lfo_nodes.iter().take(MAX_LFOS).enumerate() {
-            // Linear over at most MAX_LFOS entries. A map would be faster in
-            // theory and an allocation in practice.
+            // Linear over at most MAX_LFOS entries.
             match self.carry[..carried].iter().find(|&&(id, _, _)| id == node) {
                 Some(&(_, phase, hold)) => {
                     self.phases[i] = phase;
@@ -464,9 +387,7 @@ impl Engine {
             self.phase_nodes[i] = u32::MAX;
         }
 
-        // Latches keep their values across the swap for the same reason
-        // phases do: recompiling happens on every drag of every control, and a
-        // key switch that forgot which way it was thrown would be unusable.
+        // Latches keep their values across the swap so user switch settings persist.
         let latched = self
             .latch_carry
             .len()
@@ -487,9 +408,7 @@ impl Engine {
             self.latches[i] = f64::NAN;
         }
 
-        // Delay lines keep their contents across the swap (§14.5), both
-        // halves of them: a feedback loop that emptied itself every time the
-        // user nudged an unrelated control would not be usable.
+        // Delay line ring buffers retain their contents across program swaps.
         reorder(
             &mut self.rings,
             &mut self.ring_heads,
@@ -506,16 +425,13 @@ impl Engine {
             &next.audio_delay_nodes,
             0.0,
         );
-        // A line whose length changed comes with a new ring. Swapping rather
-        // than assigning is what sends the old one home: it rides back inside
-        // the program at the next swap, and is freed on the main thread (§9.1).
+        // When ring lengths change, new buffers provided by the main thread are swapped in.
         let next = self.program.as_mut().expect("take reported a swap");
         for line in 0..next.audio_delay_nodes.len().min(MAX_AUDIO_DELAY_LINES) {
             let len = next.audio_ring_len.get(line).copied().unwrap_or(0);
             if next.audio_rings.get(line).is_some_and(|r| !r.is_empty()) {
                 std::mem::swap(&mut self.audio_rings[line], &mut next.audio_rings[line]);
-                // Carry over what will still fit, most recent samples last, so
-                // a feedback loop survives someone widening its range.
+                // Carry over what will still fit, most recent samples last.
                 let from = &next.audio_rings[line];
                 copy_ring(
                     from,
@@ -526,18 +442,12 @@ impl Engine {
                 );
                 self.audio_ring_len[line] = len;
             } else if self.audio_ring_len[line] != len {
-                // The main thread thought this line already had the right ring
-                // and it does not. Reading a stale length would read off the
-                // end; an empty line is silence, which is recoverable.
                 self.audio_ring_len[line] = 0;
             }
         }
         for line in next.audio_delay_nodes.len()..MAX_AUDIO_DELAY_LINES {
             self.audio_ring_len[line] = 0;
         }
-        // Which tap is which may have changed, and sweeping a read pointer from
-        // where a different tap left it would be a click. One chunk of jump is
-        // the cheaper wrong answer.
         self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
         true
     }
@@ -576,14 +486,12 @@ impl Engine {
         }
     }
 
-    /// Forget every held note. Called on `reset`, where the DAW has told us the
-    /// transport jumped and any note-offs we were waiting for will never come.
+    /// Clears held notes and resets internal phase/delay head counters on host transport jump.
+    ///
+    /// This intentionally does NOT clear key switch latches, because latches should survive
+    /// transport jumps (e.g. seeking in the DAW timeline).
     pub fn reset(&mut self) {
         self.expressions = Expressions::default();
-        // The transport jumped: the note-offs we were waiting for will never
-        // come, so nothing is held any more. The latches are left alone —
-        // which way a key switch is thrown is a setting the user made, not a
-        // note still sounding.
         self.keys_held = 0;
         self.keys_struck = 0;
         self.phases.iter_mut().for_each(|p| *p = 0.0);
@@ -592,19 +500,11 @@ impl Engine {
         self.pool.fill(0.0);
         self.compensators.fill(0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
-        // The delay rings are *not* sized here. §14.5 wants them sized from the
-        // graph's `max_time`, and there is no graph yet — the DAW activates us
-        // before the state is restored. They arrive with the program instead,
-        // allocated on the main thread by `Program::size_rings`.
+        // Audio delay rings are sized and allocated by the main thread via Program::size_rings.
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
     }
 
-    /// Size the audio buffers. Called from `activate`, on the main thread.
-    ///
-    /// The only allocating method on this type. Everything is sized for the
-    /// ceilings rather than for the current program, so that a recompile —
-    /// which happens on every drag of every control — never needs memory the
-    /// audio thread does not already have (§9.1).
+    /// Allocates and sizes audio buffers for worst-case limits. Called from the main thread on activation.
     pub fn prepare(&mut self, max_frames: u32, daw_inputs: &[u16]) {
         self.stride = max_frames as usize;
         self.daw_inputs.clear();
@@ -616,56 +516,39 @@ impl Engine {
         self.compensators
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
-        // The delay rings are *not* sized here. §14.5 wants them sized from the
-        // graph's `max_time`, and there is no graph yet — the DAW activates us
-        // before the state is restored. They arrive with the program instead,
-        // allocated on the main thread by `Program::size_rings`.
+        // Audio delay rings are sized and allocated by the main thread via Program::size_rings.
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
     }
 
-    /// What the wrapper should report to the DAW as its own latency (§14.6).
+    /// Returns the latency in samples reported by the compiled program.
     pub fn latency(&self) -> u32 {
         self.program.as_ref().map_or(0, |p| p.latency)
     }
 
-    /// Whether the program routes audio at all.
-    ///
-    /// False for a graph that only drives parameters, which is every patch
-    /// written before M8 — those keep the direct path through one sub-plugin.
+    /// Returns whether the current program contains audio operations.
     pub fn has_audio(&self) -> bool {
         self.program
             .as_ref()
             .is_some_and(|p| !p.audio_ops.is_empty())
     }
 
-    /// How often [`run_audio`][Engine::run_audio] wants to be called (§14.9).
+    /// Returns the evaluation chunking granularity required by the active program.
     pub fn chunking(&self) -> Chunking {
         self.program
             .as_ref()
             .map_or(Chunking::WholeBlock, |p| p.chunking)
     }
 
-    /// Run the audio half of the program for one block the DAW handed us.
+    /// Executes the audio pipeline for a block provided by the audio host.
     ///
-    /// `daw_in` and `daw_out` are planar — the wrapper's own connection to the
-    /// DAW. `nodes` is how a sub-plugin gets run, because this crate does not
-    /// know what a sub-plugin is (§7).
-    ///
-    /// The block is cut into chunks here rather than by the caller (§14.9). A
-    /// program with an audio delay line in it runs once per sub-block, because
-    /// §14.4's `D >= chunk length` binds every plugin in the loop too; one
-    /// without runs once for the whole block, and is not made to pay for a
-    /// feedback path it does not have.
-    ///
-    /// Does nothing if `prepare` has not been called or the block is longer
-    /// than `prepare` was told to expect. Both mean the caller broke the
-    /// contract, and neither is worth reading past the end of a buffer for.
+    /// Evaluates operations at whole-block or sub-block chunking depending on whether
+    /// audio feedback delay loops are present.
     pub fn run_audio(
         &mut self,
         ctx: &AudioContext<'_>,
         daw_in: &[f32],
         daw_out: &mut [f32],
-        nodes: &mut dyn AudioNodes,
+        nodes: &mut dyn AudioInstances,
     ) {
         let total = ctx.frames as usize;
         if self.stride == 0 || total > self.stride {
@@ -677,10 +560,7 @@ impl Engine {
 
         let step = match program.chunking {
             Chunking::WholeBlock => total.max(1),
-            // The same arithmetic the slot schedule uses, so chunk `i` and lane
-            // row `i` cover the same samples. The last chunk is short whenever
-            // the block is not a multiple of the quantum, and a short chunk is
-            // always safe: it reads further into the past, never nearer.
+            // The last chunk is short whenever the block is not a multiple of the quantum.
             Chunking::SubBlock => (ctx.quantum as usize).max(1),
         };
         let mut start = 0usize;
@@ -697,16 +577,12 @@ impl Engine {
 
     /// One chunk of `run_audio`: every op, over `len` frames starting at
     /// `start` inside the DAW's block.
-    ///
-    /// Buffers in the pool are packed at `len` rather than at the block size,
-    /// so a sub-plugin can be handed the slice directly — the same reason a
-    /// short sub-block is a smaller buffer rather than a sparse one.
     #[allow(clippy::too_many_arguments)]
     fn run_chunk(
         &mut self,
         program: &Program,
         ctx: &AudioContext<'_>,
-        nodes: &mut dyn AudioNodes,
+        nodes: &mut dyn AudioInstances,
         daw_in: &[f32],
         daw_out: &mut [f32],
         start: usize,
@@ -720,11 +596,7 @@ impl Engine {
                 AudioOp::Silence { out } => self.fill(*out, frames, 0.0),
                 AudioOp::Input { out, bus } => {
                     let width = program.buffers[*out as usize] as usize;
-                    // `daw_in` holds every input bus packed, main first, the
-                    // same way a plugin's input region does (§14.11). A node
-                    // naming a bus the wrapper does not have reads silence
-                    // rather than the wrong bus: that is a failure a user can
-                    // hear and fix, and reading the wrong bus is not.
+                    // daw_in holds interleaved planar buses.
                     let bus = *bus as usize;
                     let Some(&have) = self.daw_inputs.get(bus) else {
                         self.fill(*out, frames, 0.0);
@@ -764,9 +636,8 @@ impl Engine {
                     }
                 }
                 AudioOp::Gather { out, buses } => {
-                    // Assemble one plugin's input region, bus by bus (§14.11).
-                    // Widths are adapted here rather than inside the plugin op
-                    // so the conversion is visible in the compiled program.
+                    // Assembles the plugin input buffer across connected buses.
+                    // Width conversions are performed here during assembly.
                     let mut at = 0usize;
                     for &(from, want) in buses {
                         let have = program.buffers[from as usize];
@@ -842,11 +713,10 @@ impl Engine {
                     let out_width: u16 = output_buses.iter().sum();
                     // Only what the plugin will actually read is handed over.
                     // The buffer behind it is as wide as any buffer in the
-                    // pool; the region it owns is its own buses (§14.11).
+                    // pool; the region it owns is sized for its active buses.
                     let packed_in = in_width as usize * frames;
                     let packed_out = out_width as usize * frames;
-                    // The gate is a lane, so it is read here, once per chunk,
-                    // the same way a mix's gain is (§14.10).
+                    // The gate lane is sampled per chunk.
                     let notes = notes.resolve(notes.gate.and_then(|lane| ctx.lane(row, lane)));
                     nodes.process(
                         *instance,
@@ -856,10 +726,10 @@ impl Engine {
                         AudioChunk {
                             input_channels: in_width,
                             output_channels: out_width,
-                            aux_inputs: plugin_host_api::AuxBuses::new(
+                            aux_inputs: plugin_host::AuxBuses::new(
                                 input_buses.get(1..).unwrap_or(&[]),
                             ),
-                            aux_outputs: plugin_host_api::AuxBuses::new(
+                            aux_outputs: plugin_host::AuxBuses::new(
                                 output_buses.get(1..).unwrap_or(&[]),
                             ),
                             frames: frames as u32,
@@ -883,10 +753,7 @@ impl Engine {
                             let from = self.at(input.buf, ch, frames);
                             let to = self.at(*out, ch, frames);
                             if from == to && gain == 1.0 {
-                                // Already in place and unchanged: the first
-                                // input may well have been given the
-                                // destination buffer, and a mix of one at unity
-                                // is then nothing at all.
+                                // Already in place and unchanged: unity gain on destination buffer.
                                 continue;
                             }
                             for i in 0..frames {
@@ -919,10 +786,8 @@ impl Engine {
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
                     self.delay_read(*line as usize, index, *out, width, frames, {
-                        // §14.4's floor, in samples, plus the two samples the
-                        // interpolator needs ahead of the read pointer — read
-                        // any nearer and the four points it wants would include
-                        // this chunk's own writes.
+                        // Minimum floor in samples, plus the two samples the
+                        // interpolator needs ahead of the read pointer.
                         let floor = frames as f64 + 2.0;
                         let ceiling = (max_time * ctx.sample_rate)
                             .min(self.audio_ring_len[*line as usize].saturating_sub(4) as f64)
@@ -954,15 +819,9 @@ impl Engine {
         }
     }
 
-    /// Read `line` into `buf`, sweeping the read pointer to `distance` samples
-    /// back over the chunk (§14.5).
+    /// Reads samples from an audio delay line into `buf` with cubic Hermite interpolation.
     ///
-    /// The pointer is fractional and the value between samples is interpolated,
-    /// so moving the delay time moves the pitch: this is a tape delay, and it
-    /// is what falls out of writing the thing the obvious way rather than
-    /// something extra that was built on top. The sweep is what keeps it from
-    /// clicking — the time only arrives once per sub-block (§9.2), and jumping
-    /// the pointer 32 samples at a boundary is audible.
+    /// Smooths the read pointer across chunks to prevent clicks during delay modulation.
     fn delay_read(
         &mut self,
         line: usize,
@@ -987,8 +846,7 @@ impl Engine {
             let ring = ch * ring_len;
             let to = self.at(buf, ch, frames);
             for i in 0..frames {
-                // The sweep lands exactly on `distance` at the last sample, so
-                // the next chunk starts where this one finished.
+                // The sweep lands exactly on `distance` at the last sample.
                 let t = (i + 1) as f64 / frames as f64;
                 let d = from + (distance - from) * t;
                 let position = (head + i) as f64 - d;
@@ -1036,7 +894,7 @@ impl Engine {
         self.audio_ring_heads[line] = (head + frames) % ring_len;
     }
 
-    /// Push a buffer through a fixed delay, in place (§14.6).
+    /// Delays a buffer in place by a fixed sample count for latency compensation.
     fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, frames: usize) {
         if slot >= MAX_COMPENSATORS || samples == 0 || samples >= MAX_COMPENSATION {
             return;
@@ -1059,16 +917,11 @@ impl Engine {
         self.compensator_heads[slot] = head;
     }
 
-    /// Evaluate the program for one sub-block.
+    /// Evaluates parameter operations for one sub-block.
     ///
-    /// `slots` comes in holding the DAW's automation and goes out with the
-    /// graph's outputs written over the slots it drives. Slots the graph does
-    /// not touch keep the DAW's value, which is what makes a wrapper with an
-    /// empty graph behave exactly as it did before M5.
+    /// Overwrites slot table values for lanes driven by the graph.
     pub fn run(&mut self, ctx: &BlockContext, slots: &mut [f64]) {
-        // Moved out and put back rather than borrowed: the ops write into
-        // `self.registers`, and holding a `&self.program` across that would be
-        // a borrow conflict for no benefit at run time.
+        // Moved out and put back rather than borrowed.
         let Some(program) = self.program.take() else {
             return;
         };
@@ -1083,9 +936,7 @@ impl Engine {
             0.0
         };
 
-        // How many sub-blocks back one second is. The floor of §14.4 in the
-        // param domain is one sub-block, and it is applied here rather than at
-        // compile time because only the audio thread knows both of these.
+        // Parameter delay distance converted to sub-block taps.
         let taps_per_second = if ctx.frames > 0 && ctx.sample_rate > 0.0 {
             ctx.sample_rate / f64::from(ctx.frames)
         } else {
@@ -1100,24 +951,18 @@ impl Engine {
                     time,
                     time_reg,
                 } => {
-                    // A wired time control wins over the node's own number, the
-                    // same way `Math`'s `b` gives way to its input (§14.5).
+                    // A wired time control overrides the static node setting.
                     let time = match time_reg {
                         Some(reg) => self.registers[reg as usize].max(0.0),
                         None => time,
                     };
                     let index = line as usize;
-                    // A read whose line the program does not have is silence,
-                    // not a panic: `line` is compiler-generated, but the audio
-                    // thread is the wrong place to find that out the hard way.
                     self.registers[out as usize] = if index < self.rings.len() {
                         let taps = (time * taps_per_second)
                             .round()
                             .clamp(1.0, (MAX_DELAY_TAPS - 1) as f64)
                             as usize;
                         let head = self.ring_heads[index];
-                        // `head` is where the *next* write goes, so the value
-                        // written one sub-block ago is at `head - 1`.
                         let at = (head + MAX_DELAY_TAPS - taps) % MAX_DELAY_TAPS;
                         self.rings[index][at]
                     } else {
@@ -1171,8 +1016,6 @@ impl Engine {
                     };
                     let advanced = self.phases[i] + hz * dt;
                     if advanced >= 1.0 && waveform == Waveform::Random {
-                        // A new value at each cycle boundary. Scaled to -1..1
-                        // so it lands in the same range as the other shapes.
                         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                         self.holds[i] = f64::from(self.rng >> 8) / f64::from(1u32 << 23) - 1.0;
                     }
@@ -1203,9 +1046,6 @@ impl Engine {
                         && count > 0
                         && let Some(latch) = self.latches.get_mut(state as usize)
                     {
-                        // NaN is "never set", which counts as position 0 — so
-                        // the first strike lands on 1, the way throwing a
-                        // switch that was off turns it on.
                         let at = if latch.is_nan() { 0.0 } else { *latch };
                         *latch = (at + 1.0).rem_euclid(f64::from(count));
                     }
@@ -1255,10 +1095,8 @@ impl Engine {
                         MathOp::Multiply => a * b,
                         MathOp::Min => a.min(b),
                         MathOp::Max => a.max(b),
-                        // Guarded: a zero or negative exponent on a zero input
-                        // is an infinity, and an infinity that reaches a
-                        // third-party plugin's parameter is a crash waiting to
-                        // be blamed on the plugin.
+                        // Clamping the exponent to at least 0.01 prevents yielding Infinity,
+                        // which can crash third-party plugins if fed to their parameters.
                         MathOp::Curve => a.clamp(0.0, 1.0).powf(b.clamp(0.01, 100.0)),
                     };
                 }
@@ -1285,12 +1123,8 @@ impl Engine {
 
         for &(lane, reg) in &program.outputs {
             if let Some(target) = slots.get_mut(lane as usize) {
-                // Slots and parameters are 0..1 by definition (§8.1); the
-                // mapping onto the sub-plugin's plain range belongs to the slot
-                // table. An audio lane is not — it carries decibels or seconds
-                // (§14.5) — so only the lanes below the audio range are
-                // clamped. A NaN from a degenerate graph must not get past
-                // here either way.
+                // Host automation and parameter slots are normalized to 0..1, while audio lanes
+                // carry physical units (decibels, seconds) without clamping.
                 let value = self.registers[reg as usize];
                 *target = if !value.is_finite() {
                     0.0
@@ -1302,8 +1136,6 @@ impl Engine {
             }
         }
 
-        // Each note-on is seen by one evaluation and no more: an op that fired
-        // on it this sub-block must not fire on it again next.
         self.keys_struck = 0;
 
         self.program = Some(program);
@@ -1353,14 +1185,11 @@ mod tests {
         PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
+    use subhost_adapter::NoteStream;
 
     const SLOTS: usize = 32;
 
-    /// Somewhere for a parameter chain to go.
-    ///
-    /// With `SlotOut` gone, a graph reaches the outside world through a §14.12
-    /// parameter socket, and the lane that carries it is the first one past
-    /// the slot table — which is what [`SINK`] is.
+    /// Helper creating a parameter sink plugin node.
     fn param_sink(graph: &mut Graph) -> NodeId {
         graph.add(
             NodeKind::Plugin(Plugin {
@@ -1638,8 +1467,7 @@ mod tests {
         );
     }
 
-    /// A feedback loop, built the only way §14.4 allows one to be built. The
-    /// value has to come back round, one sub-block later, scaled.
+    /// Helper creating a parameter feedback loop test graph.
     fn feedback_graph(time: f64) -> (Graph, NodeId) {
         let mut graph = Graph::new();
         let seed = graph.add(NodeKind::SlotIn(SlotIn { slot: 1 }), [0.0, 0.0]);
@@ -1712,8 +1540,7 @@ mod tests {
         );
     }
 
-    /// §14.5. The line is state, like an LFO's phase, and an edit somewhere
-    /// else must not empty it.
+    /// Verifies that recompiling does not clear parameter delay line state.
     #[test]
     fn recompiling_does_not_empty_a_delay_line() {
         let (mut graph, _) = feedback_graph(32.0 / 48_000.0);
@@ -1738,8 +1565,7 @@ mod tests {
         );
     }
 
-    /// The floor of §14.4, in the param domain. A time under one sub-block
-    /// would be a read of the value being written in this same sub-block.
+    /// Verifies that parameter delay times below one sub-block are clamped to the minimum floor.
     #[test]
     fn a_delay_shorter_than_a_sub_block_is_held_at_one() {
         let (graph, _) = feedback_graph(0.0);
@@ -1786,7 +1612,7 @@ mod tests {
     /// makes the order it ran in readable off the output.
     struct Adders;
 
-    impl AudioNodes for Adders {
+    impl AudioInstances for Adders {
         fn process(
             &mut self,
             instance: u32,
@@ -1858,8 +1684,7 @@ mod tests {
         );
     }
 
-    /// §14.6, end to end: the dry branch really is held back, so an impulse
-    /// arrives once rather than twice.
+    /// Verifies latency compensation delay aligns parallel audio branches.
     #[test]
     fn a_compensated_branch_arrives_with_the_late_one() {
         let mut graph = Graph::new();
@@ -2536,8 +2361,7 @@ mod tests {
         daw_in
     }
 
-    /// §14.5. What goes into the line comes back out of it, that many samples
-    /// later, and not before.
+    /// Verifies that an audio delay line outputs samples delayed by the expected duration.
     #[test]
     fn an_audio_delay_returns_what_it_was_given_a_delay_later() {
         let mut graph = Graph::new();
@@ -2573,8 +2397,7 @@ mod tests {
         assert!((peak.1 - 1.0).abs() < 1e-3, "and at its original height");
     }
 
-    /// §14.4. The floor is the chunk length, and a time below it is raised
-    /// rather than refused — the user sees a control that will not go lower.
+    /// Verifies that delay times shorter than chunk length are clamped to minimum safe distance.
     #[test]
     fn a_delay_shorter_than_a_chunk_is_held_at_the_chunk() {
         let mut graph = Graph::new();
@@ -2609,9 +2432,7 @@ mod tests {
         assert_eq!(peak, 34);
     }
 
-    /// The DoD of M8.5: a feedback loop sounds the same whatever the DAW's
-    /// block size, because the delay is in samples and the chunking is the
-    /// wrapper's own (§14.4, §14.9).
+    /// Verifies consistent delay feedback behavior across different host block sizes.
     #[test]
     fn a_feedback_loop_sounds_the_same_at_any_block_size() {
         let mut graph = Graph::new();
@@ -2667,13 +2488,11 @@ mod tests {
         );
     }
 
-    /// §14.4, the other half of the DoD: moving the delay time is automation,
-    /// not a recompile, so nothing about how often a sub-plugin runs depends
-    /// on it.
+    /// Verifies that modulating delay time does not alter sub-plugin processing chunk count.
     #[test]
     fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
         struct Counting(usize);
-        impl AudioNodes for Counting {
+        impl AudioInstances for Counting {
             fn process(
                 &mut self,
                 _instance: u32,
@@ -2739,16 +2558,13 @@ mod tests {
         );
     }
 
-    /// The headline of M8.5: moving the delay time moves the pitch, and does
-    /// not click (§14.5).
+    /// Verifies continuous tape-style pitch modulation during delay time sweeps without clicks.
     ///
     /// The signal written into the line is a ramp of one per sample, so what
-    /// comes out is `t - d(t)` and the *step between output samples is the
-    /// playback speed*. Holding the time still gives a step of exactly 1; a
+    /// comes out is `t - d(t)` and the step between output samples is the
+    /// playback speed. Holding the time still gives a step of exactly 1; a
     /// time shortening by a quarter of a sample per sample gives 1.25, which is
-    /// the pitch moving up. A read pointer that jumped once per sub-block
-    /// instead of sweeping would show up as one step of 32 at each boundary —
-    /// that step is the click.
+    /// the pitch moving up.
     #[test]
     fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
         let mut graph = Graph::new();
@@ -3000,8 +2816,7 @@ mod tests {
         );
     }
 
-    /// §14.5. The ring is as long as the node asked for, not as long as some
-    /// ceiling — and widening `max_time` gets a longer one without emptying it.
+    /// Verifies that resizing max delay time allocates a larger ring buffer while preserving existing samples.
     #[test]
     fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
         let mut graph = Graph::new();
@@ -3070,8 +2885,7 @@ mod tests {
         );
     }
 
-    /// §14.5. Recompiling happens on every drag of every control; a feedback
-    /// loop that emptied itself each time would be unusable.
+    /// Verifies that recompiling a patch preserves audio delay buffer contents.
     #[test]
     fn a_recompile_leaves_the_line_full() {
         let mut graph = Graph::new();

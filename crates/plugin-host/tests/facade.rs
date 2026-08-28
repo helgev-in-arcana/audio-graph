@@ -1,4 +1,5 @@
-//! The facade, driven against whatever is actually on the machine.
+//! Integration tests for the unified plugin host facade, driven against
+//! whatever is actually on the machine.
 //!
 //! The CLAP half runs everywhere, because the fixture is built from this
 //! workspace. The VST3 half skips itself when no plugin is installed, which is
@@ -21,15 +22,14 @@ impl HostContext for TestHost {
     fn request_restart(&self, _reason: RestartReason) {}
 }
 
-/// The CLAP fixture, under a `.clap` name.
+/// Locates the built CLAP test fixture and copies it under a `.clap` name.
 ///
 /// The facade infers the format from the extension and cargo's artefact is
-/// named `.dll`, so it is copied rather than renamed — the original belongs to
+/// named `.dll`, so it is copied rather than renamed: the original belongs to
 /// cargo and the next build would replace it anyway.
 ///
-/// Panics when the fixture is missing, for the reason spelled out in
-/// `clap-host/tests/fixture_plugin.rs`: skipping would make a green run mean
-/// nothing.
+/// Panics when the fixture is missing rather than skipping, because a skip
+/// would make a green run mean nothing.
 fn fixture_as_clap() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let build_dir = exe
@@ -80,15 +80,15 @@ fn the_facade_loads_a_clap_by_path_alone() {
     assert_eq!(SubPluginMain::params(&plugin).len(), 7);
     assert_eq!(SubPluginMain::io_layout(&plugin).inputs.len(), 2);
     // A tick with no editor open must still be safe, since the caller is told
-    // to call it every frame regardless — CLAP's timers and main-thread
+    // to call it every frame regardless: CLAP's timers and main-thread
     // callbacks run whether or not anything is on screen.
     plugin.tick();
 
     assert!(plugin.has_editor());
     #[cfg(windows)]
     {
-        // The whole point of the facade: the same three calls, whichever format
-        // answered.
+        // The whole point of the facade: the same three calls, whichever
+        // format answered.
         plugin.open_editor(std::ptr::null_mut()).expect("opens");
         assert!(plugin.editor_is_open());
         plugin.tick();
@@ -137,8 +137,8 @@ fn the_facade_loads_an_installed_vst3() {
         .expect("loads through the facade");
     assert_eq!(plugin.format(), Format::Vst3);
     assert_eq!(plugin.name(), class.name);
-    // Both backends answer the same question the same way; that is the facade's
-    // whole job.
+    // Both backends answer the same question the same way; that is the
+    // facade's whole job.
     let _ = SubPluginMain::io_layout(&plugin);
     let _ = SubPluginMain::capabilities(&plugin);
 }

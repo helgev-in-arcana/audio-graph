@@ -3,6 +3,7 @@ name = "audio-graph-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "README.md"
 
 [features]
 # The editor half of a node: its controls, and what the add-node menu offers.
@@ -11,7 +12,8 @@ license.workspace = true
 ui = ["dep:egui"]
 
 [dependencies]
-plugin-host-api.workspace = true
+plugin-host.workspace = true
+subhost-adapter.workspace = true
 serde.workspace = true
 # Pinned to what nice-plug-egui resolves, so the wrapper links one egui.
 egui = { version = "0.36", optional = true, default-features = false }

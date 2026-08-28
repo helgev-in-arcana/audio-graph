@@ -1,13 +1,7 @@
-//! A real, if very plain, editor for the fixture.
+//! Minimal test GUI implementation for the fixture plugin.
 //!
-//! It exists so `clap-host`'s GUI path can be checked without a third-party
-//! plugin installed. What matters is not what it draws but that it behaves like
-//! a plugin's editor does: it creates a child window inside the host's, paints
-//! into it, and must be told to go away before the host's window is destroyed —
-//! which is the ordering ARCHITECTURE.md §5.3 is entirely about.
-//!
-//! Windows only, like the host side. Elsewhere `is_api_supported` says no,
-//! which is the honest answer and the one a host must handle anyway.
+//! Provides a plain embedded child window implementation used to verify host GUI
+//! embedding and lifecycle teardown behavior.
 
 use std::ffi::{CStr, c_char, c_void};
 
@@ -56,8 +50,7 @@ unsafe extern "C" fn is_api_supported(
     is_floating: bool,
 ) -> bool {
     if is_floating || api.is_null() {
-        // Embedded only: a floating window would be the plugin's own, and then
-        // the host could not own the teardown order.
+        // Embedded only: floating windows are not managed by host lifecycle.
         return false;
     }
     (unsafe { CStr::from_ptr(api) }) == imp::WINDOW_API
@@ -104,9 +97,7 @@ unsafe extern "C" fn create(
 
 unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
-        // The child window goes with it. A plugin that leaked it here would
-        // leave the host's window with a dead child, which is the failure §5.3
-        // describes from the other side.
+        // Drop the child window during GUI destruction to avoid orphaned windows in the host.
         instance.gui = Gui::default();
     }
 }

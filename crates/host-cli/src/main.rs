@@ -1,8 +1,12 @@
-//! Development harness for the host library.
+//! Development harness and diagnostic CLI for the plugin host.
 //!
-//! Stands in for a DAW during development: everything the milestones ask us to
-//! prove — that a real plugin loads, enumerates, instantiates, and processes —
+//! Stands in for a DAW during development: everything worth proving about the
+//! host — that a real plugin loads, enumerates, instantiates, and processes —
 //! is exercised from here without a DAW in the loop.
+//!
+//! Provides command-line tools to test plugin scanning, parameter reflection,
+//! offline rendering, bus configurations, state persistence, and node graph
+//! execution.
 
 mod fault;
 mod host;
@@ -15,6 +19,18 @@ use std::process::ExitCode;
 use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Mix, NodeKind, SlotIn};
 use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
+use subhost_adapter::SubHostConfig;
+
+/// The wrapper's ceilings, as `audio-graph-plugin` builds them.
+///
+/// Repeated rather than imported: this crate checks the engine and the adapter
+/// without linking the wrapper (and so without egui). Keep in step with
+/// `audio_graph_plugin::SUB_HOST`.
+const SUB_HOST: SubHostConfig = SubHostConfig {
+    max_instances: 16,
+    slot_count: 32,
+    lanes: 32 + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES,
+};
 
 fn main() -> ExitCode {
     fault::install_crash_handler();
@@ -72,11 +88,11 @@ fn usage() {
     eprintln!(
         "usage:
   Every PLUGIN argument may be a .vst3 or a .clap; the extension picks the
-  backend. ID is that format's own plugin id -- a VST3 class id in hex, or a
-  CLAP reverse-DNS name -- as printed by `scan` and `info`.
+  backend. ID is that format's own plugin id — a VST3 class id in hex, or a
+  CLAP reverse-DNS name — as printed by `scan` and `info`.
 
   host-cli dirs                     list the directories a scan covers, and the
-                                    config file they come from -- seeded on a
+                                    config file they come from — seeded on a
                                     first run from this OS's conventions, and
                                     editable from the wrapper's editor
   host-cli scan [DIR...]            load every module found and list its plugins
@@ -100,7 +116,7 @@ fn usage() {
                                     check the graph routing A -> B matches A and B
                                     rendered one after the other
   host-cli buses <PLUGIN> [ID]      list the plugin's buses as the node graph
-                                    will see them (§14.2)
+                                    will see them
   host-cli outbus <WRAPPER.vst3> <PLUGIN> [ID]
                                     render a plugin with more than one output
                                     bus once per output socket, and report what
@@ -239,13 +255,12 @@ fn cmd_scan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// What one plugin declares for buses and notes, which is what a plugin node's
-/// sockets are built from (§14.2).
+/// Displays the bus and note configuration declared by a plugin and maps them to node graph ports.
 ///
-/// Read before activation, so this is the plugin's default shape rather than a
+/// Read before activation, so this is the plugin's *default* shape rather than a
 /// negotiated one. A sidechain socket has to exist before the graph can ask for
 /// anything to be connected to it, so the default is the right thing to build
-/// sockets from -- and §14.11 re-checks the negotiation at activate.
+/// sockets from — and the negotiation is re-checked at activate.
 fn cmd_buses(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -314,8 +329,8 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 
     // Reading the factory says what a module offers; only an instance can say
     // what it implements, because both formats answer that question through the
-    // instance (`get_extension` / `queryInterface`). So one plugin is loaded --
-    // the one named, or the first -- rather than all of them: a module like
+    // instance (`get_extension` / `queryInterface`). So one plugin is loaded —
+    // the one named, or the first — rather than all of them: a module like
     // Airwindows Consolidated has hundreds of classes, and instantiating every
     // one to print the same list is not worth the wait.
     let (class, plugin) = render::load(path, wanted, std::sync::Arc::new(host::CliHost::new()))?;
@@ -340,7 +355,7 @@ implemented by {} ({}):",
     Ok(())
 }
 
-/// M0's leak check: repeated load/unload must not grow or crash.
+/// The leak check: repeated load/unload must not grow or crash.
 fn cmd_churn(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("expected a path")?;
     let iterations: usize = args
@@ -362,8 +377,7 @@ fn cmd_churn(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// M2's parameter surface, seen from outside: the list, the ranges, and the
-/// plugin's own formatting of each current value.
+/// Lists parameters, ranges, capabilities, and formatted display values for a plugin.
 fn cmd_params(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -405,7 +419,7 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
         let text = plugin.param_to_text(p.id, current).unwrap_or_default();
         // The module is the VST3 unit the parameter sits in — the tree a DAW
         // shows when picking an automation lane. Printed because an accidental
-        // extra level there is invisible from the parameter list alone (§8.1).
+        // extra level there is invisible from the parameter list alone.
         let module = if p.module.is_empty() {
             String::new()
         } else {
@@ -479,7 +493,7 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
     // `--twice` asks whether a second instance in the *same* process plays the
     // same notes the same way. Several synths randomise oscillator phase from a
     // process-global generator, which makes them perfectly repeatable run to
-    // run and different instance to instance -- and therefore useless for any
+    // run and different instance to instance — and therefore useless for any
     // check that compares a graph against a hand-made chain.
     if twice {
         let again = render::render(
@@ -515,12 +529,11 @@ fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {
     }
 }
 
-/// M2's state DoD: change a parameter, save, restore into a *fresh* instance,
-/// and confirm the value survived.
+/// Verifies state persistence by modifying a parameter, saving state, and restoring into a new instance.
 ///
-/// Several parameters are tried before giving up. A single failure says
-/// nothing: plugins refuse writes to some parameters, and recompute others
-/// from the transport on every block.
+/// Several parameters are tried before giving up. A single failure says nothing:
+/// plugins refuse writes to some parameters, and recompute others from the
+/// transport on every block.
 fn cmd_state(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -690,11 +703,12 @@ fn pick_writable_param(plugin: &Plugin) -> Option<plugin_host::ParamInfo> {
     writable_params(plugin).into_iter().next()
 }
 
-/// M2's sample-accuracy DoD: a parameter change carrying a `sample_offset`
-/// must take effect at that sample, not at the block boundary.
+/// Verifies sample-accurate parameter automation timing.
 ///
-/// Rendering twice and diffing is the only way to see this from outside: the
-/// plugin is a black box, so the evidence is *where* the two renders diverge.
+/// A parameter change carrying a `sample_offset` must take effect at that
+/// sample, not at the block boundary. Rendering twice and diffing is the only
+/// way to see that from outside: the plugin is a black box, so the evidence is
+/// *where* the two renders diverge.
 fn cmd_automate(args: &[String]) -> Result<(), String> {
     use plugin_host::{Event, ParamEvent, Target};
     use std::sync::Arc;
@@ -891,16 +905,16 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Open and tear down one plugin's editor, both ways round (§5.3).
+/// Opens and tears down a plugin editor in normal or reverse destruction order.
 ///
 /// The second order is the one that matters: some DAWs terminate a plugin
-/// without ever sending a close notification, so correctness cannot depend on
-/// a caller remembering to close the editor first.
+/// without ever sending a close notification, so correctness cannot depend on a
+/// caller remembering to close the editor first.
 fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result<(), String> {
     use std::sync::Arc;
     use subhost_adapter::SubHost;
 
-    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(path), Some(class_id))?;
 
     let config = plugin_host::AudioConfig {
@@ -956,14 +970,13 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
     Ok(())
 }
 
-/// The standing regression sweep: every installed plugin through the lifecycle
-/// a DAW would put it through.
+/// Runs lifecycle regression tests against every installed plugin module.
 ///
 /// Each module is probed in a *child process*. A third-party plugin that
 /// corrupts its own heap on teardown would otherwise take the whole sweep with
 /// it, and losing the results for the other fifty is not an acceptable way to
-/// learn that one of them is broken. This is also a small preview of why
-/// ADR-6's out-of-process backend exists.
+/// learn that one of them is broken. It is also a small preview of why an
+/// out-of-process backend is worth having.
 fn cmd_sweep(args: &[String]) -> Result<(), String> {
     use std::process::Command;
 
@@ -1039,11 +1052,7 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
         }
     }
 
-    println!(
-        "
-{ok} module(s) passed, {} problem(s)",
-        problems.len()
-    );
+    println!("\n{ok} module(s) passed, {} problem(s)", problems.len());
     for p in &problems {
         println!("  !! {p}");
     }
@@ -1054,12 +1063,11 @@ fn cmd_sweep(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// M3's project-reopen check: does the wrapper's state carry its sub-plugin?
+/// Tests saving and restoring wrapper state to verify sub-plugin persistence.
 ///
-/// Saves state from an instance that has a sub-plugin loaded, then restores it
-/// into a fresh one and confirms the sub-plugin came back. This is what a DAW
-/// does when a project is closed and opened again, and it is the case section
-/// 8.3 exists for.
+/// Saves state from an instance with a loaded sub-plugin, restores it into a
+/// fresh instance, and confirms the sub-plugin came back. This is what a DAW
+/// does when a project is closed and opened again.
 fn cmd_nest(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1100,21 +1108,22 @@ fn cmd_nest(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// M5's acceptance check, run without a DAW.
+/// Tests modulating a sub-plugin parameter using an LFO in the node graph.
 ///
-/// The claim to demonstrate is "an LFO can wobble a sub-plugin's parameter",
-/// and it is not one the unit tests can make: they stop at the compiled program
-/// and the events it produces. What they cannot show is that those events, sent
+/// The claim to demonstrate is "an LFO can wobble a sub-plugin's parameter", and
+/// it is not one the unit tests can make: they stop at the compiled program and
+/// the events it produces. What they cannot show is that those events, sent
 /// through the wrapper, through the nesting layer, into a real commercial
 /// plugin, come out the other side as a change in the audio.
 ///
 /// So: render the same input twice through the same wrapper and the same
-/// sub-plugin, once with a graph driving the bound slot and once without, and
-/// compare. The graph is injected into the wrapper's own saved state, which is
-/// exactly the route a project file takes.
+/// sub-plugin, once with a graph driving the bound parameter and once without,
+/// and compare. The graph is injected into the wrapper's own saved state, which
+/// is exactly the route a project file takes.
 ///
+/// Usage:
 ///   AUDIO_GRAPH_SUB=...\RoughRider3.vst3 AUDIO_GRAPH_SUB_BIND=56 \
-///     cargo run -p host-cli -- graph target/AudioGraph.vst3 tone.wav
+///     cargo run -p host-cli — graph target/AudioGraph.vst3 tone.wav
 fn cmd_graph(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1330,12 +1339,11 @@ fn walk(
     }
 }
 
-/// Put an LFO on the parameter `AUDIO_GRAPH_SUB_BIND` bound.
+/// Puts an LFO on the parameter `AUDIO_GRAPH_SUB_BIND` bound.
 ///
 /// The sub-plugin becomes a node in the graph and the LFO drives one of its
-/// parameter sockets (§14.12). That used to be a slot binding with a `SlotOut`
-/// on the other end; the slot is the DAW's lane, and the graph writing it was
-/// the wrapper arguing with the host over who owns the automation.
+/// parameter sockets. Driving a *slot* instead would be the wrapper arguing with
+/// the host over who owns the automation lane.
 fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
@@ -1354,14 +1362,21 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
         .as_str()
         .unwrap_or("bound")
         .to_string();
-    let reference = value["sub_plugin"].clone();
+    // The wrapper saves its sub-plugins as a list; `sub_plugin` is the older
+    // single one, still read so an old project loads. Looking only at the old
+    // field left this reading `null` for every state the wrapper has written
+    // since.
+    let reference = match value["sub_plugins"].as_array().and_then(|xs| xs.first()) {
+        Some(entry) => entry["reference"].clone(),
+        None => value["sub_plugin"].clone(),
+    };
     let path_hint = reference["path_hint"]
         .as_str()
         .ok_or("the saved sub-plugin has no path")?
         .to_string();
 
-    // Ports discovered from the plugin itself (§14.2), so the node has the
-    // sockets it really has.
+    // Ports discovered from the plugin itself, so the node has the sockets it
+    // really has.
     let ports = {
         use std::sync::Arc;
         let (_, plugin) = render::load(Path::new(&path_hint), None, Arc::new(host::CliHost::new()))
@@ -1401,13 +1416,10 @@ fn inject_graph(state: &str, rate: f64) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// Two sub-plugins in series through the node graph, against the same two
-/// rendered one after the other (ROADMAP M8.2).
+/// Verifies serial processing through two chained sub-plugin nodes against a direct serial render.
 ///
-/// The whole point of M8 is that a graph of plugins sounds like the plugins.
-/// Rendering the chain by hand and rendering it through the wrapper has to give
-/// the same samples, and "the same" here means bit-for-bit up to the tolerance
-/// two identical float paths deserve, not "close enough".
+/// Compares output from the node graph routing (AudioIn -> Plugin 1 -> Plugin 2 -> AudioOut)
+/// against directly rendering Plugin 1 followed by Plugin 2 to verify sample-accurate equivalence.
 fn cmd_chain(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1511,14 +1523,11 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
         { "instance": 0, "reference": reference(first)? },
         { "instance": 1, "reference": reference(second)? },
     ]);
-    // The pre-M8 fields would otherwise be read instead: `instances()` prefers
-    // `sub_plugins`, but leaving a stale single sub-plugin behind would make
-    // this test lie about which path it exercised.
+    // Clear legacy single sub-plugin fields so `sub_plugins` is used exclusively.
     value["sub_plugin"] = serde_json::Value::Null;
     value["sub_state"] = serde_json::Value::Null;
 
-    // Ports as they would be after discovery (§14.2). Stereo throughout, which
-    // is what M8.2 covers.
+    // Default stereo input and output ports for both plugin instances.
     let ports = serde_json::json!({
         "audio_in": [2], "audio_out": [2],
         "accepts_notes": false, "params": [], "latency": 0
@@ -1540,23 +1549,12 @@ fn inject_chain(state: &str, first: &str, second: &str) -> Result<String, String
     Ok(value.to_string())
 }
 
-/// An instrument into two effects, through the node graph (ROADMAP M8.3).
+/// Verifies note routing to instrument nodes in the graph.
 ///
-/// Deliberately *not* a comparison against a hand-made chain. M8.2's `chain`
-/// already proves audio comes out sample-identical; what M8.3 adds is a rule
-/// about where notes go, and that rule is testable directly:
-///
-/// - notes wired to an instrument: it plays;
-/// - nothing wired to its notes port: it is silent. Before M8.3 every instance
-///   was handed every event the DAW sent, so this one played anyway;
-/// - notes wired to the *second* instrument node: that one plays. "Any
-///   instrument node", not "instance 0".
-///
-/// Comparing samples would have been the stronger check and it is not
-/// available: several synths randomise oscillator phase from a process-global
-/// generator, so two instances in one process play the same notes differently.
-/// `host-cli synth <PLUGIN> <OUT.wav> --twice` reports whether a given one
-/// does.
+/// Tests that:
+/// - Notes routed to an instrument produce audio output.
+/// - Unwired instrument nodes remain silent.
+/// - Notes can be routed to any arbitrary instrument instance in the graph.
 fn cmd_instrument(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1604,7 +1602,7 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
         )
     };
 
-    // The DoD's chain: notes -> instrument -> effect -> effect.
+    // Routing chain: notes -> instrument -> effect -> effect.
     let played = run(Some(0))?;
     println!(
         "notes -> instrument 1 -> {} -> {}",
@@ -1625,7 +1623,7 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
         .fold(0.0f32, |a, s| a.max(s.abs()));
     println!("  peak before the note: {before:.6}");
 
-    // The M8.3 rule: an unwired notes port means no notes at all.
+    // An unwired notes port means no notes are routed to the instrument.
     let unwired = run(None)?;
     println!("same graph, nothing wired to the notes port");
     println!("  peak {:.6}", unwired.audio.peak());
@@ -1650,21 +1648,13 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Every output socket of a multi-output plugin, one render each (§14.2).
+/// Renders each output socket of a multi-output plugin individually to verify bus separation.
 ///
-/// The node graph gives a plugin one output socket per declared bus. Until
-/// 2026-08-23 nothing had ever wired one other than the first, and when this
-/// check was written it turned out all three of Surge XT's sockets rendered
-/// the main output — the compiler kept a plugin's audio by node rather than by
-/// port, and handed the plugin one output bus at activate.
-///
-/// So this renders the same material once per socket. What it can assert
-/// without knowing the plugin is narrow, because which of its buses carry
-/// anything is the patch's business: socket 0 has to produce something, and
-/// the sockets must not all be the same signal. Each render is its own
-/// instance, and a synth with a free-running oscillator does not repeat
-/// itself, so socket 0 is rendered twice to establish what "the same" is worth
-/// here.
+/// Ensures each declared audio output bus is mapped to a distinct output port
+/// and that signals from secondary buses are not mirrored or merged incorrectly.
+/// Each render is its own instance, and a synth with a free-running oscillator
+/// does not repeat itself, so socket 0 is rendered twice to establish a
+/// divergence baseline for what "the same" means.
 fn cmd_outbus(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -1689,12 +1679,7 @@ fn cmd_outbus(args: &[String]) -> Result<(), String> {
             short(plugin)
         ));
     }
-    // The graph can hand a plugin the main bus and `MAX_AUX_BUSES` more, in
-    // either direction — every buffer in the engine's pool is as wide as the
-    // widest region, so the ceiling is memory rather than taste (§14.7). A
-    // 16-out drum machine has more outputs than that, and the ones past the
-    // ceiling are refused at compile time; rendering them here would show
-    // silence and read like the plugin's doing.
+    // Limit to the maximum number of auxiliary buses supported by the graph engine.
     let reachable = (1 + plugin_host::MAX_AUX_BUSES).min(outputs);
     println!(
         "{}: {} output sockets ({reachable} within the graph's reach), {} audio in, notes {}",
@@ -1864,8 +1849,8 @@ fn short(path: &str) -> String {
         .into_owned()
 }
 
-/// Build the M8.3 patch: two instrument nodes mixed together, into two effects
-/// in series, with the DAW's notes wired to `wired` (or to neither).
+/// Builds a patch with two instrument nodes mixed together into two serial effects,
+/// with note inputs routed to the specified instance (or neither).
 fn inject_instrument(
     state: &str,
     synth: &str,
@@ -1892,13 +1877,10 @@ fn inject_instrument(
         { "instance": 2, "reference": reference(first)? },
         { "instance": 3, "reference": reference(second)? },
     ]);
-    // The pre-M8 fields would otherwise be read instead, and the test would be
-    // lying about which path it exercised.
     value["sub_plugin"] = serde_json::Value::Null;
     value["sub_state"] = serde_json::Value::Null;
 
-    // Ports as discovery will report them (§14.2). An instrument has no audio
-    // input and takes notes, so its port 0 *is* the notes port.
+    // Discovered port descriptors for instruments and effects.
     let instrument = serde_json::json!({
         "audio_in": [], "audio_out": [2],
         "accepts_notes": true, "params": [], "latency": 0
@@ -1940,16 +1922,10 @@ fn inject_instrument(
     Ok(value.to_string())
 }
 
-/// A compressor inside the graph, keyed off another node (ROADMAP M8.4).
+/// Verifies sidechain ducking by keying a compressor off another node in the graph.
 ///
-/// The signal being compressed is a steady tone, so anything that moves in the
-/// output moved because of the sidechain. The key is an instrument playing one
-/// note in the middle of it. Run twice — once with the key wired, once
-/// without — and the difference is the ducking.
-///
-/// The compressor's own "SC Active" switch is turned on the way a user would:
-/// a `Constant` node driving a slot that is bound to that parameter. So this
-/// exercises the parameter path and the audio path at once.
+/// Renders audio twice (with and without the key input wired) to measure gain reduction
+/// produced when the sidechain is active.
 fn cmd_sidechain(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -2062,8 +2038,8 @@ fn cmd_sidechain(args: &[String]) -> Result<(), String> {
 /// `sidechain` asks a compressor to duck, which is a strong check but needs a
 /// plugin whose sidechain is (a) optional and (b) reached through one
 /// parameter. Plenty of plugins fail one of those and still read their aux bus
-/// -- the CLAP fixture always mixes it, Surge XT Effects hides the switch
-/// inside whichever effect is loaded -- so this asks the weaker question that
+/// — the CLAP fixture always mixes it, Surge XT Effects hides the switch
+/// inside whichever effect is loaded — so this asks the weaker question that
 /// applies to all of them: does wiring the aux bus change the output at all?
 ///
 /// Direction is not asserted. A compressor ducks, a mixer adds, a vocoder does
@@ -2175,26 +2151,20 @@ fn cmd_aux(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Tone -> compressor -> out, with an instrument keying the compressor's aux
-/// bus, and a `Constant` driving a slot bound to the sidechain-enable switch.
-/// M8.5's DoD, through the real wrapper: a feedback delay sounds the same at
-/// any block size, and the echo lands where the delay time says it does.
-///
-/// A DAW check by nature — the DAW is what chooses the block size — so it is
-/// done here instead (ROADMAP). No sub-plugin is involved: the patch is an
-/// input, a mix, a delay line and an output, which is the smallest thing that
-/// puts §14.4's cut in the middle of a cycle.
 /// How much of the loop goes back round, on the `Mix` node's second input.
 const FEEDBACK: f64 = 0.7;
 
+/// Verifies feedback delay line timing, decay, and consistency across varying block sizes.
+///
+/// Tests that delay echo peaks occur at expected sample offsets, decay exponentially
+/// by the mix feedback gain, and produce identical output at 512 vs. 64 sample block sizes.
 fn cmd_delay(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
     let wrapper = args.first().ok_or("expected the wrapper's path")?;
     let sample_rate = 48_000.0f32;
     let frames = (sample_rate * 2.0) as usize;
-    // Well above the 32-sample floor of §14.4, and short enough that several
-    // repeats fit in two seconds.
+    // Delay time in seconds, allowing multiple repeats to be observed.
     let delay = 0.25f64;
 
     // One click, then silence. Everything after it in the output came out of
@@ -2287,16 +2257,13 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// A feedback delay patch, written straight into the wrapper's saved state.
+/// Injects a feedback delay patch into the wrapper's saved state.
 ///
 /// ```text
 ///   AudioIn ─┐                ┌─> AudioOut
 ///            ├─> Mix ─────────┤
 ///   DelayRead┘                └─> DelayWrite
 /// ```
-///
-/// The read and the write are joined by the line number and by nothing else,
-/// which is what keeps this out of the cycle check (§14.4).
 fn inject_delay(state: &str, time: f64) -> Result<String, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
@@ -2352,14 +2319,7 @@ fn inject_sidechain(
     state: &str,
     comp: &str,
     synth: &str,
-    // A parameter to hold at a value through slot 0, when the plugin needs one
-    // set before it will read its aux bus at all -- a sidechain-enable switch,
-    // or Surge XT Effects' choice of which effect is loaded. `None` wires the
-    // aux bus and leaves the parameters alone.
-    //
-    // Driven through a parameter socket (§14.12) rather than written directly
-    // because that is the path a real patch uses, and because some plugins act
-    // on a parameter only when it arrives as an event during `process`.
+    // Optional parameter preset applied via slot 0.
     switch: Option<(u32, f64)>,
     keyed: bool,
 ) -> Result<String, String> {
@@ -2385,8 +2345,7 @@ fn inject_sidechain(
         ))
     };
 
-    // Ports are discovered rather than written down here (§14.2): the whole
-    // point is that the sidechain socket is the one the plugin really has.
+    // Discover ports from the plugin instance layout to wire the auxiliary bus.
     let (comp_ref, _, comp_in, _) = describe(comp)?;
     let (synth_ref, _, synth_in, synth_notes) = describe(synth)?;
     if comp_in.len() < 2 {
@@ -2450,7 +2409,7 @@ fn inject_sidechain(
         }));
     }
     if keyed {
-        // Port 1 of the compressor is its sidechain -- see `plugin_input_ports`.
+        // Port 1 of the compressor is its sidechain — see `plugin_input_ports`.
         links.push(serde_json::json!({ "from": 2, "from_port": 0, "to": 1, "to_port": 1 }));
     }
 
@@ -2469,12 +2428,7 @@ fn inject_sidechain(
     Ok(value.to_string())
 }
 
-/// Open the wrapper's own editor with a patch already in it (ROADMAP M8.4).
-///
-/// `host-cli gui` opens an empty one, which never draws a plugin node — and a
-/// plugin node is where the new drawing is. This builds a patch that has one,
-/// with its sockets discovered from the plugin and one parameter socket
-/// already added, so opening it exercises every path the canvas grew.
+/// Opens the wrapper editor with an active patch containing audio, param, and note sockets.
 fn cmd_editor(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
 
@@ -2491,7 +2445,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     let patched = inject_one_plugin(&read_wrapper_state(&baseline)?, plugin)?;
     let state = edit_wrapper_state(&baseline, &patched)?;
 
-    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(wrapper), Some(&class.id))?;
     sub.load_sub_state(0, &state)?;
     // The wrapper reads its own state at activate, not when the blob arrives:
@@ -2698,20 +2652,10 @@ fn hold_for(arg: Option<&String>) -> Result<Option<std::time::Duration>, String>
     Ok(Some(std::time::Duration::from_secs_f64(seconds)))
 }
 
-/// M4's acceptance check, run without a DAW.
+/// Opens a plugin editor and verifies clean teardown in normal and reverse destruction orders.
 ///
-/// Opens a sub-plugin's editor and tears it down in each of the two orders
-/// section 5.3 cares about:
-///
-///   normal   — the editor is closed, then the instance goes away
-///   reverse  — the whole instance is destroyed with the editor still open
-///
-/// The second is the one that actually breaks hosts. Some DAWs terminate a
-/// plugin without ever sending a close notification, so the ordering cannot
-/// live in a close path that a caller has to remember to call. It is enforced
-/// instead by field order inside `SubHost`, and this command is what proves it:
-/// `--reverse` drops the whole thing at once and the editor still tears down
-/// first.
+/// Normal: editor is closed before instance teardown.
+/// Reverse: entire instance is dropped with editor still open.
 fn cmd_gui(args: &[String]) -> Result<(), String> {
     use std::sync::Arc;
     use subhost_adapter::SubHost;
@@ -2721,7 +2665,7 @@ fn cmd_gui(args: &[String]) -> Result<(), String> {
     let hold = hold_for(args.get(2).filter(|s| !s.starts_with("--")))?;
     let reverse = args.iter().any(|a| a == "--reverse");
 
-    let mut sub = SubHost::new(Arc::new(host::CliHost::new()));
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
     sub.load(0, Path::new(path), class_id)?;
     let name = sub.class(0).map(|c| c.name.clone()).unwrap_or_default();
     sub.open_editor(0, std::ptr::null_mut())?;

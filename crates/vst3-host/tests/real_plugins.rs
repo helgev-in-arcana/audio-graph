@@ -7,7 +7,7 @@
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
-    // A test thread is not an initialised STA and plugins assume one (§13).
+    // Initialize COM STA apartment on test runner thread because plugins assume one exists.
     vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
@@ -30,8 +30,8 @@ fn every_installed_module_loads_and_enumerates() {
         match Module::open(path) {
             Ok(module) => match module.classes() {
                 Ok(classes) => {
-                    // Every class must carry an identity we can persist and
-                    // find again, since §8.3 binds slots by CID.
+                    // Every class must carry an identity that can be persisted
+                    // and resolved by CID.
                     for c in &classes {
                         assert_eq!(
                             vst3_host::Cid::from_hex(&c.cid.to_hex()),

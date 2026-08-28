@@ -1,40 +1,39 @@
-//! What is inside every installed module, remembered between runs.
+//! Persistent cache of installed plugin module metadata between runs.
 //!
-//! # Why a cache at all
+//! # Caching Behavior
 //!
-//! Neither format says whether a module is an effect or an instrument anywhere
-//! but inside the module. VST3 has it in `PClassInfo2::subCategories` and CLAP
-//! in the descriptor's feature tags, and reaching either means loading the
-//! library and running the vendor's entry point. Doing that for every plugin on
-//! the machine to draw a menu is what [`crate::scan::installed_modules`]
-//! deliberately does not do: it takes seconds, and — as M2 found — some modules
-//! crash and at least one hangs.
+//! Determining whether a module is an effect or instrument requires inspecting
+//! format-specific metadata (`PClassInfo2::subCategories` for VST3, feature tags
+//! for CLAP) by loading the library and invoking its entry point.
 //!
-//! So it is done once, written down, and read back. This is what every DAW's
-//! plugin database is, and for the same reason.
+//! Doing that for every plugin on the machine just to draw a menu takes
+//! seconds, and some modules crash while at least one is known to hang — which
+//! is why [`crate::scan::installed_modules`] deliberately does not. So it is
+//! done once, written down as `plugins.json`, and read back. This is what every
+//! DAW's plugin database is, and for the same reason.
 //!
-//! # What invalidates an entry
+//! # Cache Invalidation
 //!
-//! The module's own timestamp and size, taken together. A VST3 bundle is a
-//! directory, so the stamp is the newest modification time anywhere inside it
-//! and the total size of its files — a directory's own mtime does not change
-//! when a file two levels down is replaced, which is exactly what an installer
-//! does.
+//! Cache entries are validated against a [`Stamp`] consisting of the module's
+//! latest file modification time and total byte size. For directory bundles
+//! (such as VST3 bundles), the stamp traverses the bundle: a directory's own
+//! mtime does not change when a file two levels down is replaced, which is
+//! exactly what an installer does.
 //!
 //! Nothing else is trusted: not a version number the plugin reports (an
 //! overwritten build often keeps it), and not the cache's age (a plugin nobody
 //! touched does not need re-opening a week later).
 //!
-//! A module that failed to open is remembered as having failed, stamp and all.
+//! Modules that fail to load are recorded as failed along with their stamp.
 //! Re-opening a plugin that crashes the scanner on every rescan is the one
 //! thing worse than not knowing what it contains.
 //!
-//! # Where
+//! # Storage
 //!
-//! Beside the settings, as `plugins.json`, but it is not settings: nothing here
-//! is the user's, and deleting the file costs a rescan and nothing else. It is
-//! kept separate so that a corrupt cache can never take the user's plugin
-//! folders down with it.
+//! The cache is stored adjacent to the configuration file as `plugins.json`,
+//! but it is not settings: nothing here is the user's, and deleting the file
+//! costs a rescan and nothing else. It is kept separate so that a corrupt cache
+//! can never take the user's plugin folders down with it.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::Format;
 
-/// What a module turned out to be.
+/// High-level classification of a plugin module.
 ///
 /// One answer per module rather than per class, because that is the question
 /// the browser asks. A module exporting both — rare, but a synth shipped with
@@ -54,16 +53,16 @@ use crate::format::Format;
 pub enum Kind {
     Effect,
     Instrument,
-    /// Not opened yet, or it could not be opened. Shown under both headings
-    /// rather than hidden: a plugin the scanner choked on is still one the user
-    /// may want to try loading.
+    /// Not yet scanned, or it could not be opened. Shown under both headings
+    /// rather than hidden: a plugin the scanner choked on is still one the
+    /// user may want to try loading.
     Unknown,
 }
 
 /// One class a module exports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
-    /// Stable identity — a VST3 class id in hex, or a CLAP reverse-DNS id.
+    /// Stable identity (VST3 class id in hex, or CLAP reverse-DNS id).
     pub id: String,
     pub name: String,
     /// The format's own classification, joined with `|`. For display.
@@ -71,24 +70,24 @@ pub struct Class {
     pub is_instrument: bool,
 }
 
-/// One module, as the last scan found it.
+/// A scanned plugin module and its exported classes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Module {
     pub path: PathBuf,
     pub format: Format,
-    /// The stamp the module had when it was opened. What the next scan compares
-    /// against.
+    /// The stamp the module had when it was opened. What the next scan
+    /// compares against.
     pub stamp: Stamp,
     pub classes: Vec<Class>,
-    /// Why it could not be opened, when it could not be. Kept so that the next
-    /// scan does not try again for nothing.
+    /// Why it could not be opened, when it could not be. Kept so that the
+    /// next scan does not try again for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl Module {
-    /// The file name, extension and all — how the user recognises the module,
-    /// since its real name is only knowable by opening it.
+    /// The file name, extension and all — how the user recognises the
+    /// module, since its real name is only knowable by opening it.
     pub fn file_name(&self) -> String {
         self.path
             .file_name()
@@ -107,7 +106,8 @@ impl Module {
     }
 }
 
-/// A module's modification time and size, as one comparable value.
+/// Modification timestamp (seconds since Unix epoch) and total byte size, as
+/// one comparable value.
 ///
 /// Seconds, not the platform's full precision: the value goes through JSON and
 /// back, and a plugin replaced within the same second of another is not a case
@@ -118,12 +118,13 @@ pub struct Stamp {
     pub size: u64,
 }
 
-/// The stamp of a module, whether it is a file or a bundle directory.
+/// Computes the stamp for a file or directory bundle at `path`.
 ///
-/// A directory is walked: see the module comment for why its own mtime is not
-/// enough. Anything unreadable contributes nothing rather than failing the
-/// whole stamp — a stamp that cannot be taken compares equal to itself, which
-/// is the harmless answer.
+/// For directory bundles, walks the tree to find the newest modification
+/// timestamp and sums total file sizes — see the module comment for why the
+/// directory's own mtime is not enough. Anything unreadable contributes
+/// nothing rather than failing the whole stamp: a stamp that cannot be taken
+/// compares equal to itself, which is the harmless answer.
 pub fn stamp_of(path: &Path) -> Stamp {
     fn secs(time: SystemTime) -> u64 {
         time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -178,11 +179,11 @@ pub fn cache_path() -> Option<PathBuf> {
     Some(crate::config::config_path()?.with_file_name("plugins.json"))
 }
 
-/// Everything the last scan found, with no scanning of its own.
+/// Reads the cached module list from disk without performing a scan.
 ///
-/// The answer to "what do we already know", and what a browser draws before its
-/// rescan has finished. A missing or unreadable file is an empty list: the
-/// cache is derived data, and losing it costs a rescan.
+/// The answer to "what do we already know", and what a browser draws before
+/// its rescan has finished. A missing or unreadable file gives an empty list:
+/// the cache is derived data, and losing it costs a rescan.
 pub fn cached() -> Vec<Module> {
     let Some(path) = cache_path() else {
         return Vec::new();
@@ -202,11 +203,15 @@ pub fn cached() -> Vec<Module> {
     }
 }
 
-/// Bring the cache up to date and return it.
+/// Refreshes the cache by rescanning new or modified modules and saving results.
 ///
-/// Opens only what is new or has changed since last time, and drops what is no
-/// longer installed. **This loads third-party code** — call it off the UI
-/// thread, on a thread that has had [`crate::init_thread`] called on it.
+/// Only modules whose stamp has changed or which are not in the cache are rescanned.
+/// Modules no longer found in scanned directories are removed.
+///
+/// # Threading
+///
+/// **This loads third-party code.** Call it off the UI thread, on a thread
+/// that has had [`crate::init_thread`] called on it.
 pub fn refresh() -> Vec<Module> {
     let known = cached();
     let mut out = Vec::new();
@@ -234,7 +239,7 @@ pub fn refresh() -> Vec<Module> {
     out
 }
 
-/// Open one module and write down what it holds.
+/// Opens one module and writes down what it holds.
 fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
     match crate::scan::scan_module_as(format, path) {
         Ok(classes) => Module {
@@ -265,9 +270,9 @@ fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
     }
 }
 
-/// Write the cache out, the same way the settings are: beside the target and
-/// renamed over it, so a crash halfway through leaves the previous cache rather
-/// than half of the new one.
+/// Writes the module cache to disk the same way the settings are written:
+/// beside the target and renamed over it, so a crash halfway through leaves
+/// the previous cache rather than half of the new one.
 fn store(modules: &[Module]) -> Result<(), String> {
     let path = cache_path().ok_or_else(|| "no config directory on this platform".to_string())?;
     if let Some(parent) = path.parent() {
@@ -287,7 +292,7 @@ fn store(modules: &[Module]) -> Result<(), String> {
     })
 }
 
-/// Throw the cache away, so the next refresh opens everything again.
+/// Removes the on-disk cache file so subsequent refreshes rescan all modules.
 ///
 /// What "rescan" means when the user has replaced a plugin in a way the stamp
 /// cannot see, or when a scan went wrong and they want it done over.

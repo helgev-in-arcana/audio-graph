@@ -1,5 +1,4 @@
-//! Window plumbing for hosting somebody else's editor, with no plugin format
-//! in sight.
+//! Format-agnostic window management and event plumbing for hosting plugin editors.
 //!
 //! Three concerns, and none of them are VST3's or CLAP's:
 //!

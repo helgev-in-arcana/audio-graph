@@ -1,14 +1,19 @@
-//! The scan cache: where it lives, what it holds, and what invalidates it.
+//! Tests for the plugin catalogue cache storage, stamping, and invalidation.
 //!
-//! One test function, for the same reason as `config.rs`: the config path is
-//! process-wide state and the cache is derived from it, so two tests in this
-//! binary would fight over both.
+//! Verifies timestamp and size calculation for files and directory bundles,
+//! JSON serialization and persistence, and resilience against corrupted cache
+//! files.
 //!
-//! Real modules are not scanned here — there may be none on the machine running
+//! Real modules are not scanned here: there may be none on the machine running
 //! this, and opening whatever is installed is exactly what a test must not do.
-//! What is tested is everything around the scan: the stamp that decides whether
-//! a module is re-opened, the file the answers are kept in, and what a missing
-//! or unreadable one does.
+//! What is tested is everything around the scan.
+//!
+//! This file holds exactly one `#[test]`, and that is load-bearing: the test
+//! sets `AUDIO_GRAPH_CONFIG` with `std::env::set_var`, which is only sound
+//! while no other thread is running. Cargo builds each integration-test file
+//! as its own binary but runs the tests within one file on parallel threads,
+//! so a second test added here would make the `set_var` below unsound. Add
+//! further catalogue tests as a new file instead.
 
 use std::path::PathBuf;
 
@@ -21,12 +26,13 @@ fn the_cache_is_stamped_written_beside_the_settings_and_survives_being_lost() {
     std::fs::create_dir_all(&dir).expect("a temp directory can be made");
     let config = dir.join("config.json");
 
-    // SAFETY: set before anything in this binary reads the config, and this is
-    // the only test in it — see the module comment.
+    // SAFETY: no other thread is running. This is the only test in this
+    // binary (see the module comment), and the variable is set before
+    // anything here reads the config.
     unsafe { std::env::set_var("AUDIO_GRAPH_CONFIG", &config) };
 
-    // Beside the settings, not inside them: a corrupt cache must not be able to
-    // take the user's plugin folders with it.
+    // Beside the settings, not inside them: a corrupt cache must not be able
+    // to take the user's plugin folders with it.
     let path: PathBuf = catalogue::cache_path().expect("the override names a directory");
     assert_eq!(path, dir.join("plugins.json"));
     assert_ne!(path, config);
@@ -37,9 +43,9 @@ fn the_cache_is_stamped_written_beside_the_settings_and_survives_being_lost() {
         "no file means nothing known"
     );
 
-    // A file's stamp is its own; a bundle's is the newest thing inside it, which
-    // is the whole point: an installer replacing a binary two levels down does
-    // not touch the directory's own mtime.
+    // A file's stamp is its own; a bundle's is the newest thing inside it,
+    // which is the whole point: an installer replacing a binary two levels
+    // down does not touch the directory's own mtime.
     let file = dir.join("Plain.clap");
     std::fs::write(&file, b"not really a plugin").expect("the directory is writable");
     let file_stamp = catalogue::stamp_of(&file);
@@ -68,14 +74,15 @@ fn the_cache_is_stamped_written_beside_the_settings_and_survives_being_lost() {
     );
 
     // A refresh over a scan list that finds nothing still writes the file, so
-    // that "nothing installed" is an answer rather than an unanswered question.
+    // that "nothing installed" is an answer rather than an unanswered
+    // question.
     plugin_host::config::store(&plugin_host::config::Config::default())
         .expect("a temp profile is writable");
     assert!(catalogue::refresh().is_empty(), "no folders, no modules");
     assert!(path.is_file(), "and the answer is written down");
 
-    // A cache we cannot parse is an empty one, never a crash and never a reason
-    // to touch the settings.
+    // A cache we cannot parse is an empty one, never a crash and never a
+    // reason to touch the settings.
     std::fs::write(&path, "{ this is not json").expect("the file is writable");
     assert!(catalogue::cached().is_empty());
     assert!(config.is_file(), "and the settings are still there");

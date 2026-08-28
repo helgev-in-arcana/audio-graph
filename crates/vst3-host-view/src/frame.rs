@@ -1,12 +1,8 @@
-//! The host's `IPlugFrame`: how a plugin asks to be resized.
+//! Host-side `IPlugFrame` implementation.
 //!
-//! `resizeView` is called *by the plugin*, and the host is then expected to
-//! resize the container and call `IPlugView::onSize` back with what it actually
-//! got. That round trip is the whole reason a frame object exists.
-//!
-//! The request is recorded rather than acted on immediately. A plugin may call
-//! `resizeView` from inside `attached`, or from a paint handler, and resizing a
-//! window synchronously from there re-enters the plugin while it is mid-call.
+//! Receives plugin-initiated resize requests via `IPlugFrame::resizeView` and records
+//! them to be applied during the next UI tick. Resizing a window synchronously from a
+//! plugin callback re-enters the plugin while it is mid-call, which would crash.
 
 use std::cell::Cell;
 

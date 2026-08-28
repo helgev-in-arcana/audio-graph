@@ -7,8 +7,8 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, combo, fallback, key_control};
 use crate::port::{Port, PortType};
 
-/// How many values one key parameter may choose between. A `Mix`'s ceiling,
-/// for a `Mix`'s reason.
+/// How many values one key parameter may choose between. A `Mix`'s ceiling, for
+/// a `Mix`'s reason: past it the node is a wall of sockets.
 #[cfg(feature = "ui")]
 const MAX_VALUES: usize = 8;
 
@@ -18,8 +18,8 @@ pub enum KeyParamMode {
     /// The last key struck picks its own value. A bank of switches.
     Select,
     /// One key — the first value's — moving on to the next value each time it
-    /// is struck, and round to the first again at the end. With two values
-    /// that is a plain toggle, and it costs one key instead of two.
+    /// is struck, and round to the first again at the end. With two values that
+    /// is a plain toggle, and it costs one key instead of two.
     Toggle,
 }
 
@@ -34,26 +34,26 @@ impl KeyParamMode {
     }
 }
 
-/// A parameter set from the keyboard: keys played to choose a value rather
-/// than to sound.
+/// A parameter set from the keyboard: keys played to choose a value rather than
+/// to sound.
 ///
-/// The same gesture [`KeySwitch`][crate::KeySwitch] uses for routing, pointed
-/// at a value instead — which is what a player wants when the thing to change
-/// is a sub-plugin's parameter rather than which sub-plugin hears the notes.
+/// The same gesture [`KeySwitch`][crate::KeySwitch] uses for routing, pointed at
+/// a value instead — which is what a player wants when the thing to change is a
+/// sub-plugin's parameter rather than which sub-plugin hears the notes.
 ///
-/// Each value has a socket of its own, the way a [`Switch`][crate::Switch]'s
-/// two do, so a key can pick between two *signals* as easily as between two
-/// numbers; the number on the row is what is used while that socket is empty.
-/// The key that chooses it sits on the same row, because a key belongs to the
-/// value it picks and a list of keys elsewhere on the node is a thing to match
-/// up by counting.
+/// Each value has a socket of its own, the way a [`Switch`][crate::Switch]'s two
+/// do, so a key can pick between two *signals* as easily as between two numbers;
+/// the number on the row is what is used while that socket is empty. The key
+/// that chooses it sits on the same row, because a key belongs to the value it
+/// picks and a list of keys elsewhere on the node is a thing to match up by
+/// counting.
 ///
 /// The notes port is what the keys are read from. Nothing wired means no keys
 /// are read at all and the output stays on its first value — the same rule the
 /// gates follow, and it makes an unwired node predictable rather than secretly
 /// live.
 ///
-/// Which value is chosen survives a recompile and not a reload: the first
+/// Which value is chosen survives a recompile but not a reload: the first
 /// value is what the node reads until a key is struck, which is the honest
 /// answer for a control the DAW knows nothing about.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,9 +83,8 @@ impl Node for KeyParam {
         let mut out = vec![Port::new("notes", PortType::Note)];
         for i in 0..self.keys.len() {
             let port = Port::param(format!("value {}", i + 1));
-            // The last value is not offered a remove button: a switch with
-            // one position is a constant, and the node would have nothing to
-            // say.
+            // The last value is not offered a remove button: a switch with one
+            // position is a constant, and the node would have nothing to say.
             #[cfg(feature = "ui")]
             let port = if self.keys.len() > 1 {
                 port.removable()
@@ -117,9 +116,9 @@ impl Node for KeyParam {
         }
         let first = value(cx, 0);
 
-        // No notes, no keys: the node rests on its first value. Emitting the
-        // key ops anyway would make an unwired node quietly follow a keyboard
-        // it is not connected to.
+        // No notes, no keys: the node rests on its first value. Emitting the key
+        // ops anyway would make an unwired node quietly follow a keyboard it is
+        // not connected to.
         let position = if cx.has_input(0) {
             let state = cx.latch()?;
             match self.mode {
@@ -150,8 +149,9 @@ impl Node for KeyParam {
         };
 
         // Fold the values into one register, each later one winning where the
-        // latch has reached it. The latch holds a whole number, so a `>=` per
-        // value is an exact pick and costs one instruction each.
+        // latch has reached it.
+        // The latch holds a whole number, so a `>=` per value is an exact pick and
+        // costs one instruction each.
         let mut chosen = match first {
             Operand::Reg(reg) => reg,
             Operand::Value(value) => {
@@ -210,8 +210,8 @@ impl Node for KeyParam {
                 .changed()
         });
         // In `Toggle` only the first key does anything — one key is the point
-        // of that mode — so the rest are greyed rather than hidden, which
-        // would make switching modes look like it lost them.
+        // of that mode — so the rest are greyed rather than hidden, which would
+        // make switching modes look like it lost them.
         let live = self.mode != KeyParamMode::Toggle || index == 0;
         let out = ui.add_enabled_ui(live, |ui| key_control(ui, "", &mut self.keys[index]));
         if !live {

@@ -1,15 +1,14 @@
-//! Plain ↔ normalised conversion for the audio thread.
+//! Plain ↔ normalized conversion for the audio thread.
 //!
-//! The core speaks plain values with a range (§3.1); VST3 speaks normalised
-//! 0..1. The only authoritative converter is `IEditController`, and that is a
-//! main-thread interface — calling it from `process` would violate the format's
-//! threading contract on every parameter change.
+//! Host audio engines typically use plain (unnormalized) values with domain ranges,
+//! whereas VST3 processing operates on normalized 0.0..1.0 values. The authoritative
+//! converter is `IEditController`, which is a main-thread interface that cannot be
+//! called safely from the real-time audio thread.
 //!
-//! So the mapping is captured at activate time, on the main thread, into a
-//! table the audio thread can read without allocating or locking. Most
-//! parameters turn out to be linear or stepped, for which a closed form is
-//! exact and no table is stored at all; the sampled table is only paid for by
-//! the parameters that actually need it (log-scaled frequencies and the like).
+//! To support real-time conversion without locks or allocation, the parameter mapping
+//! is captured during activation on the main thread into a lookup structure. Linear
+//! and stepped parameters use closed-form conversions, while non-linear curves
+//! use a sampled lookup table.
 
 use plugin_host_api::{ParamId, ParamInfo};
 

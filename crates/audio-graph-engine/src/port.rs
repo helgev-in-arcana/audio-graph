@@ -1,21 +1,18 @@
-//! What a socket carries, and what a socket is.
+//! Node port definitions and types.
 //!
-//! Its own module because both sides need it and neither owns it: a node
-//! declares its ports, and the graph decides from them what may be joined to
-//! what.
+//! Defines the data types that sockets can carry and the metadata associated
+//! with input and output ports on nodes.
 
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
-/// What a port carries (§14.3).
+/// The data type carried across a connection between ports.
 ///
-/// Ports only connect to ports of the same type. Mono-to-stereo is deliberately
-/// not implicit: a hidden widening rule is the same kind of thing as a hidden
-/// mixing rule, and the graph already says no to those.
+/// Connections are only valid between ports of matching types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortType {
-    /// A scalar. One value per sub-block (§9.2).
+    /// A scalar parameter value, evaluated per sub-block.
     Param,
     /// Audio, `channels` wide.
     Audio { channels: u16 },
@@ -42,21 +39,15 @@ impl PortType {
 pub struct Port {
     pub name: Cow<'static, str>,
     pub ty: PortType,
-    /// Whether this is a *side* input rather than the signal path proper: a
-    /// sidechain or another aux bus (§14.11).
+    /// Whether this is an auxiliary input (e.g. sidechain) rather than the main signal path.
     ///
-    /// The compiler does not care — an aux bus is the bus at that index and
-    /// nothing else. It is here because the editor does: a sidechain socket
-    /// that looks exactly like the main input is one a user wires into by
-    /// mistake, and the mistake is silent.
+    /// Used by the UI to visually distinguish auxiliary inputs from main signal inputs.
     pub aux: bool,
-    /// Whether this socket is the first of a group the user may take away —
-    /// one of a `Mix`'s inputs, one of a plugin node's parameter sockets.
+    /// Indicates whether this socket represents a dynamically removable input group
+    /// (e.g. mix bus inputs or plugin parameter ports).
     ///
-    /// Marked on the port rather than answered by a method so the canvas can
-    /// draw the button beside the socket it removes without knowing which
-    /// node it is looking at. How many sockets go with it is the node's
-    /// answer, not this flag's: see [`Node::remove_input`][crate::NodeKind].
+    /// Used by the UI to render removal controls for dynamic port sets. For the actual
+    /// logic determining how many sockets are removed, see [`NodeKind::remove_input`][crate::NodeKind::remove_input].
     pub removable: bool,
 }
 

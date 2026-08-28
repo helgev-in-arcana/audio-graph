@@ -1,14 +1,12 @@
 //! The COM objects a plugin expects its host to provide.
 //!
 //! `IHostApplication` is the context handed to `IPluginBase::initialize`; many
-//! plugins refuse to initialise without it, and most use it for exactly one
-//! thing — asking the host to allocate an `IMessage` so the processor and the
-//! controller can talk to each other.
+//! plugins require it to initialize, primarily using it to allocate `IMessage`
+//! instances for processor-controller communication.
 //!
-//! Note the direction of dependency: this module implements the *plumbing*,
-//! but the host's identity and policy come in through
-//! [`plugin_host_api::HostContext`], which the caller injects (§7). This crate
-//! never decides what the host is.
+//! Note the direction of dependency: this module implements the host COM interfaces,
+//! while the host's identity and policy are provided by the caller through
+//! [`plugin_host_api::HostContext`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -330,13 +328,12 @@ impl IMessageTrait for HostMessage {
     }
 }
 
-/// Host-side `IComponentHandler`: the channel a plugin's own GUI uses to
-/// report edits.
+/// Host-side `IComponentHandler`: the interface a plugin GUI uses to report
+/// user edits and request host actions.
 ///
-/// v1 records these and hands them to [`HostContext::param_edited`], which
-/// swallows them — in Drive mode the wrapper owns parameter values, so there is
-/// nothing to forward upward (§7.5). Keeping the object real anyway matters:
-/// plugins that get a null handler often disable their editors.
+/// Parameter edits are reported through [`HostContext::param_edited`].
+/// Providing a concrete component handler is essential, as many plugins
+/// disable their UI controls when given a null handler.
 pub struct ComponentHandler {
     context: Arc<dyn HostContext>,
 }

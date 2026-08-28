@@ -1,28 +1,25 @@
-//! One hosted sub-plugin, and the layout it turned out to have.
+//! Hosted sub-plugin node and its port configuration.
 
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, ParamCx};
-use crate::ir::{AudioOp, Buf, InstanceIo, MAX_AUX_BUSES, ParamTarget};
+use crate::ir::{AudioOp, Buf, MAX_AUX_BUSES};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{CAUTION, NodeAction, NodeUi, shorten};
 use crate::port::{Port, PortType};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// One sub-plugin parameter the graph is allowed to drive.
-///
-/// A plugin node does not get a socket per parameter — Chroma has 2106 of them.
-/// The user picks which ones to expose, exactly as they pick slot bindings
-/// today (§8.3), and each pick becomes a port.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParamPort {
     /// The sub-plugin's own id for the parameter. A plain `u32` because the
-    /// common data model is CLAP-shaped (ADR-4) — nothing here is VST3.
+    /// common data model is CLAP-shaped; nothing here is VST3.
     pub id: u32,
     pub name: String,
 }
 
-/// A sub-plugin's port layout, as discovered after loading (§14.2).
+/// A sub-plugin's port layout, as discovered after loading.
 ///
 /// Cached in the graph rather than asked for on demand. A patch has to reopen
 /// with the right shape *before* its plugins have finished loading, and a node
@@ -36,17 +33,17 @@ pub struct PluginPorts {
     pub audio_in: Vec<u16>,
     #[serde(default)]
     pub audio_out: Vec<u16>,
-    /// Which output buses have a socket, in socket order (§14.2).
+    /// Which output buses have a socket, in socket order.
     ///
-    /// A plugin may report a dozen output buses — Surge XT's scenes, a drum
+    /// A plugin may report a dozen output buses — a synth's scenes, a drum
     /// machine's per-voice outs — and a node with a dozen sockets is a node
     /// nobody can read. The user adds the ones they want, the way they add
     /// parameter sockets, and each socket picks its bus from a dropdown.
     ///
-    /// Empty means *all of them*, which is what a patch saved before this
-    /// field existed meant by having no field: every bus had a socket then,
-    /// and reading it as "none" would cut every link on the way in. A fresh
-    /// node gets an explicit `[0]` from [`PluginPorts::from_layout`].
+    /// Empty means *all of them*, which is what a patch saved before this field
+    /// existed meant by having no field: every bus had a socket then, and
+    /// reading it as "none" would cut every link on the way in. A fresh node
+    /// gets an explicit `[0]` from [`PluginPorts::from_layout`].
     #[serde(default)]
     pub audio_out_shown: Vec<u16>,
     #[serde(default)]
@@ -56,19 +53,23 @@ pub struct PluginPorts {
     /// The plugin's reported latency, in samples.
     ///
     /// Discovered after loading like everything else here, and re-read when the
-    /// plugin says `kLatencyChanged`. The compiler needs it to line up parallel
-    /// paths (§14.6) and to work out how short a feedback loop may be (§14.4),
-    /// so a change to it means a recompile.
+    /// plugin says it changed. The compiler needs it to line up parallel paths
+    /// and to work out how short a feedback loop may be, so a change to it means
+    /// a recompile.
     #[serde(default)]
     pub latency: u32,
 }
 
 /// One hosted sub-plugin.
 ///
-/// `instance` indexes the wrapper's table of loaded sub-plugins, the same
-/// way `slot` indexes the slot table: which file that is, and how it was
-/// bound, stays outside the graph (§8.3). `ports` is the layout that was
-/// discovered after loading (§14.2), cached here.
+/// `instance` indexes the wrapper's table of loaded sub-plugins, the same way
+/// `slot` indexes the slot table: which file that is, and how it was bound,
+/// stays outside the graph. `ports` is the layout that was discovered after
+/// loading, cached here.
+///
+/// A plugin node does not get a socket per parameter — real plugins have
+/// thousands. The user picks which ones to expose, and each pick becomes a
+/// port.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plugin {
     pub instance: usize,
@@ -76,18 +77,16 @@ pub struct Plugin {
 }
 
 impl PluginPorts {
-    /// Build a node's ports from what a loaded plugin reported (§14.2).
+    /// Builds a node's ports from what a loaded plugin reported.
     ///
-    /// `params` is deliberately left empty. The parameter sockets are the
-    /// user's choice, not the plugin's: a compressor with 90 parameters would
-    /// otherwise arrive as a node with 90 sockets. The editor adds them one at
-    /// a time.
+    /// `params` is deliberately left empty. The parameter sockets are the user's
+    /// choice, not the plugin's: a compressor with 90 parameters would otherwise
+    /// arrive as a node with 90 sockets. The editor adds them one at a time.
     ///
-    /// Widths are clamped to [`MAX_CHANNELS`][crate::MAX_CHANNELS]. M8 is
-    /// stereo throughout (§14.8), and a node drawn with a socket the compiler
-    /// will refuse is worse than one drawn narrow.
-    pub fn from_layout(layout: &plugin_host_api::IoLayout, latency: u32) -> PluginPorts {
-        let widths = |buses: &[plugin_host_api::BusInfo]| -> Vec<u16> {
+    /// Widths are clamped to [`MAX_CHANNELS`][crate::MAX_CHANNELS]: a node drawn
+    /// with a socket the compiler will refuse is worse than one drawn narrow.
+    pub fn from_layout(layout: &plugin_host::IoLayout, latency: u32) -> PluginPorts {
+        let widths = |buses: &[plugin_host::BusInfo]| -> Vec<u16> {
             buses
                 .iter()
                 .map(|b| b.channels.min(crate::MAX_CHANNELS as u16))
@@ -97,9 +96,9 @@ impl PluginPorts {
         let audio_out = widths(&layout.outputs);
         PluginPorts {
             // Just the main bus to start with. The extra buses are the
-            // plugin's business until the patch says otherwise, and a node
-            // that arrives with one socket per bus is the wall of sockets
-            // this field exists to prevent.
+            // plugin's business until the patch says otherwise, and a node that
+            // arrives with one socket per bus is the wall of sockets this field
+            // exists to prevent.
             audio_out_shown: if audio_out.is_empty() {
                 Vec::new()
             } else {
@@ -116,8 +115,8 @@ impl PluginPorts {
     /// The output bus each output socket carries, in socket order.
     ///
     /// Picks past the end of `audio_out` are dropped: a plugin that reloaded
-    /// with fewer buses than it had cannot honour them, and a socket that
-    /// cannot be compiled is worse than one that is not drawn.
+    /// with fewer buses than it had cannot honour them, and a socket that cannot
+    /// be compiled is worse than one that is not drawn.
     pub fn shown_outputs(&self) -> Vec<u16> {
         if self.audio_out_shown.is_empty() {
             return (0..self.audio_out.len() as u16).collect();
@@ -203,8 +202,8 @@ impl Node for Plugin {
             .collect()
     }
 
-    /// The param half of a plugin node is only its parameter sockets; the
-    /// audio pass walks the same order again and emits the rest (§14.9).
+    // The param half of a plugin node is only its parameter sockets; the audio
+    // pass walks the same order again and emits the rest.
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         // A plugin node's parameter sockets sit after its audio inputs and its
         // notes port. Only the ones with something wired to them cost anything.
@@ -227,16 +226,15 @@ impl Node for Plugin {
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let out_width = cx.out_width();
         if out_width == 0 {
-            // A plugin with no output bus cannot be routed through. It is still
-            // legal to place — an analyser is one — but there is nothing
+            // A plugin with no output bus cannot be routed through. It is
+            // still legal to place — an analyser is one — but there is nothing
             // downstream of it to compile.
             return Ok(());
         }
 
-        // Which input buses the graph actually feeds (§14.11). A sidechain
-        // nobody wired is left off entirely rather than activated and fed
-        // silence: a compressor with an active, silent sidechain ducks to
-        // nothing.
+        // Which input buses the graph actually feeds. A sidechain nobody wired
+        // is left off entirely rather than activated and fed silence: a
+        // compressor with an active, silent sidechain ducks to nothing.
         let mut wired = self.ports.audio_in.len();
         while wired > 1 && cx.source(wired - 1).is_none() {
             wired -= 1;
@@ -297,15 +295,16 @@ impl Node for Plugin {
             cx.consume(input);
         }
 
-        // The same question on the way out (§14.2): a plugin's extra output
-        // buses are handed over only as far as the graph reads them, so Surge
-        // XT's `Scene B` costs nothing in a patch that ignores it. Which bus a
-        // socket carries is the user's pick, so how far is the highest bus
-        // anything reads — not how many sockets there are.
+        // The same question on the way out: a plugin's extra output buses are
+        // handed over only as far as the graph reads them, so a synth's second
+        // scene costs nothing in a patch that ignores it. Which bus a socket
+        // carries is the user's pick, so how far is the highest bus anything
+        // reads — not how many sockets there are.
         let shown = self.ports.shown_outputs();
         if cx.outputs_read() > shown.len() {
-            // A socket the node does not have. `connect` cannot make this link,
-            // so the patch was hand-edited or written by a later version.
+            // A socket the node does not have. `connect` cannot make this
+            // link, so the patch was hand-edited or written by a later
+            // version.
             return Err(CompileError::TypeMismatch {
                 node: cx.node(),
                 port: (cx.outputs_read() - 1) as u8,
@@ -329,9 +328,9 @@ impl Node for Plugin {
         let out_buses: Vec<u16> = self.ports.audio_out[..out_wired.max(1)].to_vec();
         let out_total: u16 = out_buses.iter().sum();
 
-        // One bus is the overwhelmingly common case and stays exactly as it
-        // was: the plugin writes straight into the buffer the next node reads.
-        // Only a patch that reads a second bus pays for the split.
+        // One bus is the overwhelmingly common case and costs nothing extra:
+        // the plugin writes straight into the buffer the next node reads. Only a
+        // patch that reads a second bus pays for the split.
         let single = out_buses.len() == 1;
         let readers = cx.readers();
         let output = cx.alloc_avoiding(out_total, if single { readers } else { 1 }, &[input])?;
@@ -388,16 +387,10 @@ impl Node for Plugin {
         Ok(())
     }
 
-    /// What is loaded in this node, and its parameter sockets.
-    ///
-    /// The sockets are the user's choice, not the plugin's (§14.12). A
-    /// compressor has ninety parameters and a node with ninety sockets would be
-    /// unusable, so they are added one at a time and each one picks what it
-    /// drives from a dropdown.
     /// The name of what is loaded, not "Plugin 3".
     ///
     /// The instance number stays on the front of it: two copies of the same
-    /// compressor are two nodes that would otherwise be titled identically,
+    /// plugin are two nodes that would otherwise be titled identically,
     /// and the number is also what the slot bindings outside the graph are
     /// keyed on.
     #[cfg(feature = "ui")]
@@ -413,8 +406,8 @@ impl Node for Plugin {
     /// The sub-plugin's own window, opened from the title bar.
     ///
     /// A request rather than the thing itself: opening a window may not happen
-    /// inside a draw callback (see the wrapper's `editor` module). Nothing
-    /// here changes the patch, so it always reports `false`.
+    /// inside a draw callback. Nothing here changes the patch, so it always
+    /// reports `false`.
     #[cfg(feature = "ui")]
     fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let Some(view) = cx.instances.get(self.instance).cloned() else {
@@ -424,16 +417,16 @@ impl Node for Plugin {
             return false;
         }
         // One button either way, and it stays in one place: a control that
-        // moves between "GUI" and "close GUI" is a control the hand has to
-        // find again every time it is used.
+        // moves between "GUI" and "close GUI" is a control the hand has to find
+        // again every time it is used.
         let hint = if view.editor_open {
             "close the plugin's window"
         } else {
             "open the plugin's window"
         };
-        // Framed whether the window is open or not. A `selectable_label`
-        // that is not selected draws as bare text, and bare text in a title
-        // bar does not read as something to press.
+        // Framed whether the window is open or not. A `selectable_label` that
+        // is not selected draws as bare text, and bare text in a title bar does
+        // not read as something to press.
         if ui
             .add(
                 egui::Button::new("GUI")
@@ -456,16 +449,16 @@ impl Node for Plugin {
 
     /// Why the node is drawn with sockets it cannot currently use.
     ///
-    /// All that is left in the body: the name moved to the title, the GUI
-    /// button to the title bar, and every parameter to the row of the socket
-    /// it drives.
+    /// All that is left in the body: the name moved to the title, the GUI button
+    /// to the title bar, and every parameter to the row of the socket it
+    /// drives.
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let loaded = cx.instances.get(self.instance).is_some_and(|v| v.loaded);
         if !loaded {
             ui.colored_label(CAUTION, "not loaded").on_hover_text(
                 "the plugin could not be found, or is still loading. Its links and \
-                 parameter sockets are kept either way (§8.3).",
+                 parameter sockets are preserved.",
             );
         }
         false
@@ -473,9 +466,9 @@ impl Node for Plugin {
 
     /// Which parameter a parameter socket drives.
     ///
-    /// Not wrapped in `fallback`: this is not a value the socket overrides, it
-    /// is *where the socket goes*, and a wired socket is exactly when the user
-    /// is most likely to want to re-point it.
+    /// Not wrapped in `fallback`: this is not a value the socket overrides, it is
+    /// *where the socket goes*, and a wired socket is exactly when the user is
+    /// most likely to want to re-point it.
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,
@@ -491,8 +484,8 @@ impl Node for Plugin {
         let Some(param) = self.ports.params.get_mut(index) else {
             return false;
         };
-        // Cloned because the combo's contents borrow `cx` while `param`
-        // borrows `self`, and the two would otherwise overlap.
+        // Cloned because the combo's contents borrow `cx` while `param` borrows
+        // `self`, and the two would otherwise overlap.
         let available = cx
             .instances
             .get(self.instance)
@@ -504,9 +497,9 @@ impl Node for Plugin {
         } else {
             param.name.clone()
         };
-        // The width the row has left, not a number of pixels: an absolute
-        // width does not move when the canvas is zoomed, so the dropdown was
-        // the one thing on a zoomed-out node still drawn at full size.
+        // The width the row has left, not a number of pixels: an absolute width
+        // does not move when the canvas is zoomed, so the dropdown was the one
+        // thing on a zoomed-out node still drawn at full size.
         egui::ComboBox::from_id_salt(("param", index))
             .selected_text(shorten(&label))
             .width(ui.available_width())
@@ -527,9 +520,9 @@ impl Node for Plugin {
 
     /// Which output bus this socket carries.
     ///
-    /// Drawn only when there is a choice to make. A plugin with one output bus
-    /// is the ordinary case and its node looks exactly as it always did: one
-    /// socket called "out", nothing on the row, and no button to add a second.
+    /// Drawn only when there is a choice to make. A plugin with one output bus is
+    /// the ordinary case and its node looks exactly as it always did: one socket
+    /// called "out", nothing on the row, and no button to add a second.
     #[cfg(feature = "ui")]
     fn output_control(&mut self, ui: &mut egui::Ui, port: u8, _cx: &mut NodeUi<'_>) -> bool {
         if self.ports.audio_out.len() < 2 {
@@ -567,8 +560,8 @@ impl Node for Plugin {
         true
     }
 
-    /// One socket per bus is a wall of sockets on a plugin that has a dozen,
-    /// so they are added the way parameter sockets are.
+    /// One socket per bus is a wall of sockets on a plugin that has a dozen, so
+    /// they are added the way parameter sockets are.
     #[cfg(feature = "ui")]
     fn add_output_label(&self) -> Option<&'static str> {
         (self.ports.shown_outputs().len() < self.ports.audio_out.len())
@@ -596,17 +589,20 @@ impl Node for Plugin {
         1
     }
 
-    /// A plugin node does not get a socket per parameter — Chroma has 2106 of
-    /// them — so they are added one at a time, on the node's last row.
+    /// Tooltip label for adding an additional parameter input socket.
+    ///
+    /// A plugin node does not get a socket per parameter because some plugins
+    /// have thousands of them, so they are added one at a time and each one
+    /// picks what it drives from a dropdown.
     #[cfg(feature = "ui")]
     fn add_input_label(&self) -> Option<&'static str> {
         Some("a socket for another parameter")
     }
 
-    /// Named for nothing in particular: the dropdown on its row is where it is
-    /// pointed at something, and it says "#0" until it has been.
     #[cfg(feature = "ui")]
     fn add_input(&mut self) {
+        // Named for nothing in particular: the dropdown on its row is where it
+        // is pointed at something, and it says "#0" until it has been.
         self.ports.params.push(ParamPort {
             id: 0,
             name: String::new(),
