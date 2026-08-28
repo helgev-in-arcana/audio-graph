@@ -1,30 +1,42 @@
 //! State serialization types and helpers for hosted sub-plugins.
 //!
-//! Provides serializable structures for sub-plugin references and opaque plugin
-//! state chunks (base64 encoded), along with minimal base64 utilities.
+//! What a wrapper saves is its own business — which slots it publishes, what
+//! a patch looks like. What is *not* its own business is the sub-plugin's
+//! chunk: it is opaque, it has to survive a round trip unread, and the
+//! reference that says which plugin to reload has to outlive that plugin going
+//! missing. Those are the pieces here, plus the base64 the text round trip
+//! needs.
 
 use serde::{Deserialize, Serialize};
 
 /// Persistent reference identifying a sub-plugin to load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubPluginRef {
-    /// Plugin format identifier (e.g. `"vst3"`, `"clap"`).
+    /// Plugin format identifier (e.g. `"vst3"`, `"clap"`). A field rather
+    /// than an assumption, so adding a format stays additive.
     pub format: String,
-    /// Unique plugin identifier (e.g. VST3 class ID hex string or CLAP plugin ID).
+    /// Authoritative identity: a VST3 class id in its platform-independent
+    /// hex form, or a CLAP plugin id, so a project moves between machines and
+    /// operating systems.
     pub plugin_id: String,
-    /// Filesystem path hint where the plugin was previously located.
+    /// Where it was last found. A *hint* only: plugin folders differ between
+    /// machines, so a missing path triggers a search by `plugin_id` rather
+    /// than a failure.
     pub path_hint: String,
-    /// Human-readable display name of the plugin.
+    /// For showing the user what is missing when it cannot be found.
     pub display_name: String,
 }
 
 /// Serialized state for a single sub-plugin instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceState {
-    /// Instance index within the sub-host.
+    /// Which plugin node this belongs to. Stored rather than implied by
+    /// position, because the table is sparse: deleting a node must not
+    /// renumber the ones after it.
     pub instance: usize,
     pub reference: SubPluginRef,
-    /// Base64-encoded opaque state blob saved from the sub-plugin.
+    /// The sub-plugin's own opaque chunk. Base64 rather than raw bytes
+    /// because a wrapper's saved state is usually a text document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
 }
@@ -35,7 +47,14 @@ impl InstanceState {
     }
 }
 
-/// State container for all slots and sub-plugin instances in a [`SubHost`][crate::SubHost].
+/// State container for all slots and sub-plugin instances in a
+/// [`SubHost`][crate::SubHost].
+///
+/// Not itself a saved document: a wrapper owns its own file format — a
+/// version number, whatever patch it holds — and this is only the part of it
+/// that this crate can fill in and read back. Keeping the two apart is what
+/// lets a wrapper lay its file out however it likes, and lets a project
+/// written by a newer build survive a round trip through an older one.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubHostState {
     pub slots: Vec<crate::slots::Slot>,
@@ -43,6 +62,11 @@ pub struct SubHostState {
 }
 
 /// Encodes raw bytes into standard base64 string format.
+///
+/// Written out rather than taken as a dependency: it is thirty lines, and this
+/// is the only place the project needs it. Public because a wrapper's own
+/// state has the same problem this solves — an opaque chunk in a text
+/// document.
 pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -125,7 +149,9 @@ mod tests {
 
     #[test]
     fn base64_rejects_garbage_instead_of_returning_nonsense() {
-        // Invalid base64 strings should be rejected cleanly.
+        // A corrupted project should surface as "sub-plugin state
+        // unreadable", not as a chunk of wrong bytes handed to a third-party
+        // plugin.
         assert_eq!(base64_decode("!!!!"), None);
         assert_eq!(base64_decode("abc"), None);
     }

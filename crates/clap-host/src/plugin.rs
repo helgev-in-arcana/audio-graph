@@ -951,7 +951,10 @@ pub struct ClapProcessor {
     steady_time: i64,
 }
 
-// SAFETY: ClapProcessor owns the audio processing state and is accessed only on the audio thread.
+// SAFETY: CLAP designates `process` as the audio-thread call; the whole point
+// of splitting the main-thread and processor halves into two traits is that
+// only this half crosses to that thread, and it is never shared with the
+// main thread while it lives.
 unsafe impl Send for ClapProcessor {}
 
 impl ClapProcessor {

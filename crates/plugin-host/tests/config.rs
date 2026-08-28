@@ -2,6 +2,13 @@
 //!
 //! Verifies default directory seeding, persistence, modification timestamp reload,
 //! legacy alias compatibility, and pinning operations.
+//!
+//! This file holds exactly one `#[test]`, and that is load-bearing: the test
+//! sets `AUDIO_GRAPH_CONFIG` with `std::env::set_var`, which is only sound
+//! while no other thread is running. Cargo builds each integration-test file
+//! as its own binary but runs the tests within one file on parallel threads,
+//! so a second test added here would make the `set_var` below unsound. Add
+//! further config tests as a new file instead.
 
 use std::path::PathBuf;
 
@@ -14,10 +21,14 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     std::fs::create_dir_all(&dir).expect("a temp directory can be made");
     let file = dir.join("config.json");
 
-    // SAFETY: set before anything in this binary reads the config.
+    // SAFETY: no other thread is running. This is the only test in this
+    // binary (see the module comment), and the variable is set before
+    // anything here reads the config.
     unsafe { std::env::set_var("AUDIO_GRAPH_CONFIG", &file) };
 
-    // First run with no configuration file seeds standard default directories.
+    // First run: no file, so the conventional folders are written into one.
+    // Compared as a set of paths, because that is what the settings hold — the
+    // format each is conventionally for is dropped on the way in.
     let expected: Vec<PathBuf> = {
         let mut dirs = Vec::new();
         for (_, d) in plugin_host::default_plugin_directories() {
@@ -34,7 +45,8 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         "and writes them down rather than implying them"
     );
 
-    // Every configured folder is included in directory scanning.
+    // Every one of them is a scanned directory, for every format: past the
+    // settings, a folder is a folder.
     let scanned = plugin_host::plugin_directories();
     for d in seeded.iter().filter(|d| d.is_dir()) {
         for format in plugin_host::FORMATS {
@@ -46,7 +58,8 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         }
     }
 
-    // Removing a seeded directory removes it from the configuration.
+    // A seeded folder is the user's to remove, which is the whole point of
+    // seeding rather than always scanning.
     if let Some(first) = seeded.first().cloned() {
         config::remove_directory(&first).expect("a temp profile is writable");
         assert!(
@@ -61,7 +74,8 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         );
     }
 
-    // Adding is idempotent.
+    // Adding is idempotent: the user asked for that folder to be scanned, and
+    // after the call it is, once.
     config::add_directory(&dir).expect("saving works");
     config::add_directory(&dir).expect("saving again works");
     assert_eq!(

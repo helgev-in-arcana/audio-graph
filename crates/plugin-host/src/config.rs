@@ -1,20 +1,45 @@
 //! Configuration and directory management for plugin scanning.
 //!
-//! Stores user-configured search directories and pinned plugins in `config.json`
-//! in the platform's local application data directory.
+//! Nothing in either format lets a plugin discover where the DAW looks:
+//! neither VST3 nor CLAP has a way to ask. So the list is the user's, and this
+//! is where it lives — as `config.json` in the platform's per-user *local*
+//! application data directory.
+//!
+//! Never next to the module: the bundle usually sits somewhere only an
+//! administrator can write (`Common Files\VST3` on Windows,
+//! `/Library/Audio/Plug-Ins/VST3` on macOS), writing inside a macOS bundle
+//! invalidates its signature, and a reinstall would take the file with it.
+//!
+//! Local rather than roaming, because the content is a list of absolute paths:
+//! `D:\Plugins\VST3` means nothing on the other machine a roaming profile
+//! would carry it to.
 //!
 //! # Seeding and Defaults
 //!
-//! On first run when no configuration file exists, the configuration is initialized
-//! with default OS-conventional plugin directories. The configuration file becomes
-//! the authoritative source of directories to scan; entries can be freely added
-//! or removed by the user.
+//! On first run when no configuration file exists, the configuration is
+//! initialized with the OS-conventional plugin directories — the ones a plugin
+//! would have been found in anyway. From then on the file is the whole answer:
+//! a folder the user added and a folder that came from the conventions are the
+//! same kind of thing, and either can be removed.
+//!
+//! That is deliberate, and it is what every DAW's own plugin-paths dialog does.
+//! The alternative — conventions always scanned, user folders on top — means
+//! a folder the user can see in the list but cannot remove, and no way to stop
+//! scanning somewhere slow or broken.
+//!
+//! A list that is empty because the user emptied it stays empty. Re-seeding
+//! keys off the file being absent, never off the list being short, so "scan
+//! nothing" remains something a user can ask for. [`restore_defaults`] is how
+//! they get the conventions back, and it adds rather than replaces.
 //!
 //! # Process and File Caching
 //!
-//! An in-memory cache synchronized across threads caches the loaded configuration,
-//! checking the file modification timestamp before re-reading from disk to detect
-//! external updates.
+//! Every instance in the process reads one in-memory cache, so a folder added
+//! in one wrapper's editor is there for the next one that scans without either
+//! of them knowing the other exists. Across processes — two DAWs open at once
+//! — the file's modification time settles it: a read re-fetches when the file
+//! changed underneath it, which costs one `stat` per rescan and nothing per
+//! frame.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,17 +49,33 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 /// Configuration options persisted across sessions.
+///
+/// A struct rather than a bare `Vec` so that adding a setting does not
+/// invalidate everybody's file, and `serde(default)` is what makes a file
+/// written by an older build — one from before pinning, say — still load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Directories to scan for plugins, in user-configured order.
+    /// Directories to scan for plugins, in the order they appear to the user.
     ///
-    /// An alias `extra_directories` is accepted for backwards compatibility with
-    /// earlier configuration formats.
+    /// Each is searched for every format, whatever it is called: a user
+    /// pointing at their plugin folder should not have to say which kinds of
+    /// plugin are in it, and a conventional `VST3` folder with a stray `.clap`
+    /// in it is the user's business rather than ours.
+    ///
+    /// An alias `extra_directories` is accepted for files written by the first
+    /// build of this feature, which used that name back when the conventions
+    /// were scanned separately.
     #[serde(alias = "extra_directories")]
     pub directories: Vec<PathBuf>,
 
-    /// Plugin module paths pinned by the user.
+    /// The modules the user pinned to the top of the add-node menu.
+    ///
+    /// Full paths, because that is what identifies a module: two folders can
+    /// hold a `Raum.vst3` each, and pinning one of them must not pin the
+    /// other. A path that no longer exists is kept rather than pruned — an
+    /// unplugged drive, or a plugin folder temporarily off the scan list,
+    /// should not quietly cost the user their pins.
     pub pinned: Vec<PathBuf>,
 }
 
@@ -69,6 +110,7 @@ fn cache() -> &'static RwLock<Cache> {
 fn config_directory() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
+        // Local, not Roaming: see the module comment.
         std::env::var_os("LOCALAPPDATA").map(|v| PathBuf::from(v).join("AudioGraph"))
     }
 
@@ -87,8 +129,14 @@ fn config_directory() -> Option<PathBuf> {
     }
 }
 
-/// Returns the path to `config.json`, respecting the `AUDIO_GRAPH_CONFIG` environment override.
+/// Returns the path to `config.json`, respecting the `AUDIO_GRAPH_CONFIG`
+/// environment override.
+///
+/// Public because a user who has to be told where their settings went is owed
+/// the actual path, and the CLI prints it.
 pub fn config_path() -> Option<PathBuf> {
+    // The override is what makes any of this testable: a test must not touch
+    // the profile of whoever runs it.
     if let Some(path) = std::env::var_os("AUDIO_GRAPH_CONFIG").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(path));
     }
@@ -99,7 +147,10 @@ fn stamp_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Returns the standard default plugin directories without format associations.
+/// The conventional directories, as plain paths.
+///
+/// The format each is conventionally for is dropped on the way in, because
+/// past this point a folder is a folder — see [`Config::directories`].
 fn conventional() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for (_, dir) in crate::scan::default_plugin_directories() {
@@ -110,7 +161,15 @@ fn conventional() -> Vec<PathBuf> {
     dirs
 }
 
-/// Reads the config directly from disk, updating the cache if modified.
+/// Reads the config exactly as the file has it, with no seeding, updating the
+/// cache if the file changed.
+///
+/// A file that cannot be read or does not parse gives the default rather than
+/// an error: the alternative is a wrapper that lists no plugins at all because
+/// one line of JSON is malformed. `None` means there is no file yet, which is
+/// what [`load`] acts on and what a parse failure deliberately does *not* look
+/// like — re-seeding over a file we merely failed to understand would throw
+/// the user's list away.
 fn read_file() -> Option<Config> {
     let path = config_path()?;
     let stamp = stamp_of(&path);
@@ -138,22 +197,34 @@ fn read_file() -> Option<Config> {
     Some(config)
 }
 
-/// Loads the active configuration, initializing defaults on first run if missing.
+/// Loads the active configuration, seeding one on first run if there is no
+/// file. Re-reads when the file changed underneath us, so a second DAW's edits
+/// are picked up.
 pub fn load() -> Config {
     if let Some(config) = read_file() {
         return config;
     }
+    // No file: first run. Write down the folders a plugin would have been
+    // found in anyway, so the list the user is shown is complete from the
+    // start and every line of it is theirs to remove.
     let seeded = Config {
         directories: conventional(),
         ..Config::default()
     };
     if let Err(e) = store(&seeded) {
+        // Not fatal. The list is right for this session; it just will not
+        // survive, and the editor says so when the user changes something.
         log::warn!("audio-graph: the plugin folders could not be saved: {e}");
     }
     seeded
 }
 
-/// Updates configuration in memory and writes it to disk atomically.
+/// Updates configuration in memory and writes it to disk.
+///
+/// The in-memory copy is updated whether or not the write succeeds, so a user
+/// whose profile is read-only still gets the folder they just added for as
+/// long as the DAW stays open — and is told, by the returned error, that it
+/// will not outlive it.
 pub fn store(config: &Config) -> Result<(), String> {
     {
         let mut cache = cache().write().unwrap();
@@ -168,6 +239,8 @@ pub fn store(config: &Config) -> Result<(), String> {
     }
     let json = serde_json::to_vec_pretty(config).map_err(|e| format!("encoding config: {e}"))?;
 
+    // Written beside the target and renamed over it, so that a crash halfway
+    // through leaves the previous settings rather than half of the new ones.
     let temp = path.with_extension("json.new");
     {
         let mut file =
@@ -181,17 +254,22 @@ pub fn store(config: &Config) -> Result<(), String> {
         format!("replacing {}: {e}", path.display())
     })?;
 
+    // The file just written is the newest one; record its stamp so the next
+    // read does not fetch it back for nothing.
     let mut cache = cache().write().unwrap();
     cache.stamp = stamp_of(&path);
     Ok(())
 }
 
-/// Returns all configured scan directories.
+/// Every folder to scan, in the order the user sees them.
 pub fn directories() -> Vec<PathBuf> {
     load().directories
 }
 
 /// Adds `dir` to the scan directory list and saves configuration.
+///
+/// A duplicate is neither an error nor a second entry: the user asked for that
+/// folder to be scanned, and after this call it is.
 pub fn add_directory(dir: impl Into<PathBuf>) -> Result<(), String> {
     let dir = dir.into();
     let mut config = load();
@@ -203,13 +281,21 @@ pub fn add_directory(dir: impl Into<PathBuf>) -> Result<(), String> {
 }
 
 /// Removes `dir` from the scan directory list and saves configuration.
+///
+/// Removing a folder that came from the conventions is allowed, and is the
+/// point of seeding them in: a folder full of plugins that crash the scanner
+/// is something the user must be able to stop looking at.
 pub fn remove_directory(dir: &Path) -> Result<(), String> {
     let mut config = load();
     config.directories.retain(|d| d != dir);
     store(&config)
 }
 
-/// Restores any missing default conventional plugin directories and saves configuration.
+/// Puts back any conventional folder that is not in the list, and saves.
+///
+/// Adds rather than replaces: the user's own folders are not what they asked
+/// to undo. Also the way a folder that appeared after the list was seeded — a
+/// plugin format installed later, a `CLAP_PATH` set since — gets picked up.
 pub fn restore_defaults() -> Result<(), String> {
     let mut config = load();
     let mut added = false;
@@ -235,7 +321,12 @@ pub fn is_pinned(path: &Path) -> bool {
     load().pinned.iter().any(|p| p == path)
 }
 
-/// Sets the pinned status of `path` and saves configuration, returning the new pinned state.
+/// Sets the pinned status of `path` and saves configuration, returning the new
+/// pinned state.
+///
+/// Idempotent in both directions: the caller asks for a state rather than for
+/// a change, so two editors toggling the same plugin cannot leave it pinned
+/// twice or unpin what the other just pinned.
 pub fn set_pinned(path: &Path, pin: bool) -> Result<bool, String> {
     let mut config = load();
     let had = config.pinned.iter().any(|p| p == path);
