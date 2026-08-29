@@ -56,7 +56,7 @@ impl Key {
 
     /// A digit key, or `None` if `c` is not an ASCII digit.
     pub fn digit(c: char) -> Option<Key> {
-        c.is_ascii_digit().then(|| Key::Digit(c as u8))
+        c.is_ascii_digit().then_some(Key::Digit(c as u8))
     }
 
     /// A function key, or `None` outside F1..=F24.

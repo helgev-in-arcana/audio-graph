@@ -391,7 +391,7 @@ pub mod imp {
 
     /// A colour nothing else would paint, so a screenshot of a failing teardown
     /// is unambiguous about who drew what. The same one the Win32 side uses.
-    const FILL: u32 = 0x0050_a0;
+    const FILL: u32 = 0x00_50_a0;
 
     /// The plugin's own window, living inside the host's.
     ///

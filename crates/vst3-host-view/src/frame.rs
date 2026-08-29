@@ -210,8 +210,9 @@ mod run_loop {
                 if !self.watches(handler, fd) {
                     continue;
                 }
-                unsafe { vst3::ComRef::from_raw(handler) }
-                    .map(|handler| unsafe { handler.onFDIsSet(fd) });
+                if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
+                    unsafe { handler.onFDIsSet(fd) };
+                }
             }
         }
 
@@ -234,8 +235,9 @@ mod run_loop {
                 if !self.has_timer(handler) {
                     continue;
                 }
-                unsafe { vst3::ComRef::from_raw(handler) }
-                    .map(|handler| unsafe { handler.onTimer() });
+                if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
+                    unsafe { handler.onTimer() };
+                }
             }
         }
 

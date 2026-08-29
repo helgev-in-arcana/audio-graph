@@ -70,11 +70,12 @@ jobs:
           key: ${{ matrix.os }}
 
       # X11 のヘッダはエディタまわりが要求する。Linux ランナーには入っていない。
+      # Xvfb はテスト用。理由は下の Test ステップ。
       - name: Install the Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
+          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config xvfb
 
       # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
       # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
@@ -83,7 +84,16 @@ jobs:
         run: cargo build --workspace
 
       - name: Test
+        if: runner.os != 'Linux'
         run: cargo test --workspace
+
+      # Linux のウィンドウのテストは本物の X ウィンドウを開くので、
+      # ランナーには X サーバが要る。ここを Xvfb で走らせることで、
+      # 「ウィンドウを開くテストが CI で 1 つも走らない」という穴
+      # (memo/UNTESTED.md UT-3) が Linux については塞がる。
+      - name: Test (under an X server)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test --workspace
 
       # リリースで実際に配るのは release ビルドなので、そこまで確かめる。
       - name: Build release
