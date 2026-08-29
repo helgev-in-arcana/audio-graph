@@ -664,7 +664,7 @@ impl WrapperEditor {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let forward: Vec<(u16, bool)> = ctx.input(|i| {
+        let forward: Vec<(plugin_host::Key, bool)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|event| match event {
@@ -673,13 +673,13 @@ impl WrapperEditor {
                         pressed,
                         repeat,
                         ..
-                    } if !repeat && !ours(*key) => virtual_key(*key).map(|vk| (vk, *pressed)),
+                    } if !repeat && !ours(*key) => host_key(*key).map(|key| (key, *pressed)),
                     _ => None,
                 })
                 .collect()
         });
-        for (vk, pressed) in forward {
-            plugin_host::forward_key(self.daw_window, vk, pressed);
+        for (key, pressed) in forward {
+            plugin_host::forward_key(self.daw_window, key, pressed);
         }
     }
 }
@@ -783,41 +783,31 @@ fn ours(key: egui::Key) -> bool {
     )
 }
 
-/// An egui key as Windows names it.
+/// An egui key as `host-window` names it.
 ///
-/// Letters, digits and function keys are contiguous in both, so they need a
-/// range each rather than a table. Punctuation is left out on purpose: the
-/// Win32 codes for it are OEM keys whose meaning depends on the keyboard
-/// layout, and guessing wrong sends the DAW a keystroke the user did not type.
-fn virtual_key(key: egui::Key) -> Option<u16> {
+/// Letters, digits and function keys are ranges rather than a table because
+/// egui spells them out in the same order everywhere. Punctuation is left out
+/// on purpose: what a punctuation key means depends on the keyboard layout, and
+/// `host-window` has no name for one.
+fn host_key(key: egui::Key) -> Option<plugin_host::Key> {
     use egui::Key as K;
+    use plugin_host::Key as H;
     Some(match key {
-        K::Space => 0x20,
-        K::Enter => 0x0d,
-        K::Backspace => 0x08,
-        K::Delete => 0x2e,
-        K::Insert => 0x2d,
-        K::Home => 0x24,
-        K::End => 0x23,
-        K::PageUp => 0x21,
-        K::PageDown => 0x22,
+        K::Space => H::Space,
+        K::Enter => H::Enter,
+        K::Backspace => H::Backspace,
+        K::Delete => H::Delete,
+        K::Insert => H::Insert,
+        K::Home => H::Home,
+        K::End => H::End,
+        K::PageUp => H::PageUp,
+        K::PageDown => H::PageDown,
         _ => {
             let name = key.name();
-            let byte = name.as_bytes();
-            match byte {
-                // "A".."Z" and "0".."9" share their ASCII value with their
-                // virtual key code.
-                [c @ b'A'..=b'Z'] => u16::from(*c),
-                [c @ b'0'..=b'9'] => u16::from(*c),
-                // "F1".."F24" — VK_F1 is 0x70 and they run consecutively.
-                [b'F', ..] => {
-                    let n: u16 = name[1..].parse().ok()?;
-                    if (1..=24).contains(&n) {
-                        0x6f + n
-                    } else {
-                        return None;
-                    }
-                }
+            match name.as_bytes() {
+                [c @ b'A'..=b'Z'] => H::letter(char::from(*c))?,
+                [c @ b'0'..=b'9'] => H::digit(char::from(*c))?,
+                [b'F', ..] => H::function(name[1..].parse().ok()?)?,
                 _ => return None,
             }
         }
@@ -856,35 +846,36 @@ pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperE
 
 #[cfg(test)]
 mod key_tests {
-    use super::{ours, virtual_key};
+    use super::{host_key, ours};
     use egui::Key;
+    use plugin_host::Key as H;
 
     #[test]
     fn the_space_bar_reaches_the_daw() {
         // The whole point: this is the key that starts and stops the transport.
         assert!(!ours(Key::Space));
-        assert_eq!(virtual_key(Key::Space), Some(0x20));
+        assert_eq!(host_key(Key::Space), Some(H::Space));
     }
 
     #[test]
-    fn letters_digits_and_function_keys_map_to_their_win32_codes() {
-        assert_eq!(virtual_key(Key::A), Some(0x41));
-        assert_eq!(virtual_key(Key::Z), Some(0x5a));
-        assert_eq!(virtual_key(Key::Num0), Some(0x30));
-        assert_eq!(virtual_key(Key::Num9), Some(0x39));
-        assert_eq!(virtual_key(Key::F1), Some(0x70));
-        assert_eq!(virtual_key(Key::F12), Some(0x7b));
+    fn letters_digits_and_function_keys_carry_their_own_value() {
+        assert_eq!(host_key(Key::A), Some(H::Letter(b'A')));
+        assert_eq!(host_key(Key::Z), Some(H::Letter(b'Z')));
+        assert_eq!(host_key(Key::Num0), Some(H::Digit(b'0')));
+        assert_eq!(host_key(Key::Num9), Some(H::Digit(b'9')));
+        assert_eq!(host_key(Key::F1), Some(H::Function(1)));
+        assert_eq!(host_key(Key::F12), Some(H::Function(12)));
     }
 
     #[test]
-    fn keys_with_no_layout_independent_code_are_not_guessed() {
-        // Punctuation is an OEM key on Windows and its meaning moves with the
-        // keyboard layout. Sending nothing is better than sending a keystroke
-        // the user did not type.
-        assert_eq!(virtual_key(Key::Semicolon), None);
-        assert_eq!(virtual_key(Key::Backslash), None);
-        // Beyond VK_F24 there is nothing to map onto.
-        assert_eq!(virtual_key(Key::F35), None);
+    fn keys_with_no_layout_independent_name_are_not_guessed() {
+        // What a punctuation key produces moves with the keyboard layout.
+        // Sending nothing is better than sending a keystroke the user did not
+        // type.
+        assert_eq!(host_key(Key::Semicolon), None);
+        assert_eq!(host_key(Key::Backslash), None);
+        // Past F24 there is nothing on the other side to map onto.
+        assert_eq!(host_key(Key::F35), None);
     }
 
     #[test]

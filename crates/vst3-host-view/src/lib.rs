@@ -14,7 +14,8 @@ pub use frame::PlugFrame;
 // them without depending on VST3. Re-exported so callers that already speak in
 // this crate's names do not have to change.
 pub use host_window::{
-    ContainerWindow, Deferred, Size, WindowState, deferred, forward_key, pump_events, root_window,
+    ContainerWindow, Deferred, Key, Size, WindowState, deferred, forward_key, poll, pump_events,
+    root_window,
 };
 
 /// What the platform handle means to a VST3 plugin.

@@ -1,0 +1,272 @@
+//! The X connection our windows live on, and the loop that drains it.
+//!
+//! One connection per thread, opened the first time something needs it. It is
+//! not the DAW's connection, which is the fact the rest of this backend is
+//! shaped by: nothing the host pumps will ever deliver our events, so [`pump`]
+//! has to be called by us — see [`crate::poll`].
+//!
+//! Sharing one connection between every window on a thread keeps a single queue
+//! to drain. Windows register themselves against their X id, and deferred
+//! queues register to be run on the same turn.
+
+use std::cell::{Cell, RefCell};
+use std::rc::{Rc, Weak};
+
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ConnectionExt as _, PropMode, Screen, Window as XWindow,
+};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
+use crate::deferred::Inner as DeferredInner;
+use crate::window::{Size, WindowState};
+
+thread_local! {
+    static CONN: RefCell<Option<Rc<Conn>>> = const { RefCell::new(None) };
+}
+
+/// Atoms this backend needs interned once.
+pub(crate) struct Atoms {
+    pub(crate) wm_protocols: Atom,
+    pub(crate) wm_delete_window: Atom,
+    pub(crate) net_wm_name: Atom,
+    pub(crate) utf8_string: Atom,
+    pub(crate) net_wm_window_type: Atom,
+    pub(crate) net_wm_window_type_utility: Atom,
+    pub(crate) net_wm_pid: Atom,
+}
+
+pub(crate) struct Conn {
+    pub(crate) conn: RustConnection,
+    pub(crate) screen: usize,
+    pub(crate) atoms: Atoms,
+    /// Container windows, by the X id their events name.
+    windows: RefCell<Vec<(XWindow, Weak<WindowState>)>>,
+    /// Deferred queues, by the handle that unregisters them.
+    queues: RefCell<Vec<(u64, Weak<DeferredInner>)>>,
+    next_queue: Cell<u64>,
+    /// Set when a queue has work, so an idle pump walks no lists.
+    queued: Cell<bool>,
+}
+
+impl Conn {
+    pub(crate) fn screen(&self) -> &Screen {
+        &self.conn.setup().roots[self.screen]
+    }
+
+    pub(crate) fn root(&self) -> XWindow {
+        self.screen().root
+    }
+
+    pub(crate) fn register_window(&self, id: XWindow, state: &Rc<WindowState>) {
+        self.windows.borrow_mut().push((id, Rc::downgrade(state)));
+    }
+
+    pub(crate) fn unregister_window(&self, id: XWindow) {
+        self.windows.borrow_mut().retain(|(other, _)| *other != id);
+    }
+
+    /// Register a deferred queue, answering with the handle that removes it.
+    pub(crate) fn register_queue(&self, inner: &Rc<DeferredInner>) -> u64 {
+        let id = self.next_queue.get();
+        self.next_queue.set(id + 1);
+        self.queues.borrow_mut().push((id, Rc::downgrade(inner)));
+        id
+    }
+
+    pub(crate) fn unregister_queue(&self, id: u64) {
+        self.queues.borrow_mut().retain(|(other, _)| *other != id);
+    }
+
+    /// Note that some queue has work for the next turn.
+    pub(crate) fn wake(&self) {
+        self.queued.set(true);
+    }
+
+    /// The state for `id`, as an owning handle.
+    ///
+    /// Taken out of the registry rather than borrowed across the dispatch:
+    /// handling an event can create or destroy windows, and that mutates the
+    /// very list being walked.
+    fn window(&self, id: XWindow) -> Option<Rc<WindowState>> {
+        let windows = self.windows.borrow();
+        let (_, state) = windows.iter().find(|(other, _)| *other == id)?;
+        state.upgrade()
+    }
+}
+
+/// The connection for this thread, opening one if this is the first call.
+pub(crate) fn conn() -> Result<Rc<Conn>, String> {
+    CONN.with(|cell| {
+        if let Some(conn) = cell.borrow().as_ref() {
+            return Ok(Rc::clone(conn));
+        }
+        let conn = Rc::new(open()?);
+        *cell.borrow_mut() = Some(Rc::clone(&conn));
+        Ok(conn)
+    })
+}
+
+/// The connection for this thread, or `None` if nothing has needed one yet.
+///
+/// For callers that have nothing to do without windows of their own, so that
+/// they do not open a connection just to discover that.
+fn existing() -> Option<Rc<Conn>> {
+    CONN.with(|cell| cell.borrow().as_ref().map(Rc::clone))
+}
+
+fn open() -> Result<Conn, String> {
+    let (conn, screen) =
+        RustConnection::connect(None).map_err(|e| format!("could not reach the X server: {e}"))?;
+
+    // Asked for all at once and collected afterwards: interning is a round trip
+    // each, and seven in series is seven times the latency.
+    let mut cookies = Vec::new();
+    for name in [
+        b"WM_PROTOCOLS".as_slice(),
+        b"WM_DELETE_WINDOW",
+        b"_NET_WM_NAME",
+        b"UTF8_STRING",
+        b"_NET_WM_WINDOW_TYPE",
+        b"_NET_WM_WINDOW_TYPE_UTILITY",
+        b"_NET_WM_PID",
+    ] {
+        cookies.push(
+            conn.intern_atom(false, name)
+                .map_err(|e| format!("could not intern an atom: {e}"))?,
+        );
+    }
+    let mut atoms = Vec::new();
+    for cookie in cookies {
+        atoms.push(
+            cookie
+                .reply()
+                .map_err(|e| format!("could not intern an atom: {e}"))?
+                .atom,
+        );
+    }
+
+    Ok(Conn {
+        conn,
+        screen,
+        atoms: Atoms {
+            wm_protocols: atoms[0],
+            wm_delete_window: atoms[1],
+            net_wm_name: atoms[2],
+            utf8_string: atoms[3],
+            net_wm_window_type: atoms[4],
+            net_wm_window_type_utility: atoms[5],
+            net_wm_pid: atoms[6],
+        },
+        windows: RefCell::new(Vec::new()),
+        queues: RefCell::new(Vec::new()),
+        next_queue: Cell::new(0),
+        queued: Cell::new(false),
+    })
+}
+
+/// Drain everything the server has sent us, then run anything that was deferred.
+///
+/// Never blocks: an empty queue is the ordinary case, and a caller runs this
+/// once per frame.
+pub(crate) fn pump() {
+    let Some(conn) = existing() else { return };
+
+    loop {
+        let event = match conn.conn.poll_for_event() {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("audio-graph: lost the X connection: {e}");
+                break;
+            }
+        };
+        dispatch(&conn, &event);
+    }
+
+    run_deferred(&conn);
+
+    // Anything the events or the tasks queued — a window destroyed by a
+    // deferred close, say — is only a request until it is written out.
+    let _ = conn.conn.flush();
+}
+
+/// Run every deferred queue that has work.
+///
+/// Local, with no trip through the server. Win32 defers by posting a message
+/// because the thread's queue is the only thing the DAW's pump will look at;
+/// here the pump is this function, so the work merely has to wait for it. What
+/// the caller gets is the same either way: nothing posted during a frame runs
+/// before that frame is over.
+///
+/// Bounded rather than looped to exhaustion, so a task that unconditionally
+/// queues another one cannot hold the frame.
+fn run_deferred(conn: &Conn) {
+    for _ in 0..8 {
+        if !conn.queued.replace(false) {
+            return;
+        }
+        // Snapshot before running: a task is free to create or drop a queue,
+        // and that mutates the list this walks.
+        let queues: Vec<Rc<DeferredInner>> = conn
+            .queues
+            .borrow()
+            .iter()
+            .filter_map(|(_, inner)| inner.upgrade())
+            .collect();
+        for queue in queues {
+            queue.drain();
+        }
+    }
+}
+
+fn dispatch(conn: &Conn, event: &Event) {
+    match event {
+        // The window manager asking, rather than telling: the close button
+        // arrives here because the window advertises WM_DELETE_WINDOW. Recorded
+        // and not obeyed, exactly as on Windows — destroying the window here
+        // would take the plugin's child with it without the plugin ever being
+        // told.
+        Event::ClientMessage(e) if e.type_ == conn.atoms.wm_protocols => {
+            if e.format == 32
+                && e.data.as_data32()[0] == conn.atoms.wm_delete_window
+                && let Some(state) = conn.window(e.window)
+            {
+                state.close_requested.set(true);
+            }
+        }
+        // The size the window actually got, which is not always the size that
+        // was asked for: the window manager has the last word.
+        Event::ConfigureNotify(e) => {
+            if let Some(state) = conn.window(e.window) {
+                state
+                    .size
+                    .set(Size::new(i32::from(e.width), i32::from(e.height)));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Write a UTF-8 string property, in both the modern and the legacy spelling.
+///
+/// Window managers are not consistent about which of the two they read, and a
+/// window with no title in the taskbar is a window the user cannot find.
+pub(crate) fn set_title(conn: &Conn, window: XWindow, title: &str) {
+    let _ = conn.conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        conn.atoms.net_wm_name,
+        conn.atoms.utf8_string,
+        title.as_bytes(),
+    );
+    let _ = conn.conn.change_property8(
+        PropMode::REPLACE,
+        window,
+        Atom::from(AtomEnum::WM_NAME),
+        Atom::from(AtomEnum::STRING),
+        title.as_bytes(),
+    );
+}

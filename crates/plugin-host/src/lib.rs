@@ -63,7 +63,7 @@ pub use plugin_host_api::{
 // to a format: a GUI toolkit's draw callback may only *record* that the user
 // asked for a window, never open one.
 pub use host_window::{
-    ContainerWindow, Deferred, Size, deferred, forward_key, pump_events, root_window,
+    ContainerWindow, Deferred, Key, Size, deferred, forward_key, poll, pump_events, root_window,
 };
 
 /// Prepares the calling thread for hosting plugins.

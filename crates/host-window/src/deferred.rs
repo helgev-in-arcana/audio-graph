@@ -24,21 +24,30 @@
 //! all on the platforms whose backend is still a stub. It belongs to the plugin
 //! instance now, which reaches the main thread through its host rather than
 //! through a window — see `audio-graph-plugin`'s `tick`.
+//!
+//! # Which thread the work runs on
+//!
+//! The queue runs its work on the thread that created it, and that thread is
+//! the caller's to choose. On Windows and macOS a plugin editor is built on the
+//! host's own UI thread, so the two coincide. On X11 baseview gives the editor a
+//! thread of its own, and a queue created there is *not* on the host's main
+//! thread — see [`crate::pump_events`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+
+use crate::imp;
 
 /// Work queued from a draw callback, run from the message loop.
 ///
 /// Main thread only, and dropping it cancels anything still queued.
 pub struct Deferred {
     inner: Rc<Inner>,
-    #[cfg(windows)]
-    hwnd: imp::Hwnd,
+    handle: imp::DeferredHandle,
 }
 
-struct Inner {
+pub(crate) struct Inner {
     queue: RefCell<VecDeque<Box<dyn FnOnce()>>>,
     /// Guards against a queued closure that dispatches messages causing its own
     /// handler to be entered again.
@@ -46,7 +55,14 @@ struct Inner {
 }
 
 impl Inner {
-    fn drain(&self) {
+    pub(crate) fn new() -> Rc<Inner> {
+        Rc::new(Inner {
+            queue: RefCell::new(VecDeque::new()),
+            running: Cell::new(false),
+        })
+    }
+
+    pub(crate) fn drain(&self) {
         if self.running.get() {
             return;
         }
@@ -59,179 +75,43 @@ impl Inner {
         }
         self.running.set(false);
     }
+
+    pub(crate) fn clear(&self) {
+        self.queue.borrow_mut().clear();
+    }
 }
 
 impl Deferred {
+    pub(crate) fn from_parts(inner: Rc<Inner>, handle: imp::DeferredHandle) -> Deferred {
+        Deferred { inner, handle }
+    }
+
     /// Queue `task` to run once, on the next turn of this thread's message loop.
     ///
     /// Safe to call from inside a draw callback — that is the entire point.
     pub fn post(&self, task: impl FnOnce() + 'static) {
         self.inner.queue.borrow_mut().push_back(Box::new(task));
-        self.wake();
+        imp::wake_deferred(&self.handle);
     }
 }
 
-#[cfg(windows)]
-pub use imp::new;
-
-#[cfg(windows)]
-impl Deferred {
-    fn wake(&self) {
-        imp::wake(self.hwnd);
-    }
-}
-
-#[cfg(not(windows))]
-impl Deferred {
-    fn wake(&self) {
-        // Without a message loop to post to there is nowhere to defer *to*, so
-        // the work runs now. Correct only because the non-Windows window
-        // backend is a stub that never opens anything (see `window`).
-        self.inner.drain();
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        imp::destroy_deferred(&self.handle);
+        // Anything still queued refers to state that is going away with the
+        // owner of this queue.
+        self.inner.clear();
     }
 }
 
 /// Create a queue bound to this thread's message loop.
-#[cfg(not(windows))]
 pub fn new() -> Result<Deferred, String> {
-    Ok(Deferred {
-        inner: Rc::new(Inner {
-            queue: RefCell::new(VecDeque::new()),
-            running: Cell::new(false),
-        }),
-    })
+    imp::new_deferred()
 }
 
-#[cfg(windows)]
-mod imp {
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-    use std::rc::Rc;
-    use std::sync::Once;
-
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
-        HWND_MESSAGE, PostMessageW, RegisterClassExW, SetWindowLongPtrW, WM_APP, WNDCLASSEXW,
-    };
-
-    use super::{Deferred, Inner};
-
-    pub type Hwnd = HWND;
-
-    const CLASS_NAME: &[u16] = &[
-        b'a' as u16,
-        b'u' as u16,
-        b'd' as u16,
-        b'i' as u16,
-        b'o' as u16,
-        b'g' as u16,
-        b'r' as u16,
-        b'a' as u16,
-        b'p' as u16,
-        b'h' as u16,
-        b'.' as u16,
-        b'd' as u16,
-        b'e' as u16,
-        b'f' as u16,
-        b'e' as u16,
-        b'r' as u16,
-        0,
-    ];
-
-    static REGISTER: Once = Once::new();
-
-    fn register() {
-        REGISTER.call_once(|| unsafe {
-            let mut class: WNDCLASSEXW = std::mem::zeroed();
-            class.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
-            class.lpfnWndProc = Some(wnd_proc);
-            class.hInstance = GetModuleHandleW(std::ptr::null());
-            class.lpszClassName = CLASS_NAME.as_ptr();
-            RegisterClassExW(&class);
-        });
-    }
-
-    /// Create a queue bound to this thread's message loop.
-    pub fn new() -> Result<Deferred, String> {
-        register();
-        let inner = Rc::new(Inner {
-            queue: RefCell::new(VecDeque::new()),
-            running: Cell::new(false),
-        });
-
-        // HWND_MESSAGE: no pixels, no z-order, never shown. It exists purely to
-        // own a place in the thread's message queue.
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                CLASS_NAME.as_ptr(),
-                std::ptr::null(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                HWND_MESSAGE,
-                std::ptr::null_mut(),
-                GetModuleHandleW(std::ptr::null()),
-                std::ptr::null(),
-            )
-        };
-        if hwnd.is_null() {
-            return Err("could not create the deferred-work window".into());
-        }
-        // A borrowed pointer, not an owned one: `Deferred` holds the `Rc` and
-        // clears this in `Drop` before the window goes away.
-        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::as_ptr(&inner) as isize) };
-
-        Ok(Deferred { inner, hwnd })
-    }
-
-    pub fn wake(hwnd: HWND) {
-        unsafe { PostMessageW(hwnd, WM_APP, 0, 0) };
-    }
-
-    unsafe extern "system" fn wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        unsafe {
-            let inner = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Inner;
-            if inner.is_null() {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
-            }
-            match msg {
-                WM_APP => {
-                    (*inner).drain();
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
-        }
-    }
-
-    impl Drop for Deferred {
-        fn drop(&mut self) {
-            unsafe {
-                // Clear the back-pointer before destroying: DestroyWindow
-                // dispatches synchronously, and anything still queued refers to
-                // state that is going away.
-                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-                DestroyWindow(self.hwnd);
-            }
-            self.inner.queue.borrow_mut().clear();
-        }
-    }
-}
-
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, all(unix, not(target_os = "macos")))))]
 mod tests {
     use super::*;
-    use std::rc::Rc;
 
     #[test]
     fn posted_work_waits_for_the_message_loop() {

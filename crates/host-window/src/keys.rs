@@ -1,10 +1,10 @@
 //! Keyboard event forwarding to host windows.
 //!
 //! A plugin editor is a child window, and child windows are the end of the line
-//! for keyboard messages: Windows delivers `WM_KEYDOWN` to whatever has focus,
-//! and `DefWindowProc` does not pass it to the parent the way it does for, say,
-//! a command. So while the editor has focus the DAW hears nothing, and the space
-//! bar — which every DAW binds to transport — stops working.
+//! for keyboard input: the platform delivers the key to whatever has focus and
+//! does not pass it on to the ancestor the way it does for, say, a command. So
+//! while the editor has focus the DAW hears nothing, and the space bar — which
+//! every DAW binds to transport — stops working.
 //!
 //! Neither VST3 nor the GUI stack has a route for this. `IPlugView::onKeyDown`
 //! runs the other way (host to plugin), and baseview reports a key as consumed
@@ -12,53 +12,80 @@
 //! itself: if egui had no use for the key, post it to the DAW's own window and
 //! let the DAW's accelerators see it.
 //!
-//! Only the virtual key travels. Modifier state is left to `GetKeyState`, which
-//! is still accurate because the user is physically holding the modifier down
-//! while this runs.
+//! Only the key travels. Modifier state is left to the platform, which is still
+//! accurate because the user is physically holding the modifier down while this
+//! runs.
 
-/// Post a key up or down to `window`, as if it had been typed there.
+use crate::imp;
+
+/// A key on its way back to the DAW.
 ///
-/// `window` is a root window handle as returned by [`crate::root_window`], and
-/// `vk` a Win32 virtual key code. A zero handle is ignored, so a caller that
-/// never found the DAW's window needs no special case.
-pub fn forward(window: usize, vk: u16, pressed: bool) {
-    imp::forward(window, vk, pressed);
+/// Deliberately not a platform code. Windows names these as virtual keys and
+/// X11 as keysyms, and the two disagree about nearly all of them, so the name
+/// belongs to the backend that speaks it rather than to the caller.
+///
+/// The set is short on purpose: it is what a node editor has no use for and a
+/// DAW binds to something. Punctuation is left out because its platform codes
+/// depend on the keyboard layout, and guessing wrong sends the DAW a keystroke
+/// the user did not type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// `A`..=`Z`, held as the uppercase ASCII byte.
+    Letter(u8),
+    /// `0`..=`9`, held as the ASCII byte.
+    Digit(u8),
+    /// F1..=F24, held as the number.
+    Function(u8),
+    Space,
+    Enter,
+    Backspace,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
 }
 
-#[cfg(windows)]
-mod imp {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP};
+impl Key {
+    /// A letter key, or `None` if `c` is not an ASCII letter.
+    pub fn letter(c: char) -> Option<Key> {
+        c.is_ascii_alphabetic()
+            .then(|| Key::Letter(c.to_ascii_uppercase() as u8))
+    }
 
-    pub fn forward(window: usize, vk: u16, pressed: bool) {
-        if window == 0 || vk == 0 {
-            return;
-        }
-        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) };
+    /// A digit key, or `None` if `c` is not an ASCII digit.
+    pub fn digit(c: char) -> Option<Key> {
+        c.is_ascii_digit().then(|| Key::Digit(c as u8))
+    }
 
-        // The documented lParam layout: repeat count in 0..16, scan code in
-        // 16..24, and for a release the "was down" and "transition" bits at 30
-        // and 31. Some hosts read the scan code rather than the virtual key, so
-        // it is worth filling in properly.
-        let mut lparam: usize = 1 | ((scan as usize & 0xff) << 16);
-        if !pressed {
-            lparam |= (1 << 30) | (1 << 31);
-        }
-
-        let message = if pressed { WM_KEYDOWN } else { WM_KEYUP };
-        unsafe {
-            PostMessageW(
-                window as HWND,
-                message,
-                vk as usize as WPARAM,
-                lparam as LPARAM,
-            )
-        };
+    /// A function key, or `None` outside F1..=F24.
+    pub fn function(n: u8) -> Option<Key> {
+        (1..=24).contains(&n).then_some(Key::Function(n))
     }
 }
 
-#[cfg(not(windows))]
-mod imp {
-    pub fn forward(_window: usize, _vk: u16, _pressed: bool) {}
+/// Post a key up or down to `window`, as if it had been typed there.
+///
+/// `window` is a root window handle as returned by [`crate::root_window`]. A
+/// zero handle is ignored, so a caller that never found the DAW's window needs
+/// no special case.
+pub fn forward(window: usize, key: Key, pressed: bool) {
+    imp::forward_key(window, key, pressed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_keys_a_daw_binds_are_accepted() {
+        assert_eq!(Key::letter('q'), Some(Key::Letter(b'Q')));
+        assert_eq!(Key::letter('7'), None);
+        assert_eq!(Key::digit('7'), Some(Key::Digit(b'7')));
+        assert_eq!(Key::digit('q'), None);
+        assert_eq!(Key::function(12), Some(Key::Function(12)));
+        assert_eq!(Key::function(0), None);
+        assert_eq!(Key::function(25), None);
+    }
 }
