@@ -243,14 +243,73 @@ impl Vst3Plugin {
         Some((cp_component, cp_controller))
     }
 
+    /// Ask a plugin whose main buses default to mono whether it does stereo.
+    ///
+    /// A plugin's declared bus widths are only what it starts out as, not what
+    /// it can be: several effects (Krush among them) declare mono main buses
+    /// and accept stereo the moment a host asks. A DAW always asks, so the
+    /// plugin is stereo there and mono here, and half the signal is lost on the
+    /// way through. Asking here puts the two on the same footing.
+    ///
+    /// The answer is whatever `getBusInfo` reports afterwards, so a plugin that
+    /// declines is left reporting the mono it insisted on. Aux buses are left
+    /// alone: their width is the plugin's business until something is wired to
+    /// one, and that negotiation happens at activation.
+    fn prefer_stereo_main_buses(&self) {
+        use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
+
+        // Arrangements may only be set while deactivated.
+        if *self.active.borrow() {
+            return;
+        }
+        let audio = MediaTypes_::kAudio as i32;
+        let current = |dir: i32| -> Vec<SpeakerArrangement> {
+            let count = unsafe { self.component.getBusCount(audio, dir) };
+            (0..count.max(0))
+                .map(|index| {
+                    let mut arrangement: SpeakerArrangement = 0;
+                    unsafe {
+                        self.processor
+                            .getBusArrangement(dir, index, &mut arrangement)
+                    };
+                    arrangement
+                })
+                .collect()
+        };
+        let mut inputs = current(BusDirections_::kInput as i32);
+        let mut outputs = current(BusDirections_::kOutput as i32);
+        // Nothing to gain when neither main bus is mono, and nothing to ask
+        // when there is no main bus at all.
+        let mono = |b: Option<&SpeakerArrangement>| b == Some(&SpeakerArr::kMono);
+        if !mono(inputs.first()) && !mono(outputs.first()) {
+            return;
+        }
+        for bus in inputs.first_mut().into_iter().chain(outputs.first_mut()) {
+            if *bus == SpeakerArr::kMono {
+                *bus = SpeakerArr::kStereo;
+            }
+        }
+        unsafe {
+            self.processor.setBusArrangements(
+                inputs.as_mut_ptr(),
+                inputs.len() as i32,
+                outputs.as_mut_ptr(),
+                outputs.len() as i32,
+            )
+        };
+    }
+
     /// Returns every bus declared by the plugin and note input/output capabilities.
     ///
     /// Read before activation, so these are the plugin's *defaults* — what it
-    /// says it is before anyone negotiates with it. That is the right thing to
-    /// build sockets out of: the node has to offer a sidechain socket before the
-    /// graph can ask for one to be connected.
+    /// says it is before anyone negotiates with it, except that a mono main bus
+    /// is offered stereo first (see [`prefer_stereo_main_buses`][Self::prefer_stereo_main_buses]).
+    /// That is the right thing to build sockets out of: the node has to offer a
+    /// sidechain socket before the graph can ask for one to be connected.
     pub fn io_layout(&self) -> plugin_host_api::IoLayout {
         use vst3::Steinberg::Vst::{BusDirections_, BusTypes_, MediaTypes_};
+
+        self.prefer_stereo_main_buses();
 
         let buses = |media: i32, dir: i32| -> Vec<plugin_host_api::BusInfo> {
             let count = unsafe { self.component.getBusCount(media, dir) };
