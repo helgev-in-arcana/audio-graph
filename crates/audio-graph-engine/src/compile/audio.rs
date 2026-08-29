@@ -840,8 +840,7 @@ mod tests {
     }
 
     /// A key parameter hands the stream on through a notes output of its own,
-    /// with the keys that pick the value taken out of it: the one keyboard both
-    /// chooses and plays, without being split upstream.
+    /// with the keys that pick the value taken out of it.
     #[test]
     fn a_key_parameter_passes_notes_on_without_its_own_keys() {
         let mut graph = Graph::new();
@@ -871,8 +870,7 @@ mod tests {
         );
     }
 
-    /// Clearing `mute_keys` puts the picking keys back, for the patch where the
-    /// key that chooses a value is also meant to sound.
+    /// Clearing `mute_keys` puts the picking keys back.
     #[test]
     fn an_unmuted_key_parameter_passes_its_own_keys() {
         let mut graph = Graph::new();
@@ -897,9 +895,8 @@ mod tests {
         assert_eq!(routes[0].1.mute, 0);
     }
 
-    /// A plain key mute takes its keys out of the stream and leaves everything
-    /// else — including a gate above it — alone. A node that only hands notes
-    /// on must not be read as the gate nearest the reader.
+    /// A key mute takes its keys out and leaves everything else alone,
+    /// including a gate above it.
     #[test]
     fn a_key_mute_swallows_its_keys_and_keeps_the_gate_above_it() {
         let mut graph = Graph::new();

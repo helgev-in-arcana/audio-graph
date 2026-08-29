@@ -117,7 +117,7 @@ impl Node for KeySwitch {
         (usize::from(port) < self.keys.len()).then_some(0)
     }
 
-    /// Every output is gated: which ways are open is what this node decides.
+    /// Every output is gated; which are open is what this node decides.
     fn note_gated(&self, port: u8) -> bool {
         usize::from(port) < self.keys.len()
     }

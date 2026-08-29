@@ -6,30 +6,22 @@ use crate::nodes::widgets::{NodeUi, key_control};
 use crate::port::{Port, PortType};
 
 /// How many keys one node may swallow. Past this the node is a wall of rows,
-/// and a second mute reads better than a taller one — the same ceiling every
-/// other list on a node has.
+/// and a second mute reads better than a taller one.
 #[cfg(feature = "ui")]
 const MAX_KEYS: usize = 8;
 
-/// Takes named keys out of a note stream and passes the rest on.
+/// Takes named keys out of a note stream and passes the rest on: for keys that
+/// steer something this graph knows nothing about, such as a controller's
+/// bottom octave of buttons.
 ///
-/// What [`KeySwitch`][crate::KeySwitch] and [`KeyParam`][crate::KeyParam] do to
-/// their own keys, on its own, for the keys that steer something this graph
-/// knows nothing about: a key mapped to a sampler's articulation it should not
-/// hear twice, a pedal-substitute key the DAW is reading, the bottom octave of a
-/// controller that has buttons living there.
-///
-/// Both halves of a muted key go, note-on and note-off alike. There is no
-/// sounding voice waiting for the release, so dropping it hangs nothing — that
-/// is the difference between this and a shut gate, which must let releases
-/// through.
+/// Both halves of a muted key go, note-on and note-off alike, so nothing hangs
+/// waiting for a release.
 ///
 /// The keys are a list on the node rather than a socket each: they name events
-/// rather than carry anything, so there is nothing to wire to them.
+/// rather than carry anything.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoteMute {
-    /// The keys taken out. Empty is a node that passes everything, which is what
-    /// a freshly emptied list should do rather than nothing at all.
+    /// The keys taken out. Empty passes everything.
     pub keys: Vec<u8>,
 }
 
@@ -50,8 +42,7 @@ impl Node for NoteMute {
         (port == 0).then_some(0)
     }
 
-    /// Keys past 127 cannot be set from the UI and would not fit the mask, so
-    /// they are simply not counted.
+    /// Keys past 127 do not fit the mask and are not counted.
     fn note_mute(&self, port: u8) -> u128 {
         if port != 0 {
             return 0;
@@ -62,9 +53,7 @@ impl Node for NoteMute {
             .fold(0u128, |mask, &key| mask | (1u128 << key))
     }
 
-    /// One row per key, each with the button that takes it back off the list.
-    /// The rows are the whole node, so they live here rather than on a socket:
-    /// a key names an event, and there is nothing to wire to it.
+    /// One row per key, each with the button that takes it off the list.
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
         let mut changed = false;
@@ -86,8 +75,7 @@ impl Node for NoteMute {
             changed = true;
         }
         if self.keys.len() < MAX_KEYS && ui.button("another key").clicked() {
-            // A semitone up from the last one: the keys a controller steers with
-            // are a run of adjacent keys far more often than they are not.
+            // A semitone up from the last: steering keys are usually adjacent.
             let next = self
                 .keys
                 .last()
@@ -108,8 +96,7 @@ impl NoteMute {
         vec![(
             "MIDI Key Mute",
             NoteMute {
-                // Well below where most parts are played, which is where the
-                // keys a controller steers with tend to live.
+                // Well below where most parts are played.
                 keys: vec![24],
             },
         )]

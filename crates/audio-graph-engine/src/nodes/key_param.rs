@@ -57,12 +57,9 @@ impl KeyParamMode {
 /// value is what the node reads until a key is struck, which is the honest
 /// answer for a control the DAW knows nothing about.
 ///
-/// The notes come back out of a port of their own, so the keyboard that picks
-/// the value can go on to play something without being split upstream. The
-/// picking keys are taken out of that stream by default (`mute_keys`), the same
-/// way [`KeySwitch`][crate::KeySwitch] handles its own: a key played to choose
-/// a value is not a key played to sound. Both halves of a muted key go, note-on
-/// and note-off alike — nothing is left waiting for the release.
+/// The notes come back out of a port of their own, so one keyboard both picks
+/// the value and plays. The picking keys are taken out of that stream by
+/// default (`mute_keys`), note-on and note-off alike.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyParam {
     pub mode: KeyParamMode,
@@ -73,10 +70,7 @@ pub struct KeyParam {
     #[serde(default)]
     pub values: Vec<f64>,
     /// Whether the picking keys are taken out of the stream leaving the notes
-    /// output.
-    ///
-    /// Defaulted rather than required so a patch saved before the field existed
-    /// reads as muted — which is what a fresh node does too.
+    /// output. Defaulted so an older patch reads as muted, like a fresh node.
     #[serde(default = "muted")]
     pub mute_keys: bool,
 }
@@ -117,15 +111,13 @@ impl Node for KeyParam {
         vec![Port::param("out"), Port::new("notes", PortType::Note)]
     }
 
-    /// The notes port hands on whatever came in, so a sampler downstream can be
-    /// fed from the same keyboard that picks the value.
+    /// The notes port hands on whatever came in.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         (port == NOTES_OUT).then_some(0)
     }
 
-    /// The keys this node reads, swallowed on the way out unless the user asked
-    /// for them. Keys past 127 cannot be set from the UI and would not fit the
-    /// mask, so they are simply not counted.
+    /// The keys this node reads, swallowed unless the user asked for them.
+    /// Keys past 127 do not fit the mask and are not counted.
     fn note_mute(&self, port: u8) -> u128 {
         if !self.mute_keys || port != NOTES_OUT {
             return 0;
@@ -294,8 +286,7 @@ impl Node for KeyParam {
     }
 }
 
-/// The default for [`KeyParam::mute_keys`], as a function because serde cannot
-/// spell `true` any other way.
+/// The default for [`KeyParam::mute_keys`]; a function because serde needs one.
 fn muted() -> bool {
     true
 }

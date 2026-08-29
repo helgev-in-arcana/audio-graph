@@ -119,9 +119,8 @@ pub(crate) trait Node {
     /// Whether the notes leaving output `port` pass only while a condition this
     /// node binds is open — see [`crate::compile::ParamCx::bind_note_gate`].
     ///
-    /// Asked while the chain is walked, so that a node that merely hands notes
-    /// on is not mistaken for the gate nearest the reader. Mistaking one loses
-    /// every gate above it, since the walk stops at the first gate it finds.
+    /// The chain walk stops at the first gate it finds, so a node that merely
+    /// hands notes on must answer `false` or the gates above it are lost.
     fn note_gated(&self, port: u8) -> bool {
         let _ = port;
         false
