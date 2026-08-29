@@ -167,4 +167,9 @@ pub enum AudioOp {
     },
     /// Write buffer audio into an audio delay line ring buffer.
     DelayWrite { line: u16, a: Buf },
+    /// Advance an audio delay line's write head over silence.
+    ///
+    /// Emitted for a line nothing writes. The read position is measured back
+    /// from the head, so a head that stopped would replay the ring forever.
+    DelaySilence { line: u16 },
 }

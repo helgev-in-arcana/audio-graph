@@ -559,6 +559,18 @@ impl<'a> AudioCx<'a> {
     pub(crate) fn finish(mut self) -> Audio {
         self.ops.append(&mut self.deferred);
 
+        // A line nobody writes still has to advance: its ring outlives the
+        // program it was filled by.
+        for index in 0..self.audio_lines.len() as u16 {
+            let written = self
+                .ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::DelayWrite { line, .. } if *line == index));
+            if !written {
+                self.ops.push(AudioOp::DelaySilence { line: index });
+            }
+        }
+
         // An audio line with both halves present closes a loop, and then every
         // plugin in the program has to run at sub-block granularity.
         let looped = self
