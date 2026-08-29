@@ -81,7 +81,7 @@ impl Node for DelayWrite {
             return Ok(());
         }
         let line = cx.audio_line(self.line)?;
-        if let Some((buf, _)) = cx.source(0) {
+        if let Some((buf, _)) = cx.source_at_socket_width(0)? {
             cx.consume(buf);
             cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
         }

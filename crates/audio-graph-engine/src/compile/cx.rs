@@ -476,6 +476,10 @@ pub(crate) struct AudioCx<'a> {
     /// input nobody wired, which is silence rather than an error — the same
     /// rule the param half uses.
     sources: Vec<Option<(Buf, u32)>>,
+    /// The channel width each of those sockets declares, in the same order.
+    /// What is wired to one may be narrower or wider — see
+    /// [`source_at_socket_width`][Self::source_at_socket_width].
+    source_widths: Vec<u16>,
     /// Total number of connections leaving this node across all output ports.
     readers: usize,
     /// Channel width of this node's first output socket, or 0 if it has none.
@@ -507,6 +511,7 @@ impl<'a> AudioCx<'a> {
             lanes,
             id: NodeId::MAX,
             sources: Vec::new(),
+            source_widths: Vec::new(),
             readers: 0,
             out_width: 0,
             pool: Pool::new(),
@@ -530,11 +535,20 @@ impl<'a> AudioCx<'a> {
     /// own index space.
     pub(crate) fn begin(&mut self, id: NodeId, kind: &NodeKind) {
         self.id = id;
-        self.sources = kind
-            .input_ports()
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| matches!(p.ty, PortType::Audio { .. }))
+        let ports = kind.input_ports();
+        let audio = || {
+            ports
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.ty, PortType::Audio { .. }))
+        };
+        self.source_widths = audio()
+            .map(|(_, p)| match p.ty {
+                PortType::Audio { channels } => channels,
+                _ => 0,
+            })
+            .collect();
+        self.sources = audio()
             .map(|(port, _)| {
                 self.graph
                     .source_of(id, port as u8)
@@ -607,6 +621,45 @@ impl<'a> AudioCx<'a> {
     /// Every audio input in socket order, wired or not.
     pub(crate) fn sources(&self) -> &[Option<(Buf, u32)>] {
         &self.sources
+    }
+
+    /// The same, but at the width the socket itself declares.
+    ///
+    /// A link may join sockets of different widths — the graph allows it
+    /// because refusing taught the user nothing (see
+    /// [`can_connect`][crate::Graph::can_connect]), which leaves the conversion
+    /// to the compiler. Without one, a mono source into a stereo socket reaches
+    /// the left channel and nothing else, and the right one is whatever the
+    /// consuming op finds past the end of the buffer.
+    ///
+    /// The conversion is a [`Gather`][AudioOp::Gather] of one bus, the same op
+    /// that already adapts a plugin's buses: mono is duplicated across the
+    /// wider socket, and wider is summed into mono. A node whose socket matches
+    /// what is wired to it — nearly every node in nearly every patch — pays
+    /// nothing, because no op is emitted at all.
+    ///
+    /// Plugin nodes do not go through here: they negotiate their own bus widths
+    /// and assemble every bus with one `Gather` of their own.
+    pub(crate) fn source_at_socket_width(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<(Buf, u32)>, CompileError> {
+        let Some((buf, late)) = self.source(index) else {
+            return Ok(None);
+        };
+        let want = self.source_widths.get(index).copied().unwrap_or(0);
+        if want == 0 || self.width_of(buf) == want {
+            return Ok(Some((buf, late)));
+        }
+        // Read once, here, on the way in. The buffer it lands in is read once
+        // in turn, by whichever op the caller is about to emit.
+        self.consume(buf);
+        let out = self.alloc_avoiding(want, 1, &[buf])?;
+        self.emit(AudioOp::Gather {
+            out,
+            buses: vec![(buf, want)],
+        });
+        Ok(Some((out, late)))
     }
 
     /// Whether `node` is one of the nodes this program runs.

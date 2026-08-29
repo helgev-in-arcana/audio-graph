@@ -1101,6 +1101,132 @@ mod tests {
         assert_eq!(seen.first_of_each, vec![1.0, 2.0, 3.0]);
     }
 
+    /// A mono plugin node feeding a stereo socket is heard on both channels.
+    ///
+    /// The DAW asks for stereo and gets a buffer whose right channel was never
+    /// written: the sound is in the left speaker alone. What the left channel
+    /// carries has to be copied across, which is what a host does with a mono
+    /// track.
+    #[test]
+    fn a_mono_source_reaches_both_channels_of_a_stereo_output() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = mono_plugin(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        // 1.0 on the left and 2.0 on the right are summed into the plugin's
+        // mono bus, so both output channels have to read 3.0.
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
+        assert_eq!(daw_out, [3.0f32; 8]);
+    }
+
+    /// The same conversion on the way into a Mix, which sums channel by
+    /// channel across its own width.
+    ///
+    /// Without it the mono input's second channel is read from whatever buffer
+    /// happens to sit next to it in the pool, which is worse than silence.
+    #[test]
+    fn a_mono_source_is_widened_before_a_stereo_mix_sums_it() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = mono_plugin(&mut graph, 0);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        // The mono plugin into the first input, the stereo bus into the second.
+        graph.connect(node, 0, mix, 0);
+        graph.connect(input, 0, mix, 2);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
+        // 3.0 on both channels out of the plugin, plus the input itself.
+        assert_eq!(daw_out, [4.0, 4.0, 4.0, 4.0, 5.0, 5.0, 5.0, 5.0]);
+    }
+
+    /// A socket that already matches what is wired to it converts nothing.
+    #[test]
+    fn a_matching_width_costs_no_conversion() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = plugin(&mut graph, 0, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Gather { .. })),
+            "nothing to convert on either side of a stereo plugin"
+        );
+    }
+
+    /// A plugin whose main bus is mono in both directions.
+    fn mono_plugin(graph: &mut Graph, instance: usize) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance,
+                ports: PluginPorts {
+                    audio_in: vec![1],
+                    audio_out: vec![1],
+                    audio_out_shown: Vec::new(),
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
+
+    /// A stand-in sub-plugin that writes its input straight back out.
+    struct PassThrough;
+
+    impl AudioInstances for PassThrough {
+        fn process(
+            &mut self,
+            _instance: u32,
+            _notes: NoteStream,
+            input: &[f32],
+            output: &mut [f32],
+            chunk: AudioChunk,
+        ) {
+            for ch in 0..chunk.output_channels {
+                let range = chunk.channel(ch);
+                if ch < chunk.input_channels {
+                    output[range.clone()].copy_from_slice(&input[range]);
+                } else {
+                    output[range].fill(0.0);
+                }
+            }
+        }
+    }
+
     /// Records the shape and content of what a plugin node was handed.
     #[derive(Default)]
     struct RecordInput {

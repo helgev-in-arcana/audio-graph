@@ -76,7 +76,7 @@ impl Node for Gate {
 
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let readers = cx.readers();
-        let Some((buf, late)) = cx.source(0) else {
+        let Some((buf, late)) = cx.source_at_socket_width(0)? else {
             let out = cx.alloc(self.channels, readers)?;
             cx.emit(AudioOp::Silence { out });
             cx.produce(0, out, 0);
