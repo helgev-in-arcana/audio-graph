@@ -82,7 +82,7 @@ impl Window {
             .map_err(|e| format!("could not create the container window: {e}"))?;
 
         set_title(&conn, id, title);
-        declare(&conn, id, size, owner as XWindow);
+        declare(&conn, id, size, owner as usize as XWindow);
 
         // A round trip, not just a flush: the plugin is about to be handed this
         // id and will reparent into it from a connection of its own, which can

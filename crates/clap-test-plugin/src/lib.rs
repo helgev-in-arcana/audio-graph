@@ -614,6 +614,7 @@ mod fd {
         CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_READ, clap_host_posix_fd_support,
         clap_plugin_posix_fd_support, clap_posix_fd_flags,
     };
+    use clap_sys::host::clap_host as clap_host_ptr;
     use clap_sys::plugin::clap_plugin;
 
     use crate::Instance;
@@ -709,8 +710,6 @@ mod fd {
         // keeps polling. One answer would only prove it polled once.
         instance.fd.poke();
     }
-
-    use clap_sys::host::clap_host as clap_host_ptr;
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]

@@ -6,21 +6,20 @@
 //! has to be called by us — see [`crate::poll`].
 //!
 //! Sharing one connection between every window on a thread keeps a single queue
-//! to drain. Windows register themselves against their X id, and deferred
-//! queues register to be run on the same turn.
+//! to drain. Windows register themselves against their X id and are dispatched
+//! to from [`pump`].
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ConnectionExt as _, PropMode, Screen, Window as XWindow,
+    Atom, AtomEnum, ConnectionExt as _, Keycode, Keysym, PropMode, Screen, Window as XWindow,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use crate::deferred::Inner as DeferredInner;
 use crate::window::{Size, WindowState};
 
 thread_local! {
@@ -44,11 +43,12 @@ pub(crate) struct Conn {
     pub(crate) atoms: Atoms,
     /// Container windows, by the X id their events name.
     windows: RefCell<Vec<(XWindow, Weak<WindowState>)>>,
-    /// Deferred queues, by the handle that unregisters them.
-    queues: RefCell<Vec<(u64, Weak<DeferredInner>)>>,
-    next_queue: Cell<u64>,
-    /// Set when a queue has work, so an idle pump walks no lists.
-    queued: Cell<bool>,
+    /// The user's layout, as a keysym for each keycode's unshifted level.
+    ///
+    /// Cached because forwarding a key needs it and a key arrives far more
+    /// often than a layout changes. Emptied on `MappingNotify`, which is the
+    /// server saying it just did change.
+    keymap: RefCell<Option<Vec<Keysym>>>,
 }
 
 impl Conn {
@@ -68,21 +68,42 @@ impl Conn {
         self.windows.borrow_mut().retain(|(other, _)| *other != id);
     }
 
-    /// Register a deferred queue, answering with the handle that removes it.
-    pub(crate) fn register_queue(&self, inner: &Rc<DeferredInner>) -> u64 {
-        let id = self.next_queue.get();
-        self.next_queue.set(id + 1);
-        self.queues.borrow_mut().push((id, Rc::downgrade(inner)));
-        id
+    /// The keycode this layout puts `target` on, if it puts it anywhere.
+    ///
+    /// The unshifted level only. A key that produces this symbol solely with a
+    /// modifier held would need that modifier sent as well to mean the same
+    /// thing, and forwarding half of a chord is worse than forwarding nothing.
+    pub(crate) fn keycode(&self, target: Keysym) -> Option<Keycode> {
+        let first = self.conn.setup().min_keycode;
+        if self.keymap.borrow().is_none() {
+            *self.keymap.borrow_mut() = Some(self.read_keymap()?);
+        }
+        let keymap = self.keymap.borrow();
+        let index = keymap.as_ref()?.iter().position(|sym| *sym == target)?;
+        Some(first + index as Keycode)
     }
 
-    pub(crate) fn unregister_queue(&self, id: u64) {
-        self.queues.borrow_mut().retain(|(other, _)| *other != id);
-    }
-
-    /// Note that some queue has work for the next turn.
-    pub(crate) fn wake(&self) {
-        self.queued.set(true);
+    /// The unshifted keysym of every keycode, in keycode order.
+    fn read_keymap(&self) -> Option<Vec<Keysym>> {
+        let setup = self.conn.setup();
+        let (first, last) = (setup.min_keycode, setup.max_keycode);
+        let mapping = self
+            .conn
+            .get_keyboard_mapping(first, last - first + 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let per_code = usize::from(mapping.keysyms_per_keycode);
+        if per_code == 0 {
+            return None;
+        }
+        Some(
+            mapping
+                .keysyms
+                .chunks(per_code)
+                .filter_map(|level| level.first().copied())
+                .collect(),
+        )
     }
 
     /// The state for `id`, as an owning handle.
@@ -161,16 +182,16 @@ fn open() -> Result<Conn, String> {
             net_wm_pid: atoms[6],
         },
         windows: RefCell::new(Vec::new()),
-        queues: RefCell::new(Vec::new()),
-        next_queue: Cell::new(0),
-        queued: Cell::new(false),
+        keymap: RefCell::new(None),
     })
 }
 
-/// Drain everything the server has sent us, then run anything that was deferred.
+/// Hand everything the server has sent us to whichever window it is for.
 ///
 /// Never blocks: an empty queue is the ordinary case, and a caller runs this
-/// once per frame.
+/// once per frame. Nothing here runs a caller's code — an event only ever
+/// writes to a [`WindowState`] — so there is no turn of this that is unsafe to
+/// be inside of.
 pub(crate) fn pump() {
     let Some(conn) = existing() else { return };
 
@@ -186,40 +207,8 @@ pub(crate) fn pump() {
         dispatch(&conn, &event);
     }
 
-    run_deferred(&conn);
-
-    // Anything the events or the tasks queued — a window destroyed by a
-    // deferred close, say — is only a request until it is written out.
+    // Anything the events queued is only a request until it is written out.
     let _ = conn.conn.flush();
-}
-
-/// Run every deferred queue that has work.
-///
-/// Local, with no trip through the server. Win32 defers by posting a message
-/// because the thread's queue is the only thing the DAW's pump will look at;
-/// here the pump is this function, so the work merely has to wait for it. What
-/// the caller gets is the same either way: nothing posted during a frame runs
-/// before that frame is over.
-///
-/// Bounded rather than looped to exhaustion, so a task that unconditionally
-/// queues another one cannot hold the frame.
-fn run_deferred(conn: &Conn) {
-    for _ in 0..8 {
-        if !conn.queued.replace(false) {
-            return;
-        }
-        // Snapshot before running: a task is free to create or drop a queue,
-        // and that mutates the list this walks.
-        let queues: Vec<Rc<DeferredInner>> = conn
-            .queues
-            .borrow()
-            .iter()
-            .filter_map(|(_, inner)| inner.upgrade())
-            .collect();
-        for queue in queues {
-            queue.drain();
-        }
-    }
 }
 
 fn dispatch(conn: &Conn, event: &Event) {
@@ -236,6 +225,10 @@ fn dispatch(conn: &Conn, event: &Event) {
             {
                 state.close_requested.set(true);
             }
+        }
+        // The layout changed under us, so what was cached is now a guess.
+        Event::MappingNotify(_) => {
+            *conn.keymap.borrow_mut() = None;
         }
         // The size the window actually got, which is not always the size that
         // was asked for: the window manager has the last word.

@@ -5,6 +5,15 @@
 //! plugin callback re-enters the plugin while it is mid-call, which would crash.
 //!
 //! On Linux the same object is also the host's `IRunLoop` — see [`run_loop`].
+//!
+//! # Why the state lives in the COM object
+//!
+//! Everything the frame remembers is a field of [`FrameImpl`], which is what
+//! `ComWrapper` refcounts, rather than of a `PlugFrame` the wrapper points back
+//! into. A plugin that queries `IRunLoop` holds it for its own lifetime —
+//! unregistering is the last thing it does with it — so it can outlive the
+//! `EditorWindow` that set the frame. Held this way it cannot outlive the state
+//! it calls into, because they are the same allocation.
 
 use std::cell::Cell;
 
@@ -13,8 +22,14 @@ use vst3::{Class, ComWrapper};
 
 use host_window::Size;
 
-/// Host-side `IPlugFrame`.
-pub struct PlugFrame {
+/// Host-side `IPlugFrame`, and on Linux the host's `IRunLoop` with it.
+///
+/// A handle, not the object: what the plugin holds references to is the
+/// `FrameImpl` inside, and it outlives this if the plugin kept one.
+pub struct PlugFrame(ComWrapper<FrameImpl>);
+
+/// The COM object, and everything the frame remembers.
+pub struct FrameImpl {
     /// A size the plugin asked for and the host has not applied yet.
     requested: Cell<Option<Size>>,
     /// The last size we told the plugin about, so a user-driven resize is only
@@ -22,19 +37,12 @@ pub struct PlugFrame {
     last_reported: Cell<Size>,
     #[cfg(all(unix, not(target_os = "macos")))]
     run_loop: run_loop::RunLoop,
-    wrapper: std::cell::OnceCell<ComWrapper<FrameImpl>>,
 }
 
-/// The COM object itself, separate so `PlugFrame` can be held by value.
-pub struct FrameImpl {
-    requested: *const Cell<Option<Size>>,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    run_loop: *const run_loop::RunLoop,
-}
-
-// SAFETY: the pointer refers to a `PlugFrame` that outlives this object —
-// `EditorWindow` owns both and drops the frame last. All access happens on the
-// UI thread, which is where VST3 confines `IPlugFrame` calls.
+// SAFETY: `Cell` is not `Sync`, and this object has to be because the COM
+// wrapper is. VST3 confines every call on `IPlugFrame` — and, on Linux, on
+// `IRunLoop` — to the UI thread, which is also the only thread `EditorWindow`
+// touches it from, so there is never a second thread to race with.
 unsafe impl Send for FrameImpl {}
 unsafe impl Sync for FrameImpl {}
 
@@ -59,53 +67,43 @@ impl IPlugFrameTrait for FrameImpl {
         let size = Size::new(rect.right - rect.left, rect.bottom - rect.top);
         // Recorded for the next UI tick; see the module comment on why this is
         // not applied inline.
-        unsafe { (*self.requested).set(Some(size)) };
+        self.requested.set(Some(size));
         kResultOk
     }
 }
 
 impl PlugFrame {
-    pub fn new() -> std::rc::Rc<PlugFrame> {
-        let frame = std::rc::Rc::new(PlugFrame {
+    pub fn new() -> PlugFrame {
+        PlugFrame(ComWrapper::new(FrameImpl {
             requested: Cell::new(None),
             last_reported: Cell::new(Size::default()),
             #[cfg(all(unix, not(target_os = "macos")))]
             run_loop: run_loop::RunLoop::default(),
-            wrapper: std::cell::OnceCell::new(),
-        });
-        let requested: *const Cell<Option<Size>> = &frame.requested;
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let run_loop: *const run_loop::RunLoop = &frame.run_loop;
-        let _ = frame.wrapper.set(ComWrapper::new(FrameImpl {
-            requested,
-            #[cfg(all(unix, not(target_os = "macos")))]
-            run_loop,
-        }));
-        frame
+        }))
     }
 
     /// Borrowed interface pointer to hand to `IPlugView::setFrame`.
     ///
-    /// Borrowed, not owned: the plugin does not release what it is given here,
-    /// so this object has to outlive the view's use of it.
+    /// Borrowed, not owned: the plugin does not release what it is given here.
+    /// What it *does* release is anything it queries off it, and that keeps the
+    /// object alive on its own — see the module comment.
     pub fn com_ptr(&self) -> *mut IPlugFrame {
-        self.wrapper
-            .get()
-            .and_then(|w| w.as_com_ref::<IPlugFrame>())
+        self.0
+            .as_com_ref::<IPlugFrame>()
             .map_or(std::ptr::null_mut(), |r| r.as_ptr())
     }
 
     /// Take a pending resize request, if the plugin made one.
     pub fn take_requested_size(&self) -> Option<Size> {
-        self.requested.take()
+        self.0.requested.take()
     }
 
     pub fn last_reported_size(&self) -> Size {
-        self.last_reported.get()
+        self.0.last_reported.get()
     }
 
     pub fn set_last_reported_size(&self, size: Size) {
-        self.last_reported.set(size);
+        self.0.last_reported.set(size);
     }
 
     /// Service whatever the plugin registered with the run loop.
@@ -114,7 +112,13 @@ impl PlugFrame {
     /// nothing where there is no run loop to be — see [`run_loop`].
     pub fn tick_run_loop(&self) {
         #[cfg(all(unix, not(target_os = "macos")))]
-        self.run_loop.tick();
+        self.0.run_loop.dispatch();
+    }
+}
+
+impl Default for PlugFrame {
+    fn default() -> PlugFrame {
+        PlugFrame::new()
     }
 }
 
@@ -131,12 +135,15 @@ impl PlugFrame {
 /// loaded as a VST3 on Linux has no route to the main thread at all. Third-party
 /// plugins are less forgiving still: several refuse to open an editor when the
 /// interface is missing.
+///
+/// The bookkeeping is `host_window::watch`, shared with the CLAP backend, which
+/// is asked for the same thing under a different name. Only the vocabulary is
+/// here.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod run_loop {
-    use std::cell::RefCell;
-    use std::os::fd::RawFd;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
+    use host_window::watch::{FdWatch, Interest, TimerWheel};
     use vst3::Steinberg::Linux::{
         FileDescriptor, IEventHandler, IEventHandlerTrait, IRunLoopTrait, ITimerHandler,
         ITimerHandlerTrait, TimerInterval,
@@ -145,108 +152,32 @@ mod run_loop {
 
     use super::FrameImpl;
 
-    /// The shortest period a timer will actually be run at.
-    ///
-    /// A plugin asking for zero means "as often as you can", and taking that
-    /// literally would spend the UI thread on one plugin's timer.
-    const MIN_PERIOD: Duration = Duration::from_millis(8);
-
-    /// How many of each a single plugin may register.
-    ///
-    /// Generous for anything legitimate, and a ceiling on what a plugin that
-    /// registers in a loop and never unregisters can cost the UI thread.
-    const MAX_HANDLERS: usize = 32;
-
-    struct Timer {
-        handler: *mut ITimerHandler,
-        period: Duration,
-        due: Instant,
-    }
-
+    /// The handlers are the keys: VST3 unregisters by handler, not by id.
     #[derive(Default)]
     pub(super) struct RunLoop {
-        /// Watched descriptors and who to tell when one is readable.
-        events: RefCell<Vec<(*mut IEventHandler, RawFd)>>,
-        timers: RefCell<Vec<Timer>>,
+        events: FdWatch<*mut IEventHandler>,
+        timers: TimerWheel<*mut ITimerHandler>,
     }
+
+    // SAFETY: the same argument as `FrameImpl`'s — these are COM pointers the
+    // UI thread owns and no other thread ever sees.
+    unsafe impl Send for RunLoop {}
+    unsafe impl Sync for RunLoop {}
 
     impl RunLoop {
         /// Tell the plugin about every descriptor that has data and every timer
         /// that has come due.
-        pub(super) fn tick(&self) {
-            self.poll_descriptors();
-            self.fire_timers();
-        }
-
-        fn poll_descriptors(&self) {
-            let watched = self.events.borrow().clone();
-            if watched.is_empty() {
-                return;
-            }
-
-            let mut fds: Vec<libc::pollfd> = watched
-                .iter()
-                .map(|(_, fd)| libc::pollfd {
-                    fd: *fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                })
-                .collect();
-            // Zero timeout: this runs from the host's UI tick, which has a frame
-            // to get back to.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
-            if ready <= 0 {
-                return;
-            }
-
-            for (index, poll) in fds.iter().enumerate() {
-                if poll.revents == 0 {
-                    continue;
-                }
-                let (handler, fd) = watched[index];
-                // A handler is entitled to unregister another from inside its
-                // own callback, so each one is checked against the live list
-                // rather than against the copy this loop is walking.
-                if !self.watches(handler, fd) {
-                    continue;
-                }
+        pub(super) fn dispatch(&self) {
+            self.events.dispatch(|handler, fd, _| {
                 if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
                     unsafe { handler.onFDIsSet(fd) };
                 }
-            }
-        }
-
-        fn fire_timers(&self) {
-            let now = Instant::now();
-            let due: Vec<*mut ITimerHandler> = self
-                .timers
-                .borrow_mut()
-                .iter_mut()
-                .filter(|timer| timer.due <= now)
-                .map(|timer| {
-                    // From now, not from when it was due: a UI thread that
-                    // stalled must not come back to a burst of catch-up ticks.
-                    timer.due = now + timer.period;
-                    timer.handler
-                })
-                .collect();
-
-            for handler in due {
-                if !self.has_timer(handler) {
-                    continue;
-                }
+            });
+            self.timers.dispatch(|handler| {
                 if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
                     unsafe { handler.onTimer() };
                 }
-            }
-        }
-
-        fn watches(&self, handler: *mut IEventHandler, fd: RawFd) -> bool {
-            self.events.borrow().contains(&(handler, fd))
-        }
-
-        fn has_timer(&self, handler: *mut ITimerHandler) -> bool {
-            self.timers.borrow().iter().any(|t| t.handler == handler)
+            });
         }
     }
 
@@ -259,25 +190,17 @@ mod run_loop {
             if handler.is_null() {
                 return kInvalidArgument;
             }
-            let run_loop = unsafe { &*self.run_loop };
-            let mut events = run_loop.events.borrow_mut();
-            if events.len() >= MAX_HANDLERS {
-                log::warn!("vst3 plugin asked to watch more than {MAX_HANDLERS} descriptors");
-                return kInvalidArgument;
-            }
-            // Registering the same pair twice would have it told twice per turn.
-            if !events.contains(&(handler, fd)) {
-                events.push((handler, fd));
-            }
+            // A refused registration is still `kResultOk`: VST3 says nothing
+            // about what refusal looks like and nice-plug asserts on the
+            // result, so a full table hands the plugin a descriptor that is
+            // never ready rather than aborting the process.
+            self.run_loop.events.watch(handler, fd, Interest::READ);
             kResultOk
         }
 
         unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
-            let run_loop = unsafe { &*self.run_loop };
-            run_loop
-                .events
-                .borrow_mut()
-                .retain(|(other, _)| *other != handler);
+            // By handler, which is all VST3 gives us.
+            self.run_loop.events.forget_by(|key, _| *key == handler);
             kResultOk
         }
 
@@ -289,27 +212,14 @@ mod run_loop {
             if handler.is_null() {
                 return kInvalidArgument;
             }
-            let run_loop = unsafe { &*self.run_loop };
-            let mut timers = run_loop.timers.borrow_mut();
-            if timers.len() >= MAX_HANDLERS {
-                log::warn!("vst3 plugin asked for more than {MAX_HANDLERS} timers");
-                return kInvalidArgument;
-            }
-            let period = Duration::from_millis(milliseconds).max(MIN_PERIOD);
-            timers.push(Timer {
-                handler,
-                period,
-                due: Instant::now() + period,
-            });
+            self.run_loop
+                .timers
+                .arm(handler, Duration::from_millis(milliseconds));
             kResultOk
         }
 
         unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
-            let run_loop = unsafe { &*self.run_loop };
-            run_loop
-                .timers
-                .borrow_mut()
-                .retain(|t| t.handler != handler);
+            self.run_loop.timers.disarm(handler);
             kResultOk
         }
     }
@@ -359,39 +269,59 @@ mod tests {
     /// nice-plug asserts on the result of `registerEventHandler`, and a plugin
     /// that finds no run loop at all has no route to the main thread — so the
     /// frame has to answer to the interface, not merely exist.
+    ///
+    /// What happens to a descriptor once registered is `host_window::watch`'s
+    /// to test, and it does.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_frame_is_also_the_run_loop() {
-        use vst3::Steinberg::Linux::{IRunLoop, IRunLoopTrait};
+        use vst3::Steinberg::Linux::{IEventHandler, IRunLoop, IRunLoopTrait, ITimerHandler};
 
         let frame = PlugFrame::new();
-        let plug_frame = unsafe { vst3::ComRef::<IPlugFrame>::from_raw(frame.com_ptr()) }
-            .expect("frame pointer");
+        let plug_frame =
+            unsafe { vst3::ComRef::<IPlugFrame>::from_raw(frame.com_ptr()) }.expect("frame");
         let run_loop = plug_frame
             .cast::<IRunLoop>()
             .expect("the frame is a run loop");
 
-        // A descriptor that is never readable, so the tick has something to poll
-        // and nothing to report.
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(fd >= 0, "could not make an eventfd to watch");
 
-        // Registered as a handler that is never called: `onFDIsSet` only runs
-        // for a descriptor with data, and this one has none.
-        let handler = plug_frame
-            .as_ptr()
-            .cast::<vst3::Steinberg::Linux::IEventHandler>();
-        assert_eq!(
-            unsafe { run_loop.registerEventHandler(handler, fd) },
-            kResultOk
-        );
-        frame.tick_run_loop();
-        assert_eq!(
-            unsafe { run_loop.unregisterEventHandler(handler) },
-            kResultOk
-        );
-        frame.tick_run_loop();
+        let events = plug_frame.as_ptr().cast::<IEventHandler>();
+        let timers = plug_frame.as_ptr().cast::<ITimerHandler>();
+        unsafe {
+            assert_eq!(run_loop.registerEventHandler(events, fd), kResultOk);
+            assert_eq!(run_loop.registerTimer(timers, 16), kResultOk);
+            frame.tick_run_loop();
+            assert_eq!(run_loop.unregisterEventHandler(events), kResultOk);
+            assert_eq!(run_loop.unregisterTimer(timers), kResultOk);
+            frame.tick_run_loop();
+            libc::close(fd);
+        }
+    }
 
-        unsafe { libc::close(fd) };
+    /// Why the state moved into the COM object: a plugin holds the run loop
+    /// until its own teardown, which is after the host has let the frame go.
+    /// Calling into it then must not touch freed memory.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_run_loop_outlives_the_handle_that_made_it() {
+        use vst3::Steinberg::Linux::{IRunLoop, IRunLoopTrait, ITimerHandler};
+
+        let frame = PlugFrame::new();
+        let held = unsafe { vst3::ComRef::<IPlugFrame>::from_raw(frame.com_ptr()) }
+            .expect("frame")
+            .cast::<IRunLoop>()
+            .expect("run loop");
+
+        // What `EditorWindow` does when the editor closes.
+        drop(frame);
+
+        // What a plugin does afterwards, on the reference it kept.
+        let handler = held.as_ptr().cast::<ITimerHandler>();
+        unsafe {
+            assert_eq!(held.registerTimer(handler, 16), kResultOk);
+            assert_eq!(held.unregisterTimer(handler), kResultOk);
+        }
     }
 }

@@ -9,11 +9,9 @@
 //! — see [`conn`].
 
 mod conn;
-mod deferred;
 mod keys;
 mod window;
 
-pub(crate) use deferred::{DeferredHandle, destroy_deferred, new_deferred, wake_deferred};
 pub(crate) use keys::forward_key;
 pub(crate) use window::{Window, root_window};
 

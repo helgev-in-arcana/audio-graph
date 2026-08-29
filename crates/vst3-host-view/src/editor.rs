@@ -11,8 +11,6 @@
 //! parent and take the child with it tells the plugin nothing — it keeps posting timers
 //! and calling `resizeView` against a dead window, and crashes.
 
-use std::rc::Rc;
-
 use vst3::ComPtr;
 use vst3::Steinberg::{IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk, kResultTrue};
 
@@ -29,7 +27,7 @@ pub struct EditorWindow {
     /// explicitly anyway; the ordering here is the belt to that's braces.
     view: ComPtr<IPlugView>,
     window: ContainerWindow,
-    frame: Rc<PlugFrame>,
+    frame: PlugFrame,
     /// Guards against running the teardown twice, since `close` is public and
     /// `Drop` calls it too.
     closed: bool,

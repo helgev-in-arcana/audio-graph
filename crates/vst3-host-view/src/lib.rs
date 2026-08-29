@@ -9,13 +9,12 @@ mod frame;
 pub use editor::{EditorWindow, can_resize};
 pub use frame::PlugFrame;
 
-// The container window, the deferred queue and the key forwarder are all
-// format-agnostic and live in `host-window`, where the CLAP backend can reach
-// them without depending on VST3. Re-exported so callers that already speak in
-// this crate's names do not have to change.
+// The container window and the key forwarder are both format-agnostic and live
+// in `host-window`, where the CLAP backend can reach them without depending on
+// VST3. Re-exported so callers that already speak in this crate's names do not
+// have to change.
 pub use host_window::{
-    ContainerWindow, Deferred, Key, Size, WindowState, deferred, forward_key, poll, pump_events,
-    root_window,
+    ContainerWindow, Key, Size, WindowState, forward_key, poll, pump_events, root_window,
 };
 
 /// What the platform handle means to a VST3 plugin.

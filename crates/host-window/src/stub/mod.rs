@@ -8,7 +8,6 @@
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use crate::deferred::Deferred;
 use crate::keys::Key;
 use crate::window::{Size, WindowState};
 
@@ -42,16 +41,6 @@ impl Window {
         1.0
     }
 }
-
-pub(crate) type DeferredHandle = ();
-
-pub(crate) fn new_deferred() -> Result<Deferred, String> {
-    Err("there is no message loop to defer to on this platform yet".into())
-}
-
-pub(crate) fn wake_deferred(_handle: &DeferredHandle) {}
-
-pub(crate) fn destroy_deferred(_handle: &DeferredHandle) {}
 
 pub(crate) fn pump_events() {}
 

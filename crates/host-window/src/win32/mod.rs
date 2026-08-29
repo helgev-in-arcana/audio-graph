@@ -4,11 +4,9 @@
 //! thread that created it, and inside a plugin that thread is the host's UI
 //! thread. There is no loop of ours to run.
 
-mod deferred;
 mod keys;
 mod window;
 
-pub(crate) use deferred::{DeferredHandle, destroy_deferred, new_deferred, wake_deferred};
 pub(crate) use keys::forward_key;
 pub(crate) use window::{Window, pump_events, root_window};
 

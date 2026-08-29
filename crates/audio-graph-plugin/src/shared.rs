@@ -43,8 +43,8 @@ use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
 use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
 
-use crate::editor::View;
 use crate::params::WrapperParams;
+use crate::view::View;
 
 /// Everything reached from the main thread, and from nowhere else.
 pub struct MainState {
@@ -218,9 +218,12 @@ impl Shared {
     /// Any thread. Held only for as long as it takes to read or edit — the
     /// editor takes it for a frame, the main thread to compile.
     ///
-    /// # Lock order
-    /// Always after [`Shared::main`], never before, so the two cannot be taken
-    /// in opposite orders by two threads at once.
+    /// # Never together with the others
+    /// No two of `main`, `patch` and `audio` are ever held at once anywhere in
+    /// this crate; where a function needs two of them it takes them in
+    /// sequence, and several say so at the point where it would have been
+    /// easier not to. That is a stronger property than a lock order and a
+    /// cheaper one to check, so it is the one to keep.
     pub fn patch(&self) -> parking_lot::MutexGuard<'_, Patch> {
         self.patch.lock()
     }
@@ -230,7 +233,7 @@ impl Shared {
     /// `None` while the main thread is rebuilding it: a frame that cannot have
     /// it draws the previous snapshot, which looks like nothing happened, as
     /// opposed to blanking the window for one frame.
-    pub fn try_view(&self) -> Option<parking_lot::MutexGuard<'_, View>> {
+    pub(crate) fn try_view(&self) -> Option<parking_lot::MutexGuard<'_, View>> {
         self.view.try_lock()
     }
 
@@ -239,28 +242,47 @@ impl Shared {
     /// Everything in the snapshot comes from the sub-plugin host, which is why
     /// the editor cannot simply read it: on X11 the editor is not on the thread
     /// the host is bound to.
-    pub fn publish_view(&self) {
+    /// The one place two of this type's locks are held at once — `main` and
+    /// then `view`. Both are taken with `try_`, so the pair cannot wait on
+    /// anything and a turn that cannot have them is simply skipped; the tick
+    /// comes round again.
+    pub(crate) fn publish_view(&self) {
         let Some(state) = self.try_main() else { return };
         let Some(mut view) = self.view.try_lock() else {
             return;
         };
-        view.rebuild(&state, self.generation());
+        view.rebuild(&state.host, self.generation());
     }
 
     /// Hand `task` to the main thread, to run on its next tick.
     ///
-    /// For an editor that is not on the main thread. One that is has
-    /// `plugin_host::Deferred`, which runs on the next turn of the message
-    /// loop rather than the next tick.
+    /// The route out of a draw callback, and the only one. A GUI toolkit's draw
+    /// callback is not a safe place to load a plugin or touch a window — those
+    /// calls dispatch messages, and the message lands back inside the toolkit
+    /// while it is still in the middle of the frame that started it, which
+    /// egui-baseview answers with a `RefCell` violation inside a callback that
+    /// cannot unwind. So the draw callback may only *record* what the user
+    /// asked for, and this is where the record goes.
+    ///
+    /// It is also the route across threads, which is the same route because
+    /// baseview does not always give the editor the host's thread. The queue
+    /// belongs to the plugin instance rather than to the editor, so an editor
+    /// closing cannot cancel what it just posted.
     pub fn post_main(&self, task: impl FnOnce(&Arc<Shared>) + Send + 'static) {
         self.posted.lock().push(Box::new(task));
     }
 
     /// Run everything the editor posted. Main thread only, from the tick.
     pub fn run_posted(self: &Arc<Shared>) {
-        // Taken out whole rather than popped one at a time: a task is free to
-        // post another, and draining to exhaustion would let it hold the tick.
-        let tasks = std::mem::take(&mut *self.posted.lock());
+        // The guard is dropped before a single task runs, and has to be: a task
+        // is free to post another, and that would deadlock against a lock still
+        // held here. Taking the queue whole rather than popping one at a time
+        // also settles what a re-entrant call sees — an empty queue, so no task
+        // can be started twice or lost.
+        let tasks = {
+            let mut posted = self.posted.lock();
+            std::mem::take(&mut *posted)
+        };
         for task in tasks {
             task(self);
         }
@@ -340,17 +362,28 @@ impl Shared {
     /// silence, or the DAW's raw automation reappearing — would make the
     /// editor's own error message the second thing the user noticed.
     pub fn publish_graph(&self) {
-        // Compiled with the patch lock held and nothing else, so a long compile
-        // never keeps the editor's next frame waiting on the host as well.
-        let compiled = compile(&self.patch().graph, SLOT_COUNT);
-        let mut program = match compiled {
-            Ok(program) => program,
-            Err(e) => {
-                self.patch().compile_error = Some(e.to_string());
-                return;
+        // Copied, then compiled with nothing held. The editor draws under this
+        // same lock on its own thread, so holding it across a compile would
+        // cost it a frame every time the user drags a control — which is
+        // exactly when compiles happen.
+        let graph = self.patch().graph.clone();
+        let compiled = compile(&graph, SLOT_COUNT);
+
+        // One guard for the answer, so that the error and the graph it is about
+        // cannot be separated by an edit landing in between.
+        let mut program = {
+            let mut patch = self.patch();
+            match compiled {
+                Ok(program) => {
+                    patch.compile_error = None;
+                    program
+                }
+                Err(e) => {
+                    patch.compile_error = Some(e.to_string());
+                    return;
+                }
             }
         };
-        self.patch().compile_error = None;
 
         let mut state = self.main();
         // The delay rings are allocated here, on the main thread, and ride over
@@ -420,8 +453,11 @@ impl Shared {
             }
             patch.graph = Graph::default_patch();
         }
+        // Read out rather than tested in place, so that the borrow is plainly
+        // over before the patch lock below is taken.
+        let loaded = self.main().host.is_loaded(0);
         // If a sub-plugin is already loaded, wire it inline between audio in and out.
-        if self.main().host.is_loaded(0) {
+        if loaded {
             let node = self.patch().graph.add(
                 NodeKind::Plugin(Plugin {
                     instance: 0,

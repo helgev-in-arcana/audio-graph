@@ -1,13 +1,14 @@
 //! Format-agnostic window management and event plumbing for hosting plugin editors.
 //!
-//! Three concerns, and none of them are VST3's or CLAP's:
+//! Three concerns, and none of them is VST3's or CLAP's:
 //!
 //! * [`ContainerWindow`] — a bare top-level frame for a plugin's own editor to
 //!   be attached to.
-//! * [`Deferred`] — running work on the next turn of the host's message loop,
-//!   because a draw callback is not a safe place to touch a window.
 //! * [`forward_key`] — sending a key the plugin's window swallowed on to the
 //!   DAW.
+//! * [`watch`] — running a plugin's timers, and on Linux its file descriptors,
+//!   because a plugin cannot wait on anything itself. Both formats ask for
+//!   this; only the words differ.
 //!
 //! The formats disagree only about the *name* they give a platform handle —
 //! `"HWND"` versus `"win32"`, `"X11EmbedWindowID"` versus `"x11"` — and that
@@ -23,9 +24,10 @@
 //! on the platforms where the host already does the work, so the caller needs no
 //! `cfg` of its own.
 
-mod deferred;
 mod keys;
 mod window;
+
+pub mod watch;
 
 #[cfg(windows)]
 #[path = "win32/mod.rs"]
@@ -39,16 +41,19 @@ mod imp;
 #[path = "stub/mod.rs"]
 mod imp;
 
-pub use deferred::{Deferred, new as deferred};
 pub use keys::{Key, forward as forward_key};
 pub use window::{ContainerWindow, Size, WindowState, pump_events, root_window};
 
 /// Advance our windows, if their event source is ours to advance.
 ///
-/// Call once per UI tick from anything that owns a [`ContainerWindow`] or a
-/// [`Deferred`], including inside a plugin. On Windows and macOS this does
-/// nothing — the host's pump is already delivering — and on X11 it is the only
-/// thing that delivers a close request, a resize or a deferred task.
+/// Call once per UI tick from anything that owns a [`ContainerWindow`],
+/// including inside a plugin. On Windows and macOS this does nothing — the
+/// host's pump is already delivering — and on X11 it is the only thing that
+/// delivers a close request or a resize.
+///
+/// Delivering means writing to [`WindowState`], and nothing else: no callback
+/// of the caller's runs from here, so there is no turn of this that is unsafe
+/// to be inside of.
 ///
 /// Distinct from [`pump_events`], which a plugin must never call: that one
 /// drains the *host's* queue as well, and on Windows that means dispatching the

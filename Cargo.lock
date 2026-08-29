@@ -902,6 +902,7 @@ dependencies = [
 name = "host-window"
 version = "0.1.3"
 dependencies = [
+ "libc",
  "log",
  "windows-sys 0.61.2",
  "x11rb",

@@ -13,10 +13,10 @@
 
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, KeyPressEvent, KeyReleaseEvent, Keycode, Keysym, Window as XWindow,
+    ConnectionExt as _, KeyPressEvent, KeyReleaseEvent, Keysym, Window as XWindow,
 };
 
-use super::conn::{Conn, conn};
+use super::conn::conn;
 use crate::keys::Key;
 
 pub(crate) fn forward_key(window: usize, key: Key, pressed: bool) {
@@ -25,7 +25,7 @@ pub(crate) fn forward_key(window: usize, key: Key, pressed: bool) {
         return;
     }
     let Ok(conn) = conn() else { return };
-    let Some(keycode) = keycode(&conn, keysym(key)) else {
+    let Some(keycode) = conn.keycode(keysym(key)) else {
         return;
     };
 
@@ -93,33 +93,6 @@ fn keysym(key: Key) -> Keysym {
         Key::PageUp => 0xff55,
         Key::PageDown => 0xff56,
     }
-}
-
-/// The keycode this layout puts `target` on, if it puts it anywhere.
-fn keycode(conn: &Conn, target: Keysym) -> Option<Keycode> {
-    let setup = conn.conn.setup();
-    let first = setup.min_keycode;
-    let count = setup.max_keycode - setup.min_keycode + 1;
-
-    let mapping = conn
-        .conn
-        .get_keyboard_mapping(first, count)
-        .ok()?
-        .reply()
-        .ok()?;
-    let per_code = usize::from(mapping.keysyms_per_keycode);
-    if per_code == 0 {
-        return None;
-    }
-
-    // The unshifted symbol only. A key that produces this symbol solely with a
-    // modifier held would need that modifier sent as well to mean the same
-    // thing, and forwarding half of a chord is worse than forwarding nothing.
-    mapping
-        .keysyms
-        .chunks(per_code)
-        .position(|symbols| symbols.first() == Some(&target))
-        .map(|index| first + index as Keycode)
 }
 
 #[cfg(test)]

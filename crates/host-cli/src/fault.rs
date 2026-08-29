@@ -345,7 +345,11 @@ pub fn install_crash_handler() {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Linux with glibc specifically, not "unix that is not macOS": `backtrace` is
+/// a glibc extension, the `REG_*` register indices are the linux-gnu layout,
+/// and `process_vm_readv` is a Linux system call. A musl or BSD build takes the
+/// empty one below rather than failing to link.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn install_crash_handler() {
     /// Where an address falls, as `library.so+0x1234` when that can be had.
     ///
@@ -537,5 +541,5 @@ pub fn install_crash_handler() {
     }
 }
 
-#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+#[cfg(not(any(windows, all(target_os = "linux", target_env = "gnu"))))]
 pub fn install_crash_handler() {}

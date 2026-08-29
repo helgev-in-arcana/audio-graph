@@ -5,10 +5,10 @@
 //! and restart requests to [`plugin_host_api::HostContext`].
 
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap_sys::ext::audio_ports::{CLAP_EXT_AUDIO_PORTS, clap_host_audio_ports};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui};
@@ -41,27 +41,10 @@ use clap_sys::host::clap_host;
 use clap_sys::id::{CLAP_INVALID_ID, clap_id};
 use clap_sys::plugin::clap_plugin;
 use clap_sys::version::CLAP_VERSION;
-use plugin_host_api::{HostContext, RestartReason};
-
-/// How many timers one plugin may register.
-///
-/// A ceiling rather than guidance: the list is walked on every UI tick, and a
-/// plugin that leaks registrations would otherwise make the host slower the
-/// longer it is open.
-const MAX_TIMERS: usize = 16;
-
-/// Shortest timer period the host will honour, in milliseconds.
-///
-/// Plugins ask for 16ms to match a display; anything faster is a busy loop
-/// dressed as a timer, and the UI thread is shared with the wrapper's own
-/// editor.
-const MIN_TIMER_PERIOD_MS: u32 = 8;
-
-/// How many descriptors one plugin may ask the host to watch.
-///
-/// Same reasoning as `MAX_TIMERS`: the list is polled on every UI tick.
+use host_window::watch::TimerWheel;
 #[cfg(all(unix, not(target_os = "macos")))]
-const MAX_FDS: usize = 16;
+use host_window::watch::{FdWatch, Interest, Readiness};
+use plugin_host_api::{HostContext, RestartReason};
 
 thread_local! {
     /// Non-zero while this thread is inside `clap_plugin::process`.
@@ -88,14 +71,6 @@ impl Drop for AudioThreadGuard {
 
 fn on_audio_thread() -> bool {
     AUDIO_DEPTH.with(|d| d.get()) > 0
-}
-
-/// One timer a plugin asked the host to run.
-#[derive(Debug, Clone, Copy)]
-struct Timer {
-    id: clap_id,
-    period: Duration,
-    next: Instant,
 }
 
 /// What the plugin has asked for since the owner last looked.
@@ -158,16 +133,23 @@ pub(crate) struct HostShim {
     gui_resize: AtomicU64,
     gui_closed: AtomicBool,
 
-    /// `Mutex` rather than `RefCell`: the format calls timer registration
-    /// `[main-thread]`, but a `RefCell` reachable from a struct the audio
-    /// thread also touches is a data race waiting for one misbehaving plugin.
-    timers: Mutex<Vec<Timer>>,
-    /// Descriptors the plugin asked the host to watch, and what for.
+    /// Timers the plugin asked the host to run.
+    ///
+    /// The ceiling, the floor on the period, and the rule about never calling a
+    /// plugin back with the list locked all live in `host_window::watch` — the
+    /// VST3 backend is asked for the same thing under another name, and one of
+    /// the two copies used to have the rule and the other not.
+    timers: TimerWheel<clap_id>,
+    /// Handed out in order and never reused, so that a stale
+    /// `unregister_timer` cannot cancel somebody else's.
+    next_timer: AtomicU32,
+    /// Descriptors the plugin asked the host to watch.
     ///
     /// Linux only: a plugin's toolkit reaches its X connection this way, and
-    /// there is no equivalent question to answer on the other platforms.
+    /// there is no equivalent question to answer on the other platforms. Keyed
+    /// by the descriptor, which is what CLAP unregisters by.
     #[cfg(all(unix, not(target_os = "macos")))]
-    fds: Mutex<Vec<(i32, clap_posix_fd_flags)>>,
+    fds: FdWatch<()>,
 }
 
 /// Sentinel for "no resize pending" in the packed size.
@@ -225,9 +207,10 @@ impl HostShim {
             voice_info: AtomicBool::new(false),
             gui_resize: AtomicU64::new(NO_RESIZE),
             gui_closed: AtomicBool::new(false),
-            timers: Mutex::new(Vec::new()),
+            timers: TimerWheel::default(),
+            next_timer: AtomicU32::new(0),
             #[cfg(all(unix, not(target_os = "macos")))]
-            fds: Mutex::new(Vec::new()),
+            fds: FdWatch::default(),
         });
         // Only now, once the box has its final address.
         let back = (&raw mut *shim).cast::<c_void>();
@@ -286,26 +269,7 @@ impl HostShim {
             return;
         };
 
-        // The due list is collected under the lock and fired outside it: a
-        // plugin is entitled to unregister a timer from inside its own
-        // callback, and that call comes straight back through this mutex.
-        let now = Instant::now();
-        let due: Vec<clap_id> = {
-            let Ok(mut timers) = self.timers.lock() else {
-                return;
-            };
-            timers
-                .iter_mut()
-                .filter(|t| t.next <= now)
-                .map(|t| {
-                    t.next = now + t.period;
-                    t.id
-                })
-                .collect()
-        };
-        for id in due {
-            unsafe { on_timer(plugin, id) };
-        }
+        self.timers.dispatch(|id| unsafe { on_timer(plugin, id) });
     }
 
     /// Tell the plugin about every descriptor it is waiting on that is ready.
@@ -328,82 +292,35 @@ impl HostShim {
             return;
         };
 
-        // Copied out under the lock and polled outside it: `on_fd` is entitled
-        // to register or drop a descriptor, and that call comes straight back
-        // through this mutex.
-        let watched: Vec<(i32, clap_posix_fd_flags)> = {
-            let Ok(fds) = self.fds.lock() else { return };
-            if fds.is_empty() {
-                return;
-            }
-            fds.clone()
-        };
-
-        let mut polls: Vec<libc::pollfd> = watched
-            .iter()
-            .map(|(fd, flags)| libc::pollfd {
-                fd: *fd,
-                events: poll_events(*flags),
-                revents: 0,
-            })
-            .collect();
-        // Zero timeout: this runs from a UI tick that has a frame to get back to.
-        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0) };
-        if ready <= 0 {
-            return;
-        }
-
-        for (index, poll) in polls.iter().enumerate() {
-            let flags = clap_flags(poll.revents);
-            if flags == 0 {
-                continue;
-            }
-            let fd = watched[index].0;
-            // Against the live list, not the copy: an earlier callback in this
-            // very loop may have unregistered this one.
-            let still_watched = self
-                .fds
-                .lock()
-                .is_ok_and(|fds| fds.iter().any(|(other, _)| *other == fd));
-            if !still_watched {
-                continue;
-            }
-            unsafe { on_fd(plugin, fd, flags) };
-        }
+        self.fds.dispatch(|(), fd, readiness| {
+            unsafe { on_fd(plugin, fd, clap_flags(readiness)) };
+        });
     }
 }
 
-/// What to ask `poll(2)` for, from what the plugin asked to hear about.
+/// What CLAP calls a readiness, from what the watcher calls it.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn poll_events(flags: clap_posix_fd_flags) -> libc::c_short {
-    let mut events = 0;
-    if flags & CLAP_POSIX_FD_READ != 0 {
-        events |= libc::POLLIN;
-    }
-    if flags & CLAP_POSIX_FD_WRITE != 0 {
-        events |= libc::POLLOUT;
-    }
-    events
-}
-
-/// The same translation back the other way.
-///
-/// `POLLERR` and `POLLHUP` are reported whether or not they were asked for, and
-/// a plugin that did not ask to hear about errors is better told than left
-/// polling a descriptor that has hung up.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn clap_flags(revents: libc::c_short) -> clap_posix_fd_flags {
+fn clap_flags(readiness: Readiness) -> clap_posix_fd_flags {
     let mut flags = 0;
-    if revents & libc::POLLIN != 0 {
+    if readiness.read {
         flags |= CLAP_POSIX_FD_READ;
     }
-    if revents & libc::POLLOUT != 0 {
+    if readiness.write {
         flags |= CLAP_POSIX_FD_WRITE;
     }
-    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+    if readiness.error {
         flags |= CLAP_POSIX_FD_ERROR;
     }
     flags
+}
+
+/// And the same the other way, for what the plugin asked to hear about.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn interest(flags: clap_posix_fd_flags) -> Interest {
+    Interest {
+        read: flags & CLAP_POSIX_FD_READ != 0,
+        write: flags & CLAP_POSIX_FD_WRITE != 0,
+    }
 }
 
 // SAFETY: every field is either immutable after construction or an atomic /
@@ -683,23 +600,10 @@ unsafe extern "C" fn register_fd(
     fd: i32,
     flags: clap_posix_fd_flags,
 ) -> bool {
-    let Some(shim) = (unsafe { shim(host) }) else {
-        return false;
-    };
-    let Ok(mut fds) = shim.fds.lock() else {
-        return false;
-    };
-    if fds.iter().any(|(other, _)| *other == fd) {
-        // Already watched. The format says to modify rather than register
-        // twice, and a duplicate would have the plugin told twice per turn.
-        return false;
+    match unsafe { shim(host) } {
+        Some(shim) => shim.fds.watch((), fd, interest(flags)),
+        None => false,
     }
-    if fds.len() >= MAX_FDS {
-        log::warn!("clap plugin asked to watch more than {MAX_FDS} descriptors");
-        return false;
-    }
-    fds.push((fd, flags));
-    true
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -708,32 +612,18 @@ unsafe extern "C" fn modify_fd(
     fd: i32,
     flags: clap_posix_fd_flags,
 ) -> bool {
-    let Some(shim) = (unsafe { shim(host) }) else {
-        return false;
-    };
-    let Ok(mut fds) = shim.fds.lock() else {
-        return false;
-    };
-    match fds.iter_mut().find(|(other, _)| *other == fd) {
-        Some(entry) => {
-            entry.1 = flags;
-            true
-        }
+    match unsafe { shim(host) } {
+        Some(shim) => shim.fds.modify(fd, interest(flags)),
         None => false,
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 unsafe extern "C" fn unregister_fd(host: *const clap_host, fd: i32) -> bool {
-    let Some(shim) = (unsafe { shim(host) }) else {
-        return false;
-    };
-    let Ok(mut fds) = shim.fds.lock() else {
-        return false;
-    };
-    let before = fds.len();
-    fds.retain(|(other, _)| *other != fd);
-    before != fds.len()
+    match unsafe { shim(host) } {
+        Some(shim) => shim.fds.forget(fd),
+        None => false,
+    }
 }
 
 // --- clap.timer-support ---------------------------------------------------
@@ -755,36 +645,25 @@ unsafe extern "C" fn register_timer(
     let Some(shim) = (unsafe { shim(host) }) else {
         return false;
     };
-    let Ok(mut timers) = shim.timers.lock() else {
-        return false;
-    };
-    if timers.len() >= MAX_TIMERS {
-        log::warn!("clap plugin asked for more than {MAX_TIMERS} timers");
+    let id = shim.next_timer.fetch_add(1, Ordering::Relaxed);
+    if id == CLAP_INVALID_ID {
         return false;
     }
-    // Ids are handed out densely and never reused within an instance, so a
-    // stale `unregister_timer` cannot cancel somebody else's timer.
-    let id = timers.iter().map(|t| t.id + 1).max().unwrap_or(0);
-    let period = Duration::from_millis(u64::from(period_ms.max(MIN_TIMER_PERIOD_MS)));
-    timers.push(Timer {
-        id,
-        period,
-        next: Instant::now() + period,
-    });
+    if !shim
+        .timers
+        .arm(id, Duration::from_millis(u64::from(period_ms)))
+    {
+        return false;
+    }
     unsafe { *timer_id = id };
     true
 }
 
 unsafe extern "C" fn unregister_timer(host: *const clap_host, timer_id: clap_id) -> bool {
-    let Some(shim) = (unsafe { shim(host) }) else {
-        return false;
-    };
-    let Ok(mut timers) = shim.timers.lock() else {
-        return false;
-    };
-    let before = timers.len();
-    timers.retain(|t| t.id != timer_id);
-    before != timers.len()
+    match unsafe { shim(host) } {
+        Some(shim) => shim.timers.disarm(timer_id),
+        None => false,
+    }
 }
 
 // --- clap.audio-ports -----------------------------------------------------

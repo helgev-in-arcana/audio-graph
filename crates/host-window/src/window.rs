@@ -117,16 +117,6 @@ impl ContainerWindow {
     pub fn close_requested(&self) -> bool {
         self.state.close_requested.get()
     }
-
-    /// Dispatch any pending messages for this thread.
-    ///
-    /// Only for standalone use — a plugin must *not* call this, because on
-    /// Windows the DAW's pump is already dispatching. It exists so the
-    /// development harness can drive a window without a DAW; a plugin wants
-    /// [`crate::poll`].
-    pub fn pump_events(&self) {
-        imp::pump_events();
-    }
 }
 
 /// Dispatch pending messages for the calling thread.
@@ -157,7 +147,7 @@ mod tests {
             .expect("create");
         assert!(!window.platform_handle().is_null());
         assert!(!window.close_requested());
-        window.pump_events();
+        crate::pump_events();
         drop(window);
     }
 
@@ -166,9 +156,9 @@ mod tests {
         // The window class is registered once per process; a second
         // registration fails, so a naive implementation works exactly once.
         for _ in 0..3 {
-            let window = ContainerWindow::new("test", Size::new(200, 100), std::ptr::null_mut())
+            let _window = ContainerWindow::new("test", Size::new(200, 100), std::ptr::null_mut())
                 .expect("create");
-            window.pump_events();
+            crate::pump_events();
         }
     }
 
@@ -177,7 +167,7 @@ mod tests {
         let window = ContainerWindow::new("test", Size::new(400, 300), std::ptr::null_mut())
             .expect("create");
         window.show();
-        window.pump_events();
+        crate::pump_events();
         assert_eq!(window.client_size(), Size::new(400, 300));
     }
 }
