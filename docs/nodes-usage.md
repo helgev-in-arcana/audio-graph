@@ -29,6 +29,7 @@ Linux は `$XDG_CONFIG_HOME/audio-graph/`）に保存され、同じマシンの
 - MIDI In
 - MIDI Gate
 - Key MIDI Route
+  - 切り替えに使うキーは既定で取り除かれます（[mute switching keys]）。
 
 ## Parameter
 
@@ -41,6 +42,7 @@ Linux は `$XDG_CONFIG_HOME/audio-graph/`）に保存され、同じマシンの
 - Param Map
 - Param Select
 - Key Param Select
+  - notes 出力から入力したMIDIをそのまま流せます。値を選ぶキーは既定で取り除かれ（[mute picking keys]）、外すと下流にも送られて発音します。
 
 ## Plugin
 

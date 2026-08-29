@@ -2176,6 +2176,7 @@ mod tests {
                 mode: KeyParamMode::Toggle,
                 keys: vec![24, 25],
                 values: vec![0.2, 0.8],
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
@@ -2220,6 +2221,7 @@ mod tests {
                 mode: KeyParamMode::Select,
                 keys: vec![24, 25, 26],
                 values: vec![0.25, 0.5, 1.0],
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
@@ -2267,6 +2269,7 @@ mod tests {
                 mode: KeyParamMode::Select,
                 keys: vec![24, 25],
                 values: vec![0.25, 0.75],
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );
@@ -2302,6 +2305,7 @@ mod tests {
                 mode: KeyParamMode::Select,
                 keys: vec![24, 25],
                 values: vec![0.25, 0.75],
+                mute_keys: true,
             }),
             [0.0, 0.0],
         );

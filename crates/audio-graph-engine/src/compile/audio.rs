@@ -69,8 +69,8 @@ mod tests {
     use crate::engine::AudioContext;
     use crate::ir::{AudioOp, NoteRoute};
     use crate::nodes::{
-        AudioIn, AudioOut, DelayRead, DelayWrite, KeySwitch, KeySwitchMode, Mix, NodeKind,
-        NoteGate, Plugin, PluginPorts, SlotIn,
+        AudioIn, AudioOut, DelayRead, DelayWrite, KeyParam, KeyParamMode, KeySwitch, KeySwitchMode,
+        Mix, NodeKind, NoteGate, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
     use subhost_adapter::{AudioChunk, AudioInstances, NoteSource, NoteStream};
@@ -832,6 +832,64 @@ mod tests {
         let output = stereo_out(&mut graph);
         graph.connect(notes, 0, switch, 0);
         graph.connect(switch, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.mute, 0);
+    }
+
+    /// A key parameter hands the stream on through a notes output of its own,
+    /// with the keys that pick the value taken out of it: the one keyboard both
+    /// chooses and plays, without being split upstream.
+    #[test]
+    fn a_key_parameter_passes_notes_on_without_its_own_keys() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.0, 1.0],
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 1, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.source, NoteSource::Daw { bus: 0 });
+        assert_eq!(
+            routes[0].1.mute,
+            (1u128 << 24) | (1u128 << 25),
+            "picking keys are filtered from the sounding note stream"
+        );
+    }
+
+    /// Clearing `mute_keys` puts the picking keys back, for the patch where the
+    /// key that chooses a value is also meant to sound.
+    #[test]
+    fn an_unmuted_key_parameter_passes_its_own_keys() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.0, 1.0],
+                mute_keys: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 1, synth, 0);
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();

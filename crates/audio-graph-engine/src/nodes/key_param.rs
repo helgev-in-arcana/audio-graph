@@ -56,6 +56,13 @@ impl KeyParamMode {
 /// Which value is chosen survives a recompile but not a reload: the first
 /// value is what the node reads until a key is struck, which is the honest
 /// answer for a control the DAW knows nothing about.
+///
+/// The notes come back out of a port of their own, so the keyboard that picks
+/// the value can go on to play something without being split upstream. The
+/// picking keys are taken out of that stream by default (`mute_keys`), the same
+/// way [`KeySwitch`][crate::KeySwitch] handles its own: a key played to choose
+/// a value is not a key played to sound. Both halves of a muted key go, note-on
+/// and note-off alike — nothing is left waiting for the release.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyParam {
     pub mode: KeyParamMode,
@@ -65,7 +72,17 @@ pub struct KeyParam {
     /// Missing entries are 0.0.
     #[serde(default)]
     pub values: Vec<f64>,
+    /// Whether the picking keys are taken out of the stream leaving the notes
+    /// output.
+    ///
+    /// Defaulted rather than required so a patch saved before the field existed
+    /// reads as muted — which is what a fresh node does too.
+    #[serde(default = "muted")]
+    pub mute_keys: bool,
 }
+
+/// The output socket the note stream leaves by; the parameter is output 0.
+const NOTES_OUT: u8 = 1;
 
 impl KeyParam {
     /// The value sockets sit after the notes port.
@@ -97,7 +114,26 @@ impl Node for KeyParam {
     }
 
     fn output_ports(&self) -> Vec<Port> {
-        vec![Port::param("out")]
+        vec![Port::param("out"), Port::new("notes", PortType::Note)]
+    }
+
+    /// The notes port hands on whatever came in, so a sampler downstream can be
+    /// fed from the same keyboard that picks the value.
+    fn note_passthrough(&self, port: u8) -> Option<u8> {
+        (port == NOTES_OUT).then_some(0)
+    }
+
+    /// The keys this node reads, swallowed on the way out unless the user asked
+    /// for them. Keys past 127 cannot be set from the UI and would not fit the
+    /// mask, so they are simply not counted.
+    fn note_mute(&self, port: u8) -> u128 {
+        if !self.mute_keys || port != NOTES_OUT {
+            return 0;
+        }
+        self.keys
+            .iter()
+            .filter(|&&key| key < 128)
+            .fold(0u128, |mask, &key| mask | (1u128 << key))
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
@@ -179,13 +215,20 @@ impl Node for KeyParam {
 
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, _cx: &mut NodeUi<'_>) -> bool {
-        combo(
+        let mut changed = combo(
             ui,
             "mode",
             &mut self.mode,
             &KeyParamMode::ALL,
             KeyParamMode::label,
-        )
+        );
+        changed |= ui
+            .checkbox(&mut self.mute_keys, "mute picking keys")
+            .on_hover_text(
+                "The keys pick the value either way. Muted they stop here; unmuted they also                  leave the notes output and sound.",
+            )
+            .changed();
+        changed
     }
 
     /// The value's own number and the key that picks it, on the row of the
@@ -251,6 +294,12 @@ impl Node for KeyParam {
     }
 }
 
+/// The default for [`KeyParam::mute_keys`], as a function because serde cannot
+/// spell `true` any other way.
+fn muted() -> bool {
+    true
+}
+
 #[cfg(feature = "ui")]
 impl KeyParam {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, KeyParam)> {
@@ -260,6 +309,7 @@ impl KeyParam {
                 mode: KeyParamMode::Select,
                 keys: vec![24, 25],
                 values: vec![0.0, 1.0],
+                mute_keys: true,
             },
         )]
     }
