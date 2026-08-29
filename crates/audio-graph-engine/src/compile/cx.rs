@@ -399,12 +399,10 @@ impl Pool {
     }
 
     fn alloc(&mut self, channels: u16, readers: usize) -> Result<Buf, CompileError> {
-        // Every buffer in the pool is the same width, and the engine strides by
-        // that width: a wider one does not overflow its own region so much as
-        // write over the buffers after it. Widths reach here from a patch file
-        // as well as from a plugin — a socket's channel count is serialized —
-        // so the ceiling is checked rather than assumed. The widest legitimate
-        // buffer is a plugin's whole input region, which is exactly this.
+        // Buffers are strided by MAX_BUFFER_CHANNELS — a plugin's whole input
+        // region, and the widest legitimate one. A wider buffer writes over the
+        // buffers after it rather than failing, and socket widths arrive from
+        // patch files, so the ceiling is checked rather than assumed.
         if channels as usize > MAX_BUFFER_CHANNELS {
             return Err(CompileError::TooLarge {
                 what: "channels in one buffer",
@@ -489,8 +487,7 @@ pub(crate) struct AudioCx<'a> {
     /// rule the param half uses.
     sources: Vec<Option<(Buf, u32)>>,
     /// The channel width each of those sockets declares, in the same order.
-    /// What is wired to one may be narrower or wider — see
-    /// [`source_at_socket_width`][Self::source_at_socket_width].
+    /// What is wired to one may be narrower or wider.
     source_widths: Vec<u16>,
     /// Total number of connections leaving this node across all output ports.
     readers: usize,
@@ -635,23 +632,14 @@ impl<'a> AudioCx<'a> {
         &self.sources
     }
 
-    /// The same, but at the width the socket itself declares.
+    /// The same, converted to the width the socket declares.
     ///
-    /// A link may join sockets of different widths — the graph allows it
-    /// because refusing taught the user nothing (see
-    /// [`can_connect`][crate::Graph::can_connect]), which leaves the conversion
-    /// to the compiler. Without one, a mono source into a stereo socket reaches
-    /// the left channel and nothing else, and the right one is whatever the
-    /// consuming op finds past the end of the buffer.
+    /// A link may join sockets of different widths, so the conversion is the
+    /// compiler's: a [`Gather`][AudioOp::Gather] of one bus, duplicating mono
+    /// across a wider socket and averaging a wider source into mono. A socket
+    /// already at the right width emits no op.
     ///
-    /// The conversion is a [`Gather`][AudioOp::Gather] of one bus, the same op
-    /// that already adapts a plugin's buses: mono is duplicated across the
-    /// wider socket, and wider is averaged into mono. A node whose socket matches
-    /// what is wired to it — nearly every node in nearly every patch — pays
-    /// nothing, because no op is emitted at all.
-    ///
-    /// Plugin nodes do not go through here: they negotiate their own bus widths
-    /// and assemble every bus with one `Gather` of their own.
+    /// Plugin nodes assemble their own buses and do not go through here.
     pub(crate) fn source_at_socket_width(
         &mut self,
         index: usize,
@@ -663,8 +651,7 @@ impl<'a> AudioCx<'a> {
         if want == 0 || self.width_of(buf) == want {
             return Ok(Some((buf, late)));
         }
-        // Read once, here, on the way in. The buffer it lands in is read once
-        // in turn, by whichever op the caller is about to emit.
+        // One reader: the op the caller is about to emit.
         self.consume(buf);
         let out = self.alloc_avoiding(want, 1, &[buf])?;
         self.emit(AudioOp::Gather {

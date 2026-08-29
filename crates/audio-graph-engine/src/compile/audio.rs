@@ -1071,9 +1071,7 @@ mod tests {
     }
 
     /// A stereo source into a mono sidechain is averaged, not left-only: a
-    /// detector that ignored one channel would miss half the signal it is
-    /// supposed to react to, and one that summed them would answer to a level
-    /// no fader in the patch set.
+    /// detector that ignored one channel would miss half the signal.
     #[test]
     fn a_stereo_source_reaches_a_mono_sidechain_as_an_average() {
         let mut graph = Graph::new();
@@ -1102,12 +1100,8 @@ mod tests {
         assert_eq!(seen.first_of_each, vec![1.0, 2.0, 1.5]);
     }
 
-    /// A mono plugin node feeding a stereo socket is heard on both channels.
-    ///
-    /// The DAW asks for stereo and gets a buffer whose right channel was never
-    /// written: the sound is in the left speaker alone. What the left channel
-    /// carries has to be copied across, which is what a host does with a mono
-    /// track.
+    /// A mono plugin node feeding a stereo socket is heard on both channels,
+    /// not in the left speaker alone.
     #[test]
     fn a_mono_source_reaches_both_channels_of_a_stereo_output() {
         let mut graph = Graph::new();
@@ -1123,19 +1117,16 @@ mod tests {
         handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
         assert!(engine.adopt(&handoff));
 
-        // 1.0 on the left and 2.0 on the right average to 1.5 in the plugin's
-        // mono bus, and both output channels have to carry it.
+        // 1.0 left and 2.0 right average to 1.5 in the plugin's mono bus, and
+        // both output channels have to carry it.
         let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
         let mut daw_out = [0.0f32; 8];
         engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
         assert_eq!(daw_out, [1.5f32; 8]);
     }
 
-    /// The same conversion on the way into a Mix, which sums channel by
-    /// channel across its own width.
-    ///
-    /// Without it the mono input's second channel is read from whatever buffer
-    /// happens to sit next to it in the pool, which is worse than silence.
+    /// The same conversion on the way into a Mix, which sums channel by channel
+    /// across its own width and would otherwise read the buffer next to it.
     #[test]
     fn a_mono_source_is_widened_before_a_stereo_mix_sums_it() {
         let mut graph = Graph::new();
@@ -1190,11 +1181,8 @@ mod tests {
     }
 
     /// Narrowing and widening are inverses: a signal that goes mono, stereo,
-    /// mono again comes back at the level it started at.
-    ///
-    /// This is what makes averaging the right fold rather than summing. A
-    /// mono plugin between two others would otherwise gain 6 dB per hop, and
-    /// nothing on screen would say where the level came from.
+    /// mono again comes back at the level it started at, rather than gaining
+    /// 6 dB per hop.
     #[test]
     fn a_round_trip_through_mono_and_back_keeps_its_level() {
         let mut graph = Graph::new();
@@ -1222,11 +1210,9 @@ mod tests {
 
     /// A socket wider than the pool's own buffers is refused at compile time.
     ///
-    /// Nothing in the editor makes one — a plugin's widths are clamped at
-    /// discovery, and the audio nodes' are fixed — but both are serialized, so
-    /// a patch from a hand or a later version can carry any number at all. The
-    /// engine strides every buffer by the same width, so honouring it would
-    /// write over the buffers that follow rather than fail.
+    /// The editor makes no such socket, but socket widths are serialized and a
+    /// patch can carry any number. Honouring one would write over the buffers
+    /// that follow rather than fail.
     #[test]
     fn a_socket_wider_than_the_pool_is_refused() {
         let mut graph = Graph::new();
