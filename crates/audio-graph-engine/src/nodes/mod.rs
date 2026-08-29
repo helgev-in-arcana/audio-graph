@@ -26,6 +26,7 @@ mod math;
 mod mix;
 mod note_gate;
 mod note_in;
+mod note_mute;
 mod plugin;
 mod range_map;
 mod slot;
@@ -43,6 +44,7 @@ pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
+pub use note_mute::NoteMute;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
 pub use slot::SlotIn;
@@ -112,6 +114,17 @@ pub(crate) trait Node {
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         let _ = port;
         None
+    }
+
+    /// Whether the notes leaving output `port` pass only while a condition this
+    /// node binds is open — see [`crate::compile::ParamCx::bind_note_gate`].
+    ///
+    /// Asked while the chain is walked, so that a node that merely hands notes
+    /// on is not mistaken for the gate nearest the reader. Mistaking one loses
+    /// every gate above it, since the walk stops at the first gate it finds.
+    fn note_gated(&self, port: u8) -> bool {
+        let _ = port;
+        false
     }
 
     /// Which MIDI keys this node takes *out* of the stream leaving output
@@ -276,6 +289,7 @@ pub enum NodeKind {
     NoteGate(NoteGate),
     KeySwitch(KeySwitch),
     KeyParam(KeyParam),
+    NoteMute(NoteMute),
     DelayRead(DelayRead),
 }
 
@@ -311,6 +325,7 @@ macro_rules! for_kind {
             NodeKind::NoteGate($node) => $body,
             NodeKind::KeySwitch($node) => $body,
             NodeKind::KeyParam($node) => $body,
+            NodeKind::NoteMute($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -349,6 +364,12 @@ impl NodeKind {
     /// [`Node::note_passthrough`].
     pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
         for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// Whether output `port` carries a gate of this node's own — see
+    /// [`Node::note_gated`].
+    pub(crate) fn note_gated(&self, port: u8) -> bool {
+        for_kind!(self, node => node.note_gated(port))
     }
 
     /// The keys this node swallows on output `port` — see [`Node::note_mute`].
@@ -567,6 +588,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         KeySwitch::catalogue_defaults(),
         NodeKind::KeySwitch,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteMute::catalogue_defaults(),
+        NodeKind::NoteMute,
     );
 
     // Parameter.

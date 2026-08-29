@@ -57,7 +57,9 @@ fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(No
             return (NoteSource::None, gate, mute);
         };
         mute |= node.kind.note_mute(from_port);
-        gate = gate.or(Some((from, from_port)));
+        if node.kind.note_gated(from_port) {
+            gate = gate.or(Some((from, from_port)));
+        }
         at = graph.source_of(from, input);
     }
     (NoteSource::None, gate, mute)

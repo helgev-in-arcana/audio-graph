@@ -28,6 +28,8 @@ Linux は `$XDG_CONFIG_HOME/audio-graph/`）に保存され、同じマシンの
 
 - MIDI In
 - MIDI Gate
+- MIDI Key Mute
+  - 指定したキーをMIDIストリームから取り除きます。[another key] でキーを追加、[−] で削除。ノートオン/オフの両方が取り除かれるので音は残りません。
 - Key MIDI Route
   - 切り替えに使うキーは既定で取り除かれます（[mute switching keys]）。
 

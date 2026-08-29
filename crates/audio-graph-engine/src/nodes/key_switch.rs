@@ -117,6 +117,11 @@ impl Node for KeySwitch {
         (usize::from(port) < self.keys.len()).then_some(0)
     }
 
+    /// Every output is gated: which ways are open is what this node decides.
+    fn note_gated(&self, port: u8) -> bool {
+        usize::from(port) < self.keys.len()
+    }
+
     /// The keys this switch answers to, swallowed on the way out unless the user
     /// asked for them. Keys past 127 cannot be set from the UI and would not fit
     /// the mask, so they are simply not counted.

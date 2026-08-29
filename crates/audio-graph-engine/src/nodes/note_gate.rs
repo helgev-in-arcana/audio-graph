@@ -35,6 +35,10 @@ impl Node for NoteGate {
         (port == 0).then_some(0)
     }
 
+    fn note_gated(&self, port: u8) -> bool {
+        port == 0
+    }
+
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let control = cx.input_or_zero(1)?;
         let (low, high) = if self.invert { (1.0, 0.0) } else { (0.0, 1.0) };
