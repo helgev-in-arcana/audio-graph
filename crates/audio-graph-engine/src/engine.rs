@@ -653,10 +653,12 @@ impl Engine {
                                 let src = self.at(from, 0, frames);
                                 self.pool.copy_within(src..src + frames, to);
                             } else if want == 1 && have > 1 {
-                                // Wider into mono: summed. A sidechain detector
-                                // wants both channels to count, and taking the
-                                // left one would silently ignore half the
-                                // signal.
+                                // Wider into mono: averaged. Every channel has
+                                // to count — taking the left one would silently
+                                // ignore half the signal — but summing them
+                                // would not, because the same signal duplicated
+                                // by the branch above and folded back here has
+                                // to come out at the level it went in.
                                 let first = self.at(from, 0, frames);
                                 self.pool.copy_within(first..first + frames, to);
                                 for other in 1..have {
@@ -664,6 +666,10 @@ impl Engine {
                                     for i in 0..frames {
                                         self.pool[to + i] += self.pool[src + i];
                                     }
+                                }
+                                let scale = 1.0 / have as f32;
+                                for i in 0..frames {
+                                    self.pool[to + i] *= scale;
                                 }
                             } else if ch < have {
                                 let src = self.at(from, ch as usize, frames);

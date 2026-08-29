@@ -131,7 +131,9 @@ pub enum AudioOp {
     ///
     /// Each entry names a source buffer and the width the plugin negotiated for
     /// that bus. Where they differ the copy adapts: a stereo source into a mono
-    /// sidechain is summed, a mono source into a stereo bus is duplicated. That
+    /// sidechain is averaged, a mono source into a stereo bus is duplicated —
+    /// inverses of each other, so a signal that goes both ways comes back at
+    /// the level it started at. That
     /// conversion is an op rather than a rule inside `Plugin` so it is visible
     /// in the compiled program and can be asserted on.
     Gather { out: Buf, buses: Vec<(Buf, u16)> },

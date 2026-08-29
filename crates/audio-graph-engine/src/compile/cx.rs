@@ -634,7 +634,7 @@ impl<'a> AudioCx<'a> {
     ///
     /// The conversion is a [`Gather`][AudioOp::Gather] of one bus, the same op
     /// that already adapts a plugin's buses: mono is duplicated across the
-    /// wider socket, and wider is summed into mono. A node whose socket matches
+    /// wider socket, and wider is averaged into mono. A node whose socket matches
     /// what is wired to it — nearly every node in nearly every patch — pays
     /// nothing, because no op is emitted at all.
     ///
