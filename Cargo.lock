@@ -2400,6 +2400,7 @@ name = "vst3-host-view"
 version = "0.1.3"
 dependencies = [
  "host-window",
+ "libc",
  "log",
  "vst3",
  "windows-sys 0.61.2",

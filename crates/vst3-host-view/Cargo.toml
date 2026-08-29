@@ -12,3 +12,8 @@ log.workspace = true
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+# For `poll(2)` and nothing else: the run loop a Linux VST3 plugin registers
+# its descriptors with has to actually watch them.
+[target."cfg(all(unix, not(target_os = \"macos\")))".dependencies]
+libc = "0.2"

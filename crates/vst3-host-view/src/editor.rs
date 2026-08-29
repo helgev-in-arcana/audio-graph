@@ -119,13 +119,18 @@ impl EditorWindow {
         self.window.close_requested()
     }
 
-    /// Carry out any resize the plugin asked for, and any the user made.
+    /// Carry out any resize the plugin asked for, and any the user made, and
+    /// give the plugin its descriptors and timers.
     ///
-    /// Call once per UI tick. The two directions are handled here together
-    /// because they are the same conversation: `resizeView` from the plugin
-    /// must be answered with `onSize`, and a user-driven resize must be told to
-    /// the plugin the same way.
+    /// Call once per UI tick. The two resize directions are handled here
+    /// together because they are the same conversation: `resizeView` from the
+    /// plugin must be answered with `onSize`, and a user-driven resize must be
+    /// told to the plugin the same way.
     pub fn sync_size(&mut self) {
+        // First, because a plugin that asks for a resize on Linux does it from
+        // one of these callbacks rather than from a paint.
+        self.frame.tick_run_loop();
+
         if let Some(requested) = self.frame.take_requested_size() {
             self.window.set_client_size(requested);
             let mut rect = to_rect(requested);
