@@ -80,6 +80,16 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
         return;
     }
 
+    // Our own windows, where their event source is ours to turn — X11. Before
+    // anything else, so a close the user asked for this frame is already
+    // recorded by the time the editors are ticked.
+    plugin_host::poll();
+
+    // Whatever the editor asked for and could not do itself. Only ever
+    // non-empty where the editor runs off the main thread; see the editor's
+    // `run_on_main`.
+    shared.run_posted();
+
     let busy = {
         let Some(mut main) = shared.try_main() else {
             return;
@@ -92,6 +102,14 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
     // to run while a patch just sits there playing.
     shared.reclaim();
 
+    // Last, so the snapshot the next frame draws includes everything this tick
+    // did.
+    shared.publish_view();
+
+    // An open editor needs the full rate whether or not anything is loaded: it
+    // is the only thing turning our event loop, and off the main thread it is
+    // also the only thing carrying the user's clicks across.
+    let busy = busy || shared.editor_open();
     state
         .period_ms
         .store(if busy { BUSY_MS } else { IDLE_MS }, Ordering::Relaxed);

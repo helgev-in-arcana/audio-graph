@@ -13,9 +13,14 @@
 //!
 //! So the state is split by how often it is touched rather than by what it is:
 //!
-//! - [`MainState`] — UI state, sub-plugin host controllers, and graph structure.
-//!   Reached constantly, and only ever from the main thread, so it needs no lock
-//!   at all. `MainThread` turns that from a comment into a runtime check.
+//! - [`MainState`] — the sub-plugin host and what activating it needs. Reached
+//!   constantly, and only ever from the main thread, so it needs no lock at
+//!   all. `MainThread` turns that from a comment into a runtime check.
+//! - [`Patch`] — the graph the user is editing. Behind a mutex rather than in
+//!   `MainState` because the editor draws it and the editor does not always run
+//!   on the main thread: baseview gives it one of its own on X11. Nothing here
+//!   is a plugin object, so there is no thread affinity to lose, and the audio
+//!   thread never touches it.
 //! - [`AudioState`] — the live processors, behind a mutex the audio thread only
 //!   ever *tries*, and which the main thread takes solely to start or stop a
 //!   sub-plugin. Swapping a plugin mid-playback glitches, which is the honest
@@ -28,7 +33,7 @@ use std::array;
 use std::cell::{RefCell, RefMut};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::config::SLOT_COUNT;
 use crate::state::WrapperState;
@@ -38,6 +43,7 @@ use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
 use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
 
+use crate::editor::View;
 use crate::params::WrapperParams;
 
 /// Everything reached from the main thread, and from nowhere else.
@@ -46,13 +52,6 @@ pub struct MainState {
     /// Remembered so the editor can activate a newly loaded sub-plugin without
     /// waiting for the DAW to call `activate` again.
     pub config: Option<AudioConfig>,
-    pub graph: Graph,
-    /// Why the graph on screen is not the graph being heard.
-    ///
-    /// A cycle or a duplicate output is an ordinary thing to have halfway
-    /// through an edit; the last program that compiled keeps running and the
-    /// editor says why.
-    pub compile_error: Option<String>,
     /// Bus configurations required for each sub-plugin instance under the current program.
     ///
     /// Kept here rather than read back off the engine because the engine lives
@@ -71,6 +70,17 @@ pub struct MainState {
     pub sized_rings: Vec<(NodeId, usize)>,
 }
 
+/// The graph being edited, reachable from whichever thread the editor is on.
+pub struct Patch {
+    pub graph: Graph,
+    /// Why the graph on screen is not the graph being heard.
+    ///
+    /// A cycle or a duplicate output is an ordinary thing to have halfway
+    /// through an edit; the last program that compiled keeps running and the
+    /// editor says why.
+    pub compile_error: Option<String>,
+}
+
 /// The live processor, and the only thing the audio thread ever waits on.
 pub struct AudioState {
     /// `Some` between `activate` and `deactivate`, whether or not a sub-plugin
@@ -87,6 +97,7 @@ pub struct AudioState {
 /// on it would be a rule nothing states.
 pub struct Shared {
     main: MainThread<RefCell<MainState>>,
+    patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
     programs: Handoff<Program>,
     /// Sub-block modulation quantum in samples.
@@ -114,7 +125,23 @@ pub struct Shared {
     /// two-thousand-entry parameter list sixty times a second, and this is how
     /// it knows the snapshot is stale.
     generation: AtomicU64,
+    /// What the editor should draw, rebuilt on the main thread.
+    ///
+    /// Published rather than read directly because everything in it comes from
+    /// the sub-plugin host, which only the main thread may touch.
+    view: Mutex<View>,
+    /// Work the editor asked for and may not carry out itself.
+    ///
+    /// Used where the editor has a thread of its own — see the editor's
+    /// `dispatch`. Drained by the tick, which is on the host's main thread.
+    posted: Mutex<Vec<Task>>,
+    /// Whether the editor's window is open, which is what decides how often
+    /// the tick has anything to do.
+    editor_open: AtomicBool,
 }
+
+/// One piece of main-thread work handed over by the editor.
+type Task = Box<dyn FnOnce(&Arc<Shared>) + Send>;
 
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -133,12 +160,14 @@ impl Shared {
             main: MainThread::new(RefCell::new(MainState {
                 host,
                 config: None,
-                graph: Graph::default_patch(),
-                compile_error: None,
                 instance_io: Vec::new(),
                 graph_params: Vec::new(),
                 sized_rings: Vec::new(),
             })),
+            patch: Mutex::new(Patch {
+                graph: Graph::default_patch(),
+                compile_error: None,
+            }),
             audio: Mutex::new(AudioState { processor: None }),
             programs: Handoff::new(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
@@ -148,6 +177,9 @@ impl Shared {
             live: array::from_fn(|_| AtomicU32::new(0)),
             params,
             generation: AtomicU64::new(0),
+            view: Mutex::new(View::default()),
+            posted: Mutex::new(Vec::new()),
+            editor_open: AtomicBool::new(false),
         })
     }
 
@@ -179,6 +211,68 @@ impl Shared {
     /// If called from any thread but the one that created the plugin.
     pub fn try_main(&self) -> Option<RefMut<'_, MainState>> {
         self.main.get().try_borrow_mut().ok()
+    }
+
+    /// The graph being edited.
+    ///
+    /// Any thread. Held only for as long as it takes to read or edit — the
+    /// editor takes it for a frame, the main thread to compile.
+    ///
+    /// # Lock order
+    /// Always after [`Shared::main`], never before, so the two cannot be taken
+    /// in opposite orders by two threads at once.
+    pub fn patch(&self) -> parking_lot::MutexGuard<'_, Patch> {
+        self.patch.lock()
+    }
+
+    /// What the editor should draw.
+    ///
+    /// `None` while the main thread is rebuilding it: a frame that cannot have
+    /// it draws the previous snapshot, which looks like nothing happened, as
+    /// opposed to blanking the window for one frame.
+    pub fn try_view(&self) -> Option<parking_lot::MutexGuard<'_, View>> {
+        self.view.try_lock()
+    }
+
+    /// Rebuild what the editor draws. Main thread only, from the tick.
+    ///
+    /// Everything in the snapshot comes from the sub-plugin host, which is why
+    /// the editor cannot simply read it: on X11 the editor is not on the thread
+    /// the host is bound to.
+    pub fn publish_view(&self) {
+        let Some(state) = self.try_main() else { return };
+        let Some(mut view) = self.view.try_lock() else {
+            return;
+        };
+        view.rebuild(&state, self.generation());
+    }
+
+    /// Hand `task` to the main thread, to run on its next tick.
+    ///
+    /// For an editor that is not on the main thread. One that is has
+    /// `plugin_host::Deferred`, which runs on the next turn of the message
+    /// loop rather than the next tick.
+    pub fn post_main(&self, task: impl FnOnce(&Arc<Shared>) + Send + 'static) {
+        self.posted.lock().push(Box::new(task));
+    }
+
+    /// Run everything the editor posted. Main thread only, from the tick.
+    pub fn run_posted(self: &Arc<Shared>) {
+        // Taken out whole rather than popped one at a time: a task is free to
+        // post another, and draining to exhaustion would let it hold the tick.
+        let tasks = std::mem::take(&mut *self.posted.lock());
+        for task in tasks {
+            task(self);
+        }
+    }
+
+    /// Whether the editor's window is open.
+    pub fn editor_open(&self) -> bool {
+        self.editor_open.load(Ordering::Relaxed)
+    }
+
+    pub fn set_editor_open(&self, open: bool) {
+        self.editor_open.store(open, Ordering::Relaxed);
     }
 
     /// Audio-thread access to the processor. Declines rather than waiting.
@@ -246,33 +340,36 @@ impl Shared {
     /// silence, or the DAW's raw automation reappearing — would make the
     /// editor's own error message the second thing the user noticed.
     pub fn publish_graph(&self) {
-        let mut state = self.main();
-        match compile(&state.graph, SLOT_COUNT) {
-            Ok(mut program) => {
-                state.compile_error = None;
-                // The delay rings are allocated here, on the main thread, and
-                // ride over inside the program, because the audio thread may
-                // not allocate. `sized_rings` remembers what was sent last time
-                // so an unchanged line is handed nothing rather than a fresh
-                // copy of what it already has.
-                state.sized_rings =
-                    program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
-                // A graph edit can change which buses a sub-plugin needs —
-                // wiring a sidechain is exactly that — and a bus cannot be
-                // switched on while the plugin is active. Whether the change
-                // has to be acted on is `reactivate`'s decision; recording it
-                // is this one's.
-                let changed = state.instance_io != program.instances
-                    || state.graph_params != program.param_targets;
-                state.instance_io = program.instances.clone();
-                state.graph_params = program.param_targets.clone();
-                self.programs.send(Box::new(program));
-                drop(state);
-                if changed && let Err(e) = self.rebind() {
-                    log::warn!("audio-graph: re-activating for new buses: {e}");
-                }
+        // Compiled with the patch lock held and nothing else, so a long compile
+        // never keeps the editor's next frame waiting on the host as well.
+        let compiled = compile(&self.patch().graph, SLOT_COUNT);
+        let mut program = match compiled {
+            Ok(program) => program,
+            Err(e) => {
+                self.patch().compile_error = Some(e.to_string());
+                return;
             }
-            Err(e) => state.compile_error = Some(e.to_string()),
+        };
+        self.patch().compile_error = None;
+
+        let mut state = self.main();
+        // The delay rings are allocated here, on the main thread, and ride over
+        // inside the program, because the audio thread may not allocate.
+        // `sized_rings` remembers what was sent last time so an unchanged line
+        // is handed nothing rather than a fresh copy of what it already has.
+        state.sized_rings = program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
+        // A graph edit can change which buses a sub-plugin needs — wiring a
+        // sidechain is exactly that — and a bus cannot be switched on while the
+        // plugin is active. Whether the change has to be acted on is
+        // `rebind`'s decision; recording it is this one's.
+        let changed =
+            state.instance_io != program.instances || state.graph_params != program.param_targets;
+        state.instance_io = program.instances.clone();
+        state.graph_params = program.param_targets.clone();
+        self.programs.send(Box::new(program));
+        drop(state);
+        if changed && let Err(e) = self.rebind() {
+            log::warn!("audio-graph: re-activating for new buses: {e}");
         }
     }
 
@@ -314,18 +411,18 @@ impl Shared {
     /// audio pass-through patch.
     pub fn adopt_default_patch(&self) {
         {
-            let mut state = self.main();
+            let mut patch = self.patch();
             // Empty, or still untouched: `restore_state` adopts before the
             // development override has had a chance to load anything, so the
             // patch this finds the second time round is the one it just drew.
-            if !state.graph.is_empty() && state.graph != Graph::default_patch() {
+            if !patch.graph.is_empty() && patch.graph != Graph::default_patch() {
                 return;
             }
-            state.graph = Graph::default_patch();
+            patch.graph = Graph::default_patch();
         }
         // If a sub-plugin is already loaded, wire it inline between audio in and out.
         if self.main().host.is_loaded(0) {
-            let node = self.main().graph.add(
+            let node = self.patch().graph.add(
                 NodeKind::Plugin(Plugin {
                     instance: 0,
                     ports: PluginPorts::default(),
@@ -335,14 +432,15 @@ impl Shared {
             // Sockets before links: `discover_ports` prunes, and a link into a
             // socket the node does not have yet is exactly what it prunes.
             self.discover_ports(node);
-            let mut state = self.main();
-            let (input, output) = (state.graph.nodes[0].id, state.graph.nodes[1].id);
-            state.graph.links.clear();
-            state.graph.connect(input, 0, node, 0);
-            state.graph.connect(node, 0, output, 0);
+            let mut patch = self.patch();
+            let graph = &mut patch.graph;
+            let (input, output) = (graph.nodes[0].id, graph.nodes[1].id);
+            graph.links.clear();
+            graph.connect(input, 0, node, 0);
+            graph.connect(node, 0, output, 0);
             // Out of the way of the plugin we just slid in.
-            state.graph.node_mut(output).unwrap().pos = [520.0, 80.0];
-            drop(state);
+            graph.node_mut(output).unwrap().pos = [520.0, 80.0];
+            drop(patch);
         }
         self.publish_graph();
     }
@@ -353,21 +451,31 @@ impl Shared {
     /// sockets that no longer exist are dropped by `prune`, which is the same
     /// rule a patch reopened against a newer plugin follows.
     pub fn discover_ports(&self, node: NodeId) {
-        let mut state = self.main();
-        // Before anything is read off the node: a patch older than
-        // `audio_out_shown` has no picks to preserve, and settling what it
-        // meant is what turns "every bus" into the handful it wired.
-        state.graph.migrate_plugin_outputs();
-        let Some(instance) = state.graph.node(node).and_then(|n| match n.kind {
-            NodeKind::Plugin(Plugin { instance, .. }) => Some(instance),
-            _ => None,
-        }) else {
-            return;
+        let instance = {
+            let mut patch = self.patch();
+            // Before anything is read off the node: a patch older than
+            // `audio_out_shown` has no picks to preserve, and settling what it
+            // meant is what turns "every bus" into the handful it wired.
+            patch.graph.migrate_plugin_outputs();
+            match patch.graph.node(node).map(|n| &n.kind) {
+                Some(NodeKind::Plugin(Plugin { instance, .. })) => *instance,
+                _ => return,
+            }
         };
-        let layout = state.host.io_layout(instance);
-        let latency = state.host.sub_latency(instance);
+
+        // Asked of the host before the patch is taken again, so the two locks
+        // are never held at once for a question that needs only one of them.
+        let (layout, latency) = {
+            let state = self.main();
+            (
+                state.host.io_layout(instance),
+                state.host.sub_latency(instance),
+            )
+        };
         let discovered = PluginPorts::from_layout(&layout, latency);
-        let Some(node) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
+
+        let mut patch = self.patch();
+        let Some(node) = patch.graph.nodes.iter_mut().find(|n| n.id == node) else {
             return;
         };
         if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
@@ -388,8 +496,8 @@ impl Shared {
                 }
             }
         }
-        state.graph.prune();
-        drop(state);
+        patch.graph.prune();
+        drop(patch);
         self.publish_graph();
     }
 
@@ -445,11 +553,12 @@ impl Shared {
     /// Called after every edit made from the editor, so whenever the DAW
     /// decides to save the project there is something current waiting for it.
     pub fn store_state(&self) {
+        let graph = serde_json::to_value(&self.patch().graph).ok();
         let mut state = self.main();
         let mut blob = WrapperState::default();
         blob.set_sub_host_state(state.host.save_state());
         blob.version = crate::state::STATE_VERSION;
-        blob.graph = serde_json::to_value(&state.graph).ok();
+        blob.graph = graph;
         blob.sub_block = self.quantum();
         drop(state);
         self.write_state(&blob);

@@ -59,7 +59,7 @@ fn shared() -> Arc<Shared> {
 
 /// Build the graph the editor builds when someone drops an LFO on the canvas.
 fn lfo_into(shared: &Arc<Shared>, rate: f64) {
-    let mut state = shared.main();
+    let mut state = shared.patch();
     state.graph = audio_graph_engine::Graph::new();
     let lfo = state.graph.add(
         NodeKind::Lfo(Lfo {
@@ -257,7 +257,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     // Now the user closes a loop — halfway through rearranging something, and
     // not a state worth stopping the music for.
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         let a = state.graph.add(
             NodeKind::Math(Math {
                 op: MathOp::Add,
@@ -279,7 +279,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     }
     shared.publish_graph();
 
-    assert!(shared.main().compile_error.is_some());
+    assert!(shared.patch().compile_error.is_some());
     assert!(
         !engine.adopt(shared.programs()),
         "a failed compile must publish nothing"

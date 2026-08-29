@@ -377,7 +377,108 @@ pub mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod imp {
+    use std::ffi::{CStr, c_void};
+
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{
+        ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, Window as XWindow, WindowClass,
+    };
+    use x11rb::rust_connection::RustConnection;
+
+    pub const WINDOW_API: &CStr = clap_sys::ext::gui::CLAP_WINDOW_API_X11;
+
+    /// A colour nothing else would paint, so a screenshot of a failing teardown
+    /// is unambiguous about who drew what. The same one the Win32 side uses.
+    const FILL: u32 = 0x0050_a0;
+
+    /// The plugin's own window, living inside the host's.
+    ///
+    /// On a connection of the plugin's own, which is what makes this a fair
+    /// test: a real plugin has no access to the host's, and an id is the only
+    /// thing that crosses between them.
+    #[derive(Default)]
+    pub struct Child(Option<Window>);
+
+    struct Window {
+        conn: RustConnection,
+        id: XWindow,
+    }
+
+    impl Child {
+        pub fn create(&mut self, parent: *mut c_void, width: u32, height: u32) -> bool {
+            let parent = parent as usize as XWindow;
+            if parent == x11rb::NONE || self.0.is_some() {
+                return false;
+            }
+            let Ok((conn, _)) = RustConnection::connect(None) else {
+                return false;
+            };
+            let Ok(id) = conn.generate_id() else {
+                return false;
+            };
+            let attributes = CreateWindowAux::new().background_pixel(FILL);
+            if conn
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    id,
+                    parent,
+                    0,
+                    0,
+                    width.max(1) as u16,
+                    height.max(1) as u16,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    x11rb::COPY_FROM_PARENT,
+                    &attributes,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            // Mapped straight away: CLAP creates the view before the host shows
+            // it, and `show` toggles this window rather than creating it.
+            let _ = conn.map_window(id);
+            let _ = conn.flush();
+            self.0 = Some(Window { conn, id });
+            true
+        }
+
+        pub fn resize(&mut self, width: u32, height: u32) {
+            let Some(window) = self.0.as_ref() else {
+                return;
+            };
+            let aux = ConfigureWindowAux::new()
+                .width(width.max(1))
+                .height(height.max(1));
+            let _ = window.conn.configure_window(window.id, &aux);
+            let _ = window.conn.flush();
+        }
+
+        pub fn show(&mut self, visible: bool) {
+            let Some(window) = self.0.as_ref() else {
+                return;
+            };
+            let _ = if visible {
+                window.conn.map_window(window.id)
+            } else {
+                window.conn.unmap_window(window.id)
+            };
+            let _ = window.conn.flush();
+        }
+    }
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let Some(window) = self.0.take() else { return };
+            let _ = window.conn.destroy_window(window.id);
+            let _ = window.conn.flush();
+        }
+    }
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
 pub mod imp {
     use std::ffi::{CStr, c_void};
 

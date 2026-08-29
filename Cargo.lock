@@ -352,6 +352,7 @@ version = "0.1.3"
 dependencies = [
  "clap-sys",
  "windows-sys 0.61.2",
+ "x11rb",
 ]
 
 [[package]]

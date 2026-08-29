@@ -204,7 +204,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
 
     // Dropping three nodes on the canvas and wiring them up.
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         let lfo = state.graph.add(
             NodeKind::Lfo(Lfo {
                 waveform: Waveform::Saw,
@@ -228,7 +228,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
     }
     shared.publish_graph();
     assert!(
-        shared.main().compile_error.is_none(),
+        shared.patch().compile_error.is_none(),
         "a valid graph must compile"
     );
 
@@ -271,7 +271,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
 
     // A graph the user has broken keeps the working program running.
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         let a = state.graph.add(
             NodeKind::Math(Math {
                 op: MathOp::Add,
@@ -293,7 +293,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
     }
     shared.publish_graph();
     assert!(
-        shared.main().compile_error.is_some(),
+        shared.patch().compile_error.is_some(),
         "a cycle has to be reported"
     );
     assert!(
@@ -316,10 +316,10 @@ fn a_patch_saved_without_a_graph_gets_the_default_one() {
         SubHost::new(Arc::new(SilentHost), SUB_HOST),
         WrapperParams::new(),
     );
-    shared.main().graph = Graph::new();
+    shared.patch().graph = Graph::new();
     shared.adopt_default_patch();
 
-    let state = shared.main();
+    let state = shared.patch();
     assert_eq!(state.graph.nodes.len(), 2);
     assert!(matches!(
         state.graph.nodes[0].kind,
@@ -344,14 +344,14 @@ fn adoption_leaves_an_existing_graph_alone() {
         WrapperParams::new(),
     );
     let before = {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         state
             .graph
             .add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
         state.graph.clone()
     };
     shared.adopt_default_patch();
-    assert_eq!(shared.main().graph, before);
+    assert_eq!(shared.patch().graph, before);
 }
 
 /// Verify that graph structure and parameters survive state serialization round trips.
@@ -363,7 +363,7 @@ fn a_graph_survives_the_state_round_trip() {
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params.clone());
     shared.set_quantum(64);
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         state.graph = Graph::default_patch();
         let c = state
             .graph
@@ -378,7 +378,7 @@ fn a_graph_survives_the_state_round_trip() {
     assert_eq!(saved.sub_block, 64);
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
-    assert_eq!(restored, shared.main().graph);
+    assert_eq!(restored, shared.patch().graph);
     let constant = restored
         .nodes
         .iter()
@@ -420,7 +420,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     // The canvas adds the node first and the plugin arrives afterwards, so the
     // node starts with no sockets at all.
     let node = {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         state.graph.add(
             NodeKind::Plugin(Plugin {
                 instance: 1,
@@ -438,7 +438,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     shared.discover_ports(node);
 
     let ports = {
-        let state = shared.main();
+        let state = shared.patch();
         let Some(NodeKind::Plugin(Plugin { ports, .. })) =
             state.graph.node(node).map(|n| n.kind.clone())
         else {
@@ -460,7 +460,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     let first = shared.main().host.params(1)[0].clone();
     let socket = ports.audio_in.len() as u8 + u8::from(ports.accepts_notes);
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         let Some(node_mut) = state.graph.nodes.iter_mut().find(|n| n.id == node) else {
             panic!("node vanished")
         };
@@ -487,12 +487,12 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     }
     shared.publish_graph();
 
-    let state = shared.main();
     assert!(
-        state.compile_error.is_none(),
+        shared.patch().compile_error.is_none(),
         "the graph should compile: {:?}",
-        state.compile_error
+        shared.patch().compile_error
     );
+    let state = shared.main();
     assert_eq!(
         state.graph_params.len(),
         1,

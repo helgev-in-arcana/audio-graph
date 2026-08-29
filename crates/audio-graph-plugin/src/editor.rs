@@ -59,12 +59,15 @@ enum Command {
     SetQuantum(u32),
 }
 
-/// Snapshot of state used by the editor during drawing, refreshed from [`Shared`].
+/// What the editor draws, as the main thread last saw it.
 ///
-/// Drawing from a snapshot avoids holding locks during render passes and avoids
-/// re-cloning large parameter lists every frame when no change has occurred.
-#[derive(Default)]
-struct View {
+/// Everything here comes from the sub-plugin host, which only the main thread
+/// may touch — and the editor is not always on it: baseview gives it a thread
+/// of its own on X11. So the main thread rebuilds this on its tick and the
+/// editor copies out of it, which also keeps large parameter lists from being
+/// rebuilt sixty times a second when nothing has changed.
+#[derive(Default, Clone)]
+pub struct View {
     /// The [`Shared::generation`] the vectors below were built from.
     generation: u64,
     class: Option<(String, String)>,
@@ -95,6 +98,56 @@ impl Status {
 
     fn get(&self) -> String {
         self.0.lock().unwrap().clone()
+    }
+}
+
+impl View {
+    /// Read the sub-plugin host into a snapshot. Main thread only.
+    ///
+    /// Cheap fields every time; the vectors only when `generation` says
+    /// something changed shape.
+    pub(crate) fn rebuild(&mut self, state: &crate::shared::MainState, generation: u64) {
+        self.class = state
+            .host
+            .class(0)
+            .map(|c| (c.name.clone(), c.vendor.clone()));
+        self.loaded = state.host.is_loaded(0);
+        self.sub_editor_open = state.host.editor_is_open(0);
+        self.poly_modulation = state.host.capabilities(0).poly_modulation;
+        self.free_instance = state.host.free_instance();
+
+        if generation == self.generation && !self.params.is_empty() {
+            return;
+        }
+        self.generation = generation;
+        self.params = state.host.params(0).to_vec();
+        self.instances = (0..crate::config::MAX_INSTANCES)
+            .map(|i| crate::graph_ui::InstanceView {
+                loaded: state.host.is_loaded(i),
+                name: state
+                    .host
+                    .class(i)
+                    .map_or_else(String::new, |c| c.name.clone()),
+                editor_open: state.host.editor_is_open(i),
+                params: state
+                    .host
+                    .params(i)
+                    .iter()
+                    .map(|p| (p.id.0, p.name.clone()))
+                    .collect(),
+            })
+            .collect();
+
+        let table = state.host.slots();
+        self.slots = table
+            .slots()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let binding = slot.binding.as_ref()?;
+                Some((i, binding.param_name.clone(), table.resolved(i).is_some()))
+            })
+            .collect();
     }
 }
 
@@ -151,65 +204,36 @@ impl WrapperEditor {
         }
     }
 
-    /// Refresh what gets drawn.
+    /// Take whatever the main thread has published since the last frame.
     ///
     /// Cheap fields every time; the vectors only when something actually
     /// changed shape. Rebuilding a two-thousand-entry parameter list sixty
     /// times a second would be silly; noticing a counter is not.
-    ///
-    /// No lock is involved. Everything read here is main-thread state and the
-    /// audio thread has no way to reach it — which is the whole reason having
-    /// the editor open no longer costs the audio path anything.
     fn refresh(&mut self) {
         if !self.scanned {
             self.rescan();
         }
         self.collect_scan();
-        let state = self.shared.main();
 
-        self.view.class = state
-            .host
-            .class(0)
-            .map(|c| (c.name.clone(), c.vendor.clone()));
-        self.view.loaded = state.host.is_loaded(0);
-        self.view.sub_editor_open = state.host.editor_is_open(0);
-        self.view.poly_modulation = state.host.capabilities(0).poly_modulation;
+        let Some(published) = self.shared.try_view() else {
+            // Being rebuilt right now. Drawing last frame's snapshot again
+            // looks like nothing happened; waiting would blank the window for a
+            // frame, which looks like a flicker because it is one.
+            return;
+        };
+        self.view.class = published.class.clone();
+        self.view.loaded = published.loaded;
+        self.view.sub_editor_open = published.sub_editor_open;
+        self.view.poly_modulation = published.poly_modulation;
+        self.view.free_instance = published.free_instance;
 
-        let generation = self.shared.generation();
-        if generation == self.view.generation && !self.view.params.is_empty() {
+        if published.generation == self.view.generation && !self.view.params.is_empty() {
             return;
         }
-        self.view.generation = generation;
-        self.view.params = state.host.params(0).to_vec();
-
-        self.view.free_instance = state.host.free_instance();
-        self.view.instances = (0..crate::config::MAX_INSTANCES)
-            .map(|i| crate::graph_ui::InstanceView {
-                loaded: state.host.is_loaded(i),
-                name: state
-                    .host
-                    .class(i)
-                    .map_or_else(String::new, |c| c.name.clone()),
-                editor_open: state.host.editor_is_open(i),
-                params: state
-                    .host
-                    .params(i)
-                    .iter()
-                    .map(|p| (p.id.0, p.name.clone()))
-                    .collect(),
-            })
-            .collect();
-
-        let table = state.host.slots();
-        self.view.slots = table
-            .slots()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| {
-                let binding = slot.binding.as_ref()?;
-                Some((i, binding.param_name.clone(), table.resolved(i).is_some()))
-            })
-            .collect();
+        self.view.generation = published.generation;
+        self.view.params = published.params.clone();
+        self.view.instances = published.instances.clone();
+        self.view.slots = published.slots.clone();
     }
 
     /// List every plugin module on the machine, both formats together.
@@ -319,24 +343,24 @@ impl WrapperEditor {
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
-        // The graph is main-thread state and this is the main thread, so it is
-        // edited in place. What must not happen inline is the *consequence* of
-        // an edit — see `Command::GraphEdited`.
+        // The canvas edits the graph in place: it is plain data behind a lock
+        // and needs no particular thread. What must not happen inline is the
+        // *consequence* of an edit — see `Command::GraphEdited`.
+        let mut patch = self.shared.patch();
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
             free_instance: self.view.free_instance,
             bindings: &self.view.slots,
             poly_modulation: self.view.poly_modulation,
-            error: self.shared.main().compile_error.clone(),
+            error: patch.compile_error.clone(),
             live: self.shared.live_slots(),
             quantum: self.shared.quantum(),
             sample_rate: self.shared.sample_rate() as f64,
         };
 
-        let mut state = self.shared.main();
-        let changed = self.graph_ui.ui(ui, &mut state.graph, &context);
-        drop(state);
+        let changed = self.graph_ui.ui(ui, &mut patch.graph, &context);
+        drop(patch);
 
         // Anything the canvas could not do itself: loading a plugin, opening a
         // window. Same reason as everything else here — see the module comment.
@@ -564,26 +588,33 @@ impl WrapperEditor {
         }
     }
 
-    /// Hand everything the user clicked to the message loop.
+    /// Hand everything the user clicked to the main thread.
     fn dispatch(&mut self) {
         if self.commands.is_empty() {
             return;
         }
-        let Some(deferred) = self.deferred.as_ref() else {
-            // No queue means no message loop to defer to, and running these
-            // inline is the exact thing this module exists to avoid.
-            self.status
-                .set("the editor has no message loop; command dropped");
-            self.commands.clear();
-            return;
-        };
         let commands = std::mem::take(&mut self.commands);
-        let shared = self.shared.clone();
         let status = self.status.clone();
         let owner = self.daw_window;
-        deferred
-            .get()
-            .post(move || run(&shared, &status, owner, commands));
+        self.run_on_main(move |shared| run(shared, &status, owner, commands));
+    }
+
+    /// Carry `task` out on the host's main thread, once this frame is over.
+    ///
+    /// Two routes, and which one applies is not a question about the platform
+    /// but about this editor: `deferred` exists only when baseview put the
+    /// editor on the host's own thread, and then the next turn of that thread's
+    /// message loop is the earliest safe moment. When it did not — X11 gives
+    /// the editor a thread of its own — the tick is the only thing that runs
+    /// where the sub-plugin host may be touched.
+    fn run_on_main(&self, task: impl FnOnce(&Arc<Shared>) + Send + 'static) {
+        match self.deferred.as_ref() {
+            Some(deferred) => {
+                let shared = self.shared.clone();
+                deferred.get().post(move || task(&shared));
+            }
+            None => self.shared.post_main(task),
+        }
     }
 }
 
@@ -600,7 +631,7 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
             Command::GraphEdited => {
                 shared.publish_graph();
                 shared.store_state();
-                match shared.main().compile_error.clone() {
+                match shared.patch().compile_error.clone() {
                     Some(e) => status.set(format!("graph not applied: {e}")),
                     None => status.set("graph applied"),
                 }
@@ -698,10 +729,16 @@ impl NiceEguiApp for WrapperEditor {
         // be the root and not this view.
         self.daw_window = plugin_host::root_window(raw_window(frame)) as usize;
 
-        match plugin_host::deferred() {
-            Ok(deferred) => self.deferred = Some(MainThread::new(deferred)),
-            Err(e) => log::warn!("audio-graph: {e}"),
+        // Only when baseview gave us the host's own thread. A queue made here
+        // runs its work here, and off the main thread that is exactly what must
+        // not happen — `run_on_main` posts to the tick instead.
+        if self.shared.on_main_thread() {
+            match plugin_host::deferred() {
+                Ok(deferred) => self.deferred = Some(MainThread::new(deferred)),
+                Err(e) => log::warn!("audio-graph: {e}"),
+            }
         }
+        self.shared.set_editor_open(true);
         // Periodic ticking is handled at the plugin instance level rather than by the
         // editor window, ensuring sub-plugin resize requests and main-thread callbacks
         // continue operating even when the editor window is closed (see `crate::tick`).
@@ -745,10 +782,12 @@ impl NiceEguiApp for WrapperEditor {
     }
 
     fn editor_closed(&mut self) {
+        self.shared.set_editor_open(false);
         // The wrapper's window is going away, so every sub-plugin window must
         // too: they are top level with no owner, and leaving one behind strands
-        // it with nothing ticking it.
-        self.shared.main().host.close_all_editors();
+        // it with nothing ticking it. Through the main thread like any other
+        // command — this runs on whichever thread baseview drew on.
+        self.run_on_main(|shared| shared.main().host.close_all_editors());
         // Takes anything still queued with it.
         self.deferred = None;
     }
