@@ -21,8 +21,8 @@ use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
-    MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS,
-    MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
+    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -399,6 +399,18 @@ impl Pool {
     }
 
     fn alloc(&mut self, channels: u16, readers: usize) -> Result<Buf, CompileError> {
+        // Every buffer in the pool is the same width, and the engine strides by
+        // that width: a wider one does not overflow its own region so much as
+        // write over the buffers after it. Widths reach here from a patch file
+        // as well as from a plugin — a socket's channel count is serialized —
+        // so the ceiling is checked rather than assumed. The widest legitimate
+        // buffer is a plugin's whole input region, which is exactly this.
+        if channels as usize > MAX_BUFFER_CHANNELS {
+            return Err(CompileError::TooLarge {
+                what: "channels in one buffer",
+                limit: MAX_BUFFER_CHANNELS,
+            });
+        }
         if let Some(i) =
             (0..self.widths.len()).find(|&i| self.pending[i] == 0 && self.widths[i] == channels)
         {

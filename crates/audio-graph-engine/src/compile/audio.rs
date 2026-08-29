@@ -1220,6 +1220,34 @@ mod tests {
         assert_eq!(daw_out, [1.5f32; 8], "one fold, not two, and no gain");
     }
 
+    /// A socket wider than the pool's own buffers is refused at compile time.
+    ///
+    /// Nothing in the editor makes one — a plugin's widths are clamped at
+    /// discovery, and the audio nodes' are fixed — but both are serialized, so
+    /// a patch from a hand or a later version can carry any number at all. The
+    /// engine strides every buffer by the same width, so honouring it would
+    /// write over the buffers that follow rather than fail.
+    #[test]
+    fn a_socket_wider_than_the_pool_is_refused() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: crate::ir::MAX_BUFFER_CHANNELS as u16 + 1,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, output, 0);
+        assert!(matches!(
+            compile(&graph, SLOTS),
+            Err(CompileError::TooLarge {
+                what: "channels in one buffer",
+                ..
+            })
+        ));
+    }
+
     /// A plugin whose main bus is mono in both directions.
     fn mono_plugin(graph: &mut Graph, instance: usize) -> NodeId {
         graph.add(
