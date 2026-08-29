@@ -127,9 +127,16 @@ impl Node for Mix {
 
         let mut inputs = Vec::new();
         for (port, buf, late) in wired {
+            // Compensated at the width it arrived in: the ring is narrower,
+            // and the delay is the same either side of a conversion.
             if arrive > late {
                 cx.compensate(buf, arrive - late)?;
             }
+            // The sum runs across the mix's own width, so a narrower input has
+            // to be widened before it is read.
+            let Some((buf, _)) = cx.source_at_socket_width(port)? else {
+                continue;
+            };
             inputs.push(MixIn {
                 buf,
                 // Associate each audio buffer with its corresponding gain lane.

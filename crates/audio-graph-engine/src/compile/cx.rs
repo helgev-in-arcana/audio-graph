@@ -21,8 +21,8 @@ use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
-    MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS,
-    MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
+    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -399,6 +399,16 @@ impl Pool {
     }
 
     fn alloc(&mut self, channels: u16, readers: usize) -> Result<Buf, CompileError> {
+        // Buffers are strided by MAX_BUFFER_CHANNELS — a plugin's whole input
+        // region, and the widest legitimate one. A wider buffer writes over the
+        // buffers after it rather than failing, and socket widths arrive from
+        // patch files, so the ceiling is checked rather than assumed.
+        if channels as usize > MAX_BUFFER_CHANNELS {
+            return Err(CompileError::TooLarge {
+                what: "channels in one buffer",
+                limit: MAX_BUFFER_CHANNELS,
+            });
+        }
         if let Some(i) =
             (0..self.widths.len()).find(|&i| self.pending[i] == 0 && self.widths[i] == channels)
         {
@@ -476,6 +486,9 @@ pub(crate) struct AudioCx<'a> {
     /// input nobody wired, which is silence rather than an error — the same
     /// rule the param half uses.
     sources: Vec<Option<(Buf, u32)>>,
+    /// The channel width each of those sockets declares, in the same order.
+    /// What is wired to one may be narrower or wider.
+    source_widths: Vec<u16>,
     /// Total number of connections leaving this node across all output ports.
     readers: usize,
     /// Channel width of this node's first output socket, or 0 if it has none.
@@ -507,6 +520,7 @@ impl<'a> AudioCx<'a> {
             lanes,
             id: NodeId::MAX,
             sources: Vec::new(),
+            source_widths: Vec::new(),
             readers: 0,
             out_width: 0,
             pool: Pool::new(),
@@ -530,11 +544,20 @@ impl<'a> AudioCx<'a> {
     /// own index space.
     pub(crate) fn begin(&mut self, id: NodeId, kind: &NodeKind) {
         self.id = id;
-        self.sources = kind
-            .input_ports()
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| matches!(p.ty, PortType::Audio { .. }))
+        let ports = kind.input_ports();
+        let audio = || {
+            ports
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.ty, PortType::Audio { .. }))
+        };
+        self.source_widths = audio()
+            .map(|(_, p)| match p.ty {
+                PortType::Audio { channels } => channels,
+                _ => 0,
+            })
+            .collect();
+        self.sources = audio()
             .map(|(port, _)| {
                 self.graph
                     .source_of(id, port as u8)
@@ -607,6 +630,35 @@ impl<'a> AudioCx<'a> {
     /// Every audio input in socket order, wired or not.
     pub(crate) fn sources(&self) -> &[Option<(Buf, u32)>] {
         &self.sources
+    }
+
+    /// The same, converted to the width the socket declares.
+    ///
+    /// A link may join sockets of different widths, so the conversion is the
+    /// compiler's: a [`Gather`][AudioOp::Gather] of one bus, duplicating mono
+    /// across a wider socket and averaging a wider source into mono. A socket
+    /// already at the right width emits no op.
+    ///
+    /// Plugin nodes assemble their own buses and do not go through here.
+    pub(crate) fn source_at_socket_width(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<(Buf, u32)>, CompileError> {
+        let Some((buf, late)) = self.source(index) else {
+            return Ok(None);
+        };
+        let want = self.source_widths.get(index).copied().unwrap_or(0);
+        if want == 0 || self.width_of(buf) == want {
+            return Ok(Some((buf, late)));
+        }
+        // One reader: the op the caller is about to emit.
+        self.consume(buf);
+        let out = self.alloc_avoiding(want, 1, &[buf])?;
+        self.emit(AudioOp::Gather {
+            out,
+            buses: vec![(buf, want)],
+        });
+        Ok(Some((out, late)))
     }
 
     /// Whether `node` is one of the nodes this program runs.

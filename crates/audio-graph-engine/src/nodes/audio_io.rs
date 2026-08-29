@@ -109,7 +109,7 @@ impl Node for AudioOut {
     }
 
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
-        if let Some((buf, late)) = cx.source(0) {
+        if let Some((buf, late)) = cx.source_at_socket_width(0)? {
             cx.report_latency(late);
             cx.consume(buf);
             cx.emit(AudioOp::Output {

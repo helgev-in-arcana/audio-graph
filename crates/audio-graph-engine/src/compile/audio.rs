@@ -1070,11 +1070,10 @@ mod tests {
         assert_eq!(buses, vec![2, 1]);
     }
 
-    /// A stereo source into a mono sidechain is summed, not halved and not
-    /// left-only: a detector that ignored one channel would miss half the
-    /// signal it is supposed to react to.
+    /// A stereo source into a mono sidechain is averaged, not left-only: a
+    /// detector that ignored one channel would miss half the signal.
     #[test]
-    fn a_stereo_source_reaches_a_mono_sidechain_as_a_sum() {
+    fn a_stereo_source_reaches_a_mono_sidechain_as_an_average() {
         let mut graph = Graph::new();
         let input = stereo_in(&mut graph);
         let key = stereo_in(&mut graph);
@@ -1091,14 +1090,187 @@ mod tests {
         assert!(engine.adopt(&handoff));
 
         // Both stereo inputs read DAW bus 0, so the sidechain sees the same
-        // two channels: 1.0 and 2.0, which have to arrive as 3.0.
+        // two channels: 1.0 and 2.0, which have to arrive as their mean, 1.5.
         let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
         let mut daw_out = [0.0f32; 8];
         let mut seen = RecordInput::default();
         engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut seen);
 
         assert_eq!(seen.channels, 3, "stereo main plus mono sidechain");
-        assert_eq!(seen.first_of_each, vec![1.0, 2.0, 3.0]);
+        assert_eq!(seen.first_of_each, vec![1.0, 2.0, 1.5]);
+    }
+
+    /// A mono plugin node feeding a stereo socket is heard on both channels,
+    /// not in the left speaker alone.
+    #[test]
+    fn a_mono_source_reaches_both_channels_of_a_stereo_output() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = mono_plugin(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        // 1.0 left and 2.0 right average to 1.5 in the plugin's mono bus, and
+        // both output channels have to carry it.
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
+        assert_eq!(daw_out, [1.5f32; 8]);
+    }
+
+    /// The same conversion on the way into a Mix, which sums channel by channel
+    /// across its own width and would otherwise read the buffer next to it.
+    #[test]
+    fn a_mono_source_is_widened_before_a_stereo_mix_sums_it() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = mono_plugin(&mut graph, 0);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        // The mono plugin into the first input, the stereo bus into the second.
+        graph.connect(node, 0, mix, 0);
+        graph.connect(input, 0, mix, 2);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
+        // 1.5 on both channels out of the plugin, plus the input itself.
+        assert_eq!(daw_out, [2.5, 2.5, 2.5, 2.5, 3.5, 3.5, 3.5, 3.5]);
+    }
+
+    /// A socket that already matches what is wired to it converts nothing.
+    #[test]
+    fn a_matching_width_costs_no_conversion() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let node = plugin(&mut graph, 0, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Gather { .. })),
+            "nothing to convert on either side of a stereo plugin"
+        );
+    }
+
+    /// Narrowing and widening are inverses: a signal that goes mono, stereo,
+    /// mono again comes back at the level it started at, rather than gaining
+    /// 6 dB per hop.
+    #[test]
+    fn a_round_trip_through_mono_and_back_keeps_its_level() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let first = mono_plugin(&mut graph, 0);
+        let second = mono_plugin(&mut graph, 1);
+        let output = stereo_out(&mut graph);
+        graph.connect(input, 0, first, 0);
+        // Mono out of the first, widened into the second's socket, folded back
+        // down for its mono bus.
+        graph.connect(first, 0, second, 0);
+        graph.connect(second, 0, output, 0);
+
+        let mut engine = crate::Engine::new();
+        engine.prepare(8, &[2]);
+        let handoff = crate::Handoff::new();
+        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
+        assert!(engine.adopt(&handoff));
+
+        let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut daw_out = [0.0f32; 8];
+        engine.run_audio(&ctx(4), &daw_in, &mut daw_out, &mut PassThrough);
+        assert_eq!(daw_out, [1.5f32; 8], "one fold, not two, and no gain");
+    }
+
+    /// A socket wider than the pool's own buffers is refused at compile time.
+    ///
+    /// The editor makes no such socket, but socket widths are serialized and a
+    /// patch can carry any number. Honouring one would write over the buffers
+    /// that follow rather than fail.
+    #[test]
+    fn a_socket_wider_than_the_pool_is_refused() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: crate::ir::MAX_BUFFER_CHANNELS as u16 + 1,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, output, 0);
+        assert!(matches!(
+            compile(&graph, SLOTS),
+            Err(CompileError::TooLarge {
+                what: "channels in one buffer",
+                ..
+            })
+        ));
+    }
+
+    /// A plugin whose main bus is mono in both directions.
+    fn mono_plugin(graph: &mut Graph, instance: usize) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance,
+                ports: PluginPorts {
+                    audio_in: vec![1],
+                    audio_out: vec![1],
+                    audio_out_shown: Vec::new(),
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
+
+    /// A stand-in sub-plugin that writes its input straight back out.
+    struct PassThrough;
+
+    impl AudioInstances for PassThrough {
+        fn process(
+            &mut self,
+            _instance: u32,
+            _notes: NoteStream,
+            input: &[f32],
+            output: &mut [f32],
+            chunk: AudioChunk,
+        ) {
+            for ch in 0..chunk.output_channels {
+                let range = chunk.channel(ch);
+                if ch < chunk.input_channels {
+                    output[range.clone()].copy_from_slice(&input[range]);
+                } else {
+                    output[range].fill(0.0);
+                }
+            }
+        }
     }
 
     /// Records the shape and content of what a plugin node was handed.
