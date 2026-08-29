@@ -558,6 +558,10 @@ impl Engine {
             return;
         };
 
+        // The block is the program's to fill: a channel no `Output` op reaches
+        // is silence, not whatever the caller's buffer already held.
+        daw_out.fill(0.0);
+
         let step = match program.chunking {
             Chunking::WholeBlock => total.max(1),
             // The last chunk is short whenever the block is not a multiple of the quantum.
@@ -799,6 +803,9 @@ impl Engine {
                     let width = program.buffers[*a as usize] as usize;
                     self.delay_write(*line as usize, *a, width, frames);
                 }
+                AudioOp::DelaySilence { line } => {
+                    self.delay_silence(*line as usize, frames);
+                }
             }
         }
     }
@@ -889,6 +896,25 @@ impl Engine {
                 } else {
                     0.0
                 };
+            }
+        }
+        self.audio_ring_heads[line] = (head + frames) % ring_len;
+    }
+
+    /// Advance `line`'s write head over this chunk without a source.
+    ///
+    /// The head moves at the rate a connected write would move it, so the line
+    /// drains over its delay time rather than holding still.
+    fn delay_silence(&mut self, line: usize, frames: usize) {
+        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
+        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
+            return;
+        }
+        let head = self.audio_ring_heads[line];
+        for ch in 0..MAX_CHANNELS {
+            let ring = ch * ring_len;
+            for i in 0..frames {
+                self.audio_rings[line][ring + (head + i) % ring_len] = 0.0;
             }
         }
         self.audio_ring_heads[line] = (head + frames) % ring_len;
@@ -1760,8 +1786,10 @@ mod tests {
         assert_eq!(daw_out, daw_in);
     }
 
+    /// An unconnected `AudioOut` emits no `Output` op, so `run_audio` clears
+    /// the block itself.
     #[test]
-    fn an_unconnected_output_leaves_the_daw_buffer_alone() {
+    fn an_unconnected_output_clears_the_daw_buffer() {
         let mut graph = Graph::new();
         graph.add(
             NodeKind::AudioOut(AudioOut {
@@ -1777,7 +1805,78 @@ mod tests {
         let daw_in = vec![0.0f32; 2 * 8];
         let mut daw_out = vec![7.0f32; 2 * 8];
         engine.run_audio(&audio_ctx(8), &daw_in, &mut daw_out, &mut Adders);
-        assert!(daw_out.iter().all(|&s| s == 7.0));
+        assert!(daw_out.iter().all(|&s| s == 0.0), "{daw_out:?}");
+    }
+
+    /// A channel no op reaches is silence too.
+    #[test]
+    fn a_channel_no_op_writes_is_cleared() {
+        let mut graph = Graph::new();
+        let input = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 0,
+                channels: 1,
+            }),
+            [0.0, 0.0],
+        );
+        let output = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 1,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, output, 0);
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+
+        let daw_in = vec![1.0f32; 2 * 8];
+        let mut daw_out = vec![7.0f32; 2 * 8];
+        engine.run_audio(&audio_ctx(8), &daw_in, &mut daw_out, &mut Adders);
+        assert!(daw_out[8..].iter().all(|&s| s == 0.0), "{daw_out:?}");
+    }
+
+    /// A line whose writer loses its input keeps its ring across the swap, so
+    /// the write head has to go on advancing for the line to drain.
+    #[test]
+    fn a_delay_line_nothing_writes_drains_to_silence() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        // A tap well inside a block, so a handful of blocks fills the ring.
+        let (write, read) = audio_delay(&mut graph, 100.0);
+        graph.connect(input, 0, write, 0);
+        graph.connect(read, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(128, &[2]);
+        load(&mut engine, &graph);
+
+        // Load the line.
+        let daw_in = vec![1.0f32; 2 * 128];
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        for _ in 0..8 {
+            engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+        }
+        assert!(
+            daw_out.iter().any(|s| s.abs() > 0.5),
+            "the line is loaded: {:?}",
+            &daw_out[..8]
+        );
+
+        // Pull the wire out of the write node and let the line run dry.
+        graph.disconnect(write, 0);
+        load(&mut engine, &graph);
+        let silence = vec![0.0f32; 2 * 128];
+        for _ in 0..32 {
+            engine.run_audio(&audio_ctx(128), &silence, &mut daw_out, &mut Adders);
+        }
+        assert!(
+            daw_out.iter().all(|s| s.abs() < 1e-6),
+            "the ring should have drained: {:?}",
+            &daw_out[..8]
+        );
     }
 
     /// `prepare` is the only thing that allocates, so running without it — or
