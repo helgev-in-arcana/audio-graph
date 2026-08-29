@@ -40,7 +40,7 @@ pub(crate) fn compile_audio(
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
 ) -> Result<Audio, CompileError> {
-    let mut cx = AudioCx::new(graph, lines, audio_lanes);
+    let mut cx = AudioCx::new(graph, lines, order, audio_lanes);
     for &id in order {
         let node = graph.node(id).expect("ordering only contains real nodes");
         cx.begin(id, &node.kind);
@@ -252,6 +252,72 @@ mod tests {
             })
             .expect("the read bus is split out");
         assert_eq!(split, (2, 2));
+    }
+
+    /// A branch that reaches no output is not compiled, so it is not a reader
+    /// either, and the buffer it would have read comes straight back.
+    #[test]
+    fn a_pruned_branch_does_not_hold_the_buffer_it_would_have_read() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let mut last = input;
+        for i in 0..6 {
+            let node = plugin(&mut graph, i, 0);
+            graph.connect(last, 0, node, 0);
+            // Each stage also feeds a plugin that goes nowhere.
+            let dangling = plugin(&mut graph, 100 + i, 0);
+            graph.connect(node, 0, dangling, 0);
+            last = node;
+        }
+        graph.connect(last, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            program.buffers.len() <= 3,
+            "the dangling branches read nothing, so they cost no buffers: {:?}",
+            program.buffers
+        );
+    }
+
+    /// The same question one level down: a bus whose only reader is a pruned
+    /// branch is not handed over, and nothing is copied out of it.
+    #[test]
+    fn a_bus_read_only_by_a_pruned_branch_is_not_handed_over() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_in: vec![2],
+                    audio_out: vec![2, 2],
+                    audio_out_shown: Vec::new(),
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let dangling = plugin(&mut graph, 1, 0);
+        graph.connect(input, 0, node, 0);
+        graph.connect(node, 0, output, 0);
+        graph.connect(node, 1, dangling, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let buses = program.audio_ops.iter().find_map(|op| match op {
+            AudioOp::Plugin { output_buses, .. } => Some(output_buses.clone()),
+            _ => None,
+        });
+        assert_eq!(buses, Some(vec![2]), "only the bus the output reads");
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Split { .. })),
+            "nothing to split out: {:?}",
+            program.audio_ops
+        );
     }
 
     /// A socket carries the bus its dropdown says, not the bus it happens to

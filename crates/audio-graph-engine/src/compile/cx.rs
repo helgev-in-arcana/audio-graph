@@ -464,6 +464,9 @@ impl Pool {
 pub(crate) struct AudioCx<'a> {
     graph: &'a Graph,
     lines: &'a [Line],
+    /// The nodes the program runs, in order. A link is a read only when the
+    /// node at its far end is one of these.
+    order: &'a [NodeId],
     lanes: &'a [((NodeId, u8), u16)],
     id: NodeId,
 
@@ -492,11 +495,13 @@ impl<'a> AudioCx<'a> {
     pub(crate) fn new(
         graph: &'a Graph,
         lines: &'a [Line],
+        order: &'a [NodeId],
         lanes: &'a [((NodeId, u8), u16)],
     ) -> AudioCx<'a> {
         AudioCx {
             graph,
             lines,
+            order,
             lanes,
             id: NodeId::MAX,
             sources: Vec::new(),
@@ -539,7 +544,12 @@ impl<'a> AudioCx<'a> {
                     .map(|p| (p.buf, p.latency))
             })
             .collect();
-        self.readers = self.graph.links.iter().filter(|l| l.from == id).count();
+        self.readers = self
+            .graph
+            .links
+            .iter()
+            .filter(|l| l.from == id && self.runs(l.to))
+            .count();
         self.out_width = match kind.output_ports().first().map(|p| p.ty) {
             Some(PortType::Audio { channels }) => channels,
             _ => 0,
@@ -585,17 +595,27 @@ impl<'a> AudioCx<'a> {
         &self.sources
     }
 
-    /// How many links leave this node in total.
+    /// Whether `node` is one of the nodes this program runs.
+    ///
+    /// Every question of the form "does anything read this?" goes through
+    /// here. A node that reaches no output is not compiled and so never reads
+    /// what is wired to it: its buffer would be held for a read that never
+    /// comes, and its bus handed over for nobody to collect.
+    fn runs(&self, node: NodeId) -> bool {
+        self.order.contains(&node)
+    }
+
+    /// How many of the links leaving this node are read by a node that runs.
     pub(crate) fn readers(&self) -> usize {
         self.readers
     }
 
-    /// How many links leave one particular output socket.
+    /// The same count for one particular output socket.
     pub(crate) fn readers_of(&self, port: u8) -> usize {
         self.graph
             .links
             .iter()
-            .filter(|l| l.from == self.id && l.from_port == port)
+            .filter(|l| l.from == self.id && l.from_port == port && self.runs(l.to))
             .count()
     }
 
@@ -604,7 +624,7 @@ impl<'a> AudioCx<'a> {
         self.graph
             .links
             .iter()
-            .filter(|l| l.from == self.id)
+            .filter(|l| l.from == self.id && self.runs(l.to))
             .map(|l| l.from_port as usize + 1)
             .max()
             .unwrap_or(0)
