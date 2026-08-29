@@ -69,8 +69,8 @@ mod tests {
     use crate::engine::AudioContext;
     use crate::ir::{AudioOp, NoteRoute};
     use crate::nodes::{
-        AudioIn, AudioOut, DelayRead, DelayWrite, KeySwitch, KeySwitchMode, Mix, NodeKind,
-        NoteGate, Plugin, PluginPorts, SlotIn,
+        AudioIn, AudioOut, DelayRead, DelayWrite, KeyParam, KeyParamMode, KeySwitch, KeySwitchMode,
+        Mix, NodeKind, NoteGate, NoteMute, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
     use subhost_adapter::{AudioChunk, AudioInstances, NoteSource, NoteStream};
@@ -837,6 +837,96 @@ mod tests {
         let program = compile(&graph, SLOTS).unwrap();
         let routes = note_sources(&program);
         assert_eq!(routes[0].1.mute, 0);
+    }
+
+    /// A key parameter hands the stream on through a notes output of its own,
+    /// with the keys that pick the value taken out of it.
+    #[test]
+    fn a_key_parameter_passes_notes_on_without_its_own_keys() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.0, 1.0],
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 1, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.source, NoteSource::Daw { bus: 0 });
+        assert_eq!(
+            routes[0].1.mute,
+            (1u128 << 24) | (1u128 << 25),
+            "picking keys are filtered from the sounding note stream"
+        );
+    }
+
+    /// Clearing `mute_keys` puts the picking keys back.
+    #[test]
+    fn an_unmuted_key_parameter_passes_its_own_keys() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode: KeyParamMode::Select,
+                keys: vec![24, 25],
+                values: vec![0.0, 1.0],
+                mute_keys: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 1, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.mute, 0);
+    }
+
+    /// A key mute takes its keys out and leaves everything else alone,
+    /// including a gate above it.
+    #[test]
+    fn a_key_mute_swallows_its_keys_and_keeps_the_gate_above_it() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let mute = graph.add(
+            NodeKind::NoteMute(NoteMute { keys: vec![24, 26] }),
+            [0.0, 0.0],
+        );
+        let synth = synth(&mut graph, 0);
+        let output = stereo_out(&mut graph);
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(gate, 0, mute, 0);
+        graph.connect(mute, 0, synth, 0);
+        graph.connect(synth, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let routes = note_sources(&program);
+        assert_eq!(routes[0].1.source, NoteSource::Daw { bus: 0 });
+        assert_eq!(routes[0].1.mute, (1u128 << 24) | (1u128 << 26));
+        assert!(
+            routes[0].1.gate.is_some(),
+            "the gate upstream of the mute still reaches the synth"
+        );
     }
 
     /// The notes port sits after the audio inputs, so an effect that also takes
