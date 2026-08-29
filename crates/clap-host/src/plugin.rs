@@ -375,6 +375,10 @@ impl ClapPlugin {
         let requests = self.host.take_requests();
         self.apply(requests);
         self.host.tick_timers();
+        // Beside the timers, and for the same reason: on Linux a plugin's
+        // toolkit waits on descriptors the host has to poll for it.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        self.host.tick_fds();
 
         if let Some(editor) = self.editor.as_mut() {
             editor.sync_size();

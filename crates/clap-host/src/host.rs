@@ -25,6 +25,11 @@ use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
     CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_clear_flags, clap_param_rescan_flags,
 };
+#[cfg(all(unix, not(target_os = "macos")))]
+use clap_sys::ext::posix_fd_support::{
+    CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_ERROR, CLAP_POSIX_FD_READ, CLAP_POSIX_FD_WRITE,
+    clap_host_posix_fd_support, clap_plugin_posix_fd_support, clap_posix_fd_flags,
+};
 use clap_sys::ext::state::{CLAP_EXT_STATE, clap_host_state};
 use clap_sys::ext::tail::{CLAP_EXT_TAIL, clap_host_tail};
 use clap_sys::ext::thread_check::{CLAP_EXT_THREAD_CHECK, clap_host_thread_check};
@@ -51,6 +56,12 @@ const MAX_TIMERS: usize = 16;
 /// dressed as a timer, and the UI thread is shared with the wrapper's own
 /// editor.
 const MIN_TIMER_PERIOD_MS: u32 = 8;
+
+/// How many descriptors one plugin may ask the host to watch.
+///
+/// Same reasoning as `MAX_TIMERS`: the list is polled on every UI tick.
+#[cfg(all(unix, not(target_os = "macos")))]
+const MAX_FDS: usize = 16;
 
 thread_local! {
     /// Non-zero while this thread is inside `clap_plugin::process`.
@@ -151,6 +162,12 @@ pub(crate) struct HostShim {
     /// `[main-thread]`, but a `RefCell` reachable from a struct the audio
     /// thread also touches is a data race waiting for one misbehaving plugin.
     timers: Mutex<Vec<Timer>>,
+    /// Descriptors the plugin asked the host to watch, and what for.
+    ///
+    /// Linux only: a plugin's toolkit reaches its X connection this way, and
+    /// there is no equivalent question to answer on the other platforms.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fds: Mutex<Vec<(i32, clap_posix_fd_flags)>>,
 }
 
 /// Sentinel for "no resize pending" in the packed size.
@@ -209,6 +226,8 @@ impl HostShim {
             gui_resize: AtomicU64::new(NO_RESIZE),
             gui_closed: AtomicBool::new(false),
             timers: Mutex::new(Vec::new()),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            fds: Mutex::new(Vec::new()),
         });
         // Only now, once the box has its final address.
         let back = (&raw mut *shim).cast::<c_void>();
@@ -288,6 +307,103 @@ impl HostShim {
             unsafe { on_timer(plugin, id) };
         }
     }
+
+    /// Tell the plugin about every descriptor it is waiting on that is ready.
+    ///
+    /// Called from the owner's UI tick, on the main thread, beside the timers.
+    /// Linux only — see [`HOST_POSIX_FD_SUPPORT`].
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub(crate) fn tick_fds(&self) {
+        let plugin = self.plugin.load(Ordering::Acquire);
+        if plugin.is_null() {
+            return;
+        }
+        let ext = unsafe { (*plugin).get_extension }
+            .map(|get| unsafe { get(plugin, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()) })
+            .unwrap_or(std::ptr::null());
+        if ext.is_null() {
+            return;
+        }
+        let Some(on_fd) = (unsafe { (*ext.cast::<clap_plugin_posix_fd_support>()).on_fd }) else {
+            return;
+        };
+
+        // Copied out under the lock and polled outside it: `on_fd` is entitled
+        // to register or drop a descriptor, and that call comes straight back
+        // through this mutex.
+        let watched: Vec<(i32, clap_posix_fd_flags)> = {
+            let Ok(fds) = self.fds.lock() else { return };
+            if fds.is_empty() {
+                return;
+            }
+            fds.clone()
+        };
+
+        let mut polls: Vec<libc::pollfd> = watched
+            .iter()
+            .map(|(fd, flags)| libc::pollfd {
+                fd: *fd,
+                events: poll_events(*flags),
+                revents: 0,
+            })
+            .collect();
+        // Zero timeout: this runs from a UI tick that has a frame to get back to.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0) };
+        if ready <= 0 {
+            return;
+        }
+
+        for (index, poll) in polls.iter().enumerate() {
+            let flags = clap_flags(poll.revents);
+            if flags == 0 {
+                continue;
+            }
+            let fd = watched[index].0;
+            // Against the live list, not the copy: an earlier callback in this
+            // very loop may have unregistered this one.
+            let still_watched = self
+                .fds
+                .lock()
+                .is_ok_and(|fds| fds.iter().any(|(other, _)| *other == fd));
+            if !still_watched {
+                continue;
+            }
+            unsafe { on_fd(plugin, fd, flags) };
+        }
+    }
+}
+
+/// What to ask `poll(2)` for, from what the plugin asked to hear about.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn poll_events(flags: clap_posix_fd_flags) -> libc::c_short {
+    let mut events = 0;
+    if flags & CLAP_POSIX_FD_READ != 0 {
+        events |= libc::POLLIN;
+    }
+    if flags & CLAP_POSIX_FD_WRITE != 0 {
+        events |= libc::POLLOUT;
+    }
+    events
+}
+
+/// The same translation back the other way.
+///
+/// `POLLERR` and `POLLHUP` are reported whether or not they were asked for, and
+/// a plugin that did not ask to hear about errors is better told than left
+/// polling a descriptor that has hung up.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn clap_flags(revents: libc::c_short) -> clap_posix_fd_flags {
+    let mut flags = 0;
+    if revents & libc::POLLIN != 0 {
+        flags |= CLAP_POSIX_FD_READ;
+    }
+    if revents & libc::POLLOUT != 0 {
+        flags |= CLAP_POSIX_FD_WRITE;
+    }
+    if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        flags |= CLAP_POSIX_FD_ERROR;
+    }
+    flags
 }
 
 // SAFETY: every field is either immutable after construction or an atomic /
@@ -331,6 +447,8 @@ unsafe extern "C" fn get_extension(host: *const clap_host, id: *const c_char) ->
         (&raw const HOST_STATE).cast()
     } else if id == CLAP_EXT_GUI {
         (&raw const HOST_GUI).cast()
+    } else if let Some(ptr) = platform_extension(id) {
+        ptr
     } else if id == CLAP_EXT_TIMER_SUPPORT {
         (&raw const HOST_TIMER_SUPPORT).cast()
     } else if id == CLAP_EXT_AUDIO_PORTS {
@@ -528,6 +646,94 @@ unsafe extern "C" fn gui_closed(host: *const clap_host, _was_destroyed: bool) {
     if let Some(shim) = unsafe { shim(host) } {
         shim.gui_closed.store(true, Ordering::Release);
     }
+}
+
+/// Extensions that exist on one platform and have no meaning on the others.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_extension(id: &CStr) -> Option<*const c_void> {
+    (id == CLAP_EXT_POSIX_FD_SUPPORT).then(|| (&raw const HOST_POSIX_FD_SUPPORT).cast())
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn platform_extension(_id: &CStr) -> Option<*const c_void> {
+    None
+}
+
+// --- clap.posix-fd-support ------------------------------------------------
+
+/// Watching a plugin's file descriptors, which on Linux is how it draws.
+///
+/// A plugin's toolkit has an X connection of its own and no event loop to wait
+/// on it with: the host owns the loop. So it hands the host the descriptor and
+/// is called back when there is something to read. Without this a plugin that
+/// does not also run a timer never repaints.
+///
+/// Offered on Linux only. The other platforms deliver a plugin's events through
+/// its own window and have nothing to ask for here.
+#[cfg(all(unix, not(target_os = "macos")))]
+static HOST_POSIX_FD_SUPPORT: clap_host_posix_fd_support = clap_host_posix_fd_support {
+    register_fd: Some(register_fd),
+    modify_fd: Some(modify_fd),
+    unregister_fd: Some(unregister_fd),
+};
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe extern "C" fn register_fd(
+    host: *const clap_host,
+    fd: i32,
+    flags: clap_posix_fd_flags,
+) -> bool {
+    let Some(shim) = (unsafe { shim(host) }) else {
+        return false;
+    };
+    let Ok(mut fds) = shim.fds.lock() else {
+        return false;
+    };
+    if fds.iter().any(|(other, _)| *other == fd) {
+        // Already watched. The format says to modify rather than register
+        // twice, and a duplicate would have the plugin told twice per turn.
+        return false;
+    }
+    if fds.len() >= MAX_FDS {
+        log::warn!("clap plugin asked to watch more than {MAX_FDS} descriptors");
+        return false;
+    }
+    fds.push((fd, flags));
+    true
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe extern "C" fn modify_fd(
+    host: *const clap_host,
+    fd: i32,
+    flags: clap_posix_fd_flags,
+) -> bool {
+    let Some(shim) = (unsafe { shim(host) }) else {
+        return false;
+    };
+    let Ok(mut fds) = shim.fds.lock() else {
+        return false;
+    };
+    match fds.iter_mut().find(|(other, _)| *other == fd) {
+        Some(entry) => {
+            entry.1 = flags;
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+unsafe extern "C" fn unregister_fd(host: *const clap_host, fd: i32) -> bool {
+    let Some(shim) = (unsafe { shim(host) }) else {
+        return false;
+    };
+    let Ok(mut fds) = shim.fds.lock() else {
+        return false;
+    };
+    let before = fds.len();
+    fds.retain(|(other, _)| *other != fd);
+    before != fds.len()
 }
 
 // --- clap.timer-support ---------------------------------------------------
