@@ -18,10 +18,16 @@ sight.
 ## Backends
 
 One module each, under `src/`: `win32`, `x11`, and `stub` for what is left.
-X11 rather than Wayland because that is what the plugin formats speak — VST3's
-`X11EmbedWindowID` and CLAP's `x11` both name an X window id, and neither format
-has a Wayland handle to hand over. Under a Wayland session the DAW and the
-plugins are on XWayland for the same reason.
+X11 rather than Wayland, and not because Wayland is unspoken: VST3 has
+`IWaylandHost` and `IWaylandFrame` for it, and CLAP reserves the name `wayland`
+without yet saying what handle goes with it. What decides it is that the formats
+disagree — a Wayland backend would serve VST3 and leave CLAP where it is — and
+that the model is inverted. Wayland has no cross-process reparenting, so there
+the *host* owns the surface and lends it; here the plugin owns its window and
+reparents into an id, which is what lets this container own no pixels at all.
+
+Under a Wayland session the DAW and the plugins are on XWayland, which is what
+every Linux host does today for the same reason.
 
 ## Not this crate's job
 

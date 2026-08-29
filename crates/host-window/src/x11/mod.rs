@@ -1,9 +1,18 @@
 //! X11 backend.
 //!
-//! X11 rather than Wayland because that is what the plugin formats speak:
-//! VST3's `X11EmbedWindowID` and CLAP's `x11` both name an X window id, and
-//! neither format has a Wayland handle to hand over. Under a Wayland session the
-//! DAW and the plugins are running on XWayland for the same reason.
+//! X11 rather than Wayland, and not because Wayland is unspoken. VST3 has a
+//! whole interface pair for it — `IWaylandHost` lends the plugin a connection,
+//! `IWaylandFrame` lends it a surface — and CLAP reserves the name `wayland`
+//! without yet saying what handle goes with it.
+//!
+//! Two things decide it. The formats disagree, so a Wayland backend would serve
+//! VST3 and leave CLAP where it is; and the model is inverted from this one —
+//! Wayland has no cross-process reparenting, so the *host* owns the surface and
+//! lends it, where here the plugin owns its window and reparents into an id.
+//! This container deliberately owns no pixels, and there it would have to.
+//!
+//! Under a Wayland session the DAW and the plugins are on XWayland, which is
+//! what every Linux host does today for the same reason.
 //!
 //! The connection is ours, not the DAW's, so nothing the host pumps advances it
 //! — see [`conn`].
