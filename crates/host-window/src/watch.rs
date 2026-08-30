@@ -344,8 +344,8 @@ fn readiness_of(revents: libc::c_short) -> Readiness {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod descriptors {
     use super::*;
     use std::cell::RefCell;
 
@@ -468,6 +468,12 @@ mod tests {
             })
         );
     }
+}
+
+#[cfg(test)]
+mod timers {
+    use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn a_timer_fires_once_its_period_is_up() {

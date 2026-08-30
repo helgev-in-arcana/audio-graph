@@ -33,6 +33,7 @@ const PARAM_ACTIVE_PORTS: ParamId = ParamId(4);
 const OUTPUT_PORT_BIT: u32 = 8;
 const PARAM_ASK: ParamId = ParamId(5);
 const PARAM_RENDER_MODE: ParamId = ParamId(6);
+#[cfg(all(unix, not(target_os = "macos")))]
 const PARAM_FD_CALLS: ParamId = ParamId(7);
 /// Mirrors `clap_test_plugin::ask`, spelled out for the same reason as
 /// `OUTPUT_PORT_BIT`: this crate does not depend on the fixture's Rust API,

@@ -731,7 +731,6 @@ mod fd {
             _host: *const clap_sys::host::clap_host,
         ) {
         }
-        pub(crate) fn poke(&self) {}
         pub(crate) fn close(&mut self, _host: *const clap_sys::host::clap_host) {}
     }
 }
