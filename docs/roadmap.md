@@ -3,12 +3,15 @@
 ## Planned Features / 予定
 
 - macOS 対応 (ウィンドウ実装がまだありません)
-- Wayland ネイティブ対応 — 保留。VST3 には API がありますが CLAP は渡すハンドルが未定義で、
-  エディタが載っている baseview にも Wayland バックエンドがありません。現状 XWayland で
-  動くので、揃うまでは書きません
 - Linux の HiDPI (`Xft.dpi` が無い環境では等倍に落ちます)
 - プラグイン読み込み制限を無くしたい
 - 出力バスを 1 本も宣言しないプラグインが、オーディオのコンパイル対象から外れることの修正。
+
+## Pending Features　/ 保留
+
+- Wayland ネイティブ対応。VST3 には API がありますが CLAP は渡すハンドルが未定義で、
+  エディタが載っている baseview にも Wayland バックエンドがありません。現状 XWayland で
+  動くので、無理に対応を試みるメリットが無い。
 
 ## Limitations / 今後も出来ないこと
 
