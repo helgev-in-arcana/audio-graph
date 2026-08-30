@@ -33,6 +33,8 @@ const PARAM_ACTIVE_PORTS: ParamId = ParamId(4);
 const OUTPUT_PORT_BIT: u32 = 8;
 const PARAM_ASK: ParamId = ParamId(5);
 const PARAM_RENDER_MODE: ParamId = ParamId(6);
+#[cfg(all(unix, not(target_os = "macos")))]
+const PARAM_FD_CALLS: ParamId = ParamId(7);
 /// Mirrors `clap_test_plugin::ask`, spelled out for the same reason as
 /// `OUTPUT_PORT_BIT`: this crate does not depend on the fixture's Rust API,
 /// only on the module it builds.
@@ -104,6 +106,47 @@ fn the_host_forwards_what_the_plugin_asks_for() {
     }
 }
 
+/// The host has to actually poll the descriptor a plugin registers.
+///
+/// Linux only, because that is the only platform where the extension exists.
+/// The fixture registers a pipe at `init` and leaves a byte in it, so a host
+/// that polls calls `on_fd`, the fixture drains and re-arms, and the count it
+/// reports keeps rising. A host that answers `register_fd` and then never looks
+/// leaves the count at zero — which is the failure this catches, since nothing
+/// else about the plugin would look any different.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn the_host_polls_the_descriptors_a_plugin_registers() {
+    let module = Module::open(fixture_path()).expect("the fixture opens");
+    let context: Arc<dyn HostContext> = Arc::new(TestHost);
+    let mut plugin = ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", context)
+        .expect("instantiates");
+
+    assert_eq!(
+        SubPluginMain::snapshot(&plugin).get(PARAM_FD_CALLS),
+        Some(0.0),
+        "nothing has been polled yet"
+    );
+
+    plugin.tick();
+    let after_one = SubPluginMain::snapshot(&plugin)
+        .get(PARAM_FD_CALLS)
+        .expect("fd calls");
+    assert!(
+        after_one >= 1.0,
+        "the descriptor was registered and never polled"
+    );
+
+    plugin.tick();
+    let after_two = SubPluginMain::snapshot(&plugin)
+        .get(PARAM_FD_CALLS)
+        .expect("fd calls");
+    assert!(
+        after_two > after_one,
+        "polling stopped after one turn: {after_one} then {after_two}"
+    );
+}
+
 /// Where `cargo` put the fixture's shared library.
 ///
 /// A `.clap` on Windows and Linux *is* the shared library, so the artifact is
@@ -164,7 +207,7 @@ fn the_backend_drives_a_real_clap_module() {
         ClapPlugin::create(&module, &class.id, Arc::clone(&context)).expect("instantiates");
 
     let params = SubPluginMain::params(&plugin).to_vec();
-    assert_eq!(params.len(), 7, "{params:#?}");
+    assert_eq!(params.len(), 8, "{params:#?}");
 
     let gain = params.iter().find(|p| p.id == PARAM_GAIN).expect("gain");
     // Verify raw parameter range as reported by the plugin.

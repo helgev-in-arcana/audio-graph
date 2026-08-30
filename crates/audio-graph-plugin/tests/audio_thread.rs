@@ -59,7 +59,7 @@ fn shared() -> Arc<Shared> {
 
 /// Build the graph the editor builds when someone drops an LFO on the canvas.
 fn lfo_into(shared: &Arc<Shared>, rate: f64) {
-    let mut state = shared.main();
+    let mut state = shared.patch();
     state.graph = audio_graph_engine::Graph::new();
     let lfo = state.graph.add(
         NodeKind::Lfo(Lfo {
@@ -257,7 +257,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     // Now the user closes a loop — halfway through rearranging something, and
     // not a state worth stopping the music for.
     {
-        let mut state = shared.main();
+        let mut state = shared.patch();
         let a = state.graph.add(
             NodeKind::Math(Math {
                 op: MathOp::Add,
@@ -279,7 +279,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     }
     shared.publish_graph();
 
-    assert!(shared.main().compile_error.is_some());
+    assert!(shared.patch().compile_error.is_some());
     assert!(
         !engine.adopt(shared.programs()),
         "a failed compile must publish nothing"
@@ -288,4 +288,41 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
         engine.drives_lane(SINK_LANE),
         "the last good program keeps playing"
     );
+}
+
+/// Work the editor cannot do itself reaches the main thread and runs there.
+///
+/// The route only exists because baseview gives the editor a thread of its own
+/// on X11: what a button does — loading a plugin, opening a window — has to be
+/// carried out where the sub-plugin host is bound. Posting from another thread
+/// is the case worth stating, since it is the only one that happens.
+#[test]
+fn posted_work_runs_on_the_thread_that_drains_it() {
+    let shared = shared();
+    let ran_on = Arc::new(std::sync::Mutex::new(None));
+
+    let seen = ran_on.clone();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            shared.post_main(move |_| {
+                *seen.lock().unwrap() = Some(std::thread::current().id());
+            });
+        });
+    });
+
+    // Nothing runs until the main thread asks for it. A task that ran where it
+    // was posted would be the whole bug this exists to prevent.
+    assert!(ran_on.lock().unwrap().is_none());
+
+    shared.run_posted();
+    assert_eq!(
+        *ran_on.lock().unwrap(),
+        Some(std::thread::current().id()),
+        "the task ran somewhere other than the draining thread"
+    );
+
+    // Drained, not merely run: a second turn must not repeat it.
+    *ran_on.lock().unwrap() = None;
+    shared.run_posted();
+    assert!(ran_on.lock().unwrap().is_none());
 }

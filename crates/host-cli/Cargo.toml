@@ -10,3 +10,8 @@ plugin-host.workspace = true
 audio-graph-engine.workspace = true
 subhost-adapter.workspace = true
 serde_json.workspace = true
+
+# For the crash handler: a plugin's access violation is a signal, not a panic,
+# and nothing in std reports one.
+[target."cfg(all(unix, not(target_os = \"macos\")))".dependencies]
+libc = "0.2"

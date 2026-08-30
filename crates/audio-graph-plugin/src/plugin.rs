@@ -151,7 +151,7 @@ impl Wrapper {
                         // version whose node kinds have since changed, can hold
                         // links that no longer mean anything.
                         graph.prune();
-                        self.shared.main().graph = graph;
+                        self.shared.patch().graph = graph;
                     }
                     Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
                     None => {}

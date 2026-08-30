@@ -88,7 +88,14 @@ pub const PARAM_ASK: clap_id = 5;
 /// [`PARAM_ACTIVE_PORTS`], `clap.render` is a pure command with nothing to
 /// read back, so the fixture reports it as a parameter or not at all.
 pub const PARAM_RENDER_MODE: clap_id = 6;
-pub const PARAM_COUNT: u32 = 7;
+/// Read-only, and the only way a test can see that the host is watching the
+/// descriptor the plugin gave it.
+///
+/// Counts the `on_fd` calls this instance has had. Linux only: elsewhere the
+/// fixture registers nothing and this stays at zero, which is the honest answer
+/// on a platform where `clap.posix-fd-support` does not exist.
+pub const PARAM_FD_CALLS: clap_id = 7;
+pub const PARAM_COUNT: u32 = 8;
 
 /// Values for [`PARAM_ASK`].
 pub mod ask {
@@ -192,6 +199,11 @@ pub(crate) struct Instance {
     /// [`PARAM_RENDER_MODE`]. Realtime is the value a fresh instance has,
     /// which is what CLAP says too.
     render_mode: i32,
+    /// The host's answers to the descriptor the fixture registered; see
+    /// [`PARAM_FD_CALLS`].
+    fd_calls: u32,
+    /// The descriptor itself; see [`fd`].
+    fd: fd::Pipe,
     /// GUI state for the plugin instance. Declared last so it drops last, which is the wrong
     /// order on purpose — it verifies the host calls `gui.destroy` first. Cleaning it up
     /// automatically would hide lifecycle bugs.
@@ -337,6 +349,8 @@ unsafe extern "C" fn factory_create(
         // CLAP says every port starts active.
         active_ports: u32::MAX,
         render_mode: CLAP_RENDER_REALTIME,
+        fd_calls: 0,
+        fd: fd::Pipe::default(),
         gui: gui::Gui::default(),
     });
     // Only once the box has its final address.
@@ -353,6 +367,10 @@ unsafe extern "C" fn plugin_init(plugin: *const clap_plugin) -> bool {
     match unsafe { Instance::from_host(plugin) } {
         Some(instance) => {
             instance.initialised = true;
+            // At init rather than with the GUI: a test should not have to open
+            // a window to find out whether the host polls.
+            let host = instance.host;
+            instance.fd.open(plugin, host);
             true
         }
         None => false,
@@ -363,6 +381,10 @@ unsafe extern "C" fn plugin_destroy(plugin: *const clap_plugin) {
     let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
         return;
     };
+    // Before the allocation goes: a descriptor the host is still watching would
+    // be polled against a plugin that no longer exists.
+    let host = instance.host;
+    instance.fd.close(host);
     let owned = unsafe { Box::from_raw((&raw mut *instance).cast::<Instance>()) };
     drop(owned);
     LIVE_INSTANCES.fetch_sub(1, Ordering::AcqRel);
@@ -570,8 +592,146 @@ unsafe extern "C" fn plugin_get_extension(
         (&raw const EXT_RENDER).cast()
     } else if id == CLAP_EXT_VOICE_INFO {
         (&raw const EXT_VOICE_INFO).cast()
+    } else if let Some(ptr) = fd::extension(id) {
+        ptr
     } else {
         std::ptr::null()
+    }
+}
+
+/// The fixture's side of `clap.posix-fd-support`.
+///
+/// A Linux plugin's toolkit waits on descriptors it cannot poll itself, and the
+/// host promising to poll them is the only thing that makes an editor repaint.
+/// The fixture stands in for that toolkit with a pipe: it registers the read
+/// end, writes a byte, and counts the answers in [`PARAM_FD_CALLS`]. Nothing
+/// else in this crate can tell whether the host is really watching.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod fd {
+    use std::ffi::{CStr, c_void};
+
+    use clap_sys::ext::posix_fd_support::{
+        CLAP_EXT_POSIX_FD_SUPPORT, CLAP_POSIX_FD_READ, clap_host_posix_fd_support,
+        clap_plugin_posix_fd_support, clap_posix_fd_flags,
+    };
+    use clap_sys::host::clap_host as clap_host_ptr;
+    use clap_sys::plugin::clap_plugin;
+
+    use crate::Instance;
+
+    static EXT: clap_plugin_posix_fd_support = clap_plugin_posix_fd_support { on_fd: Some(on_fd) };
+
+    pub(crate) fn extension(id: &CStr) -> Option<*const c_void> {
+        (id == CLAP_EXT_POSIX_FD_SUPPORT).then(|| (&raw const EXT).cast())
+    }
+
+    /// The pipe the fixture asks the host to watch.
+    #[derive(Default)]
+    pub(crate) struct Pipe {
+        read: Option<i32>,
+        write: Option<i32>,
+    }
+
+    impl Pipe {
+        /// Open a pipe, register the read end, and put a byte in it.
+        ///
+        /// The byte is what makes the descriptor ready: a host that never polls
+        /// leaves it there and `on_fd` is never called.
+        pub(crate) fn open(&mut self, plugin: *const clap_plugin, host: *const clap_host_ptr) {
+            if self.read.is_some() || host.is_null() {
+                return;
+            }
+            let ext = unsafe { (*host).get_extension }
+                .map(|get| unsafe { get(host, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()) })
+                .unwrap_or(std::ptr::null());
+            if ext.is_null() {
+                return;
+            }
+            let Some(register) =
+                (unsafe { (*ext.cast::<clap_host_posix_fd_support>()).register_fd })
+            else {
+                return;
+            };
+
+            let mut ends = [0i32; 2];
+            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                return;
+            }
+            let [read, write] = ends;
+            if !unsafe { register(host, read, CLAP_POSIX_FD_READ) } {
+                unsafe {
+                    libc::close(read);
+                    libc::close(write);
+                }
+                return;
+            }
+            self.read = Some(read);
+            self.write = Some(write);
+            let _ = plugin;
+            self.poke();
+        }
+
+        /// Make the descriptor readable again, so the next turn calls back too.
+        pub(crate) fn poke(&self) {
+            if let Some(write) = self.write {
+                let byte = 1u8;
+                unsafe { libc::write(write, (&raw const byte).cast(), 1) };
+            }
+        }
+
+        pub(crate) fn close(&mut self, host: *const clap_host_ptr) {
+            let Some(read) = self.read.take() else { return };
+            if !host.is_null()
+                && let Some(ext) = unsafe { (*host).get_extension }
+                    .map(|get| unsafe { get(host, CLAP_EXT_POSIX_FD_SUPPORT.as_ptr()) })
+                    .filter(|p| !p.is_null())
+                && let Some(unregister) =
+                    unsafe { (*ext.cast::<clap_host_posix_fd_support>()).unregister_fd }
+            {
+                unsafe { unregister(host, read) };
+            }
+            unsafe { libc::close(read) };
+            if let Some(write) = self.write.take() {
+                unsafe { libc::close(write) };
+            }
+        }
+    }
+
+    unsafe extern "C" fn on_fd(plugin: *const clap_plugin, fd: i32, _flags: clap_posix_fd_flags) {
+        let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+            return;
+        };
+        // Drained, or the descriptor stays ready and every turn calls back —
+        // which would be true but would say nothing about the host.
+        let mut byte = 0u8;
+        unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+        instance.fd_calls = instance.fd_calls.saturating_add(1);
+        // Made ready again, so the count keeps rising for as long as the host
+        // keeps polling. One answer would only prove it polled once.
+        instance.fd.poke();
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+mod fd {
+    use std::ffi::{CStr, c_void};
+
+    pub(crate) fn extension(_id: &CStr) -> Option<*const c_void> {
+        None
+    }
+
+    /// Nothing to watch where the extension does not exist.
+    #[derive(Default)]
+    pub(crate) struct Pipe;
+
+    impl Pipe {
+        pub(crate) fn open(
+            &mut self,
+            _plugin: *const clap_sys::plugin::clap_plugin,
+            _host: *const clap_sys::host::clap_host,
+        ) {
+        }
+        pub(crate) fn close(&mut self, _host: *const clap_sys::host::clap_host) {}
     }
 }
 
@@ -639,7 +799,15 @@ unsafe extern "C" fn params_get_info(
             CLAP_PARAM_IS_STEPPED,
         ),
         5 => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
-        _ => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        6 => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        _ => (
+            "FD Calls",
+            "",
+            0.0,
+            f64::from(u32::MAX),
+            0.0,
+            CLAP_PARAM_IS_STEPPED,
+        ),
     };
 
     let out = unsafe { &mut *info };
@@ -675,6 +843,10 @@ unsafe extern "C" fn params_get_value(
     let (Some(instance), false) = (unsafe { Instance::from_host(plugin) }, out.is_null()) else {
         return false;
     };
+    if id == PARAM_FD_CALLS {
+        unsafe { *out = f64::from(instance.fd_calls) };
+        return true;
+    }
     if id == PARAM_RENDER_MODE {
         // Reported rather than stored with the rest, for the same reason as
         // the ports below: the host set it, not the user.

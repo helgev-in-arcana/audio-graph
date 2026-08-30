@@ -14,6 +14,7 @@ mod plugin;
 mod shared;
 mod state;
 mod tick;
+mod view;
 
 use std::sync::Arc;
 

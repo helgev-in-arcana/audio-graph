@@ -58,13 +58,7 @@ pub use plugin_host_api::{
 };
 
 // Window plumbing a host application needs and that no backend owns.
-//
-// `Deferred` is here because the rule it exists for belongs to the host, not
-// to a format: a GUI toolkit's draw callback may only *record* that the user
-// asked for a window, never open one.
-pub use host_window::{
-    ContainerWindow, Deferred, Size, deferred, forward_key, pump_events, root_window,
-};
+pub use host_window::{ContainerWindow, Key, Size, forward_key, poll, pump_events, root_window};
 
 /// Prepares the calling thread for hosting plugins.
 ///

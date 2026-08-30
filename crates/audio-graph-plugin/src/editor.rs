@@ -13,19 +13,22 @@
 //! re-enters baseview while the borrow is active, a panic or process termination
 //! occurs.
 //!
-//! Commands are therefore posted to [`plugin_host::Deferred`], which executes them
-//! on the next turn of the host DAW's message loop after the frame completes.
-//! Periodic sub-plugin window maintenance and resize handling run from the plugin's
-//! background ticking mechanism (`crate::tick`), keeping them independent of the
-//! draw callback.
+//! Commands are therefore handed to [`Shared::post_main`], which runs them from
+//! the plugin's periodic tick (`crate::tick`) — the main thread, and not inside
+//! anybody's frame. Sub-plugin window maintenance and resize handling run from
+//! there too.
 //!
 //! # Threads
 //!
 //! `NiceEguiApp` is `Send` because baseview runs the UI on its own thread on some
 //! platforms (e.g. X11). On Windows and macOS it runs on the caller's thread (the
 //! DAW's main thread), which is where sub-plugin COM/C++ objects are bound.
-//! Main-thread-only components are wrapped in [`MainThread`], asserting thread
-//! affinity on access.
+//!
+//! Nothing here depends on which of those it got. The editor never touches
+//! main-thread-only state: it draws from a snapshot the main thread publishes
+//! ([`View`]), edits the graph through a lock ([`Shared::patch`]), and hands
+//! everything else over. That is what makes one code path correct on every
+//! platform rather than one path per platform.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,11 +36,10 @@ use std::sync::Arc;
 use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
-use plugin_host::MainThread;
-use plugin_host::ParamInfo;
 
 use crate::graph_ui::{GraphContext, GraphEditor};
 use crate::shared::Shared;
+use crate::view::View;
 
 /// Action requested by the UI to be executed after the current frame finishes.
 enum Command {
@@ -57,27 +59,6 @@ enum Command {
     /// (recompilation and serialization) is deferred to run once per frame.
     GraphEdited,
     SetQuantum(u32),
-}
-
-/// Snapshot of state used by the editor during drawing, refreshed from [`Shared`].
-///
-/// Drawing from a snapshot avoids holding locks during render passes and avoids
-/// re-cloning large parameter lists every frame when no change has occurred.
-#[derive(Default)]
-struct View {
-    /// The [`Shared::generation`] the vectors below were built from.
-    generation: u64,
-    class: Option<(String, String)>,
-    loaded: bool,
-    sub_editor_open: bool,
-    params: Vec<ParamInfo>,
-    /// `(index, parameter name, currently resolved)`.
-    slots: Vec<(usize, String, bool)>,
-    /// One entry per instance slot, used by plugin nodes for rendering.
-    instances: Vec<crate::graph_ui::InstanceView>,
-    free_instance: Option<usize>,
-    /// Whether the sub-plugin supports per-voice modulation.
-    poly_modulation: bool,
 }
 
 /// Status message from the last executed command.
@@ -101,9 +82,6 @@ impl Status {
 pub struct WrapperEditor {
     shared: Arc<Shared>,
     repaint: RepaintNotifier,
-    /// `None` until `build`: it binds to the message loop of the thread the
-    /// editor actually runs on, which is not known until then.
-    deferred: Option<MainThread<plugin_host::Deferred>>,
 
     /// Populated on first use, refreshed on demand.
     ///
@@ -137,7 +115,6 @@ impl WrapperEditor {
         WrapperEditor {
             shared,
             repaint,
-            deferred: None,
             entries: Vec::new(),
             scanned: false,
             scan: None,
@@ -151,65 +128,40 @@ impl WrapperEditor {
         }
     }
 
-    /// Refresh what gets drawn.
+    /// Take whatever the main thread has published since the last frame.
     ///
     /// Cheap fields every time; the vectors only when something actually
     /// changed shape. Rebuilding a two-thousand-entry parameter list sixty
     /// times a second would be silly; noticing a counter is not.
-    ///
-    /// No lock is involved. Everything read here is main-thread state and the
-    /// audio thread has no way to reach it — which is the whole reason having
-    /// the editor open no longer costs the audio path anything.
     fn refresh(&mut self) {
         if !self.scanned {
             self.rescan();
         }
         self.collect_scan();
-        let state = self.shared.main();
 
-        self.view.class = state
-            .host
-            .class(0)
-            .map(|c| (c.name.clone(), c.vendor.clone()));
-        self.view.loaded = state.host.is_loaded(0);
-        self.view.sub_editor_open = state.host.editor_is_open(0);
-        self.view.poly_modulation = state.host.capabilities(0).poly_modulation;
+        let Some(published) = self.shared.try_view() else {
+            // Being rebuilt right now. Drawing last frame's snapshot again
+            // looks like nothing happened; waiting would blank the window for a
+            // frame, which looks like a flicker because it is one.
+            return;
+        };
+        self.view.class = published.class.clone();
+        self.view.loaded = published.loaded;
+        self.view.poly_modulation = published.poly_modulation;
+        self.view.free_instance = published.free_instance;
 
-        let generation = self.shared.generation();
-        if generation == self.view.generation && !self.view.params.is_empty() {
+        if published.generation == self.view.generation && !self.view.params.is_empty() {
+            // The vectors are unchanged in shape, but an editor the user closed
+            // from its own title bar is not a change of shape — see `rebuild`.
+            for (mine, theirs) in self.view.instances.iter_mut().zip(&published.instances) {
+                mine.editor_open = theirs.editor_open;
+            }
             return;
         }
-        self.view.generation = generation;
-        self.view.params = state.host.params(0).to_vec();
-
-        self.view.free_instance = state.host.free_instance();
-        self.view.instances = (0..crate::config::MAX_INSTANCES)
-            .map(|i| crate::graph_ui::InstanceView {
-                loaded: state.host.is_loaded(i),
-                name: state
-                    .host
-                    .class(i)
-                    .map_or_else(String::new, |c| c.name.clone()),
-                editor_open: state.host.editor_is_open(i),
-                params: state
-                    .host
-                    .params(i)
-                    .iter()
-                    .map(|p| (p.id.0, p.name.clone()))
-                    .collect(),
-            })
-            .collect();
-
-        let table = state.host.slots();
-        self.view.slots = table
-            .slots()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, slot)| {
-                let binding = slot.binding.as_ref()?;
-                Some((i, binding.param_name.clone(), table.resolved(i).is_some()))
-            })
-            .collect();
+        self.view.generation = published.generation;
+        self.view.params = published.params.clone();
+        self.view.instances = published.instances.clone();
+        self.view.slots = published.slots.clone();
     }
 
     /// List every plugin module on the machine, both formats together.
@@ -319,24 +271,24 @@ impl WrapperEditor {
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
-        // The graph is main-thread state and this is the main thread, so it is
-        // edited in place. What must not happen inline is the *consequence* of
-        // an edit — see `Command::GraphEdited`.
+        // The canvas edits the graph in place: it is plain data behind a lock
+        // and needs no particular thread. What must not happen inline is the
+        // *consequence* of an edit — see `Command::GraphEdited`.
+        let mut patch = self.shared.patch();
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
             free_instance: self.view.free_instance,
             bindings: &self.view.slots,
             poly_modulation: self.view.poly_modulation,
-            error: self.shared.main().compile_error.clone(),
+            error: patch.compile_error.clone(),
             live: self.shared.live_slots(),
             quantum: self.shared.quantum(),
             sample_rate: self.shared.sample_rate() as f64,
         };
 
-        let mut state = self.shared.main();
-        let changed = self.graph_ui.ui(ui, &mut state.graph, &context);
-        drop(state);
+        let changed = self.graph_ui.ui(ui, &mut patch.graph, &context);
+        drop(patch);
 
         // Anything the canvas could not do itself: loading a plugin, opening a
         // window. Same reason as everything else here — see the module comment.
@@ -564,26 +516,16 @@ impl WrapperEditor {
         }
     }
 
-    /// Hand everything the user clicked to the message loop.
+    /// Hand everything the user clicked to the main thread.
     fn dispatch(&mut self) {
         if self.commands.is_empty() {
             return;
         }
-        let Some(deferred) = self.deferred.as_ref() else {
-            // No queue means no message loop to defer to, and running these
-            // inline is the exact thing this module exists to avoid.
-            self.status
-                .set("the editor has no message loop; command dropped");
-            self.commands.clear();
-            return;
-        };
         let commands = std::mem::take(&mut self.commands);
-        let shared = self.shared.clone();
         let status = self.status.clone();
         let owner = self.daw_window;
-        deferred
-            .get()
-            .post(move || run(&shared, &status, owner, commands));
+        self.shared
+            .post_main(move |shared| run(shared, &status, owner, commands));
     }
 }
 
@@ -600,7 +542,7 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
             Command::GraphEdited => {
                 shared.publish_graph();
                 shared.store_state();
-                match shared.main().compile_error.clone() {
+                match shared.patch().compile_error.clone() {
                     Some(e) => status.set(format!("graph not applied: {e}")),
                     None => status.set("graph applied"),
                 }
@@ -664,7 +606,7 @@ impl WrapperEditor {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let forward: Vec<(u16, bool)> = ctx.input(|i| {
+        let forward: Vec<(plugin_host::Key, bool)> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|event| match event {
@@ -673,13 +615,13 @@ impl WrapperEditor {
                         pressed,
                         repeat,
                         ..
-                    } if !repeat && !ours(*key) => virtual_key(*key).map(|vk| (vk, *pressed)),
+                    } if !repeat && !ours(*key) => host_key(*key).map(|key| (key, *pressed)),
                     _ => None,
                 })
                 .collect()
         });
-        for (vk, pressed) in forward {
-            plugin_host::forward_key(self.daw_window, vk, pressed);
+        for (key, pressed) in forward {
+            plugin_host::forward_key(self.daw_window, key, pressed);
         }
     }
 }
@@ -698,10 +640,7 @@ impl NiceEguiApp for WrapperEditor {
         // be the root and not this view.
         self.daw_window = plugin_host::root_window(raw_window(frame)) as usize;
 
-        match plugin_host::deferred() {
-            Ok(deferred) => self.deferred = Some(MainThread::new(deferred)),
-            Err(e) => log::warn!("audio-graph: {e}"),
-        }
+        self.shared.set_editor_open(true);
         // Periodic ticking is handled at the plugin instance level rather than by the
         // editor window, ensuring sub-plugin resize requests and main-thread callbacks
         // continue operating even when the editor window is closed (see `crate::tick`).
@@ -747,10 +686,15 @@ impl NiceEguiApp for WrapperEditor {
     fn editor_closed(&mut self) {
         // The wrapper's window is going away, so every sub-plugin window must
         // too: they are top level with no owner, and leaving one behind strands
-        // it with nothing ticking it.
-        self.shared.main().host.close_all_editors();
-        // Takes anything still queued with it.
-        self.deferred = None;
+        // it with nothing ticking it. Through the main thread like any other
+        // command — this runs on whichever thread baseview drew on, and the
+        // queue it goes into belongs to the plugin instance rather than to this
+        // editor, so closing cannot cancel it.
+        self.shared
+            .post_main(|shared| shared.main().host.close_all_editors());
+        // After the post, so the tick that carries it out still counts the
+        // editor as open and runs at the full rate.
+        self.shared.set_editor_open(false);
     }
 }
 
@@ -783,41 +727,31 @@ fn ours(key: egui::Key) -> bool {
     )
 }
 
-/// An egui key as Windows names it.
+/// An egui key as `host-window` names it.
 ///
-/// Letters, digits and function keys are contiguous in both, so they need a
-/// range each rather than a table. Punctuation is left out on purpose: the
-/// Win32 codes for it are OEM keys whose meaning depends on the keyboard
-/// layout, and guessing wrong sends the DAW a keystroke the user did not type.
-fn virtual_key(key: egui::Key) -> Option<u16> {
+/// Letters, digits and function keys are ranges rather than a table because
+/// egui spells them out in the same order everywhere. Punctuation is left out
+/// on purpose: what a punctuation key means depends on the keyboard layout, and
+/// `host-window` has no name for one.
+fn host_key(key: egui::Key) -> Option<plugin_host::Key> {
     use egui::Key as K;
+    use plugin_host::Key as H;
     Some(match key {
-        K::Space => 0x20,
-        K::Enter => 0x0d,
-        K::Backspace => 0x08,
-        K::Delete => 0x2e,
-        K::Insert => 0x2d,
-        K::Home => 0x24,
-        K::End => 0x23,
-        K::PageUp => 0x21,
-        K::PageDown => 0x22,
+        K::Space => H::Space,
+        K::Enter => H::Enter,
+        K::Backspace => H::Backspace,
+        K::Delete => H::Delete,
+        K::Insert => H::Insert,
+        K::Home => H::Home,
+        K::End => H::End,
+        K::PageUp => H::PageUp,
+        K::PageDown => H::PageDown,
         _ => {
             let name = key.name();
-            let byte = name.as_bytes();
-            match byte {
-                // "A".."Z" and "0".."9" share their ASCII value with their
-                // virtual key code.
-                [c @ b'A'..=b'Z'] => u16::from(*c),
-                [c @ b'0'..=b'9'] => u16::from(*c),
-                // "F1".."F24" — VK_F1 is 0x70 and they run consecutively.
-                [b'F', ..] => {
-                    let n: u16 = name[1..].parse().ok()?;
-                    if (1..=24).contains(&n) {
-                        0x6f + n
-                    } else {
-                        return None;
-                    }
-                }
+            match name.as_bytes() {
+                [c @ b'A'..=b'Z'] => H::letter(char::from(*c))?,
+                [c @ b'0'..=b'9'] => H::digit(char::from(*c))?,
+                [b'F', ..] => H::function(name[1..].parse().ok()?)?,
                 _ => return None,
             }
         }
@@ -856,35 +790,36 @@ pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperE
 
 #[cfg(test)]
 mod key_tests {
-    use super::{ours, virtual_key};
+    use super::{host_key, ours};
     use egui::Key;
+    use plugin_host::Key as H;
 
     #[test]
     fn the_space_bar_reaches_the_daw() {
         // The whole point: this is the key that starts and stops the transport.
         assert!(!ours(Key::Space));
-        assert_eq!(virtual_key(Key::Space), Some(0x20));
+        assert_eq!(host_key(Key::Space), Some(H::Space));
     }
 
     #[test]
-    fn letters_digits_and_function_keys_map_to_their_win32_codes() {
-        assert_eq!(virtual_key(Key::A), Some(0x41));
-        assert_eq!(virtual_key(Key::Z), Some(0x5a));
-        assert_eq!(virtual_key(Key::Num0), Some(0x30));
-        assert_eq!(virtual_key(Key::Num9), Some(0x39));
-        assert_eq!(virtual_key(Key::F1), Some(0x70));
-        assert_eq!(virtual_key(Key::F12), Some(0x7b));
+    fn letters_digits_and_function_keys_carry_their_own_value() {
+        assert_eq!(host_key(Key::A), Some(H::Letter(b'A')));
+        assert_eq!(host_key(Key::Z), Some(H::Letter(b'Z')));
+        assert_eq!(host_key(Key::Num0), Some(H::Digit(b'0')));
+        assert_eq!(host_key(Key::Num9), Some(H::Digit(b'9')));
+        assert_eq!(host_key(Key::F1), Some(H::Function(1)));
+        assert_eq!(host_key(Key::F12), Some(H::Function(12)));
     }
 
     #[test]
-    fn keys_with_no_layout_independent_code_are_not_guessed() {
-        // Punctuation is an OEM key on Windows and its meaning moves with the
-        // keyboard layout. Sending nothing is better than sending a keystroke
-        // the user did not type.
-        assert_eq!(virtual_key(Key::Semicolon), None);
-        assert_eq!(virtual_key(Key::Backslash), None);
-        // Beyond VK_F24 there is nothing to map onto.
-        assert_eq!(virtual_key(Key::F35), None);
+    fn keys_with_no_layout_independent_name_are_not_guessed() {
+        // What a punctuation key produces moves with the keyboard layout.
+        // Sending nothing is better than sending a keystroke the user did not
+        // type.
+        assert_eq!(host_key(Key::Semicolon), None);
+        assert_eq!(host_key(Key::Backslash), None);
+        // Past F24 there is nothing on the other side to map onto.
+        assert_eq!(host_key(Key::F35), None);
     }
 
     #[test]

@@ -1,11 +1,20 @@
 //! Native fault diagnostics handler for host-cli.
 //!
-//! Hooks Windows Vectored Exception Handling (VEH) to report crash address,
-//! module offset, exception type, registers, instruction bytes, and stack trace
-//! when a native fault occurs in loaded plugin binaries.
+//! A plugin crash is not a Rust panic: an access violation does not unwind and
+//! `catch_unwind` never sees it, so without this the process simply disappears.
+//! The handler reports the fault address as a module offset, the registers, the
+//! instruction bytes around the fault, and a backtrace — enough to disassemble
+//! the plugin at the right place and find out what it was doing.
 //!
-//! The handler logs diagnostic information and returns `EXCEPTION_CONTINUE_SEARCH`
-//! so that normal exception routing continues unimpeded.
+//! Windows through Vectored Exception Handling, Linux through a signal handler.
+//! Neither takes the fault over: the Windows one returns
+//! `EXCEPTION_CONTINUE_SEARCH` and the Linux one restores the default action
+//! and re-raises, so the process still dies exactly as it would have.
+//!
+//! Neither is written to the letter of what a fault handler may do — resolving
+//! a symbol allocates, and printing takes a lock. That is a deliberate trade:
+//! the process is already dying, and a report that occasionally deadlocks
+//! instead of printing is still better than no report at all.
 
 #[cfg(windows)]
 pub fn install_crash_handler() {
@@ -336,5 +345,201 @@ pub fn install_crash_handler() {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux with glibc specifically, not "unix that is not macOS": `backtrace` is
+/// a glibc extension, the `REG_*` register indices are the linux-gnu layout,
+/// and `process_vm_readv` is a Linux system call. A musl or BSD build takes the
+/// empty one below rather than failing to link.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn install_crash_handler() {
+    /// Where an address falls, as `library.so+0x1234` when that can be had.
+    ///
+    /// The offset is from the library's load address, which is what a
+    /// disassembler wants: the absolute address moves with every run.
+    fn resolve_addr(addr: *mut std::ffi::c_void) -> String {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        if unsafe { libc::dladdr(addr, &mut info) } == 0 || info.dli_fname.is_null() {
+            return format!("{addr:p}");
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let offset = (addr as usize).saturating_sub(info.dli_fbase as usize);
+        format!("{name}+0x{offset:x} ({addr:p})")
+    }
+
+    /// Read `dst.len()` bytes from `addr` without faulting on a bad address.
+    ///
+    /// Dereferencing directly would fault inside the fault handler, which ends
+    /// the process with nothing printed. This asks the kernel to do the read
+    /// and tells us how much it managed.
+    fn read_memory(addr: usize, dst: &mut [u8]) -> usize {
+        if addr == 0 {
+            return 0;
+        }
+        let local = libc::iovec {
+            iov_base: dst.as_mut_ptr().cast(),
+            iov_len: dst.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: addr as *mut std::ffi::c_void,
+            iov_len: dst.len(),
+        };
+        let got = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+        got.max(0) as usize
+    }
+
+    /// The instruction stream either side of `addr`, as a disassembler wants it.
+    fn dump_code(label: &str, addr: usize) {
+        let mut bytes = [0u8; 128];
+        let base = addr.saturating_sub(64);
+        let read = read_memory(base, &mut bytes);
+        if read < 65 {
+            return;
+        }
+        eprintln!("\n{label} ([-64..+64]):");
+        for row in 0..(read / 16) {
+            let offset = (row as isize * 16) - 64;
+            eprint!("  {offset:>+4}: ");
+            for col in 0..16 {
+                let index = row * 16 + col;
+                let byte = bytes[index];
+                if index == 64 {
+                    eprint!("[{byte:02X}] ");
+                } else {
+                    eprint!("{byte:02X} ");
+                }
+            }
+            eprintln!();
+        }
+    }
+
+    unsafe extern "C" fn handler(
+        signal: libc::c_int,
+        info: *mut libc::siginfo_t,
+        context: *mut std::ffi::c_void,
+    ) {
+        let name = match signal {
+            libc::SIGSEGV => "SIGSEGV (invalid memory reference)",
+            libc::SIGBUS => "SIGBUS (bad memory access)",
+            libc::SIGFPE => "SIGFPE (arithmetic exception)",
+            libc::SIGILL => "SIGILL (illegal instruction)",
+            _ => "unknown signal",
+        };
+
+        eprintln!("\n================== NATIVE FAULT CAUGHT ==================");
+        eprintln!("Signal: {signal} ({name})");
+        if !info.is_null() {
+            let target = unsafe { (*info).si_addr() };
+            eprintln!("Faulting address: {target:p}");
+        }
+
+        // Registers and instruction bytes are the x86_64 layout. On another
+        // architecture the backtrace below is still the useful half.
+        #[cfg(target_arch = "x86_64")]
+        if !context.is_null() {
+            let gregs = unsafe { &(*context.cast::<libc::ucontext_t>()).uc_mcontext.gregs };
+            let reg = |index: usize| gregs[index] as u64;
+            let rip = reg(libc::REG_RIP as usize);
+
+            eprintln!("Fault location: {}", resolve_addr(rip as *mut _));
+            eprintln!("\nRegisters:");
+            eprintln!(
+                "  RAX: 0x{:016X}  RCX: 0x{:016X}  RDX: 0x{:016X}  RBX: 0x{:016X}",
+                reg(libc::REG_RAX as usize),
+                reg(libc::REG_RCX as usize),
+                reg(libc::REG_RDX as usize),
+                reg(libc::REG_RBX as usize)
+            );
+            eprintln!(
+                "  RSP: 0x{:016X}  RBP: 0x{:016X}  RSI: 0x{:016X}  RDI: 0x{:016X}",
+                reg(libc::REG_RSP as usize),
+                reg(libc::REG_RBP as usize),
+                reg(libc::REG_RSI as usize),
+                reg(libc::REG_RDI as usize)
+            );
+            eprintln!(
+                "  R8 : 0x{:016X}  R9 : 0x{:016X}  R10: 0x{:016X}  R11: 0x{:016X}",
+                reg(libc::REG_R8 as usize),
+                reg(libc::REG_R9 as usize),
+                reg(libc::REG_R10 as usize),
+                reg(libc::REG_R11 as usize)
+            );
+            eprintln!(
+                "  R12: 0x{:016X}  R13: 0x{:016X}  R14: 0x{:016X}  R15: 0x{:016X}",
+                reg(libc::REG_R12 as usize),
+                reg(libc::REG_R13 as usize),
+                reg(libc::REG_R14 as usize),
+                reg(libc::REG_R15 as usize)
+            );
+            eprintln!(
+                "  RIP: 0x{rip:016X}  EFLAGS: 0x{:08X}",
+                reg(libc::REG_EFL as usize)
+            );
+
+            dump_code("Code bytes at RIP", rip as usize);
+
+            // The first argument register on the SysV ABI, which is where a
+            // null `this` shows up.
+            let rdi = reg(libc::REG_RDI as usize) as usize;
+            let mut at_rdi = [0u8; 64];
+            let read = read_memory(rdi, &mut at_rdi);
+            if read >= 8 {
+                eprintln!("\nMemory at RDI (0x{rdi:016X}):");
+                for offset in (0..read & !7).step_by(8) {
+                    let word = u64::from_ne_bytes(at_rdi[offset..offset + 8].try_into().unwrap());
+                    eprintln!("  +0x{offset:02X}: 0x{word:016X} ({})", word as i64);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = context;
+
+        let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 32];
+        let count = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int) };
+        eprintln!("\nStack backtrace:");
+        for (index, frame) in frames.iter().take(count.max(0) as usize).enumerate() {
+            let mut bytes = [0u8; 16];
+            let read = read_memory((*frame as usize).saturating_sub(6), &mut bytes);
+            let mut hex = String::new();
+            if read >= 10 {
+                for (position, byte) in bytes[..read].iter().enumerate() {
+                    if position == 6 {
+                        hex.push_str(&format!("[{byte:02X}] "));
+                    } else {
+                        hex.push_str(&format!("{byte:02X} "));
+                    }
+                }
+            }
+            eprintln!("  [{index:>2}] {}  bytes: {hex}", resolve_addr(*frame));
+        }
+        eprintln!("========================================================\n");
+
+        // Put the default action back and let the signal happen again, so the
+        // process ends exactly as it would have and a shell still sees the
+        // right status. Returning instead would re-run the faulting
+        // instruction and loop forever.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as *const () as usize;
+    // Deliberately *not* `SA_ONSTACK`. Rust installs a small alternate signal
+    // stack per thread to report its own stack overflows, and writing this
+    // report needs more room than that leaves — the effect is a handler that
+    // prints two lines and then dies on the alternate stack, which is worse
+    // than not running at all. Off it, the faulting thread's own stack is used
+    // and there is room on every thread. The case this gives up is a genuine
+    // stack overflow, which is exactly when there is no stack to run on; a
+    // plugin's access violation, which is what this exists for, is unaffected.
+    action.sa_flags = libc::SA_SIGINFO;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+
+    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL] {
+        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+    }
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_env = "gnu"))))]
 pub fn install_crash_handler() {}

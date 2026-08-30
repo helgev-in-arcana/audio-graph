@@ -26,6 +26,13 @@ DTMで、ディレイループにエフェクトを掛けることは、伝統�
 ## Getting Started / Features
 
 1. [Releases](https://github.com/helgev-in-arcana/audio-graph/releases) から環境に合わせてダウンロード
+
+    動作確認済み:
+
+    |OS|Arch|
+    | --- | --- |
+    |Win-11|x86_64|
+    |Ubuntu-24.04 (XWayland)|x86_64|
 2. DAW で AudioGraph を立ち上げ、`Plugin folders` に手持ちのプラグインのスキャンディレクトリを登録
 3. 空白を右クリック（または `Add Node`）でノードを置き、繋ぐ
 
@@ -72,8 +79,9 @@ plugin.deactivate(processor);
 - 現在アルファ版です。任意のリリースに破壊的変更の可能性が含まれます。
 - UIは現在仮組みです。改良中です。
 - コード署名が現在ありません。
-- 動作確認ができているのは **Windows (x86_64)** のみです。
-  - リリースに色んなビルドが並んでいますが、Windows (x86_64) 以外はビルドが通っているというだけの状態です。LinuxとmacOSはGUIまわりで動かないはずです。
+- MacOS版、arm版が動作未確認です。
+  - Win11(x86_64)、Ubuntu24(x86_64)はVST3/CLAPともに動作確認しています。
+  - **macOS** はビルドが通っているだけで、ウィンドウ実装がまだありません。
   - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
 - VST2ネイティブ対応はライセンスの問題で今後も不可能です。VST3化ツールなど使ってください。
 - このリポジトリはAI駆動で開発されており、私([@helgev-in-arcana](https://github.com/helgev-in-arcana))が設計・コード監査を進めています。<br>

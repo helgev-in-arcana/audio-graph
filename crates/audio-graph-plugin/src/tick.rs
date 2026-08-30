@@ -75,10 +75,38 @@ impl TickState {
 pub fn run(shared: &Arc<Shared>, state: &TickState) {
     state.pending.store(false, Ordering::Release);
 
+    // Before the thread check, because it does not need a thread: freeing a
+    // superseded program the audio thread handed back is a swap and a drop.
+    // Everything below is main-thread-only, and on one host — VST3 under Linux
+    // with our editor closed — that check never passes, so anything left below
+    // it would grow without bound for the life of the instance.
+    shared.reclaim();
+
     if !shared.on_main_thread() {
-        // VST3 on Linux runs GUI callbacks on worker threads; skip safely.
+        // nice-plug runs GUI callbacks on a worker thread when it has no run
+        // loop to post to, which on Linux is VST3 with our editor closed. Said
+        // once rather than every tick: it is a property of the host, so it will
+        // not change, and the reason to say it at all is that a tick which
+        // silently does nothing for a whole session is indistinguishable from
+        // one that ran and found nothing to do.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            log::warn!(
+                "audio-graph: the host runs its main-thread callbacks on a worker thread; \
+                 sub-plugin timers and callbacks will not run while this editor is closed"
+            );
+        });
         return;
     }
+
+    // Our own windows, where their event source is ours to turn — X11. Before
+    // anything else, so a close the user asked for this frame is already
+    // recorded by the time the editors are ticked.
+    plugin_host::poll();
+
+    // Whatever the editor asked for and could not do itself: every button in
+    // the editor arrives here, on whichever thread it was pressed from.
+    shared.run_posted();
 
     let busy = {
         let Some(mut main) = shared.try_main() else {
@@ -87,11 +115,14 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
         main.host.tick_editors();
         main.host.any_loaded()
     };
-    // Free superseded compiled graph programs returned by the audio thread.
-    // This is done here because nothing else on the main thread is guaranteed
-    // to run while a patch just sits there playing.
-    shared.reclaim();
+    // Last, so the snapshot the next frame draws includes everything this tick
+    // did.
+    shared.publish_view();
 
+    // An open editor needs the full rate whether or not anything is loaded: it
+    // is the only thing turning our event loop, and off the main thread it is
+    // also the only thing carrying the user's clicks across.
+    let busy = busy || shared.editor_open();
     state
         .period_ms
         .store(if busy { BUSY_MS } else { IDLE_MS }, Ordering::Relaxed);
