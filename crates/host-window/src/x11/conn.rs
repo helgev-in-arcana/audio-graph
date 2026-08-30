@@ -10,9 +10,12 @@
 //! to from [`pump`].
 
 use std::cell::RefCell;
+use std::io::ErrorKind;
 use std::rc::{Rc, Weak};
+use std::time::Duration;
 
 use x11rb::connection::Connection;
+use x11rb::errors::ConnectError;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as _, Keycode, Keysym, PropMode, Screen, Window as XWindow,
@@ -138,9 +141,49 @@ fn existing() -> Option<Rc<Conn>> {
     CONN.with(|cell| cell.borrow().as_ref().map(Rc::clone))
 }
 
+/// Reach the server, allowing for a handshake that is dropped rather than
+/// refused.
+///
+/// Connecting is a socket and then an exchange over it, and a busy server will
+/// occasionally close one part-way through — this crate's own tests saw it
+/// under Xvfb while the rest of the suite loaded the machine. That says nothing
+/// about whether there is a server to talk to, so it is worth a moment and
+/// another go. Every other answer is returned as it came: no display, a refused
+/// socket and a rejected cookie are all settled the first time they are given.
+fn connect() -> Result<(RustConnection, usize), ConnectError> {
+    let mut wait = Duration::from_millis(1);
+    for _ in 0..ATTEMPTS - 1 {
+        match RustConnection::connect(None) {
+            Err(e) if dropped_mid_handshake(&e) => std::thread::sleep(wait),
+            settled => return settled,
+        }
+        wait *= 2;
+    }
+    RustConnection::connect(None)
+}
+
+/// How many times to try before the answer is the answer.
+///
+/// Small on purpose: the wait doubles from a millisecond, and a window that
+/// takes a noticeable moment to appear is worse than one that reports why it
+/// did not.
+const ATTEMPTS: usize = 4;
+
+fn dropped_mid_handshake(e: &ConnectError) -> bool {
+    let ConnectError::IoError(e) = e else {
+        return false;
+    };
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::Interrupted
+            | ErrorKind::TimedOut
+    )
+}
+
 fn open() -> Result<Conn, String> {
-    let (conn, screen) =
-        RustConnection::connect(None).map_err(|e| format!("could not reach the X server: {e}"))?;
+    let (conn, screen) = connect().map_err(|e| format!("could not reach the X server: {e}"))?;
 
     // Asked for all at once and collected afterwards: interning is a round trip
     // each, and seven in series is seven times the latency.
@@ -262,4 +305,24 @@ pub(crate) fn set_title(conn: &Conn, window: XWindow, title: &str) {
         Atom::from(AtomEnum::STRING),
         title.as_bytes(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_dropped_handshake_is_worth_a_second_go() {
+        let dropped = |kind| ConnectError::IoError(std::io::Error::from(kind));
+        assert!(dropped_mid_handshake(&dropped(ErrorKind::ConnectionReset)));
+        assert!(dropped_mid_handshake(&dropped(ErrorKind::Interrupted)));
+
+        // There is no server, or it will not have us. Trying again only makes
+        // the failure slower.
+        assert!(!dropped_mid_handshake(&dropped(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(!dropped_mid_handshake(&dropped(ErrorKind::NotFound)));
+        assert!(!dropped_mid_handshake(&ConnectError::ZeroIdMask));
+    }
 }
