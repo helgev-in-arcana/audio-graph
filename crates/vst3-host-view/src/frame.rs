@@ -300,9 +300,9 @@ mod tests {
         }
     }
 
-    /// Why the state moved into the COM object: a plugin holds the run loop
-    /// until its own teardown, which is after the host has let the frame go.
-    /// Calling into it then must not touch freed memory.
+    /// A plugin holds the run loop until its own teardown, which is after the
+    /// host has let the frame go. Calling into it then must not touch freed
+    /// memory — see the module comment on where the state lives.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_run_loop_outlives_the_handle_that_made_it() {

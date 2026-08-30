@@ -137,8 +137,8 @@ pub(crate) struct HostShim {
     ///
     /// The ceiling, the floor on the period, and the rule about never calling a
     /// plugin back with the list locked all live in `host_window::watch` — the
-    /// VST3 backend is asked for the same thing under another name, and one of
-    /// the two copies used to have the rule and the other not.
+    /// VST3 backend is asked for the same thing under another name, and two
+    /// copies of a rule like that is one copy to forget it in.
     timers: TimerWheel<clap_id>,
     /// Handed out in order and never reused, so that a stale
     /// `unregister_timer` cannot cancel somebody else's.

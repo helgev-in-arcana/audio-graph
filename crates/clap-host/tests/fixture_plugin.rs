@@ -112,8 +112,8 @@ fn the_host_forwards_what_the_plugin_asks_for() {
 /// The fixture registers a pipe at `init` and leaves a byte in it, so a host
 /// that polls calls `on_fd`, the fixture drains and re-arms, and the count it
 /// reports keeps rising. A host that answers `register_fd` and then never looks
-/// leaves the count at zero — which is what this was written to catch, since
-/// nothing else about the plugin would look any different.
+/// leaves the count at zero — which is the failure this catches, since nothing
+/// else about the plugin would look any different.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn the_host_polls_the_descriptors_a_plugin_registers() {

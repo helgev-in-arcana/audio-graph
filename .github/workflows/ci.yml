@@ -89,8 +89,8 @@ jobs:
 
       # Linux のウィンドウのテストは本物の X ウィンドウを開くので、
       # ランナーには X サーバが要る。ここを Xvfb で走らせることで、
-      # 「ウィンドウを開くテストが CI で 1 つも走らない」という穴
-      # (memo/UNTESTED.md UT-3) が Linux については塞がる。
+      # 「ウィンドウを開くテストが CI で 1 つも走らない」という穴が
+      # Linux については塞がる。
       - name: Test (under an X server)
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo test --workspace

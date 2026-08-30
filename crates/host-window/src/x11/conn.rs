@@ -144,12 +144,11 @@ fn existing() -> Option<Rc<Conn>> {
 /// Reach the server, allowing for a handshake that is dropped rather than
 /// refused.
 ///
-/// Connecting is a socket and then an exchange over it, and a busy server will
-/// occasionally close one part-way through — this crate's own tests saw it
-/// under Xvfb while the rest of the suite loaded the machine. That says nothing
-/// about whether there is a server to talk to, so it is worth a moment and
-/// another go. Every other answer is returned as it came: no display, a refused
-/// socket and a rejected cookie are all settled the first time they are given.
+/// Connecting is a socket and then an exchange over it, and a loaded server
+/// will occasionally close one part-way through. That says nothing about
+/// whether there is a server to talk to, so it is worth a moment and another
+/// go. Every other answer is returned as it came: no display, a refused socket
+/// and a rejected cookie are all settled the first time they are given.
 fn connect() -> Result<(RustConnection, usize), ConnectError> {
     let mut wait = Duration::from_millis(1);
     for _ in 0..ATTEMPTS - 1 {
