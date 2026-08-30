@@ -106,12 +106,27 @@ jobs:
 
       # 出る形式はバイナリのエクスポート記号で決まる。片方だけ消えるのは
       # ここでしか気付けないので、両方あることを確かめる。
+      #
+      # 名前だけでなく中身まで見る。ホストが読むのはバンドルの中のバイナリで、
+      # 器だけのディレクトリは名前の上では揃って見えるのに読み込みでは空振り
+      # する。VST3 はどの OS でもバンドル、CLAP は macOS だけがバンドルで
+      # 他は共有ライブラリそのもの、という違いがあるので両方を許す。
       - name: Verify both bundles exist
         shell: bash
         run: |
-          for f in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
-            if [ ! -e "$f" ]; then
-              echo "::error::$f が生成されていません。"
+          for bundle in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
+            if [ -d "$bundle" ]; then
+              binary=$(find "$bundle/Contents" -type f -size +0 2>/dev/null | head -n 1)
+              if [ -z "$binary" ]; then
+                echo "::error::$bundle の中にバイナリがありません。"
+                ls -R "$bundle" || true
+                exit 1
+              fi
+              echo "$bundle: $binary"
+            elif [ -s "$bundle" ]; then
+              echo "$bundle: 共有ライブラリ"
+            else
+              echo "::error::$bundle が生成されていません。"
               exit 1
             fi
           done
