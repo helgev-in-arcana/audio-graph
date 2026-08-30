@@ -25,11 +25,26 @@ DTMで、ディレイループにエフェクトを掛けることは、伝統�
 
 ## Getting Started / Features
 
-1. [Releases](https://github.com/helgev-in-arcana/audio-graph/releases) から環境に合わせてダウンロード
+1. [Releases](https://github.com/helgev-in-arcana/audio-graph/releases) から環境に合わせてダウンロードし、
+   下記の場所に置く
 2. DAW で AudioGraph を立ち上げ、`Plugin folders` に手持ちのプラグインのスキャンディレクトリを登録
 3. 空白を右クリック（または `Add Node`）でノードを置き、繋ぐ
 
 機能、詳しい操作とノードの一覧は →[Nodes and Usage](docs/nodes-usage.md)
+
+### インストール先
+
+| | VST3 | CLAP |
+|---|---|---|
+| Windows | `%CommonProgramFiles%\VST3\` | `%CommonProgramFiles%\CLAP\` |
+| Linux | `~/.vst3/` | `~/.clap/` |
+
+`AudioGraph.vst3` は中身が 1 ファイルでも**ディレクトリ**です（VST3 の規約で、Linux では
+`AudioGraph.vst3/Contents/x86_64-linux/AudioGraph.so`）。中の `.so` だけを取り出して置いても
+DAW は読みません。ディレクトリごとコピーしてください。CLAP は逆に規約上バンドルではないので、
+`AudioGraph.clap` という 1 ファイルのままです。
+
+更新する時は、上書きではなく古い `AudioGraph.vst3` を**ディレクトリごと削除**してから置いてください。
 
 ## Build from source
 
@@ -39,7 +54,8 @@ MSRV: Rust 1.95.0
 cargo xtask bundle audio-graph-plugin --release
 ```
 
-`target/bundled/` に `AudioGraph.vst3` と `AudioGraph.clap` ができます。
+`target/bundled/` に `AudioGraph.vst3` と `AudioGraph.clap` ができます。置き場所は
+[インストール先](#インストール先)と同じです。
 
 ## [Architecture](docs/architecture.md)
 
@@ -73,7 +89,7 @@ plugin.deactivate(processor);
 - UIは現在仮組みです。改良中です。
 - コード署名が現在ありません。
 - 実 DAW で動作確認ができているのは **Windows (x86_64)** のみです。
-  - **Linux (x86_64)** は X11 でウィンドウが開くところまで実装・確認済みです。確認は `host-cli` (ウィンドウ、サブプラグインの埋め込み、エディタ、オーディオ経路) までで、実 DAW と市販プラグインでの確認はこれからです。Wayland セッションでは XWayland 経由で動きます (Wayland ネイティブ対応の判断は Roadmap 参照)。
+  - **Linux (x86_64)** は X11 で動きます。REAPER で VST3 / CLAP 両形式のエディタと、サブプラグインの埋め込みまで確認済みです。Wayland セッションでは XWayland 経由で動きます (Wayland ネイティブ対応の判断は Roadmap 参照)。HiDPI は `Xft.dpi` を見ており、それが無い環境では等倍に落ちます。
   - **macOS** はビルドが通っているだけで、ウィンドウ実装がまだありません。
   - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
 - VST2ネイティブ対応はライセンスの問題で今後も不可能です。VST3化ツールなど使ってください。
