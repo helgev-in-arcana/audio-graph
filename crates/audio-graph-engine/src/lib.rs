@@ -44,8 +44,8 @@ pub use ir::{
 pub use nodes::{
     AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, FilterMode, Gate, KeyParam,
     KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteGate, NoteIn,
-    NoteMute, ParamPort, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, db_to_linear,
-    linear_to_db,
+    NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch,
+    db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{

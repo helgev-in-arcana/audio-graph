@@ -23,7 +23,7 @@ use crate::ir::{
     ALL_CHANNELS, ALL_CONTROLLERS, AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES,
     MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION,
     MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS,
-    MAX_REGISTERS, NoteBuf, NoteOp, Op, Reg,
+    MAX_NOTE_EMITS, MAX_REGISTERS, NoteBuf, NoteOp, Op, Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -467,6 +467,7 @@ pub(crate) struct AudioCx<'a> {
     /// same buffer; nothing writes a buffer twice, so sharing is free.
     note_outputs: Vec<((NodeId, u8), NoteBuf)>,
     note_bufs: u16,
+    note_states: u16,
 }
 
 impl<'a> AudioCx<'a> {
@@ -499,6 +500,7 @@ impl<'a> AudioCx<'a> {
             note_ops: Vec::new(),
             note_outputs: Vec::new(),
             note_bufs: 0,
+            note_states: 0,
         }
     }
 
@@ -698,6 +700,30 @@ impl<'a> AudioCx<'a> {
         }
 
         for port in 0..kind.output_ports().len() as u8 {
+            if let Some((channel, cc)) = kind.note_emits(port) {
+                if self.readers_of(port) == 0 {
+                    continue;
+                }
+                // Silently emitting nothing would be worse than compiling: a
+                // node with no value wired reads zero, and sending CC 0 is a
+                // real thing to ask for.
+                let Some(lane) = self.lane(0) else { continue };
+                let a = kind
+                    .note_passthrough(port)
+                    .and_then(|input| self.note_source_of(input));
+                let out = self.alloc_note_buf()?;
+                let state = self.alloc_note_state()?;
+                self.note_ops.push(NoteOp::Emit {
+                    a,
+                    out,
+                    lane,
+                    state,
+                    channel,
+                    cc,
+                });
+                self.note_outputs.push(((self.id, port), out));
+                continue;
+            }
             // A socket nobody reads gets no buffer. A key switch offers one
             // output per destination and a patch usually leaves some of them
             // empty; filling those would spend the pool on streams no plugin
@@ -765,6 +791,18 @@ impl<'a> AudioCx<'a> {
             .iter()
             .find(|&&(key, _)| key == (self.id, OUTPUT_SOCKET + port))
             .map(|&(_, lane)| lane)
+    }
+
+    fn alloc_note_state(&mut self) -> Result<u16, CompileError> {
+        if usize::from(self.note_states) >= MAX_NOTE_EMITS {
+            return Err(CompileError::TooLarge {
+                what: "nodes that generate controllers",
+                limit: MAX_NOTE_EMITS,
+            });
+        }
+        let state = self.note_states;
+        self.note_states += 1;
+        Ok(state)
     }
 
     fn alloc_note_buf(&mut self) -> Result<NoteBuf, CompileError> {

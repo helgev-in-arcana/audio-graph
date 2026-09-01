@@ -28,6 +28,7 @@ mod note_filter;
 mod note_gate;
 mod note_in;
 mod note_mute;
+mod param_to_cc;
 mod plugin;
 mod range_map;
 mod slot;
@@ -47,6 +48,7 @@ pub use note_filter::{FilterMode, NoteFilter};
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use note_mute::NoteMute;
+pub use param_to_cc::ParamToCc;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
 pub use slot::SlotIn;
@@ -93,6 +95,17 @@ pub(crate) trait Node {
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
+    }
+
+    /// The channel and controller number this node adds to the stream leaving
+    /// output `port`, when it makes controller events of its own.
+    ///
+    /// The value comes off the audio lane the node booked for its own input
+    /// socket 0, so a node answering this must also call
+    /// [`ParamCx::drive_audio`][crate::compile::ParamCx::drive_audio] for it.
+    fn note_emits(&self, port: u8) -> Option<(u8, u8)> {
+        let _ = port;
+        None
     }
 
     /// Which MIDI channels the notes leaving output `port` are allowed on —
@@ -310,6 +323,7 @@ pub enum NodeKind {
     KeyParam(KeyParam),
     NoteMute(NoteMute),
     NoteFilter(NoteFilter),
+    ParamToCc(ParamToCc),
     DelayRead(DelayRead),
 }
 
@@ -347,6 +361,7 @@ macro_rules! for_kind {
             NodeKind::KeyParam($node) => $body,
             NodeKind::NoteMute($node) => $body,
             NodeKind::NoteFilter($node) => $body,
+            NodeKind::ParamToCc($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -394,6 +409,10 @@ impl NodeKind {
     }
 
     /// The keys this node swallows on output `port` — see [`Node::note_mute`].
+    pub(crate) fn note_emits(&self, port: u8) -> Option<(u8, u8)> {
+        for_kind!(self, node => node.note_emits(port))
+    }
+
     pub(crate) fn note_channels(&self, port: u8) -> u16 {
         for_kind!(self, node => node.note_channels(port))
     }
@@ -629,6 +648,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         NoteFilter::catalogue_defaults(),
         NodeKind::NoteFilter,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        ParamToCc::catalogue_defaults(),
+        NodeKind::ParamToCc,
     );
 
     // Parameter.

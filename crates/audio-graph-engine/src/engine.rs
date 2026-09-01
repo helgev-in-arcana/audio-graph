@@ -24,8 +24,8 @@ use crate::handoff::Handoff;
 use crate::ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_NOTE_BUFS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, Op, Operand,
-    Program, RateSpec, Waveform,
+    MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, Op,
+    Operand, Program, RateSpec, Waveform,
 };
 use crate::nodes::db_to_linear;
 use subhost_adapter::{AudioChunk, AudioInstances};
@@ -208,6 +208,9 @@ pub struct Engine {
     /// A program swap happens on the audio thread, so nothing here may be
     /// sized from the program.
     note_pool: Vec<Vec<Event>>,
+    /// Last value each controller-generating op sent, or NaN before its first.
+    /// Forgotten on a program swap; see [`NoteOp::Emit`].
+    note_emitted: Vec<f64>,
     /// Events dropped because a note buffer was full, since the last reset.
     ///
     /// Counted rather than silently swallowed: an overflow is a real fault and
@@ -390,6 +393,7 @@ impl Engine {
             daw_inputs: Vec::new(),
             stride: 0,
             note_pool: Vec::new(),
+            note_emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             notes_dropped: 0,
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
@@ -696,6 +700,52 @@ impl Engine {
                             &mut self.notes_dropped,
                             event,
                         );
+                    }
+                }
+                NoteOp::Emit {
+                    a,
+                    out,
+                    lane,
+                    state,
+                    channel,
+                    cc,
+                } => {
+                    let value = ctx.lane(row, lane).unwrap_or(0.0).clamp(0.0, 1.0);
+                    let last = &mut self.note_emitted[state as usize];
+                    // NaN on the left of a comparison is never equal, which is
+                    // what makes the first sub-block after a swap send.
+                    let moved = *last != value;
+                    *last = value;
+
+                    let event = Event::Note(NoteEvent::Cc {
+                        port: 0,
+                        channel: i16::from(channel),
+                        cc,
+                        value,
+                        // The lane's value became true at the start of this
+                        // sub-block, and writing it before the stream keeps
+                        // the buffer sorted.
+                        sample_offset: start,
+                    });
+                    match a {
+                        Some(a) => {
+                            let (source, dest) =
+                                index_two(&mut self.note_pool, a as usize, out as usize);
+                            dest.clear();
+                            if moved {
+                                dest.push(event);
+                            }
+                            for &passed in source.iter() {
+                                Self::push_note(dest, &mut self.notes_dropped, passed);
+                            }
+                        }
+                        None => {
+                            let dest = &mut self.note_pool[out as usize];
+                            dest.clear();
+                            if moved {
+                                dest.push(event);
+                            }
+                        }
                     }
                 }
                 NoteOp::Filter {
@@ -1386,7 +1436,7 @@ mod tests {
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
         KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteGate,
-        NoteMute, ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2085,6 +2135,103 @@ mod tests {
             })
         ));
         assert!(matches!(seen[1], Event::Note(NoteEvent::Cc { cc: 64, .. })));
+    }
+
+    /// A parameter driving a controller: the value reaches the plugin as CC,
+    /// and joins the stream that was already flowing rather than replacing it.
+    #[test]
+    fn a_parameter_reaches_the_plugin_as_a_controller() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(notes, 0, pedal, 1);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let heard = hear(&graph, &[note_on(60, 2)], &[1.0]);
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2, "the pedal and the note: {seen:?}");
+        assert!(
+            matches!(
+                seen[0],
+                Event::Note(NoteEvent::Cc { cc: 64, value, sample_offset: 0, .. }) if value == 1.0
+            ),
+            "the controller comes first, at the sub-block start, so the \
+             buffer stays sorted: {seen:?}"
+        );
+        assert!(matches!(
+            seen[1],
+            Event::Note(NoteEvent::NoteOn { key: 60, .. })
+        ));
+    }
+
+    /// An unchanged controller is not an event. Re-sending it every sub-block
+    /// would fill a plugin's parameter queue with nothing and retrigger the
+    /// smoothing on plugins that ramp towards each incoming point.
+    #[test]
+    fn a_controller_is_sent_once_until_it_moves() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut heard = Heard::default();
+        let block = |engine: &mut Engine, value: f64, heard: &mut Heard| {
+            let mut row = vec![0.0; width];
+            row[0] = value;
+            engine.run(&ctx(8), &mut row);
+            engine.run_audio(
+                &AudioContext {
+                    frames: 8,
+                    quantum: 32,
+                    sample_rate: RATE,
+                    lanes: &row,
+                    lanes_per_row: width,
+                    events: &[],
+                },
+                &[0.0; 2 * 8],
+                &mut [0.0; 2 * 8],
+                heard,
+            );
+        };
+
+        block(&mut engine, 1.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 1, "the first value is always news");
+        block(&mut engine, 1.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 1, "and holding it is not");
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 2, "letting go is");
     }
 
     /// Each sub-block gets its own events, once. Handing every chunk the whole

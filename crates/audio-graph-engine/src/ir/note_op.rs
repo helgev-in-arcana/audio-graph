@@ -37,11 +37,35 @@ pub const ALL_CHANNELS: u16 = u16::MAX;
 /// Every controller number.
 pub const ALL_CONTROLLERS: u128 = u128::MAX;
 
+/// Ceiling on the ops that remember the last value they sent.
+pub const MAX_NOTE_EMITS: usize = 16;
+
 /// One step of the note half of a program.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteOp {
     /// Fill a buffer with what the DAW sent on `bus`, for this sub-block.
     Input { out: NoteBuf, bus: u16 },
+    /// Add a control change to a stream when the parameter on `lane` moves.
+    ///
+    /// `a` is the stream it joins, passed through first; `None` starts a fresh
+    /// one. The generated event is timed at the start of the sub-block, which
+    /// is where the lane's value became true, and is written before the passed
+    /// stream so the buffer stays sorted.
+    ///
+    /// `state` indexes the last value sent. Only a change is emitted — not to
+    /// ration events, but because an unchanged controller is not an event.
+    /// A program swap forgets it, so the next sub-block re-sends the current
+    /// value; a duplicate CC carrying the value the receiver already has is
+    /// not something anyone can hear, and the alternative is carrying the
+    /// state across recompiles for no gain.
+    Emit {
+        a: Option<NoteBuf>,
+        out: NoteBuf,
+        lane: u16,
+        state: u16,
+        channel: u8,
+        cc: u8,
+    },
     /// Copy `a` into `out`, dropping what this node refuses.
     ///
     /// `gate` names the lane carrying the open/shut decision, sampled per

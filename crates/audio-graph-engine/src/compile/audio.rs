@@ -605,13 +605,16 @@ mod tests {
                 .note_ops
                 .iter()
                 .find(|op| match op {
-                    NoteOp::Input { out, .. } | NoteOp::Filter { out, .. } => *out == want,
+                    NoteOp::Input { out, .. }
+                    | NoteOp::Filter { out, .. }
+                    | NoteOp::Emit { out, .. } => *out == want,
                 })
                 .copied()
                 .expect("every note buffer a program names is written by an op");
             chain.push(op);
             at = match op {
                 NoteOp::Filter { a, .. } => Some(a),
+                NoteOp::Emit { a, .. } => a,
                 NoteOp::Input { .. } => None,
             };
         }
@@ -632,7 +635,7 @@ mod tests {
             .iter()
             .filter_map(|op| match *op {
                 NoteOp::Filter { gate, mute, .. } => Some((gate, mute)),
-                NoteOp::Input { .. } => None,
+                NoteOp::Input { .. } | NoteOp::Emit { .. } => None,
             })
             .collect()
     }
