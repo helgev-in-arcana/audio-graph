@@ -641,6 +641,10 @@ impl Engine {
     /// carries an event into a chunk it does not belong to. Buffers past
     /// `note_bufs` are the previous program's and are left alone; nothing
     /// reads them.
+    /// The note half for one sub-block, into freshly emptied buffers.
+    ///
+    /// What the parameter half calls: it evaluates one row at a time, and the
+    /// buffers it leaves behind are read by the next row and by nothing else.
     fn run_notes(
         &mut self,
         program: &Program,
@@ -650,10 +654,77 @@ impl Engine {
         frames: u32,
         lanes: &[f64],
     ) {
+        self.clear_note_bufs(program);
+        self.run_notes_step(
+            program,
+            pass,
+            events,
+            start,
+            frames,
+            lanes,
+            &[0; MAX_NOTE_BUFS],
+        );
+    }
+
+    /// The note half for a whole chunk, stepped one lane row at a time.
+    ///
+    /// What the audio half calls. Stepping rather than evaluating the chunk in
+    /// one go is what lets a whole-block chunk still judge its gates and run
+    /// its generators once per sub-block: a chunk covering the whole block
+    /// would otherwise read one row's lane values and apply them to every
+    /// event in it, so a `Param → CC` would send one value per block and a
+    /// gate that closed halfway would have closed from the start.
+    ///
+    /// The buffers end up holding the whole chunk, in order, with each event
+    /// judged by the lane values in force when it arrived.
+    fn run_notes_chunk(
+        &mut self,
+        program: &Program,
+        ctx: &AudioContext<'_>,
+        start: u32,
+        frames: u32,
+        first_row: usize,
+    ) {
+        self.clear_note_bufs(program);
+        let quantum = ctx.quantum.max(1);
+        let end = start + frames;
+        let mut at = start;
+        let mut row = first_row;
+        while at < end {
+            let len = quantum.min(end - at);
+            // Where each buffer stood before this step, so an op reads only
+            // what this step brought in and appends its own answer to what is
+            // already there.
+            let mut base = [0usize; MAX_NOTE_BUFS];
+            for (slot, buf) in base.iter_mut().zip(self.note_pool.iter()) {
+                *slot = buf.len();
+            }
+            let lanes = ctx.lanes.get(row * ctx.lanes_per_row..).unwrap_or_default();
+            self.run_notes_step(program, PASS_AUDIO, ctx.events, at, len, lanes, &base);
+            at += len;
+            row += 1;
+        }
+    }
+
+    fn clear_note_bufs(&mut self, program: &Program) {
         for buf in 0..usize::from(program.note_bufs).min(MAX_NOTE_BUFS) {
             self.note_pool[buf].clear();
         }
+    }
 
+    /// One sub-block's worth of the note half, appended to what the buffers
+    /// already hold. `base` is where each of them stood beforehand.
+    #[allow(clippy::too_many_arguments)]
+    fn run_notes_step(
+        &mut self,
+        program: &Program,
+        pass: usize,
+        events: &[Event],
+        start: u32,
+        frames: u32,
+        lanes: &[f64],
+        base: &[usize; MAX_NOTE_BUFS],
+    ) {
         for op in &program.note_ops {
             match *op {
                 NoteOp::Input { out, bus } => {
@@ -676,7 +747,7 @@ impl Engine {
                         );
                     }
                     if pass == PASS_PARAM {
-                        self.follow_notes(out);
+                        self.follow_notes(out, base[out as usize]);
                     }
                 }
                 NoteOp::Emit {
@@ -707,21 +778,20 @@ impl Engine {
                     });
                     match a {
                         Some(a) => {
+                            let from = base[a as usize];
                             let (source, dest) =
                                 index_two(&mut self.note_pool, a as usize, out as usize);
-                            dest.clear();
                             if moved {
-                                dest.push(event);
+                                Self::push_note(dest, &mut self.notes_dropped, event);
                             }
-                            for &passed in source.iter() {
+                            for &passed in &source[from.min(source.len())..] {
                                 Self::push_note(dest, &mut self.notes_dropped, passed);
                             }
                         }
                         None => {
-                            let dest = &mut self.note_pool[out as usize];
-                            dest.clear();
+                            let dropped = &mut self.notes_dropped;
                             if moved {
-                                dest.push(event);
+                                Self::push_note(&mut self.note_pool[out as usize], dropped, event);
                             }
                         }
                     }
@@ -740,9 +810,9 @@ impl Engine {
                     // loud one.
                     let shut = gate
                         .is_some_and(|lane| !lanes.get(lane as usize).is_some_and(|&v| v >= 0.5));
+                    let from = base[a as usize];
                     let (source, dest) = index_two(&mut self.note_pool, a as usize, out as usize);
-                    dest.clear();
-                    for &event in source.iter() {
+                    for &event in &source[from.min(source.len())..] {
                         if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
                             continue;
                         }
@@ -752,7 +822,7 @@ impl Engine {
                         Self::push_note(dest, &mut self.notes_dropped, event);
                     }
                     if pass == PASS_PARAM {
-                        self.follow_notes(out);
+                        self.follow_notes(out, base[out as usize]);
                     }
                 }
             }
@@ -793,15 +863,7 @@ impl Engine {
         // The note half runs first and whole: an op reads a buffer a
         // previous op filled, and a plugin later in the block reads the
         // result. Offsets stay relative to the DAW's block.
-        let lanes = ctx.lanes.get(row * ctx.lanes_per_row..).unwrap_or_default();
-        self.run_notes(
-            program,
-            PASS_AUDIO,
-            ctx.events,
-            start as u32,
-            frames as u32,
-            lanes,
-        );
+        self.run_notes_chunk(program, ctx, start as u32, frames as u32, row);
 
         for op in &program.audio_ops {
             match op {
@@ -1469,11 +1531,12 @@ impl Engine {
     /// Called once per buffer per sub-block, from the parameter half's pass
     /// over the note ops — never from the audio half's, which replays the same
     /// events for the plugins and would otherwise count them twice.
-    fn follow_notes(&mut self, buf: u16) {
+    fn follow_notes(&mut self, buf: u16, from: usize) {
         let index = buf as usize;
         let Some(events) = self.note_pool.get(index) else {
             return;
         };
+        let events = &events[from.min(events.len())..];
         let mut struck = 0u128;
         let mut held = self.keys_held[index];
         let mut count = self.held_count[index];
@@ -2328,6 +2391,98 @@ mod tests {
         assert_eq!(heard.0[&0].len(), 1, "and holding it is not");
         block(&mut engine, 0.0, &mut heard);
         assert_eq!(heard.0[&0].len(), 2, "letting go is");
+    }
+
+    /// A generator follows its parameter at sub-block resolution even when the
+    /// plugins are called once for the whole block.
+    ///
+    /// Those are separate questions and the note half used to conflate them:
+    /// it read one row's lane values and applied them to the entire chunk, so a
+    /// `Param → CC` sent one value per block however fast the parameter moved.
+    /// The sub-plugin call rate is a cost decision; the resolution of what it
+    /// is told is not.
+    #[test]
+    fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+        assert_eq!(
+            engine.chunking(),
+            Chunking::WholeBlock,
+            "no feedback loop, so the plugin is called once for the block"
+        );
+
+        // Four sub-blocks of 16, with the control taking a different value in
+        // each. One whole-block chunk covers all four.
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let values = [0.0, 0.25, 0.25, 1.0];
+        let mut rows = vec![0.0; width * values.len()];
+        for (index, &value) in values.iter().enumerate() {
+            let row = &mut rows[index * width..(index + 1) * width];
+            row[0] = value;
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 16,
+                    offset: index as u32 * 16,
+                    events: &[],
+                },
+                row,
+            );
+        }
+
+        let mut heard = Heard::default();
+        engine.run_audio(
+            &AudioContext {
+                frames: 64,
+                quantum: 16,
+                sample_rate: RATE,
+                lanes: &rows,
+                lanes_per_row: width,
+                events: &[],
+            },
+            &[0.0; 2 * 64],
+            &mut [0.0; 2 * 64],
+            &mut heard,
+        );
+
+        let seen = &heard.0[&0];
+        let sent: Vec<(u32, f64)> = seen
+            .iter()
+            .filter_map(|event| match *event {
+                Event::Note(NoteEvent::Cc {
+                    value,
+                    sample_offset,
+                    ..
+                }) => Some((sample_offset, value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(0, 0.0), (16, 0.25), (48, 1.0)],
+            "one event per move, timed at the sub-block it happened in, and \
+             nothing for the sub-block where it held: {seen:?}"
+        );
     }
 
     /// Each sub-block gets its own events, once. Handing every chunk the whole
