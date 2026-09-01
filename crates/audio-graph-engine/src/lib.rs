@@ -42,10 +42,10 @@ pub use ir::{
     MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, Program, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, FilterMode, Gate, KeyParam,
-    KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteGate, NoteIn,
-    NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch,
-    db_to_linear, linear_to_db,
+    AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, Expression, FilterMode, Gate,
+    KeyParam, KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter,
+    NoteGate, NoteIn, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn,
+    Switch, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{

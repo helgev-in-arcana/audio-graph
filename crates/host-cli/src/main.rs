@@ -57,6 +57,7 @@ fn main() -> ExitCode {
         "synth" => cmd_synth(rest),
         "sustain" => cmd_sustain(rest),
         "pedal" => cmd_pedal(rest),
+        "wheel" => cmd_wheel(rest),
         "state" => cmd_state(rest),
         "twice" => cmd_twice(rest),
         "sweep" => cmd_sweep(rest),
@@ -112,6 +113,9 @@ fn usage() {
   host-cli pedal <WRAPPER.vst3> <SYNTH>
                                     drive the sub-plugin's sustain pedal from a
                                     Param -> CC node inside the graph
+  host-cli wheel <WRAPPER.vst3> <SYNTH> <PARAM_ID>
+                                    drive a sub-plugin parameter from the DAW's
+                                    mod wheel through a CC In node
   host-cli sweep [DIR...]           lifecycle-test every plugin, one child process each
   host-cli probe <PLUGIN>           lifecycle-test one module in this process
   host-cli nest <WRAPPER.vst3> [ID]
@@ -2019,6 +2023,128 @@ fn inject_pedal(state: &str, synth: &str, held: f64) -> Result<String, String> {
             { "from": 3, "from_port": 0, "to": 4, "to_port": 0 }
         ],
         "next_id": 5
+    });
+    Ok(value.to_string())
+}
+
+/// Drive a sub-plugin parameter from the DAW's mod wheel, through the graph.
+///
+/// The other direction from `pedal`: there a parameter became a controller,
+/// here a controller becomes a parameter. Together they close the loop — the
+/// note path carries controllers, the graph can read them and make them.
+///
+/// A parameter id is required because there is no way to guess which of a
+/// synth's parameters is audible; `host-cli params` lists them.
+fn cmd_wheel(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+    let param: u32 = args
+        .get(2)
+        .ok_or("expected a parameter id for the wheel to drive")?
+        .parse()
+        .map_err(|_| "the parameter id must be a number")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0;
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let silence = wav::Audio::silence(sample_rate, 2, at(3.0));
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+    let patched = inject_wheel(&baseline_json, synth, param)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let run = |wheel: u8| -> Result<wav::Audio, String> {
+        let mut events = render::note(60, at(0.2), at(2.0));
+        // Before the note, so the parameter is already where it belongs when
+        // the voice starts: many parameters are only read at note-on.
+        events.push(render::cc(1, wheel, at(0.05)));
+        events.sort_by_key(|(at, _)| *at);
+        Ok(render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )?
+        .audio)
+    };
+
+    let down = run(0)?;
+    let up = run(127)?;
+    println!("  peak, wheel down: {:.6}", down.peak());
+    println!("  peak, wheel up:   {:.6}", up.peak());
+
+    if down.peak() < 1e-4 && up.peak() < 1e-4 {
+        return Err("the instrument was silent either way; nothing here means anything".into());
+    }
+    let differs = (0..down.frames.min(up.frames))
+        .any(|i| (0..down.channels).any(|ch| down.channel(ch)[i] != up.channel(ch)[i]));
+    if differs {
+        println!("the mod wheel reaches the sub-plugin's parameter through the graph");
+        return Ok(());
+    }
+    Err(format!(
+        "moving the wheel changed nothing; parameter {param} may not be audible \
+         on its own — pick another from `host-cli params`"
+    ))
+}
+
+/// MIDI In into a `CC In`, whose value drives one of the instrument's
+/// parameters.
+fn inject_wheel(state: &str, synth: &str, param: u32) -> Result<String, String> {
+    use std::sync::Arc;
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let (class, plugin) = render::load(Path::new(synth), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = plugin.io_layout();
+    let mut ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
+    ports.params = vec![audio_graph_engine::ParamPort {
+        id: param,
+        name: "wheel".into(),
+    }];
+    // The parameter socket sits after the audio inputs and the notes port.
+    let notes_port = ports.audio_in.len() as u32;
+    let param_port = notes_port + 1;
+    drop(plugin);
+
+    value["sub_plugins"] = serde_json::json!([{
+        "instance": 0,
+        "reference": {
+            "format": class.format.tag(),
+            "plugin_id": class.id,
+            "path_hint": synth,
+            "display_name": class.name,
+        },
+    }]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],   "kind": "NoteIn" },
+            { "id": 1, "pos": [220.0, 200.0], "kind": { "CcIn": { "cc": 1, "channel": null, "initial": 0.0 } } },
+            { "id": 2, "pos": [420.0, 40.0],  "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 3, "pos": [620.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": [
+            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
+            { "from": 0, "from_port": 0, "to": 2, "to_port": notes_port },
+            { "from": 1, "from_port": 0, "to": 2, "to_port": param_port },
+            { "from": 2, "from_port": 0, "to": 3, "to_port": 0 }
+        ],
+        "next_id": 4
     });
     Ok(value.to_string())
 }

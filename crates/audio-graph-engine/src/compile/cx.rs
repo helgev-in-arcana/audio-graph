@@ -20,10 +20,9 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    ALL_CHANNELS, ALL_CONTROLLERS, AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES,
-    MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION,
-    MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS,
-    MAX_NOTE_EMITS, MAX_REGISTERS, NoteBuf, NoteOp, Op, Reg,
+    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
+    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -35,6 +34,7 @@ use crate::ir::{
 /// was.
 const OUTPUT_SOCKET: u8 = 128;
 
+use crate::compile::notes::Notes;
 use crate::nodes::NodeKind;
 use crate::port::PortType;
 use subhost_adapter::{InstanceIo, ParamTarget};
@@ -60,6 +60,7 @@ pub(crate) struct ParamCx<'a> {
     /// Read by the gate downstream of it, never by the audio half, which reads
     /// the lane instead.
     note_gates: Vec<((NodeId, u8), Reg)>,
+    notes: &'a Notes,
 }
 
 /// What the parameter half produced.
@@ -74,7 +75,12 @@ pub(crate) struct ParamHalf {
 }
 
 impl<'a> ParamCx<'a> {
-    pub(crate) fn new(graph: &'a Graph, lines: &'a [Line], slot_count: usize) -> ParamCx<'a> {
+    pub(crate) fn new(
+        graph: &'a Graph,
+        lines: &'a [Line],
+        slot_count: usize,
+        notes: &'a Notes,
+    ) -> ParamCx<'a> {
         ParamCx {
             graph,
             lines,
@@ -90,6 +96,7 @@ impl<'a> ParamCx<'a> {
             param_targets: Vec::new(),
             audio_lanes: Vec::new(),
             note_gates: Vec::new(),
+            notes,
         }
     }
 
@@ -284,6 +291,15 @@ impl<'a> ParamCx<'a> {
         Ok(())
     }
 
+    /// The note buffer wired into this node's input `port`, for a node that
+    /// reads the stream as a parameter signal.
+    ///
+    /// The note pass settled this before either half ran, which is the whole
+    /// reason it is a pass of its own.
+    pub(crate) fn note_source_of(&self, port: u8) -> Option<NoteBuf> {
+        self.notes.source_of(self.graph, self.id, port)
+    }
+
     /// Says that the notes leaving this node's output `port` pass only while
     /// `reg` is 1.
     ///
@@ -461,13 +477,7 @@ pub(crate) struct AudioCx<'a> {
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
 
-    note_ops: Vec<NoteOp>,
-    /// Output socket → the note buffer leaving it. An open filter binds its
-    /// input's buffer rather than a new one, so several sockets can name the
-    /// same buffer; nothing writes a buffer twice, so sharing is free.
-    note_outputs: Vec<((NodeId, u8), NoteBuf)>,
-    note_bufs: u16,
-    note_states: u16,
+    notes: &'a Notes,
 }
 
 impl<'a> AudioCx<'a> {
@@ -476,6 +486,7 @@ impl<'a> AudioCx<'a> {
         lines: &'a [Line],
         order: &'a [NodeId],
         lanes: &'a [((NodeId, u8), u16)],
+        notes: &'a Notes,
     ) -> AudioCx<'a> {
         AudioCx {
             graph,
@@ -497,10 +508,7 @@ impl<'a> AudioCx<'a> {
             audio_lines: Vec::new(),
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
-            note_ops: Vec::new(),
-            note_outputs: Vec::new(),
-            note_bufs: 0,
-            note_states: 0,
+            notes,
         }
     }
 
@@ -575,8 +583,6 @@ impl<'a> AudioCx<'a> {
         Audio {
             instances: self.instances,
             ops: self.ops,
-            note_ops: self.note_ops,
-            note_bufs: self.note_bufs,
             delay_nodes: self.delay_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
@@ -684,137 +690,10 @@ impl<'a> AudioCx<'a> {
             .map(|&(_, lane)| lane)
     }
 
-    /// Emit this node's share of the note half, before it compiles its audio.
-    ///
-    /// Generic over the node kinds rather than written into each of them: what
-    /// a note node contributes is entirely described by the three questions it
-    /// already answers — where notes come from, which input an output hands on,
-    /// and what it drops on the way. Topological order guarantees the buffer
-    /// feeding a socket is bound before anything reads it.
-    pub(crate) fn route_notes(&mut self, kind: &NodeKind) -> Result<(), CompileError> {
-        if let Some(bus) = kind.note_source() {
-            let out = self.alloc_note_buf()?;
-            self.note_ops.push(NoteOp::Input { out, bus });
-            self.note_outputs.push(((self.id, 0), out));
-            return Ok(());
-        }
-
-        for port in 0..kind.output_ports().len() as u8 {
-            if let Some((channel, cc)) = kind.note_emits(port) {
-                if self.readers_of(port) == 0 {
-                    continue;
-                }
-                // Silently emitting nothing would be worse than compiling: a
-                // node with no value wired reads zero, and sending CC 0 is a
-                // real thing to ask for.
-                let Some(lane) = self.lane(0) else { continue };
-                let a = kind
-                    .note_passthrough(port)
-                    .and_then(|input| self.note_source_of(input));
-                let out = self.alloc_note_buf()?;
-                let state = self.alloc_note_state()?;
-                self.note_ops.push(NoteOp::Emit {
-                    a,
-                    out,
-                    lane,
-                    state,
-                    channel,
-                    cc,
-                });
-                self.note_outputs.push(((self.id, port), out));
-                continue;
-            }
-            // A socket nobody reads gets no buffer. A key switch offers one
-            // output per destination and a patch usually leaves some of them
-            // empty; filling those would spend the pool on streams no plugin
-            // will ever be handed.
-            if self.readers_of(port) == 0 {
-                continue;
-            }
-            let Some(input) = kind.note_passthrough(port) else {
-                continue;
-            };
-            let Some(a) = self.note_source_of(input) else {
-                // Nothing wired upstream. Leaving the socket unbound is what
-                // makes an instrument behind it silent.
-                continue;
-            };
-            let gate = kind
-                .note_gated(port)
-                .then(|| self.note_gate_lane(port))
-                .flatten();
-            let mute = kind.note_mute(port);
-            let channels = kind.note_channels(port);
-            let controllers = kind.note_controllers(port);
-            // An open filter that drops nothing is not worth a buffer or a
-            // copy; the socket simply carries what came in.
-            let passes_everything = gate.is_none()
-                && mute == 0
-                && channels == ALL_CHANNELS
-                && controllers == ALL_CONTROLLERS;
-            let out = if passes_everything {
-                a
-            } else {
-                let out = self.alloc_note_buf()?;
-                self.note_ops.push(NoteOp::Filter {
-                    a,
-                    out,
-                    gate,
-                    mute,
-                    channels,
-                    controllers,
-                });
-                out
-            };
-            self.note_outputs.push(((self.id, port), out));
-        }
-        Ok(())
-    }
-
-    /// The note buffer wired into this node's input `port`.
-    ///
-    /// `None` when nothing is connected, which is the answer that makes an
-    /// unwired instrument silent rather than making it play whatever the DAW
-    /// happened to send.
+    /// The note buffer wired into this node's input `port`, from the layout
+    /// the note pass settled before either half ran.
     pub(crate) fn note_source_of(&self, port: u8) -> Option<NoteBuf> {
-        let (from, from_port) = self.graph.source_of(self.id, port)?;
-        self.note_outputs
-            .iter()
-            .find(|&&(socket, _)| socket == (from, from_port))
-            .map(|&(_, buf)| buf)
-    }
-
-    /// The lane the param half booked for the gate on this node's output
-    /// `port`.
-    fn note_gate_lane(&self, port: u8) -> Option<u16> {
-        self.lanes
-            .iter()
-            .find(|&&(key, _)| key == (self.id, OUTPUT_SOCKET + port))
-            .map(|&(_, lane)| lane)
-    }
-
-    fn alloc_note_state(&mut self) -> Result<u16, CompileError> {
-        if usize::from(self.note_states) >= MAX_NOTE_EMITS {
-            return Err(CompileError::TooLarge {
-                what: "nodes that generate controllers",
-                limit: MAX_NOTE_EMITS,
-            });
-        }
-        let state = self.note_states;
-        self.note_states += 1;
-        Ok(state)
-    }
-
-    fn alloc_note_buf(&mut self) -> Result<NoteBuf, CompileError> {
-        if usize::from(self.note_bufs) >= MAX_NOTE_BUFS {
-            return Err(CompileError::TooLarge {
-                what: "note buffers",
-                limit: MAX_NOTE_BUFS,
-            });
-        }
-        let buf = self.note_bufs;
-        self.note_bufs += 1;
-        Ok(buf)
+        self.notes.source_of(self.graph, self.id, port)
     }
 
     // --- buffers ----------------------------------------------------------

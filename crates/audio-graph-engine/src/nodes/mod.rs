@@ -15,6 +15,7 @@
 pub mod widgets;
 
 mod audio_io;
+mod cc_in;
 mod constant;
 mod delay;
 mod expression;
@@ -35,6 +36,7 @@ mod slot;
 mod switch;
 
 pub use audio_io::{AudioIn, AudioOut};
+pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
 pub use expression::Expression;
@@ -324,6 +326,7 @@ pub enum NodeKind {
     NoteMute(NoteMute),
     NoteFilter(NoteFilter),
     ParamToCc(ParamToCc),
+    CcIn(CcIn),
     DelayRead(DelayRead),
 }
 
@@ -362,6 +365,7 @@ macro_rules! for_kind {
             NodeKind::NoteMute($node) => $body,
             NodeKind::NoteFilter($node) => $body,
             NodeKind::ParamToCc($node) => $body,
+            NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -654,6 +658,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         ParamToCc::catalogue_defaults(),
         NodeKind::ParamToCc,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        CcIn::catalogue_defaults(),
+        NodeKind::CcIn,
     );
 
     // Parameter.

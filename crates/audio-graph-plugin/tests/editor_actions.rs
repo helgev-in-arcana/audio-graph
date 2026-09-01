@@ -254,6 +254,8 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
                 sample_rate: 48_000.0,
                 tempo_bpm: 120.0,
                 frames: 32,
+                offset: 0,
+                events: &[],
             },
             &mut slots,
         );

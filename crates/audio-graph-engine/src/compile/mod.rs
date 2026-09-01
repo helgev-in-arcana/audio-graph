@@ -15,6 +15,7 @@
 
 mod audio;
 mod cx;
+mod notes;
 
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
@@ -115,7 +116,11 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         visit(graph, &index, root, &mut mark, &mut order)?;
     }
 
-    let mut cx = ParamCx::new(graph, &lines, slot_count);
+    // Notes first: both halves below need to be able to name a note buffer,
+    // and which buffer leaves which socket is pure topology.
+    let mut notes = notes::compile_notes(graph, &order)?;
+
+    let mut cx = ParamCx::new(graph, &lines, slot_count, &notes);
     for &id in &order {
         let node = graph.node(id).expect("ordering only contains real nodes");
         cx.begin(id);
@@ -123,15 +128,18 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     }
     let param = cx.finish();
 
-    let audio = audio::compile_audio(graph, &order, &lines, &param.audio_lanes)?;
+    // The gates and generators booked their lanes during the pass above.
+    notes::resolve_lanes(&mut notes, &param.audio_lanes);
+
+    let audio = audio::compile_audio(graph, &order, &lines, &param.audio_lanes, &notes)?;
 
     Ok(Program {
         ops: param.ops,
         registers: param.registers,
         outputs: param.outputs,
         audio_ops: audio.ops,
-        note_ops: audio.note_ops,
-        note_bufs: audio.note_bufs,
+        note_ops: notes.ops,
+        note_bufs: notes.bufs,
         param_targets: param.param_targets,
         audio_lane_base: (slot_count + crate::ir::MAX_GRAPH_PARAMS) as u16,
         instances: audio.instances,
@@ -605,6 +613,7 @@ mod tests {
             | Op::KeyStep { .. }
             | Op::KeyLatch { .. }
             | Op::Latch { .. }
+            | Op::NoteCc { .. }
             | Op::LatchIs { .. } => Vec::new(),
             Op::Math { a, b, .. } => match b {
                 Operand::Reg(b) => vec![a, b],
@@ -643,6 +652,7 @@ mod tests {
             | Op::Range { out, .. }
             | Op::KeyHeld { out, .. }
             | Op::Latch { out, .. }
+            | Op::NoteCc { out, .. }
             | Op::LatchIs { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
             Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,

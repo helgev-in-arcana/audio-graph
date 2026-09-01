@@ -8,16 +8,15 @@
 //! runs.
 
 use crate::graph::{Graph, NodeId};
-use crate::ir::{AudioOp, Chunking, NoteOp};
+use crate::ir::{AudioOp, Chunking};
 use subhost_adapter::InstanceIo;
 
+use crate::compile::notes::Notes;
 use crate::compile::{AudioCx, CompileError, Line};
 
 /// The audio half of a `Program`.
 pub(crate) struct Audio {
     pub ops: Vec<AudioOp>,
-    pub note_ops: Vec<NoteOp>,
-    pub note_bufs: u16,
     /// Audio line index → its `DelayWrite` node, so a program swap can carry
     /// the ring contents over.
     pub delay_nodes: Vec<NodeId>,
@@ -41,12 +40,12 @@ pub(crate) fn compile_audio(
     order: &[NodeId],
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
+    notes: &Notes,
 ) -> Result<Audio, CompileError> {
-    let mut cx = AudioCx::new(graph, lines, order, audio_lanes);
+    let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
     for &id in order {
         let node = graph.node(id).expect("ordering only contains real nodes");
         cx.begin(id, &node.kind);
-        cx.route_notes(&node.kind)?;
         node.kind.compile_audio(&mut cx)?;
     }
     Ok(cx.finish())

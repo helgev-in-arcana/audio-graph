@@ -117,6 +117,8 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
                                 sample_rate: 48_000.0,
                                 tempo_bpm: 120.0,
                                 frames: 32,
+                                offset: 0,
+                                events: &[],
                             },
                             &mut slots,
                         );
@@ -238,6 +240,8 @@ fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames: 32,
+            offset: 0,
+            events: &[],
         },
         &mut slots,
     );

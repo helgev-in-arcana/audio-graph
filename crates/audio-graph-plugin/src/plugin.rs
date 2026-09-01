@@ -580,6 +580,8 @@ fn run_graph(
             sample_rate,
             tempo_bpm,
             frames: schedule.frames_of(index),
+            offset: start,
+            events,
         };
         let values = schedule.block_mut(index);
         // The DAW's automation fills the slot lanes; the rest are the graph's

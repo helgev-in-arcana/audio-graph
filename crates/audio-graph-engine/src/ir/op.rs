@@ -101,6 +101,31 @@ pub enum Op {
         key: u8,
         value: f64,
     },
+    /// Read the latest value of a controller off note buffer `buf`.
+    ///
+    /// The one op that reads the note half, and the reason the note pass runs
+    /// before this one: it names a buffer, so the buffer had to exist already.
+    ///
+    /// It sees the *previous* sub-block's stream, because the note half fills
+    /// the buffers at the end of each sub-block's parameter evaluation. That is
+    /// the honest answer rather than a shortcut: a parameter signal has
+    /// sub-block resolution, so the value a reader wants is the one in effect
+    /// at the boundary — the last event before it, not one from the middle of
+    /// the sub-block it is about to start. Events reaching a sub-plugin keep
+    /// their own sample offsets and are not delayed by this.
+    ///
+    /// `channel` of -1 means any. `state` is a latch holding the last value
+    /// seen, because a controller keeps its position between messages and a
+    /// block with no CC in it must not snap the value back to zero.
+    NoteCc {
+        out: Reg,
+        buf: u16,
+        state: u16,
+        channel: i16,
+        cc: u8,
+        /// What the controller reads as before it has ever been moved.
+        initial: f64,
+    },
     /// Read latch `state`, or `initial` if unset.
     Latch {
         out: Reg,
