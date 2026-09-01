@@ -4,9 +4,9 @@ Program {
             out: 0,
             slot: 0,
         },
-        Expr {
+        Const {
             out: 1,
-            source: Velocity,
+            value: 0.0,
         },
         Math {
             out: 2,

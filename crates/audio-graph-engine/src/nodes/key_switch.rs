@@ -136,11 +136,21 @@ impl Node for KeySwitch {
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        // A switch answers to the stream wired into it. Nothing wired means no
+        // keys to watch, so it rests where it is rather than following a
+        // keyboard it is not connected to.
+        let Some(buf) = cx.note_source_of(0) else {
+            return Ok(());
+        };
         match self.mode {
             KeySwitchMode::Hold => {
                 for (port, &key) in self.keys.iter().enumerate() {
                     let held = cx.alloc()?;
-                    cx.emit(Op::KeyHeld { out: held, key });
+                    cx.emit(Op::KeyHeld {
+                        out: held,
+                        buf,
+                        key,
+                    });
                     cx.bind_note_gate(port as u8, held)?;
                 }
                 Ok(())
@@ -155,6 +165,7 @@ impl Node for KeySwitch {
                 match self.mode {
                     KeySwitchMode::Toggle => cx.emit(Op::KeyStep {
                         state,
+                        buf,
                         key: self.keys[0],
                         count: self.keys.len() as u16,
                     }),
@@ -162,6 +173,7 @@ impl Node for KeySwitch {
                         for (port, &key) in self.keys.iter().enumerate() {
                             cx.emit(Op::KeyLatch {
                                 state,
+                                buf,
                                 key,
                                 value: port as f64,
                             });

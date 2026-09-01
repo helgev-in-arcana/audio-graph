@@ -18,7 +18,6 @@ mod audio_io;
 mod cc_in;
 mod constant;
 mod delay;
-mod expression;
 mod gate;
 mod key_param;
 mod key_switch;
@@ -26,6 +25,7 @@ mod lfo;
 mod math;
 mod mix;
 mod note_filter;
+mod note_follow;
 mod note_gate;
 mod note_in;
 mod note_mute;
@@ -39,7 +39,6 @@ pub use audio_io::{AudioIn, AudioOut};
 pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
-pub use expression::Expression;
 pub use gate::Gate;
 pub use key_param::{KeyParam, KeyParamMode};
 pub use key_switch::{KeySwitch, KeySwitchMode};
@@ -47,6 +46,7 @@ pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
 pub use note_filter::{FilterMode, NoteFilter};
+pub use note_follow::NoteFollow;
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use note_mute::NoteMute;
@@ -306,7 +306,7 @@ pub enum NodeKind {
     Constant(Constant),
     SlotIn(SlotIn),
     Lfo(Lfo),
-    Expression(Expression),
+    NoteFollow(NoteFollow),
     Math(Math),
     RangeMap(RangeMap),
     Switch(Switch),
@@ -345,7 +345,7 @@ macro_rules! for_kind {
             NodeKind::Constant($node) => $body,
             NodeKind::SlotIn($node) => $body,
             NodeKind::Lfo($node) => $body,
-            NodeKind::Expression($node) => $body,
+            NodeKind::NoteFollow($node) => $body,
             NodeKind::Math($node) => $body,
             NodeKind::RangeMap($node) => $body,
             NodeKind::Switch($node) => $body,
@@ -665,6 +665,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         CcIn::catalogue_defaults(),
         NodeKind::CcIn,
     );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteFollow::catalogue_defaults(),
+        NodeKind::NoteFollow,
+    );
 
     // Parameter.
     take(
@@ -684,12 +690,6 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Param,
         Lfo::catalogue_defaults(),
         NodeKind::Lfo,
-    );
-    take(
-        &mut out,
-        NodeGroup::Param,
-        Expression::catalogue_defaults(),
-        NodeKind::Expression,
     );
     take(
         &mut out,

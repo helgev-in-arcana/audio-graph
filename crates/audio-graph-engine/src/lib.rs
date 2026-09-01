@@ -37,13 +37,13 @@ pub use engine::{AudioContext, BlockContext, Engine};
 pub use graph::{Graph, LineId, Link, Node, NodeId};
 pub use handoff::Handoff;
 pub use ir::{
-    AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
+    AudioOp, Buf, Chunking, Follow, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS,
     MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, Program, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, Expression, FilterMode, Gate,
-    KeyParam, KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter,
+    AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, FilterMode, Gate, KeyParam,
+    KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteFollow,
     NoteGate, NoteIn, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn,
     Switch, db_to_linear, linear_to_db,
 };

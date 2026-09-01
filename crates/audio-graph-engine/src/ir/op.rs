@@ -3,7 +3,7 @@
 //! Contains the scalar operations the parameter engine executes each sub-block.
 //!
 //! The payload enums a node's settings reduce to — [`Waveform`], [`MathOp`],
-//! [`ExprSource`] — live here rather than next to the node that offers them,
+//! [`Follow`] — live here rather than next to the node that offers them,
 //! because an instruction carries them: they are part of what crosses to the
 //! audio thread, and `ir` is what may not depend on the edit side. The node
 //! modules use them from here.
@@ -51,10 +51,6 @@ pub enum Op {
         depth: f64,
         centre: f64,
     },
-    Expr {
-        out: Reg,
-        source: ExprSource,
-    },
     /// One of two operands, chosen by where `control` sits against `threshold`:
     /// `high` at the threshold and above, `low` below it.
     ///
@@ -75,6 +71,10 @@ pub enum Op {
     /// played since.
     KeyHeld {
         out: Reg,
+        /// The note buffer to watch. A key switch answers to the stream wired
+        /// into it, not to whatever the DAW happened to send: a switch behind
+        /// a channel filter must not fire on another channel's keys.
+        buf: u16,
         key: u8,
     },
     /// Advances latch `state` to the next of `count` positions when `key` is
@@ -87,6 +87,7 @@ pub enum Op {
     /// the topological sort, preventing cycles.
     KeyStep {
         state: u16,
+        buf: u16,
         key: u8,
         count: u16,
     },
@@ -98,6 +99,7 @@ pub enum Op {
     /// the topological sort, preventing cycles.
     KeyLatch {
         state: u16,
+        buf: u16,
         key: u8,
         value: f64,
     },
@@ -125,6 +127,23 @@ pub enum Op {
         cc: u8,
         /// What the controller reads as before it has ever been moved.
         initial: f64,
+    },
+    /// Follow the notes on buffer `buf`: how hard, whether any are down, or
+    /// which key.
+    ///
+    /// Monophonic on purpose. These three are the ones that still mean
+    /// something when polyphony is flattened — how hard the player is playing,
+    /// whether they are playing at all, and where on the keyboard — which is
+    /// why they survived the per-note expression node that used to carry them
+    /// alongside sources that did not.
+    ///
+    /// `state` is a latch: velocity and key hold their last value between
+    /// notes, and the gate holds a count of what is down.
+    NoteFollow {
+        out: Reg,
+        buf: u16,
+        state: u16,
+        what: Follow,
     },
     /// Read latch `state`, or `initial` if unset.
     Latch {
@@ -210,67 +229,27 @@ impl Waveform {
     }
 }
 
-/// Which per-note controller a node reads.
-///
-/// The graph is monophonic, so polyphony is reduced away: each source keeps the
-/// most recent value from any note, because a per-voice value would have nowhere
-/// to go. `Capabilities.poly_modulation` is what will decide whether the *voice*
-/// level ever becomes reachable, and the editor already greys these out when the
-/// sub-plugin cannot accept per-note modulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExprSource {
-    Pressure,
-    Tuning,
-    Brightness,
-    Expression,
-    Vibrato,
-    Volume,
-    Pan,
-    /// Velocity of the most recent note-on event, scaled to 0..1.
+/// What a [`Op::NoteFollow`] reads off a note stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Follow {
+    /// Velocity of the most recent note-on, `0..=1`.
+    #[default]
     Velocity,
-    /// 1.0 while any note is currently held, 0.0 otherwise.
+    /// 1 while any note from this stream is held, 0 otherwise.
     Gate,
-    /// Key number of the most recent note, normalized to 0..1 across the MIDI range.
+    /// Key number of the most recent note-on, `0..=1` across the MIDI range.
     KeyTrack,
 }
 
-impl ExprSource {
-    pub const ALL: [ExprSource; 10] = [
-        ExprSource::Pressure,
-        ExprSource::Tuning,
-        ExprSource::Brightness,
-        ExprSource::Expression,
-        ExprSource::Vibrato,
-        ExprSource::Volume,
-        ExprSource::Pan,
-        ExprSource::Velocity,
-        ExprSource::Gate,
-        ExprSource::KeyTrack,
-    ];
+impl Follow {
+    pub const ALL: [Follow; 3] = [Follow::Velocity, Follow::Gate, Follow::KeyTrack];
 
     pub fn label(self) -> &'static str {
         match self {
-            ExprSource::Pressure => "Pressure",
-            ExprSource::Tuning => "Tuning",
-            ExprSource::Brightness => "Brightness",
-            ExprSource::Expression => "Expression",
-            ExprSource::Vibrato => "Vibrato",
-            ExprSource::Volume => "Volume",
-            ExprSource::Pan => "Pan",
-            ExprSource::Velocity => "Velocity",
-            ExprSource::Gate => "Gate",
-            ExprSource::KeyTrack => "Key track",
+            Follow::Velocity => "Velocity",
+            Follow::Gate => "Gate",
+            Follow::KeyTrack => "Key Track",
         }
-    }
-
-    /// Whether this source comes from a per-note controller rather than from the
-    /// note itself. These are the ones a sub-plugin without per-note modulation
-    /// cannot meaningfully receive.
-    pub fn is_per_note(self) -> bool {
-        !matches!(
-            self,
-            ExprSource::Velocity | ExprSource::Gate | ExprSource::KeyTrack
-        )
     }
 }
 

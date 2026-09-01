@@ -608,7 +608,7 @@ mod tests {
             Op::Const { .. }
             | Op::Slot { .. }
             | Op::Lfo { .. }
-            | Op::Expr { .. }
+            | Op::NoteFollow { .. }
             | Op::KeyHeld { .. }
             | Op::KeyStep { .. }
             | Op::KeyLatch { .. }
@@ -646,7 +646,7 @@ mod tests {
             Op::Const { out, .. }
             | Op::Slot { out, .. }
             | Op::Lfo { out, .. }
-            | Op::Expr { out, .. }
+            | Op::NoteFollow { out, .. }
             | Op::Select { out, .. }
             | Op::Math { out, .. }
             | Op::Range { out, .. }

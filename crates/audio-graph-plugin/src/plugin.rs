@@ -566,16 +566,13 @@ fn run_graph(
         return;
     }
 
-    let mut next_event = 0;
     for index in 0..blocks {
         let start = schedule.offset(index);
-        while next_event < events.len() && events[next_event].sample_offset() <= start {
-            if let Event::Note(note) = events[next_event] {
-                engine.note(&note);
-            }
-            next_event += 1;
-        }
-
+        // The whole block's stream goes in, and the engine cuts it to the
+        // sub-block itself. It used to be folded into global state here, one
+        // event at a time, before each row; now the events flow along the
+        // graph's own wires and the only thing the engine needs is where the
+        // sub-block sits.
         let context = BlockContext {
             sample_rate,
             tempo_bpm,
@@ -592,14 +589,6 @@ fn run_graph(
         values[..slots].copy_from_slice(&daw_slots[..slots]);
         values[slots..].fill(0.0);
         engine.run(&context, values);
-    }
-
-    // Whatever is left lands after the final boundary. Folding it in now means
-    // the next block starts from the right state rather than rediscovering it.
-    for event in &events[next_event..] {
-        if let Event::Note(note) = *event {
-            engine.note(&note);
-        }
     }
 }
 
