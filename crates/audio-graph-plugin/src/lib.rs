@@ -59,7 +59,13 @@ macro_rules! wrapper_class {
 
             // Note input on both forms. The effect needs it as well because
             // note events and per-note expressions are graph input sources.
-            const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+            //
+            // `MidiCCs` rather than `Basic` so control change, pitch bend and
+            // channel pressure reach the graph as events. The cost is 130x16
+            // hidden read-only parameters on the VST3 side, which is how the
+            // format delivers CC at all — a plugin that wants controllers has
+            // no other route.
+            const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
 
             // The wrapper handles sub-block quantization for parameter automation,
             // so sample-accurate buffer splitting from the host is disabled.

@@ -745,10 +745,51 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             Expr::Brightness,
             brightness,
         ),
-        // CCs, pitch bend and sysex still go nowhere. They are host-level MIDI
-        // rather than per-note expression, and no node reads them; forwarding
-        // them to the sub-plugin blindly would be a separate decision about
-        // MIDI routing.
+        NoteEvent::MidiCC {
+            timing,
+            channel,
+            cc,
+            value,
+        } => ApiNote::Cc {
+            port: 0,
+            channel: channel as i16,
+            cc,
+            value: value as f64,
+            sample_offset: timing,
+        },
+        // nice-plug normalizes bend to `0..=1` with 0.5 at rest; the core model
+        // is signed, so centre lands on an exact zero either way.
+        NoteEvent::MidiPitchBend {
+            timing,
+            channel,
+            value,
+        } => ApiNote::PitchBend {
+            port: 0,
+            channel: channel as i16,
+            value: value as f64 * 2.0 - 1.0,
+            sample_offset: timing,
+        },
+        NoteEvent::MidiChannelPressure {
+            timing,
+            channel,
+            pressure,
+        } => ApiNote::ChannelPressure {
+            port: 0,
+            channel: channel as i16,
+            value: pressure as f64,
+            sample_offset: timing,
+        },
+        NoteEvent::MidiProgramChange {
+            timing,
+            channel,
+            program,
+        } => ApiNote::Midi {
+            port: 0,
+            data: [0xc0 | (channel & 0x0f), program & 0x7f, 0],
+            sample_offset: timing,
+        },
+        // SysEx is generic over the plugin's own message type, which we do not
+        // define, so there is nothing here to forward it as.
         _ => return None,
     })
 }
@@ -756,6 +797,62 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CC, bend and channel pressure reaching the graph is the whole point of
+    /// asking the host for `MidiConfig::MidiCCs`; before that they were dropped
+    /// here, so nothing downstream could have observed the difference.
+    #[test]
+    fn controllers_convert_instead_of_being_dropped() {
+        let cc = convert_note(&NoteEvent::<()>::MidiCC {
+            timing: 3,
+            channel: 1,
+            cc: 64,
+            value: 1.0,
+        });
+        assert!(matches!(
+            cc,
+            Some(ApiNote::Cc {
+                channel: 1,
+                cc: 64,
+                value,
+                sample_offset: 3,
+                ..
+            }) if value == 1.0
+        ));
+
+        // nice-plug centres bend at 0.5; the core model centres it at zero.
+        let bend = convert_note(&NoteEvent::<()>::MidiPitchBend {
+            timing: 0,
+            channel: 0,
+            value: 0.5,
+        });
+        assert!(matches!(bend, Some(ApiNote::PitchBend { value, .. }) if value == 0.0));
+
+        let pressure = convert_note(&NoteEvent::<()>::MidiChannelPressure {
+            timing: 0,
+            channel: 0,
+            pressure: 0.25,
+        });
+        assert!(matches!(
+            pressure,
+            Some(ApiNote::ChannelPressure { value, .. }) if value == 0.25
+        ));
+    }
+
+    /// The host's answer about voice identity is passed through, absence
+    /// included. Substituting the key number here used to make an invented id
+    /// indistinguishable from a real one.
+    #[test]
+    fn a_missing_voice_id_stays_missing() {
+        let on = convert_note(&NoteEvent::<()>::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 60,
+            velocity: 1.0,
+        });
+        assert!(matches!(on, Some(ApiNote::NoteOn { note_id: None, .. })));
+    }
     use audio_graph_engine::{
         Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,
     };
