@@ -427,7 +427,7 @@ fn the_backend_drives_a_real_clap_module() {
     // --- notes -------------------------------------------------------------
 
     let note_on = [Event::Note(NoteEvent::NoteOn {
-        note_id: 1,
+        note_id: Some(1),
         port: 0,
         channel: 0,
         key: 60,

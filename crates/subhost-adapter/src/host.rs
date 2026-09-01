@@ -1014,7 +1014,7 @@ mod tests {
     fn a_chunk_hears_only_its_own_events_rebased() {
         let (mut p, seen) = harness(Vec::new());
         let note = Event::Note(NoteEvent::NoteOn {
-            note_id: -1,
+            note_id: None,
             port: 0,
             channel: 0,
             key: 60,
@@ -1153,7 +1153,7 @@ mod tests {
         }
         let notes = [
             Event::Note(plugin_host::NoteEvent::NoteOn {
-                note_id: 1,
+                note_id: Some(1),
                 port: 0,
                 channel: 0,
                 key: 60,
@@ -1161,7 +1161,7 @@ mod tests {
                 sample_offset: 40,
             }),
             Event::Note(plugin_host::NoteEvent::NoteOff {
-                note_id: 1,
+                note_id: Some(1),
                 port: 0,
                 channel: 0,
                 key: 60,
@@ -1220,7 +1220,7 @@ mod tests {
         };
 
         let note = Event::Note(NoteEvent::NoteOn {
-            note_id: -1,
+            note_id: None,
             port: 0,
             channel: 0,
             key: 60,
@@ -1272,7 +1272,7 @@ mod tests {
 
         let incoming = [
             Event::Note(NoteEvent::NoteOn {
-                note_id: -1,
+                note_id: None,
                 port: 0,
                 channel: 0,
                 key: 60,
@@ -1280,7 +1280,7 @@ mod tests {
                 sample_offset: 0,
             }),
             Event::Note(NoteEvent::NoteOff {
-                note_id: -1,
+                note_id: None,
                 port: 0,
                 channel: 0,
                 key: 55,

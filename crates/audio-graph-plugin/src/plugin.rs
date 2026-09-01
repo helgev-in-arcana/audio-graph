@@ -620,6 +620,10 @@ fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
 ///
 /// Forwards note-on, note-off, voice termination, and per-note expressions (pressure,
 /// volume, pan, tuning, vibrato, brightness) to the engine.
+/// The host's `voice_id` is passed through as-is, including its absence. It
+/// used to be replaced with the key number when the host supplied none, which
+/// made a note we invented an id for indistinguishable from one the host
+/// actually numbered — and collided the moment the same key overlapped itself.
 fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
     use plugin_host::NoteExpression as Expr;
 
@@ -634,7 +638,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
         value: f32,
     ) -> ApiNote {
         ApiNote::Expression {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -652,7 +656,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             note,
             velocity,
         } => ApiNote::NoteOn {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -666,7 +670,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             note,
             velocity,
         } => ApiNote::NoteOff {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -679,7 +683,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             channel,
             note,
         } => ApiNote::NoteEnd {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,

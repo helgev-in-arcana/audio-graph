@@ -246,7 +246,7 @@ pub fn note(key: i16, start: usize, length: usize) -> Vec<(usize, Event)> {
         (
             start,
             Event::Note(NoteEvent::NoteOn {
-                note_id: key as i32,
+                note_id: Some(key as i32),
                 port: 0,
                 channel: 0,
                 key,
@@ -257,7 +257,7 @@ pub fn note(key: i16, start: usize, length: usize) -> Vec<(usize, Event)> {
         (
             start + length,
             Event::Note(NoteEvent::NoteOff {
-                note_id: key as i32,
+                note_id: Some(key as i32),
                 port: 0,
                 channel: 0,
                 key,

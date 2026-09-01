@@ -482,7 +482,14 @@ impl Engine {
             } => {
                 self.expressions.values[expression_index(expression)] = value;
             }
-            NoteEvent::Midi { .. } => {}
+            // MIDI controllers have no reader yet. Phase 5 gives them nodes;
+            // folding them into the global expression state would be the
+            // opposite of that.
+            NoteEvent::Cc { .. }
+            | NoteEvent::PitchBend { .. }
+            | NoteEvent::ChannelPressure { .. }
+            | NoteEvent::PolyPressure { .. }
+            | NoteEvent::Midi { .. } => {}
         }
     }
 
@@ -1976,7 +1983,7 @@ mod tests {
 
         let mut slots = lanes();
         engine.note(&NoteEvent::Expression {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 60,
@@ -2045,7 +2052,7 @@ mod tests {
         assert_eq!(lanes[lane], 0.0, "nothing is held yet");
 
         engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2057,7 +2064,7 @@ mod tests {
 
         // A different key coming and going must not move it.
         engine.note(&NoteEvent::NoteOn {
-            note_id: 2,
+            note_id: Some(2),
             port: 0,
             channel: 0,
             key: 60,
@@ -2065,7 +2072,7 @@ mod tests {
             sample_offset: 0,
         });
         engine.note(&NoteEvent::NoteOff {
-            note_id: 2,
+            note_id: Some(2),
             port: 0,
             channel: 0,
             key: 60,
@@ -2076,7 +2083,7 @@ mod tests {
         assert_eq!(lanes[lane], 1.0, "another key came and went");
 
         engine.note(&NoteEvent::NoteOff {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2141,7 +2148,7 @@ mod tests {
         let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
         let mut lanes = vec![0.0; width];
         let strike = NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2192,7 +2199,7 @@ mod tests {
         load(&mut engine, &graph);
         let mut slots = lanes();
         let strike = NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2237,7 +2244,7 @@ mod tests {
         load(&mut engine, &graph);
         let mut slots = lanes();
         let strike = |key: i16| NoteEvent::NoteOn {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,
@@ -2285,7 +2292,7 @@ mod tests {
         let mut slots = lanes();
 
         engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 25,
@@ -2324,7 +2331,7 @@ mod tests {
         let mut slots = lanes();
         slots[3] = 0.6;
         engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 25,
@@ -2352,7 +2359,7 @@ mod tests {
         let mut slots = lanes();
 
         let on = |key: i16| NoteEvent::NoteOn {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,
@@ -2360,7 +2367,7 @@ mod tests {
             sample_offset: 0,
         };
         let off = |key: i16| NoteEvent::NoteOff {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,

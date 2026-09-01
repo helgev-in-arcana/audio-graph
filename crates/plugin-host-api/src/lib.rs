@@ -18,7 +18,10 @@ mod params;
 mod traits;
 
 pub use buffers::{AudioBuffers, AudioConfig, AuxBuses, BufferLayout, MAX_AUX_BUSES};
-pub use events::{Event, EventSink, NoteEvent, NoteExpression, ParamEvent, Target, TimeContext};
+pub use events::{
+    Event, EventSink, NoteEvent, NoteExpression, NoteId, ParamEvent, Target, TimeContext,
+    note_id_from_wire, note_id_to_wire,
+};
 pub use params::{
     BusInfo, Capabilities, IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
     VoiceInfo,

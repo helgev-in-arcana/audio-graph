@@ -8,11 +8,12 @@
 
 use plugin_host_api::{
     Event as ApiEvent, EventSink, NoteEvent, NoteExpression, ParamEvent, TimeContext,
+    note_id_from_wire, note_id_to_wire,
 };
 use vst3::ComWrapper;
 use vst3::Steinberg::Vst::{
     Event as VstEvent, Event_::EventTypes_, NoteExpressionTypeIDs_, NoteExpressionValueEvent,
-    NoteOffEvent, NoteOnEvent, ProcessContext, ProcessContext_::StatesAndFlags_,
+    NoteOffEvent, NoteOnEvent, PolyPressureEvent, ProcessContext, ProcessContext_::StatesAndFlags_,
 };
 
 use crate::param_map::ParamMap;
@@ -82,7 +83,7 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
                 tuning: 0.0,
                 velocity: velocity as f32,
                 length: 0,
-                noteId: note_id,
+                noteId: note_id_to_wire(note_id),
             };
         }
         NoteEvent::NoteOff {
@@ -97,7 +98,7 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
                 channel,
                 pitch: key,
                 velocity: velocity as f32,
-                noteId: note_id,
+                noteId: note_id_to_wire(note_id),
                 tuning: 0.0,
             };
         }
@@ -111,15 +112,37 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
             vst.r#type = EventTypes_::kNoteExpressionValueEvent as u16;
             vst.__field0.noteExpressionValue = NoteExpressionValueEvent {
                 typeId: type_id,
-                noteId: note_id,
+                noteId: note_id_to_wire(note_id),
                 value,
             };
         }
         // NoteEnd travels plugin-to-host only; sending one would be meaningless.
         NoteEvent::NoteEnd { .. } => return None,
-        // Raw MIDI bytes do not map directly to VST3 events; standard MIDI controllers
-        // are routed through parameter changes via IMidiMapping.
-        NoteEvent::Midi { .. } => return None,
+        // Polyphonic aftertouch is the one MIDI channel-voice message VST3
+        // carries as an event; it addresses a note, so it belongs here rather
+        // than on the parameter side.
+        NoteEvent::PolyPressure {
+            channel,
+            key,
+            value,
+            ..
+        } => {
+            vst.r#type = EventTypes_::kPolyPressureEvent as u16;
+            vst.__field0.polyPressure = PolyPressureEvent {
+                channel,
+                pitch: key,
+                pressure: value as f32,
+                noteId: -1,
+            };
+        }
+        // Control change, pitch bend and channel pressure are not VST3 events
+        // at all: the format requires them to arrive as parameter changes via
+        // IMidiMapping. Routing them there is phase 3; until then they are
+        // dropped rather than approximated.
+        NoteEvent::Cc { .. }
+        | NoteEvent::PitchBend { .. }
+        | NoteEvent::ChannelPressure { .. }
+        | NoteEvent::Midi { .. } => return None,
     }
 
     Some(vst)
@@ -156,7 +179,7 @@ pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
         if vst.r#type == EventTypes_::kNoteOffEvent as u16 {
             let off = unsafe { vst.__field0.noteOff };
             sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
-                note_id: off.noteId,
+                note_id: note_id_from_wire(off.noteId),
                 port: 0,
                 channel: off.channel,
                 key: off.pitch,
@@ -299,7 +322,7 @@ mod tests {
         let changes = ParameterChanges::new(1, 1);
         fill_inputs(
             &[ApiEvent::Note(NoteEvent::NoteOn {
-                note_id: 42,
+                note_id: Some(42),
                 port: 0,
                 channel: 1,
                 key: 60,
