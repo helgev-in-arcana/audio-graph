@@ -5,7 +5,7 @@
 //! pointer, so a `Program` stays a value that could cross a process boundary
 //! unchanged.
 
-use subhost_adapter::{NoteSource, NoteStream};
+use crate::ir::NoteBuf;
 
 /// An index into the audio buffer pool.
 pub type Buf = u16;
@@ -34,51 +34,6 @@ pub enum Chunking {
     /// the rule that a delay must be at least one chunk long binds the plugins
     /// in the loop too.
     SubBlock,
-}
-
-/// How a plugin's notes reach it: where they come from, what may stop them on
-/// the way, and which keys are swallowed before they arrive.
-///
-/// The gate is a lane number rather than a decision because the decision is the
-/// parameter half's and is remade every sub-block, while the audio half runs on
-/// its own grain — the same arrangement a `Mix`'s gain and a delay's time use.
-/// Below 0.5 the stream is shut.
-///
-/// `mute` is settled at compile time instead: which keys a key switch answers to
-/// is an edit, not a signal, so there is nothing for a lane to carry.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct NoteRoute {
-    pub source: NoteSource,
-    pub gate: Option<u16>,
-    pub mute: u128,
-}
-
-impl NoteRoute {
-    pub fn from_source(source: NoteSource) -> NoteRoute {
-        NoteRoute {
-            source,
-            gate: None,
-            mute: 0,
-        }
-    }
-
-    /// Resolves the effective [`NoteStream`] based on the dynamic gate lane value.
-    ///
-    /// When the gate lane value is below 0.5, only release/note-off events are
-    /// passed. `None` for the lane value means the lane is not there at all,
-    /// which is a program the engine should not have been handed; shutting the
-    /// stream is the quiet failure rather than the loud one.
-    pub fn resolve(self, lane_value: Option<f64>) -> NoteStream {
-        let source = match self.gate {
-            None => self.source,
-            Some(_) if lane_value.is_some_and(|v| v >= 0.5) => self.source,
-            Some(_) => self.source.releases_only(),
-        };
-        NoteStream {
-            source,
-            mute: self.mute,
-        }
-    }
 }
 
 /// One step of the audio half of a program.
@@ -111,8 +66,14 @@ pub enum AudioOp {
         /// common case; more only when a patch reads a plugin's extra
         /// outputs.
         output_buses: Vec<u16>,
-        /// Note stream routing and gating configuration for this plugin instance.
-        notes: NoteRoute,
+        /// The note buffer this instance hears, or `None` when nothing is
+        /// wired to its notes port.
+        ///
+        /// `None` rather than an empty buffer because an unwired instrument
+        /// has to hear nothing: handing every instance whatever the DAW sent
+        /// is the tempting default and the wrong one — two synths then play in
+        /// unison whatever the patch says.
+        notes: Option<NoteBuf>,
     },
     /// Copy one bus out of a plugin's output region.
     ///

@@ -464,8 +464,7 @@ impl Wrapper {
             let mut empty = subhost_adapter::NoInstances;
             let nodes: &mut dyn subhost_adapter::AudioInstances = match processor {
                 Some(processor) => {
-                    loaded =
-                        processor.bind(&self.schedule, &self.events, &time, &mut self.out_events);
+                    loaded = processor.bind(&self.schedule, &time, &mut self.out_events);
                     &mut loaded
                 }
                 None => &mut empty,
@@ -479,6 +478,7 @@ impl Wrapper {
                     // half reads only its own range of lane numbers out of it.
                     lanes: self.schedule.rows(),
                     lanes_per_row: LANES,
+                    events: &self.events,
                 },
                 &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],

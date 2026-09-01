@@ -49,6 +49,8 @@ Program {
             a: 0,
         },
     ],
+    note_ops: [],
+    note_bufs: 0,
     param_targets: [],
     audio_lane_base: 96,
     instances: [],

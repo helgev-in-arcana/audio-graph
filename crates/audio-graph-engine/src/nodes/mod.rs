@@ -99,18 +99,19 @@ pub(crate) trait Node {
         Ok(())
     }
 
-    /// Identifies the note stream originating from this node, if it is a note source.
-    fn note_identity(&self) -> Option<NoteSource> {
+    /// The DAW note bus this node reads, if it is where notes come from.
+    fn note_source(&self) -> Option<u16> {
         None
     }
 
     /// Which of this node's inputs the notes leaving output `port` came in
     /// through, for a node that passes notes on rather than making them.
     ///
-    /// This is what lets a note stream be routed through several nodes and still
-    /// be found: the compiler walks up the chain socket by socket until
-    /// something answers [`Node::note_identity`]. A node that answers neither is
-    /// the end of the walk, and a plugin behind it hears nothing.
+    /// This is what makes a note node a filter: the compiler gives the output
+    /// the buffer that arrived at `port`, or a copy of it with whatever this
+    /// node refuses taken out. A node that answers neither this nor
+    /// [`Node::note_source`] produces no note buffer, and a plugin behind it
+    /// hears nothing.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         let _ = port;
         None
@@ -119,8 +120,8 @@ pub(crate) trait Node {
     /// Whether the notes leaving output `port` pass only while a condition this
     /// node binds is open — see [`crate::compile::ParamCx::bind_note_gate`].
     ///
-    /// The chain walk stops at the first gate it finds, so a node that merely
-    /// hands notes on must answer `false` or the gates above it are lost.
+    /// Each gate applies its own condition to its own copy of the stream, so a
+    /// node that merely hands notes on answers `false` and costs nothing.
     fn note_gated(&self, port: u8) -> bool {
         let _ = port;
         false
@@ -130,9 +131,9 @@ pub(crate) trait Node {
     /// `port` — bit `k` set means key `k` does not go on.
     ///
     /// A key switch's own keys are the case: they are played to steer, not to
-    /// sound, and by default the thing being steered should never hear them. The
-    /// mask is collected while the compiler walks the chain, so several switches
-    /// in series each swallow their own.
+    /// sound, and by default the thing being steered should never hear them.
+    /// Several switches in series each swallow their own, because each is its
+    /// own filter on the stream.
     fn note_mute(&self, port: u8) -> u128 {
         let _ = port;
         0
@@ -257,7 +258,6 @@ pub(crate) trait Node {
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::port::Port;
-use subhost_adapter::NoteSource;
 
 /// One node's identity and settings.
 ///
@@ -355,8 +355,8 @@ impl NodeKind {
     }
 
     /// Identifies the note stream originating from this node, if it is a note source.
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        for_kind!(self, node => node.note_identity())
+    pub(crate) fn note_source(&self) -> Option<u16> {
+        for_kind!(self, node => node.note_source())
     }
 
     /// Where the notes leaving output `port` came in — see

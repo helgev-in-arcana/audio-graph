@@ -1,6 +1,5 @@
 use crate::nodes::Node;
 use crate::port::{Port, PortType};
-use subhost_adapter::NoteSource;
 
 /// MIDI note stream input from the host DAW.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -19,9 +18,9 @@ impl Node for NoteIn {
         vec![Port::new("out", PortType::Note)]
     }
 
-    /// Identifies the note stream originating from the DAW's primary note bus.
-    fn note_identity(&self) -> Option<NoteSource> {
-        Some(NoteSource::Daw { bus: 0 })
+    /// The DAW's primary note bus.
+    fn note_source(&self) -> Option<u16> {
+        Some(0)
     }
 }
 

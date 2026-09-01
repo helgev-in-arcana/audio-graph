@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
-use crate::ir::{MathOp, Op, Operand};
+use crate::ir::{Op, Operand};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::NodeUi;
@@ -50,21 +50,10 @@ impl Node for NoteGate {
             low: Operand::Value(low),
             high: Operand::Value(high),
         });
-        // Combine this gate condition with any upstream note gate condition via multiplication.
-        let condition = match cx.upstream_note_gate(0) {
-            Some(upstream) => {
-                let both = cx.alloc()?;
-                cx.emit(Op::Math {
-                    out: both,
-                    a: open,
-                    b: Operand::Reg(upstream),
-                    op: MathOp::Multiply,
-                });
-                both
-            }
-            None => open,
-        };
-        cx.bind_note_gate(0, condition)
+        // No folding of the gates upstream: each one is its own filter on its
+        // own copy of the stream, so two in series already pass only what both
+        // let through.
+        cx.bind_note_gate(0, open)
     }
 
     #[cfg(feature = "ui")]

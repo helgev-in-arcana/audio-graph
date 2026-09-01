@@ -18,9 +18,11 @@
 //! rewrite.
 
 mod audio_op;
+mod note_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn};
+pub use note_op::{MAX_NOTE_BUFS, NOTE_BUF_CAPACITY, NoteBuf, NoteOp};
 
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};
@@ -154,6 +156,10 @@ pub struct Program {
     pub delay_nodes: Vec<NodeId>,
     /// Audio processing operations in topological execution order.
     pub audio_ops: Vec<AudioOp>,
+    /// The note half, run once per sub-block ahead of the audio ops.
+    pub note_ops: Vec<NoteOp>,
+    /// How many note buffers this program uses.
+    pub note_bufs: u16,
     /// Which sub-plugin parameter each graph-driven lane drives.
     ///
     /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
@@ -201,6 +207,8 @@ impl Program {
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),
+            note_ops: Vec::new(),
+            note_bufs: 0,
             param_targets: Vec::new(),
             audio_lane_base: 0,
             instances: Vec::new(),

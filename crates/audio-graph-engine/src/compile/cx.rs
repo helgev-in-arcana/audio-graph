@@ -22,7 +22,8 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
     MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_REGISTERS, NoteBuf, NoteOp, Op,
+    Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -34,39 +35,9 @@ use crate::ir::{
 /// was.
 const OUTPUT_SOCKET: u8 = 128;
 
-/// Walks up a note chain from `(node, port)` to whatever makes the notes.
-///
-/// Returns the source, the gate socket nearest the reader, and the accumulated
-/// key mute mask. Nearest, because each gate already folds the ones above it
-/// into its own condition, so the closest one is the whole answer.
-fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>, u128) {
-    let mut at = graph.source_of(node, port);
-    let mut gate = None;
-    let mut mute = 0u128;
-    for _ in 0..=graph.nodes.len() {
-        let Some((from, from_port)) = at else {
-            return (NoteSource::None, gate, mute);
-        };
-        let Some(node) = graph.node(from) else {
-            return (NoteSource::None, gate, mute);
-        };
-        if let Some(source) = node.kind.note_identity() {
-            return (source, gate, mute);
-        }
-        let Some(input) = node.kind.note_passthrough(from_port) else {
-            return (NoteSource::None, gate, mute);
-        };
-        mute |= node.kind.note_mute(from_port);
-        if node.kind.note_gated(from_port) {
-            gate = gate.or(Some((from, from_port)));
-        }
-        at = graph.source_of(from, input);
-    }
-    (NoteSource::None, gate, mute)
-}
 use crate::nodes::NodeKind;
 use crate::port::PortType;
-use subhost_adapter::{InstanceIo, NoteSource, ParamTarget};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// What a node is handed while the parameter half is being compiled.
 pub(crate) struct ParamCx<'a> {
@@ -313,21 +284,6 @@ impl<'a> ParamCx<'a> {
         Ok(())
     }
 
-    /// The gate condition on the note chain feeding this node's input `port`,
-    /// if there is one upstream.
-    ///
-    /// A gate node asks for this so it can fold the gates above it into its own
-    /// condition: two gates in series pass notes only when both are open, and
-    /// one register saying so is cheaper than the audio half carrying a list.
-    pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
-        let (_, socket, _) = trace_notes(self.graph, self.id, port);
-        let socket = socket?;
-        self.note_gates
-            .iter()
-            .find(|&&(key, _)| key == socket)
-            .map(|&(_, reg)| reg)
-    }
-
     /// Says that the notes leaving this node's output `port` pass only while
     /// `reg` is 1.
     ///
@@ -504,6 +460,13 @@ pub(crate) struct AudioCx<'a> {
     audio_lines: Vec<LineId>,
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
+
+    note_ops: Vec<NoteOp>,
+    /// Output socket → the note buffer leaving it. An open filter binds its
+    /// input's buffer rather than a new one, so several sockets can name the
+    /// same buffer; nothing writes a buffer twice, so sharing is free.
+    note_outputs: Vec<((NodeId, u8), NoteBuf)>,
+    note_bufs: u16,
 }
 
 impl<'a> AudioCx<'a> {
@@ -533,6 +496,9 @@ impl<'a> AudioCx<'a> {
             audio_lines: Vec::new(),
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
+            note_ops: Vec::new(),
+            note_outputs: Vec::new(),
+            note_bufs: 0,
         }
     }
 
@@ -607,6 +573,8 @@ impl<'a> AudioCx<'a> {
         Audio {
             instances: self.instances,
             ops: self.ops,
+            note_ops: self.note_ops,
+            note_bufs: self.note_bufs,
             delay_nodes: self.delay_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
@@ -714,23 +682,88 @@ impl<'a> AudioCx<'a> {
             .map(|&(_, lane)| lane)
     }
 
-    /// How notes reach this node's input `port`.
+    /// Emit this node's share of the note half, before it compiles its audio.
+    ///
+    /// Generic over the node kinds rather than written into each of them: what
+    /// a note node contributes is entirely described by the three questions it
+    /// already answers — where notes come from, which input an output hands on,
+    /// and what it drops on the way. Topological order guarantees the buffer
+    /// feeding a socket is bound before anything reads it.
+    pub(crate) fn route_notes(&mut self, kind: &NodeKind) -> Result<(), CompileError> {
+        if let Some(bus) = kind.note_source() {
+            let out = self.alloc_note_buf()?;
+            self.note_ops.push(NoteOp::Input { out, bus });
+            self.note_outputs.push(((self.id, 0), out));
+            return Ok(());
+        }
+
+        for port in 0..kind.output_ports().len() as u8 {
+            // A socket nobody reads gets no buffer. A key switch offers one
+            // output per destination and a patch usually leaves some of them
+            // empty; filling those would spend the pool on streams no plugin
+            // will ever be handed.
+            if self.readers_of(port) == 0 {
+                continue;
+            }
+            let Some(input) = kind.note_passthrough(port) else {
+                continue;
+            };
+            let Some(a) = self.note_source_of(input) else {
+                // Nothing wired upstream. Leaving the socket unbound is what
+                // makes an instrument behind it silent.
+                continue;
+            };
+            let gate = kind
+                .note_gated(port)
+                .then(|| self.note_gate_lane(port))
+                .flatten();
+            let mute = kind.note_mute(port);
+            // An open filter that drops nothing is not worth a buffer or a
+            // copy; the socket simply carries what came in.
+            let out = if gate.is_none() && mute == 0 {
+                a
+            } else {
+                let out = self.alloc_note_buf()?;
+                self.note_ops.push(NoteOp::Filter { a, out, gate, mute });
+                out
+            };
+            self.note_outputs.push(((self.id, port), out));
+        }
+        Ok(())
+    }
+
+    /// The note buffer wired into this node's input `port`.
     ///
     /// `None` when nothing is connected, which is the answer that makes an
     /// unwired instrument silent rather than making it play whatever the DAW
-    /// happened to send. Only `NoteIn` produces notes today; a plugin's own
-    /// note output would need the engine to carry event buffers. What sits
-    /// between the source and here — gates — comes back as a lane number for
-    /// the audio half to read each chunk.
-    pub(crate) fn note_route(&self, port: u8) -> NoteRoute {
-        let (source, socket, mute) = trace_notes(self.graph, self.id, port);
-        let gate = socket.and_then(|(node, out_port)| {
-            self.lanes
-                .iter()
-                .find(|&&(key, _)| key == (node, OUTPUT_SOCKET + out_port))
-                .map(|&(_, lane)| lane)
-        });
-        NoteRoute { source, gate, mute }
+    /// happened to send.
+    pub(crate) fn note_source_of(&self, port: u8) -> Option<NoteBuf> {
+        let (from, from_port) = self.graph.source_of(self.id, port)?;
+        self.note_outputs
+            .iter()
+            .find(|&&(socket, _)| socket == (from, from_port))
+            .map(|&(_, buf)| buf)
+    }
+
+    /// The lane the param half booked for the gate on this node's output
+    /// `port`.
+    fn note_gate_lane(&self, port: u8) -> Option<u16> {
+        self.lanes
+            .iter()
+            .find(|&&(key, _)| key == (self.id, OUTPUT_SOCKET + port))
+            .map(|&(_, lane)| lane)
+    }
+
+    fn alloc_note_buf(&mut self) -> Result<NoteBuf, CompileError> {
+        if usize::from(self.note_bufs) >= MAX_NOTE_BUFS {
+            return Err(CompileError::TooLarge {
+                what: "note buffers",
+                limit: MAX_NOTE_BUFS,
+            });
+        }
+        let buf = self.note_bufs;
+        self.note_bufs += 1;
+        Ok(buf)
     }
 
     // --- buffers ----------------------------------------------------------

@@ -29,9 +29,7 @@ mod state;
 pub use host::{
     BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
-pub use instances::{
-    AudioChunk, AudioInstances, InstanceIo, NoInstances, NoteSource, NoteStream, ParamTarget,
-};
+pub use instances::{AudioChunk, AudioInstances, InstanceIo, NoInstances, ParamTarget};
 pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, SlotSchedule};
 pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
 pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};

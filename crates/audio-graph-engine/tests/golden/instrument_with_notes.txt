@@ -19,19 +19,22 @@ Program {
             output_buses: [
                 2,
             ],
-            notes: NoteRoute {
-                source: Daw {
-                    bus: 0,
-                },
-                gate: None,
-                mute: 0,
-            },
+            notes: Some(
+                0,
+            ),
         },
         Output {
             a: 1,
             bus: 0,
         },
     ],
+    note_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+    ],
+    note_bufs: 1,
     param_targets: [],
     audio_lane_base: 96,
     instances: [

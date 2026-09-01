@@ -39,7 +39,7 @@ pub use handoff::Handoff;
 pub use ir::{
     AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteRoute, Op, Operand, Program, RateSpec, Reg, Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, Program, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
     AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam, KeyParamMode,
