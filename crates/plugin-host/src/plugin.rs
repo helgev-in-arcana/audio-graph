@@ -277,6 +277,10 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::voice_info(p))
     }
 
+    fn note_dialects(&self) -> Vec<&'static str> {
+        delegate!(self, p => SubPluginMain::note_dialects(p))
+    }
+
     fn io_layout(&self) -> IoLayout {
         delegate!(self, p => SubPluginMain::io_layout(p))
     }

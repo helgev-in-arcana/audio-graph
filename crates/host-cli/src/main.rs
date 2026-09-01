@@ -399,6 +399,11 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
     println!("capabilities: {:?}", plugin.capabilities());
+    // Empty for VST3, which has one way to deliver a note and no name for it.
+    let dialects = SubPluginMain::note_dialects(&plugin);
+    if !dialects.is_empty() {
+        println!("note dialects: {}", dialects.join(", "));
+    }
     // Only CLAP instruments answer this, so most plugins print nothing rather
     // than a line of zeroes.
     if let Some(voices) = SubPluginMain::voice_info(&plugin) {
