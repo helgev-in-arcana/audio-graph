@@ -52,6 +52,7 @@ use vst3::{ComPtr, ComWrapper, Interface};
 use crate::cid::Cid;
 use crate::host_app::{ComponentHandler, HostApplication};
 
+use crate::midi_map::MidiMap;
 use crate::module::{Module, ModuleInner};
 use crate::param_map::ParamMap;
 use crate::process_io::{EventList, ParameterChanges};
@@ -660,11 +661,20 @@ impl SubPluginMain for Vst3Plugin {
             None => ParamMap::build(&[], |_, n| n),
         };
 
+        // Same thread, same reason: IMidiMapping hangs off IEditController.
+        let midi = MidiMap::build(
+            self.controller
+                .as_ref()
+                .and_then(|c| c.cast::<IMidiMapping>())
+                .as_ref(),
+        );
+
         Ok(Box::new(Vst3Processor::new(
             self.processor.clone(),
             config,
             &declared,
             map,
+            midi,
             Arc::clone(&self.pending_edits),
         )))
     }
@@ -732,6 +742,8 @@ pub struct Vst3Processor {
 
     /// Plain→normalised conversion captured at activate.
     param_map: ParamMap,
+    /// MIDI controller → parameter id, also captured at activate.
+    midi_map: MidiMap,
     /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
 }
@@ -747,6 +759,7 @@ impl Vst3Processor {
         config: AudioConfig,
         declared: &DeclaredBuses,
         param_map: ParamMap,
+        midi_map: MidiMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
     ) -> Vst3Processor {
         Vst3Processor {
@@ -761,6 +774,7 @@ impl Vst3Processor {
             input_buses: declared.inputs.iter().map(empty_bus).collect(),
             output_buses: declared.outputs.iter().map(empty_bus).collect(),
             param_map,
+            midi_map,
             pending_edits,
         }
     }
@@ -803,6 +817,7 @@ impl SubPluginProcessor for Vst3Processor {
         vst_events::fill_inputs(
             events,
             &self.param_map,
+            &self.midi_map,
             &self.input_changes,
             &self.input_events,
         );

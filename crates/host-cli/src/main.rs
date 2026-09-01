@@ -55,6 +55,7 @@ fn main() -> ExitCode {
         "params" => cmd_params(rest),
         "render" => cmd_render(rest),
         "synth" => cmd_synth(rest),
+        "sustain" => cmd_sustain(rest),
         "state" => cmd_state(rest),
         "twice" => cmd_twice(rest),
         "sweep" => cmd_sweep(rest),
@@ -105,6 +106,8 @@ fn usage() {
                                     run audio through the plugin
   host-cli synth <PLUGIN> <OUT.wav> [ID]
                                     play a note into an instrument
+  host-cli sustain <PLUGIN> [ID]    hold CC64 past a note-off and check the
+                                    instrument keeps sounding
   host-cli sweep [DIR...]           lifecycle-test every plugin, one child process each
   host-cli probe <PLUGIN>           lifecycle-test one module in this process
   host-cli nest <WRAPPER.vst3> [ID]
@@ -513,6 +516,58 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Send a note, hold the sustain pedal past its note-off, and listen.
+///
+/// This is the end-to-end check for the controller route. VST3 delivers no CC
+/// as a MIDI message at all — it has to become a parameter change through
+/// `IMidiMapping` — so a synth that rings on here proves the whole path, and
+/// one that cuts off proves nothing arrived.
+fn cmd_sustain(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("expected a plugin path")?;
+    let id = args.get(1).map(String::as_str);
+
+    let sample_rate = 48_000.0;
+    let frames = (sample_rate * 3.0) as usize;
+    let input = wav::Audio::silence(sample_rate, 2, frames);
+
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let note = render::note(60, at(0.2), at(0.3));
+
+    let tail_from = at(1.0);
+    let measure = |events: &[(usize, plugin_host::Event)]| -> Result<f32, String> {
+        let outcome = render::render(Path::new(path), id, &input, 512, events)?;
+        let audio = &outcome.audio;
+        let tail: f32 = (0..audio.channels as usize)
+            .flat_map(|ch| {
+                let start = ch * audio.frames;
+                audio.samples[start + tail_from..start + audio.frames].iter()
+            })
+            .fold(0.0f32, |peak, s| peak.max(s.abs()));
+        Ok(tail)
+    };
+
+    let dry = measure(&note)?;
+
+    // Pedal down before the note-off and released well after it, so anything
+    // still ringing at the measurement point is the pedal's doing.
+    let mut pedalled = note.clone();
+    pedalled.push(render::cc(64, 127, at(0.3)));
+    pedalled.push(render::cc(64, 0, at(2.5)));
+    pedalled.sort_by_key(|(at, _)| *at);
+    let wet = measure(&pedalled)?;
+
+    println!("  peak after the note-off, no pedal: {dry:.6}");
+    println!("  peak after the note-off, pedal held: {wet:.6}");
+
+    if wet > dry * 2.0 && wet > 1e-4 {
+        println!("the sustain pedal reaches the plugin");
+        return Ok(());
+    }
+    Err(format!(
+        "the pedal changed nothing (dry {dry:.6}, wet {wet:.6}); either CC64 is not          reaching the plugin, or this plugin has no sustain pedal — check it makes          a sound at all with `host-cli synth` first"
+    ))
 }
 
 fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {

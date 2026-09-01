@@ -14,6 +14,7 @@ mod cid;
 mod com;
 mod host_app;
 mod library;
+mod midi_map;
 mod module;
 mod moduleinfo;
 mod param_map;

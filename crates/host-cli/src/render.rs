@@ -236,8 +236,25 @@ fn offset_event(event: Event, sample_offset: u32) -> Event {
             value,
             sample_offset,
         }),
+        // Everything else is rebased through the core model's own accessor,
+        // which knows every variant and does not have to be extended here.
+        Event::Note(n) => Event::Note(n.at_offset(sample_offset)),
         other => other,
     }
+}
+
+/// A control change at an absolute time, as a 0..127 MIDI value.
+pub fn cc(number: u8, value: u8, at: usize) -> (usize, Event) {
+    (
+        at,
+        Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: number,
+            value: f64::from(value) / 127.0,
+            sample_offset: 0,
+        }),
+    )
 }
 
 /// A held note, as a pair of absolute-time events.

@@ -16,6 +16,7 @@ use vst3::Steinberg::Vst::{
     NoteOffEvent, NoteOnEvent, PolyPressureEvent, ProcessContext, ProcessContext_::StatesAndFlags_,
 };
 
+use crate::midi_map::{self, MidiMap};
 use crate::param_map::ParamMap;
 use crate::process_io::{EventList, ParameterChanges};
 
@@ -24,9 +25,12 @@ use crate::process_io::{EventList, ParameterChanges};
 /// `map` converts the core's plain values into the normalised ones VST3 wants;
 /// it was captured on the main thread at activate precisely so this can happen
 /// here without touching `IEditController` (see [`crate::param_map`]).
+/// `midi` says which parameter each MIDI controller stands for, which in VST3
+/// is the only route a controller has (see [`crate::midi_map`]).
 pub fn fill_inputs(
     events: &[ApiEvent],
     map: &ParamMap,
+    midi: &MidiMap,
     changes: &ComWrapper<ParameterChanges>,
     list: &ComWrapper<EventList>,
 ) {
@@ -34,12 +38,54 @@ pub fn fill_inputs(
         match event {
             ApiEvent::Param(p) => fill_param(p, map, changes),
             ApiEvent::Note(n) => {
-                if let Some(vst) = to_vst_event(n) {
+                if let Some((controller, channel, value)) = as_controller(n) {
+                    fill_controller(n, midi, controller, channel, value, changes);
+                } else if let Some(vst) = to_vst_event(n) {
                     list.push(vst);
                 }
             }
         }
     }
+}
+
+/// The controller number, channel and normalised value of a MIDI controller
+/// message, or `None` for everything that is not one.
+fn as_controller(event: &NoteEvent) -> Option<(u16, i16, f64)> {
+    Some(match *event {
+        NoteEvent::Cc {
+            channel, cc, value, ..
+        } => (u16::from(cc), channel, value),
+        NoteEvent::ChannelPressure { channel, value, .. } => (midi_map::AFTERTOUCH, channel, value),
+        // VST3 has no signed controller value: the parameter runs 0..1 with
+        // 0.5 at rest, the way a bend wheel reads to the plugin.
+        NoteEvent::PitchBend { channel, value, .. } => {
+            (midi_map::PITCH_BEND, channel, value * 0.5 + 0.5)
+        }
+        _ => return None,
+    })
+}
+
+/// Send a controller as the parameter change the format requires.
+///
+/// The value goes in as-is rather than through [`ParamMap`]. That is not an
+/// oversight: `ParamMap` converts *plain* values, and a controller has no
+/// plain domain — CC 64 at 100 is a wheel position, not a cutoff in hertz.
+/// The plugin defines its mapped parameter so that the controller's own range
+/// covers 0..1, which is exactly what we already hold.
+fn fill_controller(
+    event: &NoteEvent,
+    midi: &MidiMap,
+    controller: u16,
+    channel: i16,
+    value: f64,
+    changes: &ComWrapper<ParameterChanges>,
+) {
+    // No mapping means the plugin does not answer to this controller. Nothing
+    // to approximate: there is no other door.
+    let Some(id) = midi.param(channel, controller) else {
+        return;
+    };
+    changes.add_point(id, event.sample_offset() as i32, value.clamp(0.0, 1.0));
 }
 
 fn fill_param(event: &ParamEvent, map: &ParamMap, changes: &ComWrapper<ParameterChanges>) {
@@ -135,10 +181,9 @@ fn to_vst_event(event: &NoteEvent) -> Option<VstEvent> {
                 noteId: -1,
             };
         }
-        // Control change, pitch bend and channel pressure are not VST3 events
-        // at all: the format requires them to arrive as parameter changes via
-        // IMidiMapping. Routing them there is phase 3; until then they are
-        // dropped rather than approximated.
+        // Controllers never reach here: `fill_inputs` sends them through
+        // IMidiMapping, which is the only route VST3 gives them. Raw bytes
+        // have no VST3 event at all.
         NoteEvent::Cc { .. }
         | NoteEvent::PitchBend { .. }
         | NoteEvent::ChannelPressure { .. }
@@ -262,10 +307,68 @@ mod tests {
                 sample_offset: 16,
             })],
             &unit_map(3),
+            &MidiMap::empty(),
             &changes,
             &list,
         );
         assert_eq!(changes.points(), vec![(3, 16, 0.5)]);
+    }
+
+    /// The sustain pedal is the reason this route exists: without it, CC64
+    /// reaches a VST3 plugin by no path at all.
+    #[test]
+    fn a_controller_arrives_as_the_parameter_it_is_mapped_to() {
+        let changes = ParameterChanges::new(4, 4);
+        let list = EventList::new(4);
+        let midi = MidiMap::from_assignments(&[(0, 64, 900), (0, midi_map::PITCH_BEND, 901)]);
+        fill_inputs(
+            &[
+                ApiEvent::Note(NoteEvent::Cc {
+                    port: 0,
+                    channel: 0,
+                    cc: 64,
+                    value: 1.0,
+                    sample_offset: 8,
+                }),
+                // At rest, which is the midpoint of the parameter VST3 maps it
+                // to rather than the zero the core model uses.
+                ApiEvent::Note(NoteEvent::PitchBend {
+                    port: 0,
+                    channel: 0,
+                    value: 0.0,
+                    sample_offset: 9,
+                }),
+            ],
+            &unit_map(3),
+            &midi,
+            &changes,
+            &list,
+        );
+        assert_eq!(changes.points(), vec![(900, 8, 1.0), (901, 9, 0.5)]);
+        assert_eq!(list.len(), 0, "controllers are not VST3 events");
+    }
+
+    /// An unmapped controller has nowhere else to go, and inventing a
+    /// parameter for it would drive something the user never touched.
+    #[test]
+    fn an_unmapped_controller_is_dropped() {
+        let changes = ParameterChanges::new(4, 4);
+        let list = EventList::new(4);
+        fill_inputs(
+            &[ApiEvent::Note(NoteEvent::Cc {
+                port: 0,
+                channel: 0,
+                cc: 64,
+                value: 1.0,
+                sample_offset: 0,
+            })],
+            &unit_map(3),
+            &MidiMap::empty(),
+            &changes,
+            &list,
+        );
+        assert!(changes.points().is_empty());
+        assert_eq!(list.len(), 0);
     }
 
     #[test]
@@ -286,7 +389,7 @@ mod tests {
             })
             .collect();
 
-        fill_inputs(&events, &unit_map(3), &changes, &list);
+        fill_inputs(&events, &unit_map(3), &MidiMap::empty(), &changes, &list);
 
         let ids: std::collections::BTreeSet<_> =
             changes.points().iter().map(|(id, _, _)| *id).collect();
@@ -310,6 +413,7 @@ mod tests {
                 sample_offset: 0,
             })],
             &unit_map(3),
+            &MidiMap::empty(),
             &changes,
             &list,
         );
@@ -330,6 +434,7 @@ mod tests {
                 sample_offset: 8,
             })],
             &unit_map(1),
+            &MidiMap::empty(),
             &changes,
             &list,
         );
