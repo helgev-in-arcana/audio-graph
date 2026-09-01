@@ -103,15 +103,34 @@ fn index_two<T>(pool: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
     }
 }
 
-/// Whether a key mask swallows this event — see [`NoteOp::Filter`].
-fn muted(event: &Event, mask: u128) -> bool {
+/// Whether an event survives a filter's masks — see [`NoteOp::Filter`].
+///
+/// Each mask judges only the events that have the thing it names. An event
+/// with no key is not swallowed by a key mask, an event with no channel is not
+/// swallowed by a channel mask, and only a control change is asked about
+/// controller numbers.
+fn passes(event: &Event, keys: u128, channels: u16, controllers: u128) -> bool {
     let Event::Note(note) = event else {
-        return false;
+        return true;
     };
-    match note.key() {
-        Some(key) if (0..128).contains(&key) => mask & (1u128 << key) != 0,
-        _ => false,
+    if let Some(key) = note.key()
+        && (0..128).contains(&key)
+        && keys & (1u128 << key) != 0
+    {
+        return false;
     }
+    if let Some(channel) = note.channel()
+        && (0..16).contains(&channel)
+        && channels & (1u16 << channel) == 0
+    {
+        return false;
+    }
+    if let NoteEvent::Cc { cc, .. } = note
+        && controllers & (1u128 << (cc & 0x7f)) == 0
+    {
+        return false;
+    }
+    true
 }
 
 /// The per-note controllers, flattened to one value each.
@@ -679,7 +698,14 @@ impl Engine {
                         );
                     }
                 }
-                NoteOp::Filter { a, out, gate, mute } => {
+                NoteOp::Filter {
+                    a,
+                    out,
+                    gate,
+                    mute,
+                    channels,
+                    controllers,
+                } => {
                     // Below 0.5 the gate is shut. A gate whose lane is missing
                     // is a program the engine should not have been handed;
                     // shutting the stream is the quiet failure rather than the
@@ -692,7 +718,7 @@ impl Engine {
                         if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
                             continue;
                         }
-                        if muted(&event, mute) {
+                        if !passes(&event, mute, channels, controllers) {
                             continue;
                         }
                         Self::push_note(dest, &mut self.notes_dropped, event);
@@ -1359,8 +1385,8 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
-        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteGate, NoteMute,
-        ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteGate,
+        NoteMute, ParamPort, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -1993,6 +2019,72 @@ mod tests {
             seen[1],
             Event::Note(NoteEvent::NoteOn { key: 60, .. })
         ));
+    }
+
+    /// A MIDI filter narrows the stream by channel and by controller number,
+    /// and judges each event only on what it actually has: a note has a
+    /// channel but no controller number, so a CC list must not swallow it.
+    #[test]
+    fn a_midi_filter_narrows_by_channel_and_controller() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let filter = graph.add(
+            NodeKind::NoteFilter(NoteFilter {
+                channels: vec![0],
+                channel_mode: crate::nodes::FilterMode::Keep,
+                controllers: vec![64],
+                controller_mode: crate::nodes::FilterMode::Keep,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, filter, 0);
+        graph.connect(filter, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let cc = |number: u8, channel: i16, at: u32| {
+            Event::Note(NoteEvent::Cc {
+                port: 0,
+                channel,
+                cc: number,
+                value: 1.0,
+                sample_offset: at,
+            })
+        };
+        let mut on_other_channel = note_on(60, 4);
+        if let Event::Note(NoteEvent::NoteOn { channel, .. }) = &mut on_other_channel {
+            *channel = 1;
+        }
+
+        let heard = hear(
+            &graph,
+            &[
+                note_on(60, 0),   // channel 0: passes
+                on_other_channel, // channel 1: dropped
+                cc(64, 0, 1),     // the sustain pedal: passes
+                cc(1, 0, 2),      // the mod wheel: dropped
+                cc(64, 1, 3),     // right controller, wrong channel
+            ],
+            &[],
+        );
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2, "expected the note and the pedal: {seen:?}");
+        assert!(matches!(
+            seen[0],
+            Event::Note(NoteEvent::NoteOn {
+                key: 60,
+                channel: 0,
+                ..
+            })
+        ));
+        assert!(matches!(seen[1], Event::Note(NoteEvent::Cc { cc: 64, .. })));
     }
 
     /// Each sub-block gets its own events, once. Handing every chunk the whole

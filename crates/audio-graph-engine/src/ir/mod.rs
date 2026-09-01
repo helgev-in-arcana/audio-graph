@@ -22,7 +22,9 @@ mod note_op;
 mod op;
 
 pub use audio_op::{AudioOp, Buf, Chunking, MixIn};
-pub use note_op::{MAX_NOTE_BUFS, NOTE_BUF_CAPACITY, NoteBuf, NoteOp};
+pub use note_op::{
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, NOTE_BUF_CAPACITY, NoteBuf, NoteOp,
+};
 
 pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};

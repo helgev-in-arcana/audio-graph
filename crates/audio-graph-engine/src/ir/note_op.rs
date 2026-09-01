@@ -31,6 +31,12 @@ pub const MAX_NOTE_BUFS: usize = 16;
 /// rather than tightly because the memory is trivial next to the audio pool.
 pub const NOTE_BUF_CAPACITY: usize = 256;
 
+/// Every MIDI channel. What a node that has no opinion about channels says.
+pub const ALL_CHANNELS: u16 = u16::MAX;
+
+/// Every controller number.
+pub const ALL_CONTROLLERS: u128 = u128::MAX;
+
 /// One step of the note half of a program.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteOp {
@@ -47,13 +53,25 @@ pub enum NoteOp {
     /// `mute` is a key mask: bit `k` set drops key `k`, note-on *and*
     /// note-off. Dropping both is what makes it safe, and it is the opposite
     /// case from a shut gate — the note-on never went, so nothing is waiting
-    /// for a release. Events with no key of their own always pass: a control
-    /// change carries the whole channel, and swallowing it because a key
-    /// switch sits upstream would take the pedal with the keys.
+    /// for a release. Events with no key of their own are not affected: a
+    /// control change carries the whole channel, and swallowing it because a
+    /// key switch sits upstream would take the pedal with the keys.
+    ///
+    /// `channels` is a mask of the sixteen MIDI channels, and `controllers` a
+    /// mask of the 128 controller numbers; set bits pass. They are here rather
+    /// than on a filter of their own because every note node has to answer for
+    /// them anyway — a key mute that quietly dropped channel 10 would be a
+    /// worse surprise than one that says it passes everything.
+    ///
+    /// An event with no channel — raw bytes with no channel-voice status —
+    /// passes any channel mask, on the same principle as a keyless event and a
+    /// key mask.
     Filter {
         a: NoteBuf,
         out: NoteBuf,
         gate: Option<u16>,
         mute: u128,
+        channels: u16,
+        controllers: u128,
     },
 }

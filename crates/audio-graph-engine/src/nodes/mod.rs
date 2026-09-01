@@ -24,6 +24,7 @@ mod key_switch;
 mod lfo;
 mod math;
 mod mix;
+mod note_filter;
 mod note_gate;
 mod note_in;
 mod note_mute;
@@ -42,6 +43,7 @@ pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
+pub use note_filter::{FilterMode, NoteFilter};
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use note_mute::NoteMute;
@@ -91,6 +93,24 @@ pub(crate) trait Node {
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
+    }
+
+    /// Which MIDI channels the notes leaving output `port` are allowed on —
+    /// bit `c` set means channel `c` passes.
+    ///
+    /// Defaults to all sixteen. A node with no opinion about channels must say
+    /// so rather than say nothing, because a mask of zero is a stream that
+    /// carries nothing.
+    fn note_channels(&self, port: u8) -> u16 {
+        let _ = port;
+        crate::ir::ALL_CHANNELS
+    }
+
+    /// Which controller numbers survive output `port` — bit `n` set means
+    /// controller `n` passes. Defaults to all 128, for the same reason.
+    fn note_controllers(&self, port: u8) -> u128 {
+        let _ = port;
+        crate::ir::ALL_CONTROLLERS
     }
 
     /// Compiles audio processing operations into the audio context.
@@ -289,6 +309,7 @@ pub enum NodeKind {
     KeySwitch(KeySwitch),
     KeyParam(KeyParam),
     NoteMute(NoteMute),
+    NoteFilter(NoteFilter),
     DelayRead(DelayRead),
 }
 
@@ -325,6 +346,7 @@ macro_rules! for_kind {
             NodeKind::KeySwitch($node) => $body,
             NodeKind::KeyParam($node) => $body,
             NodeKind::NoteMute($node) => $body,
+            NodeKind::NoteFilter($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -372,6 +394,14 @@ impl NodeKind {
     }
 
     /// The keys this node swallows on output `port` — see [`Node::note_mute`].
+    pub(crate) fn note_channels(&self, port: u8) -> u16 {
+        for_kind!(self, node => node.note_channels(port))
+    }
+
+    pub(crate) fn note_controllers(&self, port: u8) -> u128 {
+        for_kind!(self, node => node.note_controllers(port))
+    }
+
     pub(crate) fn note_mute(&self, port: u8) -> u128 {
         for_kind!(self, node => node.note_mute(port))
     }
@@ -593,6 +623,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         NoteMute::catalogue_defaults(),
         NodeKind::NoteMute,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteFilter::catalogue_defaults(),
+        NodeKind::NoteFilter,
     );
 
     // Parameter.

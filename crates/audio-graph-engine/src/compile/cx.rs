@@ -20,10 +20,10 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
-    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_REGISTERS, NoteBuf, NoteOp, Op,
-    Reg,
+    ALL_CHANNELS, ALL_CONTROLLERS, AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES,
+    MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION,
+    MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS,
+    MAX_REGISTERS, NoteBuf, NoteOp, Op, Reg,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -718,13 +718,26 @@ impl<'a> AudioCx<'a> {
                 .then(|| self.note_gate_lane(port))
                 .flatten();
             let mute = kind.note_mute(port);
+            let channels = kind.note_channels(port);
+            let controllers = kind.note_controllers(port);
             // An open filter that drops nothing is not worth a buffer or a
             // copy; the socket simply carries what came in.
-            let out = if gate.is_none() && mute == 0 {
+            let passes_everything = gate.is_none()
+                && mute == 0
+                && channels == ALL_CHANNELS
+                && controllers == ALL_CONTROLLERS;
+            let out = if passes_everything {
                 a
             } else {
                 let out = self.alloc_note_buf()?;
-                self.note_ops.push(NoteOp::Filter { a, out, gate, mute });
+                self.note_ops.push(NoteOp::Filter {
+                    a,
+                    out,
+                    gate,
+                    mute,
+                    channels,
+                    controllers,
+                });
                 out
             };
             self.note_outputs.push(((self.id, port), out));
