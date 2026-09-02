@@ -15,36 +15,44 @@
 pub mod widgets;
 
 mod audio_io;
+mod cc_in;
 mod constant;
 mod delay;
-mod expression;
+mod envelope;
 mod gate;
 mod key_param;
 mod key_switch;
 mod lfo;
 mod math;
 mod mix;
+mod note_filter;
+mod note_follow;
 mod note_gate;
 mod note_in;
 mod note_mute;
+mod param_to_cc;
 mod plugin;
 mod range_map;
 mod slot;
 mod switch;
 
 pub use audio_io::{AudioIn, AudioOut};
+pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
-pub use expression::Expression;
+pub use envelope::EnvelopeFollower;
 pub use gate::Gate;
 pub use key_param::{KeyParam, KeyParamMode};
 pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
+pub use note_filter::{FilterMode, NoteFilter};
+pub use note_follow::NoteFollow;
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
 pub use note_mute::NoteMute;
+pub use param_to_cc::ParamToCc;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
 pub use slot::SlotIn;
@@ -93,24 +101,54 @@ pub(crate) trait Node {
         Ok(())
     }
 
+    /// The channel and controller number this node adds to the stream leaving
+    /// output `port`, when it makes controller events of its own.
+    ///
+    /// The value comes off the audio lane the node booked for its own input
+    /// socket 0, so a node answering this must also call
+    /// [`ParamCx::drive_audio`][crate::compile::ParamCx::drive_audio] for it.
+    fn note_emits(&self, port: u8) -> Option<(u8, u8)> {
+        let _ = port;
+        None
+    }
+
+    /// Which MIDI channels the notes leaving output `port` are allowed on —
+    /// bit `c` set means channel `c` passes.
+    ///
+    /// Defaults to all sixteen. A node with no opinion about channels must say
+    /// so rather than say nothing, because a mask of zero is a stream that
+    /// carries nothing.
+    fn note_channels(&self, port: u8) -> u16 {
+        let _ = port;
+        crate::ir::ALL_CHANNELS
+    }
+
+    /// Which controller numbers survive output `port` — bit `n` set means
+    /// controller `n` passes. Defaults to all 128, for the same reason.
+    fn note_controllers(&self, port: u8) -> u128 {
+        let _ = port;
+        crate::ir::ALL_CONTROLLERS
+    }
+
     /// Compiles audio processing operations into the audio context.
     fn compile_audio(&self, cx: &mut AudioCx) -> Result<(), CompileError> {
         let _ = cx;
         Ok(())
     }
 
-    /// Identifies the note stream originating from this node, if it is a note source.
-    fn note_identity(&self) -> Option<NoteSource> {
+    /// The DAW note bus this node reads, if it is where notes come from.
+    fn note_source(&self) -> Option<u16> {
         None
     }
 
     /// Which of this node's inputs the notes leaving output `port` came in
     /// through, for a node that passes notes on rather than making them.
     ///
-    /// This is what lets a note stream be routed through several nodes and still
-    /// be found: the compiler walks up the chain socket by socket until
-    /// something answers [`Node::note_identity`]. A node that answers neither is
-    /// the end of the walk, and a plugin behind it hears nothing.
+    /// This is what makes a note node a filter: the compiler gives the output
+    /// the buffer that arrived at `port`, or a copy of it with whatever this
+    /// node refuses taken out. A node that answers neither this nor
+    /// [`Node::note_source`] produces no note buffer, and a plugin behind it
+    /// hears nothing.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         let _ = port;
         None
@@ -119,8 +157,8 @@ pub(crate) trait Node {
     /// Whether the notes leaving output `port` pass only while a condition this
     /// node binds is open — see [`crate::compile::ParamCx::bind_note_gate`].
     ///
-    /// The chain walk stops at the first gate it finds, so a node that merely
-    /// hands notes on must answer `false` or the gates above it are lost.
+    /// Each gate applies its own condition to its own copy of the stream, so a
+    /// node that merely hands notes on answers `false` and costs nothing.
     fn note_gated(&self, port: u8) -> bool {
         let _ = port;
         false
@@ -130,9 +168,9 @@ pub(crate) trait Node {
     /// `port` — bit `k` set means key `k` does not go on.
     ///
     /// A key switch's own keys are the case: they are played to steer, not to
-    /// sound, and by default the thing being steered should never hear them. The
-    /// mask is collected while the compiler walks the chain, so several switches
-    /// in series each swallow their own.
+    /// sound, and by default the thing being steered should never hear them.
+    /// Several switches in series each swallow their own, because each is its
+    /// own filter on the stream.
     fn note_mute(&self, port: u8) -> u128 {
         let _ = port;
         0
@@ -257,7 +295,6 @@ pub(crate) trait Node {
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::port::Port;
-use subhost_adapter::NoteSource;
 
 /// One node's identity and settings.
 ///
@@ -271,7 +308,8 @@ pub enum NodeKind {
     Constant(Constant),
     SlotIn(SlotIn),
     Lfo(Lfo),
-    Expression(Expression),
+    NoteFollow(NoteFollow),
+    EnvelopeFollower(EnvelopeFollower),
     Math(Math),
     RangeMap(RangeMap),
     Switch(Switch),
@@ -289,6 +327,9 @@ pub enum NodeKind {
     KeySwitch(KeySwitch),
     KeyParam(KeyParam),
     NoteMute(NoteMute),
+    NoteFilter(NoteFilter),
+    ParamToCc(ParamToCc),
+    CcIn(CcIn),
     DelayRead(DelayRead),
 }
 
@@ -307,7 +348,8 @@ macro_rules! for_kind {
             NodeKind::Constant($node) => $body,
             NodeKind::SlotIn($node) => $body,
             NodeKind::Lfo($node) => $body,
-            NodeKind::Expression($node) => $body,
+            NodeKind::NoteFollow($node) => $body,
+            NodeKind::EnvelopeFollower($node) => $body,
             NodeKind::Math($node) => $body,
             NodeKind::RangeMap($node) => $body,
             NodeKind::Switch($node) => $body,
@@ -325,6 +367,9 @@ macro_rules! for_kind {
             NodeKind::KeySwitch($node) => $body,
             NodeKind::KeyParam($node) => $body,
             NodeKind::NoteMute($node) => $body,
+            NodeKind::NoteFilter($node) => $body,
+            NodeKind::ParamToCc($node) => $body,
+            NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
         }
     };
@@ -355,8 +400,8 @@ impl NodeKind {
     }
 
     /// Identifies the note stream originating from this node, if it is a note source.
-    pub(crate) fn note_identity(&self) -> Option<NoteSource> {
-        for_kind!(self, node => node.note_identity())
+    pub(crate) fn note_source(&self) -> Option<u16> {
+        for_kind!(self, node => node.note_source())
     }
 
     /// Where the notes leaving output `port` came in — see
@@ -372,6 +417,18 @@ impl NodeKind {
     }
 
     /// The keys this node swallows on output `port` — see [`Node::note_mute`].
+    pub(crate) fn note_emits(&self, port: u8) -> Option<(u8, u8)> {
+        for_kind!(self, node => node.note_emits(port))
+    }
+
+    pub(crate) fn note_channels(&self, port: u8) -> u16 {
+        for_kind!(self, node => node.note_channels(port))
+    }
+
+    pub(crate) fn note_controllers(&self, port: u8) -> u128 {
+        for_kind!(self, node => node.note_controllers(port))
+    }
+
     pub(crate) fn note_mute(&self, port: u8) -> u128 {
         for_kind!(self, node => node.note_mute(port))
     }
@@ -594,6 +651,36 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NoteMute::catalogue_defaults(),
         NodeKind::NoteMute,
     );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteFilter::catalogue_defaults(),
+        NodeKind::NoteFilter,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        ParamToCc::catalogue_defaults(),
+        NodeKind::ParamToCc,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        CcIn::catalogue_defaults(),
+        NodeKind::CcIn,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteFollow::catalogue_defaults(),
+        NodeKind::NoteFollow,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        EnvelopeFollower::catalogue_defaults(),
+        NodeKind::EnvelopeFollower,
+    );
 
     // Parameter.
     take(
@@ -613,12 +700,6 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Param,
         Lfo::catalogue_defaults(),
         NodeKind::Lfo,
-    );
-    take(
-        &mut out,
-        NodeGroup::Param,
-        Expression::catalogue_defaults(),
-        NodeKind::Expression,
     );
     take(
         &mut out,

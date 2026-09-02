@@ -147,11 +147,12 @@ impl Node for KeyParam {
         // No notes, no keys: the node rests on its first value. Emitting the key
         // ops anyway would make an unwired node quietly follow a keyboard it is
         // not connected to.
-        let position = if cx.has_input(0) {
+        let position = if let Some(buf) = cx.note_source_of(0) {
             let state = cx.latch()?;
             match self.mode {
                 KeyParamMode::Toggle => cx.emit(Op::KeyStep {
                     state,
+                    buf,
                     key: self.keys[0],
                     count: self.keys.len() as u16,
                 }),
@@ -159,6 +160,7 @@ impl Node for KeyParam {
                     for (index, &key) in self.keys.iter().enumerate() {
                         cx.emit(Op::KeyLatch {
                             state,
+                            buf,
                             key,
                             value: index as f64,
                         });

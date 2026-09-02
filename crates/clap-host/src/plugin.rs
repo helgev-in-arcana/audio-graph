@@ -30,7 +30,9 @@ use clap_sys::ext::audio_ports_activation::{
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_plugin_gui};
 use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
 use clap_sys::ext::note_ports::{
-    CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, clap_note_port_info, clap_plugin_note_ports,
+    CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI,
+    CLAP_NOTE_DIALECT_MIDI_MPE, CLAP_NOTE_DIALECT_MIDI2, clap_note_port_info,
+    clap_plugin_note_ports,
 };
 use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
@@ -124,6 +126,8 @@ pub struct ClapPlugin {
     note_outputs: usize,
     /// True when the plugin's note input speaks CLAP's own dialect.
     clap_notes: bool,
+    /// Diagnostic only; see `SubPluginMain::note_dialects`.
+    note_dialects: Vec<&'static str>,
 
     ext_params: *const clap_plugin_params,
     ext_state: *const clap_plugin_state,
@@ -236,7 +240,7 @@ impl ClapPlugin {
 
         let params = unsafe { read_params(plugin, ext_params) };
         let ports = unsafe { read_ports(plugin, ext_audio_ports) };
-        let (note_inputs, note_outputs, clap_notes) =
+        let (note_inputs, note_outputs, clap_notes, note_dialects) =
             unsafe { read_note_ports(plugin, ext_note_ports) };
 
         Ok(ClapPlugin {
@@ -249,6 +253,7 @@ impl ClapPlugin {
             note_inputs,
             note_outputs,
             clap_notes,
+            note_dialects,
             ext_params,
             ext_state,
             ext_latency,
@@ -574,6 +579,10 @@ impl SubPluginMain for ClapPlugin {
 
     fn voice_info(&self) -> Option<VoiceInfo> {
         self.voices.get()
+    }
+
+    fn note_dialects(&self) -> Vec<&'static str> {
+        self.note_dialects.clone()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -1348,35 +1357,53 @@ unsafe fn read_ports(
     }
 }
 
-/// Note port counts, and whether the input speaks CLAP's own note dialect.
+/// Note port counts, whether the input speaks CLAP's own note dialect, and
+/// which dialects it accepts in total.
 ///
 /// # Safety
 /// `plugin` must be live; `ext` may be null.
 unsafe fn read_note_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_note_ports,
-) -> (usize, usize, bool) {
+) -> (usize, usize, bool, Vec<&'static str>) {
     if ext.is_null() {
-        return (0, 0, false);
+        return (0, 0, false, Vec::new());
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return (0, 0, false);
+        return (0, 0, false, Vec::new());
     };
 
     let inputs = unsafe { count(plugin, true) } as usize;
     let outputs = unsafe { count(plugin, false) } as usize;
 
-    let mut clap_notes = false;
+    // Unioned across input ports rather than reported per port: the caller is
+    // asking what this plugin can be spoken to in, not which socket does what.
+    let mut dialects = 0u32;
     for index in 0..inputs as u32 {
         let mut raw: clap_note_port_info = unsafe { std::mem::zeroed() };
-        if unsafe { get(plugin, index, true, &mut raw) }
-            && raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0
-        {
-            clap_notes = true;
-            break;
+        if unsafe { get(plugin, index, true, &mut raw) } {
+            dialects |= raw.supported_dialects;
         }
     }
-    (inputs, outputs, clap_notes)
+
+    let names = [
+        (CLAP_NOTE_DIALECT_CLAP, "clap"),
+        (CLAP_NOTE_DIALECT_MIDI, "midi"),
+        (CLAP_NOTE_DIALECT_MIDI_MPE, "midi-mpe"),
+        (CLAP_NOTE_DIALECT_MIDI2, "midi2"),
+    ];
+    let supported = names
+        .iter()
+        .filter(|(bit, _)| dialects & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+
+    (
+        inputs,
+        outputs,
+        dialects & CLAP_NOTE_DIALECT_CLAP != 0,
+        supported,
+    )
 }
 
 #[cfg(test)]

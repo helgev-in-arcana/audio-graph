@@ -5,7 +5,7 @@
 //! pointer, so a `Program` stays a value that could cross a process boundary
 //! unchanged.
 
-use subhost_adapter::{NoteSource, NoteStream};
+use crate::ir::NoteBuf;
 
 /// An index into the audio buffer pool.
 pub type Buf = u16;
@@ -30,55 +30,66 @@ pub enum Chunking {
     /// call a plugin more often than the DAW does.
     #[default]
     WholeBlock,
-    /// Once per sub-block. Required as soon as an audio feedback loop exists:
-    /// the rule that a delay must be at least one chunk long binds the plugins
-    /// in the loop too.
+    /// Once per sub-block. What the two ends of a delay line need, because a
+    /// delay is at least one chunk long and a whole-block chunk would put the
+    /// floor at ten milliseconds.
     SubBlock,
 }
 
-/// How a plugin's notes reach it: where they come from, what may stop them on
-/// the way, and which keys are swallowed before they arrive.
-///
-/// The gate is a lane number rather than a decision because the decision is the
-/// parameter half's and is remade every sub-block, while the audio half runs on
-/// its own grain — the same arrangement a `Mix`'s gain and a delay's time use.
-/// Below 0.5 the stream is shut.
-///
-/// `mute` is settled at compile time instead: which keys a key switch answers to
-/// is an edit, not a signal, so there is nothing for a lane to carry.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct NoteRoute {
-    pub source: NoteSource,
-    pub gate: Option<u16>,
-    pub mute: u128,
+/// A run of one op list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
 }
 
-impl NoteRoute {
-    pub fn from_source(source: NoteSource) -> NoteRoute {
-        NoteRoute {
-            source,
-            gate: None,
-            mute: 0,
-        }
+impl Span {
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
     }
 
-    /// Resolves the effective [`NoteStream`] based on the dynamic gate lane value.
-    ///
-    /// When the gate lane value is below 0.5, only release/note-off events are
-    /// passed. `None` for the lane value means the lane is not there at all,
-    /// which is a program the engine should not have been handed; shutting the
-    /// stream is the quiet failure rather than the loud one.
-    pub fn resolve(self, lane_value: Option<f64>) -> NoteStream {
-        let source = match self.gate {
-            None => self.source,
-            Some(_) if lane_value.is_some_and(|v| v >= 0.5) => self.source,
-            Some(_) => self.source.releases_only(),
-        };
-        NoteStream {
-            source,
-            mute: self.mute,
-        }
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
     }
+}
+
+/// One slice of a program: the parameter, note and audio ops that run
+/// together, at one granularity.
+///
+/// A program's three lists are one topological order between them, cut into
+/// stages. A stage covers the whole DAW block before the next one starts, and
+/// inside it the order is parameters, then notes, then audio — the order a
+/// signal changes rate in. What differs from one stage to the next is whether
+/// its audio ops are called once for the block or once per sub-block.
+///
+/// Two things ask for a cut. A delay line's two ends have to run at the
+/// quantum, because a delay is at least one chunk long. And a parameter read
+/// off audio cannot be worked out until that audio exists, which is what makes
+/// an envelope follower expressible at all: the stage holding it runs after
+/// the stage that made the sound it is measuring.
+///
+/// Granularity is per stage rather than per program. One answer for the whole
+/// program would mean a delay line anywhere in a patch calling every plugin in
+/// it once per sub-block. How often a sub-plugin is called is a cost; how short
+/// a delay the graph can express is not the same question, and should not be
+/// paid for by everything that asked neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stage {
+    /// Where this stage's ops sit in `Program::ops`.
+    pub params: Span,
+    /// Its ops in `Program::note_ops`.
+    pub notes: Span,
+    /// Its ops in `Program::audio_ops`.
+    pub audio: Span,
+    /// Which note buffers those note ops write, one bit each.
+    ///
+    /// The engine records where a buffer stood before each sub-block so the
+    /// audio half can find its own rows again. Only the stage that fills a
+    /// buffer may write that mark: a later stage passing over the same rows
+    /// would overwrite every one of them with the length the buffer finished
+    /// at, and the audio half would read the whole block as one row.
+    pub note_bufs: u16,
+    pub chunking: Chunking,
 }
 
 /// One step of the audio half of a program.
@@ -111,8 +122,14 @@ pub enum AudioOp {
         /// common case; more only when a patch reads a plugin's extra
         /// outputs.
         output_buses: Vec<u16>,
-        /// Note stream routing and gating configuration for this plugin instance.
-        notes: NoteRoute,
+        /// The note buffer this instance hears, or `None` when nothing is
+        /// wired to its notes port.
+        ///
+        /// `None` rather than an empty buffer because an unwired instrument
+        /// has to hear nothing: handing every instance whatever the DAW sent
+        /// is the tempting default and the wrong one — two synths then play in
+        /// unison whatever the patch says.
+        notes: Option<NoteBuf>,
     },
     /// Copy one bus out of a plugin's output region.
     ///

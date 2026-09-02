@@ -19,6 +19,7 @@ use clap_sys::events::{
 use clap_sys::fixedpoint::{CLAP_BEATTIME_FACTOR, CLAP_SECTIME_FACTOR};
 use plugin_host_api::{
     Event, EventSink, NoteEvent, NoteExpression, ParamEvent, ParamId, Target, TimeContext,
+    note_id_from_wire, note_id_to_wire,
 };
 
 /// One event, wide enough for any CLAP event this host sends or receives.
@@ -190,7 +191,7 @@ fn encode(event: &Event) -> Option<RawEvent> {
                     sample_offset,
                     CLAP_EVENT_NOTE_ON,
                 ),
-                note_id,
+                note_id: note_id_to_wire(note_id),
                 port_index: port,
                 channel,
                 key,
@@ -211,7 +212,7 @@ fn encode(event: &Event) -> Option<RawEvent> {
                     sample_offset,
                     CLAP_EVENT_NOTE_OFF,
                 ),
-                note_id,
+                note_id: note_id_to_wire(note_id),
                 port_index: port,
                 channel,
                 key,
@@ -234,7 +235,7 @@ fn encode(event: &Event) -> Option<RawEvent> {
                     sample_offset,
                     CLAP_EVENT_NOTE_END,
                 ),
-                note_id,
+                note_id: note_id_to_wire(note_id),
                 port_index: port,
                 channel,
                 key,
@@ -257,22 +258,30 @@ fn encode(event: &Event) -> Option<RawEvent> {
                     CLAP_EVENT_NOTE_EXPRESSION,
                 ),
                 expression_id: to_clap_expression(expression),
-                note_id,
+                note_id: note_id_to_wire(note_id),
                 port_index: port,
                 channel,
                 key,
                 value,
             };
         }
-        Event::Note(NoteEvent::Midi {
-            port,
-            data,
-            sample_offset,
-        }) => {
+        // Everything MIDI-shaped leaves as CLAP_EVENT_MIDI. `to_midi` only
+        // refuses the two variants matched above, so the `?` never fires here.
+        Event::Note(
+            note @ (NoteEvent::Cc { .. }
+            | NoteEvent::PitchBend { .. }
+            | NoteEvent::ChannelPressure { .. }
+            | NoteEvent::PolyPressure { .. }
+            | NoteEvent::Midi { .. }),
+        ) => {
             raw.midi = clap_event_midi {
-                header: header(size_of::<clap_event_midi>(), sample_offset, CLAP_EVENT_MIDI),
-                port_index: port.max(0) as u16,
-                data,
+                header: header(
+                    size_of::<clap_event_midi>(),
+                    note.sample_offset(),
+                    CLAP_EVENT_MIDI,
+                ),
+                port_index: note.port().max(0) as u16,
+                data: note.to_midi()?,
             };
         }
     }
@@ -318,7 +327,7 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         CLAP_EVENT_NOTE_ON => {
             let e = unsafe { raw.note };
             Event::Note(NoteEvent::NoteOn {
-                note_id: e.note_id,
+                note_id: note_id_from_wire(e.note_id),
                 port: e.port_index,
                 channel: e.channel,
                 key: e.key,
@@ -329,7 +338,7 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         CLAP_EVENT_NOTE_OFF => {
             let e = unsafe { raw.note };
             Event::Note(NoteEvent::NoteOff {
-                note_id: e.note_id,
+                note_id: note_id_from_wire(e.note_id),
                 port: e.port_index,
                 channel: e.channel,
                 key: e.key,
@@ -341,7 +350,7 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         CLAP_EVENT_NOTE_END => {
             let e = unsafe { raw.note };
             Event::Note(NoteEvent::NoteEnd {
-                note_id: e.note_id,
+                note_id: note_id_from_wire(e.note_id),
                 port: e.port_index,
                 channel: e.channel,
                 key: e.key,
@@ -351,7 +360,7 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         CLAP_EVENT_NOTE_EXPRESSION => {
             let e = unsafe { raw.expression };
             Event::Note(NoteEvent::Expression {
-                note_id: e.note_id,
+                note_id: note_id_from_wire(e.note_id),
                 port: e.port_index,
                 channel: e.channel,
                 key: e.key,
@@ -362,11 +371,13 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         }
         CLAP_EVENT_MIDI => {
             let e = unsafe { raw.midi };
-            Event::Note(NoteEvent::Midi {
-                port: e.port_index as i16,
-                data: e.data,
-                sample_offset: header.time,
-            })
+            // Classified here rather than carried as bytes: the graph treats
+            // a CC as a signal, not as a message.
+            Event::Note(NoteEvent::from_midi(
+                e.port_index as i16,
+                e.data,
+                header.time,
+            ))
         }
         // NOTE_CHOKE, MIDI_SYSEX, MIDI2 and TRANSPORT have no core
         // representation. Dropped, not approximated.
@@ -690,7 +701,7 @@ mod tests {
     fn every_note_variant_round_trips() {
         let events = [
             Event::Note(NoteEvent::NoteOn {
-                note_id: 3,
+                note_id: Some(3),
                 port: 0,
                 channel: 1,
                 key: 60,
@@ -698,7 +709,7 @@ mod tests {
                 sample_offset: 4,
             }),
             Event::Note(NoteEvent::NoteOff {
-                note_id: 3,
+                note_id: Some(3),
                 port: 0,
                 channel: 1,
                 key: 60,
@@ -706,14 +717,14 @@ mod tests {
                 sample_offset: 8,
             }),
             Event::Note(NoteEvent::NoteEnd {
-                note_id: 3,
+                note_id: Some(3),
                 port: 0,
                 channel: 1,
                 key: 60,
                 sample_offset: 9,
             }),
             Event::Note(NoteEvent::Expression {
-                note_id: 3,
+                note_id: Some(3),
                 port: 0,
                 channel: 1,
                 key: 60,
@@ -721,10 +732,49 @@ mod tests {
                 value: -1.5,
                 sample_offset: 10,
             }),
+            Event::Note(NoteEvent::Cc {
+                port: 0,
+                channel: 1,
+                cc: 64,
+                value: 100.0 / 127.0,
+                sample_offset: 11,
+            }),
+            Event::Note(NoteEvent::ChannelPressure {
+                port: 0,
+                channel: 1,
+                value: 100.0 / 127.0,
+                sample_offset: 12,
+            }),
+            Event::Note(NoteEvent::PolyPressure {
+                port: 0,
+                channel: 1,
+                key: 60,
+                value: 100.0 / 127.0,
+                sample_offset: 13,
+            }),
+            // Exactly centred, which is the one bend value that has to survive
+            // the asymmetric 14-bit encoding unchanged.
+            Event::Note(NoteEvent::PitchBend {
+                port: 0,
+                channel: 1,
+                value: 0.0,
+                sample_offset: 14,
+            }),
+            // A program change: nothing here models it, so it stays bytes.
             Event::Note(NoteEvent::Midi {
                 port: 0,
-                data: [0x90, 60, 100],
-                sample_offset: 11,
+                data: [0xc0, 5, 0],
+                sample_offset: 15,
+            }),
+            // Note-on carrying no id, which is what raw MIDI produces and
+            // what an `unwrap_or(key)` would silently hide.
+            Event::Note(NoteEvent::NoteOn {
+                note_id: None,
+                port: 0,
+                channel: 1,
+                key: 60,
+                velocity: 0.75,
+                sample_offset: 16,
             }),
         ];
         for event in events {

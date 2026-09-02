@@ -52,7 +52,7 @@ pub use scan::{
 // and get the vocabulary with it.
 pub use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, BusInfo, Capabilities, Event, EventSink,
-    HostContext, HostError, IoLayout, MAX_AUX_BUSES, NoteEvent, NoteExpression, ParamEvent,
+    HostContext, HostError, IoLayout, MAX_AUX_BUSES, NoteEvent, NoteExpression, NoteId, ParamEvent,
     ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, RestartReason,
     Result, SubPluginMain, SubPluginProcessor, Target, TimeContext, VoiceInfo,
 };

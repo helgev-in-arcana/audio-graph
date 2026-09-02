@@ -23,11 +23,7 @@ Program {
                 2,
                 2,
             ],
-            notes: NoteRoute {
-                source: None,
-                gate: None,
-                mute: 0,
-            },
+            notes: None,
         },
         Split {
             from: 1,
@@ -50,6 +46,8 @@ Program {
             bus: 1,
         },
     ],
+    note_ops: [],
+    note_bufs: 0,
     param_targets: [],
     audio_lane_base: 96,
     instances: [
@@ -69,7 +67,24 @@ Program {
         2,
         2,
     ],
-    chunking: WholeBlock,
+    stages: [
+        Stage {
+            params: Span {
+                start: 0,
+                end: 0,
+            },
+            notes: Span {
+                start: 0,
+                end: 0,
+            },
+            audio: Span {
+                start: 0,
+                end: 6,
+            },
+            note_bufs: 0,
+            chunking: WholeBlock,
+        },
+    ],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

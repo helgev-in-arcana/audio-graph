@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::schedule::SlotSchedule;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
-    NoteEvent, ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain,
-    SubPluginProcessor, Target, TimeContext,
+    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
+    Target, TimeContext,
 };
 
 use crate::instances::{InstanceIo, ParamTarget};
@@ -454,7 +454,6 @@ impl SubHost {
                     let message = e.to_string();
                     self.deactivate(SubHostProcessors {
                         entries: processors,
-                        gated: Vec::new(),
                     });
                     return Err(message);
                 }
@@ -463,7 +462,6 @@ impl SubHost {
 
         Ok(SubHostProcessors {
             entries: processors,
-            gated: Vec::with_capacity(capacity),
         })
     }
 
@@ -687,11 +685,6 @@ impl SubHostProcessor {
 /// instance by index.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
-    /// Event buffer for filtering note streams (e.g. note-off only for closed
-    /// gates). Owned here and sized at activate, because the audio thread may
-    /// not allocate and a filtered stream has to live somewhere while the
-    /// sub-plugin reads it.
-    gated: Vec<Event>,
 }
 
 impl SubHostProcessors {
@@ -709,9 +702,12 @@ impl SubHostProcessors {
         }
     }
 
-    /// Binds block-level context (slot schedule, incoming events, transport
-    /// context) to produce a [`BoundInstances`] processor for the duration of
-    /// a block.
+    /// Binds block-level context (slot schedule, transport context) to produce
+    /// a [`BoundInstances`] processor for the duration of a block.
+    ///
+    /// The DAW's note stream is not among it: the graph decides what each
+    /// instance hears and hands that over per call, so there is nothing here
+    /// for a whole block to share.
     ///
     /// A caller runs `process(instance, ...)` with nothing but buffers,
     /// because it has no reason to know that a plugin has events or a
@@ -720,14 +716,12 @@ impl SubHostProcessors {
     pub fn bind<'a>(
         &'a mut self,
         slots: &'a SlotSchedule,
-        events: &'a [Event],
         context: &'a TimeContext,
         out_events: &'a mut EventSink,
     ) -> BoundInstances<'a> {
         BoundInstances {
             processors: self,
             slots,
-            events,
             context,
             out_events,
         }
@@ -738,7 +732,6 @@ impl SubHostProcessors {
 pub struct BoundInstances<'a> {
     processors: &'a mut SubHostProcessors,
     slots: &'a SlotSchedule,
-    events: &'a [Event],
     context: &'a TimeContext,
     out_events: &'a mut EventSink,
 }
@@ -747,16 +740,17 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
     fn process(
         &mut self,
         instance: u32,
-        notes: crate::instances::NoteStream,
+        notes: &[Event],
         input: &[f32],
         output: &mut [f32],
         chunk: crate::instances::AudioChunk,
     ) {
-        // Destructured rather than reached through twice: the scratch and
-        // the processor are different fields, and saying so is what lets both
-        // be borrowed at once.
-        let SubHostProcessors { entries, gated } = &mut *self.processors;
-        let Some(processor) = entries.get_mut(instance as usize).and_then(Option::as_mut) else {
+        let Some(processor) = self
+            .processors
+            .entries
+            .get_mut(instance as usize)
+            .and_then(Option::as_mut)
+        else {
             // A node whose plugin failed to load, or was deleted while the
             // audio thread held this program. Silence is the only honest
             // answer; passing the input through would let the user hear the
@@ -780,62 +774,14 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
-        // The engine routes a note *name*; turning it into events is this
-        // side's job, and an instance with nothing wired to its notes port has
-        // to hear nothing — otherwise every instance gets every event and two
-        // synths play in unison.
-        //
-        // A shut gate holds the note-ons back and lets everything else
-        // through, so a note that was sounding when it closed still gets its
-        // note-off. A key switch's own keys are dropped outright, both halves:
-        // the note-on went too, so no voice is left waiting for the release.
-        // Filtered into scratch reserved at activate, never grown.
-        let events: &[Event] = match notes.source {
-            crate::instances::NoteSource::Daw { bus: 0 } if notes.mute == 0 => self.events,
-            source @ (crate::instances::NoteSource::Daw { bus: 0 }
-            | crate::instances::NoteSource::DawReleases { bus: 0 }) => {
-                let shut = matches!(source, crate::instances::NoteSource::DawReleases { .. });
-                gated.clear();
-                for event in self.events {
-                    if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
-                        continue;
-                    }
-                    if muted(event, notes.mute) {
-                        continue;
-                    }
-                    if gated.len() == gated.capacity() {
-                        break;
-                    }
-                    gated.push(*event);
-                }
-                gated.as_slice()
-            }
-            _ => &[],
-        };
         processor.process(
             &mut buffers,
             self.slots,
-            events,
+            notes,
             chunk.offset..chunk.offset + chunk.frames,
             self.context,
             self.out_events,
         );
-    }
-}
-
-/// Returns `true` if the event is a note event whose MIDI key bit is set in
-/// `mask` — see `NoteStream::mute`.
-///
-/// Anything without a key of its own passes: a control change carries the
-/// whole channel, and swallowing it because a key switch sits upstream would
-/// take the pedal with the keys.
-fn muted(event: &Event, mask: u128) -> bool {
-    let Event::Note(note) = event else {
-        return false;
-    };
-    match note.key() {
-        Some(key) if (0..128).contains(&key) => mask & (1u128 << key) != 0,
-        _ => false,
     }
 }
 
@@ -1014,7 +960,7 @@ mod tests {
     fn a_chunk_hears_only_its_own_events_rebased() {
         let (mut p, seen) = harness(Vec::new());
         let note = Event::Note(NoteEvent::NoteOn {
-            note_id: -1,
+            note_id: None,
             port: 0,
             channel: 0,
             key: 60,
@@ -1153,7 +1099,7 @@ mod tests {
         }
         let notes = [
             Event::Note(plugin_host::NoteEvent::NoteOn {
-                note_id: 1,
+                note_id: Some(1),
                 port: 0,
                 channel: 0,
                 key: 60,
@@ -1161,7 +1107,7 @@ mod tests {
                 sample_offset: 40,
             }),
             Event::Note(plugin_host::NoteEvent::NoteOff {
-                note_id: 1,
+                note_id: Some(1),
                 port: 0,
                 channel: 0,
                 key: 60,
@@ -1206,21 +1152,23 @@ mod tests {
         );
     }
 
-    /// Verifies that only instances routed to a note source receive note events.
+    /// Notes are the caller's decision by the time they get here, so the only
+    /// thing this side owes is delivering exactly what it was handed — and
+    /// nothing to an instance handed nothing. Which events an instance should
+    /// hear is the engine's business, and tested there.
     #[test]
-    fn only_the_instance_the_graph_wired_hears_the_daws_notes() {
-        use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};
+    fn an_instance_hears_what_it_was_handed_and_no_more() {
+        use crate::instances::{AudioChunk, AudioInstances};
         use plugin_host::NoteEvent;
 
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());
         let mut processors = SubHostProcessors {
-            gated: Vec::with_capacity(64),
             entries: vec![Some(wired), Some(idle)],
         };
 
         let note = Event::Note(NoteEvent::NoteOn {
-            note_id: -1,
+            note_id: None,
             port: 0,
             channel: 0,
             key: 60,
@@ -1230,8 +1178,7 @@ mod tests {
         let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
-        let incoming = [note];
-        let mut running = processors.bind(&schedule, &incoming, &context, &mut sink);
+        let mut running = processors.bind(&schedule, &context, &mut sink);
 
         let chunk = AudioChunk {
             input_channels: 2,
@@ -1243,79 +1190,13 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        let daw = NoteStream::from_source(NoteSource::Daw { bus: 0 });
-        running.process(0, daw, &input, &mut output, chunk);
-        running.process(1, NoteStream::default(), &input, &mut output, chunk);
+        running.process(0, &[note], &input, &mut output, chunk);
+        running.process(1, &[], &input, &mut output, chunk);
 
-        assert_eq!(
-            wired_saw.lock().unwrap().len(),
-            1,
-            "wired node gets the note"
-        );
+        assert_eq!(wired_saw.lock().unwrap().len(), 1);
         assert!(
             idle_saw.lock().unwrap().is_empty(),
-            "an unwired notes port must mean silence, not everything"
+            "an instance handed nothing must hear nothing"
         );
-    }
-
-    /// Verifies that a gated note stream filters out note-on events while delivering note-offs.
-    #[test]
-    fn a_shut_note_gate_still_delivers_the_releases() {
-        use crate::instances::{AudioChunk, AudioInstances, NoteSource, NoteStream};
-        use plugin_host::NoteEvent;
-
-        let (gated_node, saw) = harness(Vec::new());
-        let mut processors = SubHostProcessors {
-            gated: Vec::with_capacity(64),
-            entries: vec![Some(gated_node)],
-        };
-
-        let incoming = [
-            Event::Note(NoteEvent::NoteOn {
-                note_id: -1,
-                port: 0,
-                channel: 0,
-                key: 60,
-                velocity: 1.0,
-                sample_offset: 0,
-            }),
-            Event::Note(NoteEvent::NoteOff {
-                note_id: -1,
-                port: 0,
-                channel: 0,
-                key: 55,
-                velocity: 0.0,
-                sample_offset: 1,
-            }),
-        ];
-        let schedule = SlotSchedule::new(LANES, 4, 32);
-        let mut sink = EventSink::new();
-        let context = TimeContext::default();
-        let mut running = processors.bind(&schedule, &incoming, &context, &mut sink);
-
-        let chunk = AudioChunk {
-            input_channels: 2,
-            output_channels: 2,
-            aux_inputs: Default::default(),
-            aux_outputs: Default::default(),
-            frames: 4,
-            offset: 0,
-        };
-        let input = [0.0f32; 8];
-        let mut output = [0.0f32; 8];
-        running.process(
-            0,
-            NoteStream::from_source(NoteSource::DawReleases { bus: 0 }),
-            &input,
-            &mut output,
-            chunk,
-        );
-
-        let seen = saw.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "only the release got through");
-        assert!(matches!(
-            seen[0],
-            Event::Note(NoteEvent::NoteOff { key: 55, .. })
-        ));
     }
 }

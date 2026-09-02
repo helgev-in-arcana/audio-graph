@@ -94,6 +94,16 @@ pub trait SubPluginMain {
         None
     }
 
+    /// Which note dialects the plugin's note input accepts, named.
+    ///
+    /// Purely diagnostic, and empty for a format that has no such notion —
+    /// VST3 does not, having exactly one way to deliver a note. The question
+    /// this answers is whether any plugin here would actually benefit from us
+    /// speaking MIDI 2.0, which is otherwise easy to guess at and hard to know.
+    fn note_dialects(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// The plugin's audio buses and note input/output layout.
     ///
     /// Read after loading and used to build the node's sockets. Batched for the

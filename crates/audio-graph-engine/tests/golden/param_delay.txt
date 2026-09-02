@@ -36,6 +36,8 @@ Program {
         0,
     ],
     audio_ops: [],
+    note_ops: [],
+    note_bufs: 0,
     param_targets: [
         ParamTarget {
             instance: 0,
@@ -45,7 +47,24 @@ Program {
     audio_lane_base: 96,
     instances: [],
     buffers: [],
-    chunking: WholeBlock,
+    stages: [
+        Stage {
+            params: Span {
+                start: 0,
+                end: 4,
+            },
+            notes: Span {
+                start: 0,
+                end: 0,
+            },
+            audio: Span {
+                start: 0,
+                end: 0,
+            },
+            note_bufs: 0,
+            chunking: WholeBlock,
+        },
+    ],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

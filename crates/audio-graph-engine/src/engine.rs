@@ -18,16 +18,18 @@
 //! is a [`Program`] and nothing else. A `use crate::graph::…` appearing above
 //! the `#[cfg(test)]` line is the signal that something has leaked across.
 
-use plugin_host::{NoteEvent, NoteExpression};
+use plugin_host::{Event, NoteEvent};
 
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioOp, Buf, Chunking, ExprSource, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
-    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_REGISTERS, MathOp, Op, Operand, Program, RateSpec, Waveform,
+    AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
+    MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
+    MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
+    NoteOp, Op, Operand, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
-use subhost_adapter::{AudioChunk, AudioInstances};
+use crate::notes::{Ended, NoteLedger};
+use subhost_adapter::{AudioChunk, AudioInstances, MIN_QUANTUM};
 
 /// Maximum number of `DelayRead` taps supported in a single program.
 ///
@@ -50,6 +52,19 @@ pub struct BlockContext {
     /// by this much afterwards, which is what makes the sub-block rate a
     /// property of the caller rather than of the engine.
     pub frames: u32,
+    /// Where this sub-block starts inside the DAW's block.
+    pub offset: u32,
+    /// Frames in the whole DAW block, which is how the audio buffers are
+    /// packed. Only [`Op::Follow`] needs it — it is the one parameter op that
+    /// reads one. See [`Window`].
+    pub block: u32,
+    /// Which sub-block this is, counting from the start of the DAW's block.
+    ///
+    /// The same number as the lane grid's row. Carried rather than divided out
+    /// of `offset`, because the last sub-block of a block is short whenever the
+    /// block is not a multiple of the quantum, and because each stage walks the
+    /// sub-blocks from the start again so a counter would not do either.
+    pub row: u32,
 }
 
 /// Context for evaluating one whole block of audio.
@@ -79,42 +94,355 @@ impl AudioContext<'_> {
     }
 }
 
-/// The per-note controllers, flattened to one value each.
+/// How many events one DAW block may carry into the graph.
 ///
-/// Monophonic: the graph has one value per source, and the newest note wins.
-/// Nothing here assumes it will stay that way — the wrapper feeds note events
-/// in, and a per-voice engine would feed the same events into more of these.
-#[derive(Debug, Clone, Copy)]
-struct Expressions {
-    /// Indexed by `NoteExpression as usize`.
-    values: [f64; 7],
-    velocity: f64,
-    key: f64,
-    held: u32,
+/// Sized here rather than from the block length because it is the DAW's
+/// stream, not ours: a dense controller lane is what makes the number matter.
+const MAX_BLOCK_EVENTS: usize = 1024;
+
+/// Where one chunk of a block sits inside the buffer pool.
+///
+/// Channels are packed at the DAW's block length, never at the chunk's, so
+/// where a sample lives does not depend on how big the call that wrote it was.
+/// A buffer filled in one go has to be readable a sub-block at a time, and the
+/// other way round, the moment two parts of a program run at different
+/// granularities.
+///
+/// The sub-plugin boundary is the one place that still wants the chunk's own
+/// packing, because that is what every plugin format's buffer layout means.
+/// See [`AudioOp::Plugin`] in `run_chunk`.
+#[derive(Clone, Copy)]
+struct Window {
+    /// Frames in the DAW's block: the distance between one channel and the
+    /// next inside a buffer.
+    block: usize,
+    /// Where this chunk starts inside the block.
+    start: usize,
+    /// Frames this chunk covers.
+    frames: usize,
 }
 
-impl Default for Expressions {
-    fn default() -> Self {
-        Expressions {
-            // Centres, not zeros: pan and tuning are signed, and a graph
-            // reading Pan before any note has arrived should read "middle".
-            values: [1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
-            velocity: 0.0,
-            key: 0.5,
-            held: 0,
-        }
+/// Two disjoint `&mut` into one pool, for an op that copies between buffers.
+///
+/// The compiler never gives a filter the same buffer for both ends — a filter
+/// that drops anything allocates its own output — so the panic is a bug in the
+/// compiler, not a case a program can reach.
+fn index_two<T>(pool: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
+    assert!(a != b, "a note filter reads and writes the same buffer");
+    if a < b {
+        let (front, back) = pool.split_at_mut(b);
+        (&front[a], &mut back[0])
+    } else {
+        let (front, back) = pool.split_at_mut(a);
+        (&back[0], &mut front[b])
     }
 }
 
-fn expression_index(kind: NoteExpression) -> usize {
-    match kind {
-        NoteExpression::Volume => 0,
-        NoteExpression::Pan => 1,
-        NoteExpression::Tuning => 2,
-        NoteExpression::Vibrato => 3,
-        NoteExpression::Expression => 4,
-        NoteExpression::Brightness => 5,
-        NoteExpression::Pressure => 6,
+/// Whether an event survives a filter's masks — see [`NoteOp::Filter`].
+///
+/// Each mask judges only the events that have the thing it names. An event
+/// with no key is not swallowed by a key mask, an event with no channel is not
+/// swallowed by a channel mask, and only a control change is asked about
+/// controller numbers.
+fn passes(event: &Event, keys: u128, channels: u16, controllers: u128) -> bool {
+    let Event::Note(note) = event else {
+        return true;
+    };
+    if let Some(key) = note.key()
+        && (0..128).contains(&key)
+        && keys & (1u128 << key) != 0
+    {
+        return false;
+    }
+    if let Some(channel) = note.channel()
+        && (0..16).contains(&channel)
+        && channels & (1u16 << channel) == 0
+    {
+        return false;
+    }
+    if let NoteEvent::Cc { cc, .. } = note
+        && controllers & (1u128 << (cc & 0x7f)) == 0
+    {
+        return false;
+    }
+    true
+}
+
+/// One note buffer: the events it holds, and what they amount to.
+///
+/// Kept together rather than as one array per reading. Every reader — a key
+/// switch, a gate, a velocity follow, a controller latch — asks about one
+/// buffer at a time, so what it wants is one of these rather than the same
+/// index into five different tables.
+///
+/// The tables are per buffer rather than per engine because a stream is
+/// something the graph routes. One table for the whole program, fed straight
+/// from the DAW, would make a key switch fire on keys a filter upstream of it
+/// had already taken out.
+#[derive(Debug)]
+struct NoteBuf {
+    /// One whole DAW block of events, appended a sub-block at a time as the
+    /// parameter half walks the rows, plus the last sub-block of the block
+    /// before it. See [`NoteState`] and [`Engine::note_marks`].
+    events: Vec<Event>,
+    /// Which keys are down, one bit each.
+    held: u128,
+    /// Which keys were struck in the sub-block this buffer last carried, so an
+    /// op sees each note-on exactly once.
+    struck: u128,
+    /// How many notes are down.
+    count: u32,
+    /// Velocity of the most recent note-on, and the key it was on, normalized.
+    /// Both held between notes.
+    velocity: f64,
+    key: f64,
+}
+
+impl NoteBuf {
+    fn new() -> NoteBuf {
+        NoteBuf {
+            events: Vec::with_capacity(NOTE_BUF_CAPACITY),
+            held: 0,
+            struck: 0,
+            count: 0,
+            velocity: 0.0,
+            // The absence of a note is not the bottom of the keyboard, for the
+            // same reason a pan sits in the middle.
+            key: 0.5,
+        }
+    }
+
+    /// Forget what is being played, without touching what is in the buffer.
+    fn silence(&mut self) {
+        self.held = 0;
+        self.struck = 0;
+        self.count = 0;
+        self.velocity = 0.0;
+        self.key = 0.5;
+    }
+}
+
+/// What the note half fills in as it runs.
+///
+/// Held apart from the stream it reads ([`Engine::translated`]) rather than
+/// beside it, and that is the whole point of the split: the note pass wants
+/// the stream by shared reference and this by exclusive one, and a method
+/// taking `&mut self` on a type that owned both could be given neither without
+/// a dance.
+///
+/// The note ops run once for a sub-block, appending to what the buffers
+/// already hold, and the two readers differ only in where they look: a
+/// parameter op reads everything the buffer holds, which is the stream up to
+/// the boundary it just crossed — the value in force at that instant, which is
+/// what a parameter signal's sub-block resolution means. The audio half reads
+/// the rows of its own chunk, found through [`Engine::note_marks`]. Replaying
+/// them per reader instead, into buffers cleared before each replay, would
+/// copy every event twice per note op, and force the generating ops to keep a
+/// private "did it move" state per replay or the first replay would eat the
+/// edge the second has to send.
+#[derive(Debug)]
+struct NoteState {
+    /// One per note buffer, allocated in [`Engine::new`] and only ever cleared
+    /// and refilled after that. A program swap happens on the audio thread, so
+    /// nothing here may be sized from the program.
+    bufs: Vec<NoteBuf>,
+    /// Last value each controller-generating op sent, or NaN before its first.
+    /// Forgotten on a program swap; see [`NoteOp::Emit`].
+    emitted: Vec<f64>,
+    /// Events dropped because a buffer was full, since the last reset.
+    ///
+    /// Counted rather than silently swallowed: an overflow is a real fault and
+    /// the number is the only way anyone would find out.
+    dropped: u64,
+}
+
+impl NoteState {
+    fn new() -> NoteState {
+        NoteState {
+            bufs: (0..MAX_NOTE_BUFS).map(|_| NoteBuf::new()).collect(),
+            emitted: vec![f64::NAN; MAX_NOTE_EMITS],
+            dropped: 0,
+        }
+    }
+
+    /// Appends unless the buffer is full. Dropping an event is bad; growing a
+    /// `Vec` on the audio thread is worse.
+    fn push(buf: &mut Vec<Event>, dropped: &mut u64, event: Event) {
+        if buf.len() < buf.capacity() {
+            buf.push(event);
+        } else {
+            *dropped += 1;
+        }
+    }
+
+    /// One sub-block's worth of the note half, appended to what the buffers
+    /// already hold. `base` is where each of them stood beforehand.
+    ///
+    /// On [`NoteState`] rather than on the engine, so the stream it reads can
+    /// be handed in by shared reference from the same call. An engine method
+    /// would borrow the whole engine, `translated` included, and the stream
+    /// would have to be moved out and put back around every call.
+    #[allow(clippy::too_many_arguments)]
+    fn run_notes_step(
+        &mut self,
+        program: &Program,
+        stage: Stage,
+        events: &[Event],
+        start: u32,
+        frames: u32,
+        lanes: &[f64],
+        base: &[usize; MAX_NOTE_BUFS],
+    ) {
+        for op in &program.note_ops[stage.notes.range()] {
+            match *op {
+                NoteOp::Input { out, bus } => {
+                    // One note bus so far. A second would be a second DAW note
+                    // input, which the wrapper does not offer yet.
+                    if bus != 0 {
+                        continue;
+                    }
+                    // The stream is sorted, so the chunk is a range rather
+                    // than a filter — and on the common block where every
+                    // event falls in the first chunk, no per-event work at
+                    // all.
+                    let from = events.partition_point(|e| e.sample_offset() < start);
+                    let to = events.partition_point(|e| e.sample_offset() < start + frames);
+                    for &event in &events[from..to.max(from)] {
+                        NoteState::push(
+                            &mut self.bufs[out as usize].events,
+                            &mut self.dropped,
+                            event,
+                        );
+                    }
+                    self.follow_notes(out, base[out as usize]);
+                }
+                NoteOp::Emit {
+                    a,
+                    out,
+                    lane,
+                    state,
+                    channel,
+                    cc,
+                } => {
+                    let value = lanes.get(lane as usize).copied().unwrap_or(0.0);
+                    let value = value.clamp(0.0, 1.0);
+                    let last = &mut self.emitted[state as usize];
+                    // NaN on the left of a comparison is never equal, which is
+                    // what makes the first sub-block after a swap send.
+                    let moved = *last != value;
+                    *last = value;
+
+                    let event = Event::Note(NoteEvent::Cc {
+                        port: 0,
+                        channel: i16::from(channel),
+                        cc,
+                        value,
+                        // The lane's value became true at the start of this
+                        // sub-block, and writing it before the stream keeps
+                        // the buffer sorted.
+                        sample_offset: start,
+                    });
+                    match a {
+                        Some(a) => {
+                            let from = base[a as usize];
+                            let (source, dest) =
+                                index_two(&mut self.bufs, a as usize, out as usize);
+                            let (source, dest) = (&source.events, &mut dest.events);
+                            if moved {
+                                NoteState::push(dest, &mut self.dropped, event);
+                            }
+                            for &passed in &source[from.min(source.len())..] {
+                                NoteState::push(dest, &mut self.dropped, passed);
+                            }
+                        }
+                        None => {
+                            let dropped = &mut self.dropped;
+                            if moved {
+                                NoteState::push(
+                                    &mut self.bufs[out as usize].events,
+                                    dropped,
+                                    event,
+                                );
+                            }
+                        }
+                    }
+                }
+                NoteOp::Filter {
+                    a,
+                    out,
+                    gate,
+                    mute,
+                    channels,
+                    controllers,
+                } => {
+                    // Below 0.5 the gate is shut. A gate whose lane is missing
+                    // is a program the engine should not have been handed;
+                    // shutting the stream is the quiet failure rather than the
+                    // loud one.
+                    let shut = gate
+                        .is_some_and(|lane| !lanes.get(lane as usize).is_some_and(|&v| v >= 0.5));
+                    let from = base[a as usize];
+                    let (source, dest) = index_two(&mut self.bufs, a as usize, out as usize);
+                    let (source, dest) = (&source.events, &mut dest.events);
+                    for &event in &source[from.min(source.len())..] {
+                        if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
+                            continue;
+                        }
+                        if !passes(&event, mute, channels, controllers) {
+                            continue;
+                        }
+                        NoteState::push(dest, &mut self.dropped, event);
+                    }
+                    self.follow_notes(out, base[out as usize]);
+                }
+            }
+        }
+    }
+
+    /// Fold a buffer's notes into the tables the key and follow ops read.
+    ///
+    /// Called once per buffer per sub-block, over the events that sub-block
+    /// appended and no others: the tables are a running total, and folding an
+    /// event into them twice would leave a key held after it was let go.
+    fn follow_notes(&mut self, buf: u16, from: usize) {
+        let Some(buf) = self.bufs.get_mut(buf as usize) else {
+            return;
+        };
+        let events = &buf.events[from.min(buf.events.len())..];
+        let mut struck = 0u128;
+        let mut held = buf.held;
+        let mut count = buf.count;
+        let mut velocity = buf.velocity;
+        let mut key_track = buf.key;
+        for event in events {
+            match *event {
+                Event::Note(NoteEvent::NoteOn {
+                    key, velocity: v, ..
+                }) => {
+                    velocity = v;
+                    key_track = f64::from(key).clamp(0.0, 127.0) / 127.0;
+                    count = count.saturating_add(1);
+                    if let Some(bit) = key_bit(key) {
+                        held |= bit;
+                        struck |= bit;
+                    }
+                }
+                // NoteEnd is the plugin saying a voice finished, which is not
+                // the player letting go; only a note-off lifts a key.
+                Event::Note(NoteEvent::NoteOff { key, .. }) => {
+                    count = count.saturating_sub(1);
+                    if let Some(bit) = key_bit(key) {
+                        held &= !bit;
+                    }
+                }
+                _ => {}
+            }
+        }
+        buf.struck = struck;
+        buf.held = held;
+        buf.count = count;
+        buf.velocity = velocity;
+        buf.key = key_track;
     }
 }
 
@@ -149,6 +477,33 @@ pub struct Engine {
     /// index. Sized by [`prepare`][Engine::prepare], which is the only place in
     /// this type that allocates.
     pool: Vec<f32>,
+    /// One sub-plugin call's channels, packed at the chunk's length rather
+    /// than the block's. Used only when a chunk is shorter than the block it
+    /// sits in; see [`Window`] and the `Plugin` arm of `run_chunk`.
+    chunk_in: Vec<f32>,
+    chunk_out: Vec<f32>,
+    /// What the note half fills in. See [`NoteState`].
+    notes: NoteState,
+    /// Where each note buffer stood before each sub-block was appended to it.
+    ///
+    /// One row per sub-block the schedule can produce, sized in `prepare`. It
+    /// is what lets the audio half find its chunk's events in a buffer that
+    /// holds the whole block: a chunk covers a contiguous run of rows, so its
+    /// events are `note_marks[first] .. note_marks[end]`.
+    note_marks: Vec<[u32; MAX_NOTE_BUFS]>,
+    /// How many sub-blocks of the current block the parameter half has run.
+    /// Rows past this have stale marks and the buffer's end is the answer.
+    note_rows: usize,
+    /// The DAW's stream for the block being processed, with every note given
+    /// the graph's own id.
+    ///
+    /// Translated once, before either half runs, because both of them read it
+    /// and they must agree about which note is which. Doing it inside the note
+    /// pass would hand out a fresh id for the same note-on in every stage that
+    /// walks over it.
+    translated: Vec<Event>,
+    /// Who is who, and who still owes an ending. See [`crate::notes`].
+    ledger: NoteLedger,
     /// Frames one buffer's channel holds. Zero until `prepare`.
     stride: usize,
     /// Channel width of each of the wrapper's own input buses, main first. Set
@@ -176,17 +531,6 @@ pub struct Engine {
     /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
-    expressions: Expressions,
-    /// Which keys are down, one bit each. 128 keys, which is the whole MIDI
-    /// range, so a `u128` is the table.
-    ///
-    /// Apart from [`Expressions`] because that is the newest note whatever it
-    /// was, and a key switch asks about one particular key regardless of what
-    /// has been played since.
-    keys_held: u128,
-    /// Which keys have been struck since the last [`Engine::run`]. Cleared at
-    /// the end of it, so an op sees each note-on exactly once.
-    keys_struck: u128,
     /// One value per latch, or NaN for a latch nothing has set yet.
     latches: Vec<f64>,
     /// Which node each latch belongs to, so a program swap can carry it over.
@@ -325,11 +669,18 @@ impl Engine {
             pool: Vec::new(),
             daw_inputs: Vec::new(),
             stride: 0,
+            // Sized here rather than in `prepare`, because the note pool
+            // does not depend on the block size and a graph with no audio in
+            // it still evaluates note ops.
+            translated: Vec::with_capacity(MAX_BLOCK_EVENTS),
+            ledger: NoteLedger::new(),
+            notes: NoteState::new(),
+            chunk_in: Vec::new(),
+            chunk_out: Vec::new(),
+            note_marks: Vec::new(),
+            note_rows: 0,
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
-            expressions: Expressions::default(),
-            keys_held: 0,
-            keys_struck: 0,
             latches: vec![f64::NAN; MAX_LATCHES],
             latch_nodes: vec![u32::MAX; MAX_LATCHES],
             latch_carry: vec![(u32::MAX, f64::NAN); MAX_LATCHES],
@@ -459,41 +810,14 @@ impl Engine {
         self.program.take()
     }
 
-    /// Fold one note event into the expression state.
-    pub fn note(&mut self, event: &NoteEvent) {
-        match *event {
-            NoteEvent::NoteOn { key, velocity, .. } => {
-                self.expressions.velocity = velocity;
-                self.expressions.key = f64::from(key).clamp(0.0, 127.0) / 127.0;
-                self.expressions.held = self.expressions.held.saturating_add(1);
-                if let Some(bit) = key_bit(key) {
-                    self.keys_held |= bit;
-                    self.keys_struck |= bit;
-                }
-            }
-            NoteEvent::NoteOff { key, .. } | NoteEvent::NoteEnd { key, .. } => {
-                self.expressions.held = self.expressions.held.saturating_sub(1);
-                if let Some(bit) = key_bit(key) {
-                    self.keys_held &= !bit;
-                }
-            }
-            NoteEvent::Expression {
-                expression, value, ..
-            } => {
-                self.expressions.values[expression_index(expression)] = value;
-            }
-            NoteEvent::Midi { .. } => {}
-        }
-    }
-
     /// Clears held notes and resets internal phase/delay head counters on host transport jump.
     ///
     /// This intentionally does NOT clear key switch latches, because latches should survive
     /// transport jumps (e.g. seeking in the DAW timeline).
     pub fn reset(&mut self) {
-        self.expressions = Expressions::default();
-        self.keys_held = 0;
-        self.keys_struck = 0;
+        self.ledger.clear();
+        self.translated.clear();
+        self.notes.bufs.iter_mut().for_each(NoteBuf::silence);
         self.phases.iter_mut().for_each(|p| *p = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
@@ -512,12 +836,96 @@ impl Engine {
         self.pool.clear();
         self.pool
             .resize(MAX_BUFFERS * MAX_BUFFER_CHANNELS * self.stride, 0.0);
+        for scratch in [&mut self.chunk_in, &mut self.chunk_out] {
+            scratch.clear();
+            scratch.resize(MAX_BUFFER_CHANNELS * self.stride, 0.0);
+        }
+        for buf in &mut self.notes.bufs {
+            buf.events.clear();
+        }
+        self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
+        // One row per sub-block the schedule can cut the block into, at the
+        // finest quantum it offers, plus one so a chunk ending on the last row
+        // still has a row to ask about.
+        self.note_marks.clear();
+        self.note_marks
+            .resize(self.stride / MIN_QUANTUM as usize + 2, [0; MAX_NOTE_BUFS]);
+        self.note_rows = 0;
+        self.notes.dropped = 0;
         self.compensators.clear();
         self.compensators
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
         // Audio delay rings are sized and allocated by the main thread via Program::size_rings.
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
+    }
+
+    /// Take in the DAW's note stream for one block.
+    ///
+    /// Called once, before the parameter half runs. Every note-on gets an id of
+    /// the graph's own here, and every note-off is matched back to the note it
+    /// ends — by address, because neither format promises the note-off will
+    /// carry an id at all.
+    ///
+    /// This is also where the note buffers are emptied — all but the last
+    /// sub-block of the block that just ended.
+    ///
+    /// That tail is what the first sub-block of this block reads. A parameter
+    /// op reads the stream in force at the boundary it has just crossed, and
+    /// at the first boundary of a block that stream belongs to the block
+    /// before: dropping it would make every controller snap back to its
+    /// starting value once per DAW block. The audio half never sees it,
+    /// because its rows start at `note_marks[0]`, which is recorded after the
+    /// carry-over is already in place.
+    pub fn begin_block(&mut self, events: &[Event]) {
+        for (buf, pool) in self.notes.bufs.iter_mut().enumerate() {
+            // Everything before the last row starts is spent: the parameter
+            // half has read past it and the plugins have been handed it.
+            let spent = match self.note_rows.checked_sub(1) {
+                Some(last) => self
+                    .note_marks
+                    .get(last)
+                    .and_then(|marks| marks.get(buf))
+                    .map_or(0, |&at| (at as usize).min(pool.events.len())),
+                // No row ran, so there is no boundary to carry.
+                None => pool.events.len(),
+            };
+            pool.events.drain(..spent);
+        }
+        self.note_rows = 0;
+        self.translated.clear();
+        for &event in events {
+            if self.translated.len() == self.translated.capacity() {
+                self.notes.dropped += 1;
+                continue;
+            }
+            self.translated.push(match event {
+                Event::Note(note) => Event::Note(self.ledger.translate(note)),
+                other => other,
+            });
+        }
+    }
+
+    /// Settle the block and collect the notes the graph has finished with.
+    ///
+    /// `from_plugins` is what the sub-plugins emitted; a `NoteEnd` in it is one
+    /// of them saying it is done with a note. `ended` comes back holding the
+    /// notes to report to the DAW, addressed the way the DAW will recognise.
+    pub fn end_block(&mut self, from_plugins: &[Event], ended: &mut Vec<Ended>) {
+        for event in from_plugins {
+            if let Event::Note(NoteEvent::NoteEnd {
+                note_id: Some(id), ..
+            }) = event
+            {
+                self.ledger.finished(*id);
+            }
+        }
+        self.ledger.end_block(ended);
+    }
+
+    /// How many notes have been forced out of the ledger to make room.
+    pub fn notes_stolen(&self) -> u64 {
+        self.ledger.stolen()
     }
 
     /// Returns the latency in samples reported by the compiled program.
@@ -532,19 +940,76 @@ impl Engine {
             .is_some_and(|p| !p.audio_ops.is_empty())
     }
 
-    /// Returns the evaluation chunking granularity required by the active program.
+    /// How many stages the active program is cut into.
+    ///
+    /// A caller that runs audio walks these itself, alternating
+    /// [`run_stage`][Engine::run_stage] over the sub-blocks with
+    /// [`run_audio_stage`][Engine::run_audio_stage], because a stage's
+    /// parameters may be read off the audio the stage before it made.
+    pub fn stages(&self) -> usize {
+        self.program.as_ref().map_or(0, |p| p.stages.len())
+    }
+
+    /// The finest granularity anything in the active program runs at.
+    ///
+    /// A summary: the program is cut into stages and only the one holding a
+    /// delay line's two ends runs a sub-block at a time. See [`Stage`].
     pub fn chunking(&self) -> Chunking {
-        self.program
-            .as_ref()
-            .map_or(Chunking::WholeBlock, |p| p.chunking)
+        let looped = self.program.as_ref().is_some_and(|program| {
+            program
+                .stages
+                .iter()
+                .any(|stage| stage.chunking == Chunking::SubBlock)
+        });
+        if looped {
+            Chunking::SubBlock
+        } else {
+            Chunking::WholeBlock
+        }
     }
 
     /// Executes the audio pipeline for a block provided by the audio host.
     ///
     /// Evaluates operations at whole-block or sub-block chunking depending on whether
     /// audio feedback delay loops are present.
+    ///
+    /// Runs after [`begin_block`][Engine::begin_block] and one
+    /// [`run`][Engine::run] per sub-block, in that order. The note buffers are
+    /// filled by those calls and read here; calling this without them hands
+    /// the sub-plugins the previous block's events, or none at all.
+    ///
+    /// Every stage in one call. See [`Engine::run`] for what that costs and
+    /// when it costs nothing.
     pub fn run_audio(
         &mut self,
+        ctx: &AudioContext<'_>,
+        daw_in: &[f32],
+        daw_out: &mut [f32],
+        nodes: &mut dyn AudioInstances,
+    ) {
+        self.clear_output(daw_out);
+        for stage in 0..self.stages() {
+            self.run_audio_stage(stage, ctx, daw_in, daw_out, nodes);
+        }
+    }
+
+    /// The block is the program's to fill: a channel no `Output` op reaches is
+    /// silence, not whatever the caller's buffer already held. Called once
+    /// before the stages, because each of them writes only its own part.
+    pub fn clear_output(&self, daw_out: &mut [f32]) {
+        daw_out.fill(0.0);
+    }
+
+    /// One stage's audio ops, over the whole block.
+    ///
+    /// A stage covers the block before the next one starts, so a stage that
+    /// steps a sub-block at a time hands the one after it a finished buffer.
+    /// Only the stage holding a delay line's two ends steps; the rest of the
+    /// program is called once, however many loops are drawn elsewhere in the
+    /// patch.
+    pub fn run_audio_stage(
+        &mut self,
+        stage: usize,
         ctx: &AudioContext<'_>,
         daw_in: &[f32],
         daw_out: &mut [f32],
@@ -557,26 +1022,62 @@ impl Engine {
         let Some(program) = self.program.take() else {
             return;
         };
-
-        // The block is the program's to fill: a channel no `Output` op reaches
-        // is silence, not whatever the caller's buffer already held.
-        daw_out.fill(0.0);
-
-        let step = match program.chunking {
-            Chunking::WholeBlock => total.max(1),
-            // The last chunk is short whenever the block is not a multiple of the quantum.
-            Chunking::SubBlock => (ctx.quantum as usize).max(1),
-        };
-        let mut start = 0usize;
-        let mut row = 0usize;
-        while start < total {
-            let len = step.min(total - start);
-            self.run_chunk(&program, ctx, nodes, daw_in, daw_out, start, len, row);
-            start += len;
-            row += 1;
+        if let Some(&stage) = program.stages.get(stage) {
+            let step = match stage.chunking {
+                Chunking::WholeBlock => total.max(1),
+                // The last chunk is short whenever the block is not a multiple
+                // of the quantum.
+                Chunking::SubBlock => (ctx.quantum as usize).max(1),
+            };
+            let mut start = 0usize;
+            let mut row = 0usize;
+            while start < total {
+                let len = step.min(total - start);
+                self.run_chunk(
+                    &program, stage, ctx, nodes, daw_in, daw_out, start, len, row,
+                );
+                start += len;
+                row += 1;
+            }
         }
 
         self.program = Some(program);
+    }
+
+    /// Where the rows `first..end` sit in note buffer `buf`.
+    ///
+    /// The buffer holds the whole block, so this is how the audio half asks
+    /// for its own chunk's events without the note half having to run again.
+    /// A row past what the parameter half has filled reads to the end, which
+    /// is what makes the last chunk right whether or not the block divides
+    /// evenly by the quantum.
+    fn note_slice(&self, buf: u16, first: usize, end: usize) -> std::ops::Range<usize> {
+        let len = self
+            .notes
+            .bufs
+            .get(buf as usize)
+            .map_or(0, |buf| buf.events.len());
+        let mark = |row: usize| {
+            self.note_marks
+                .get(row)
+                .and_then(|marks| marks.get(buf as usize))
+                .map_or(len, |&at| (at as usize).min(len))
+        };
+        // Not zero for row 0: what sits before it is the carry-over from the
+        // previous block, which the parameter half reads and the plugins have
+        // already been handed.
+        let from = mark(first);
+        let to = if end >= self.note_rows {
+            len
+        } else {
+            mark(end)
+        };
+        from..to.max(from)
+    }
+
+    /// How many events have been dropped for want of buffer space.
+    pub fn notes_dropped(&self) -> u64 {
+        self.notes.dropped
     }
 
     /// One chunk of `run_audio`: every op, over `len` frames starting at
@@ -585,6 +1086,7 @@ impl Engine {
     fn run_chunk(
         &mut self,
         program: &Program,
+        stage: Stage,
         ctx: &AudioContext<'_>,
         nodes: &mut dyn AudioInstances,
         daw_in: &[f32],
@@ -595,26 +1097,36 @@ impl Engine {
     ) {
         let block = ctx.frames as usize;
         let mut tap = 0usize;
-        for op in &program.audio_ops {
+        // Which rows of the note buffers this chunk covers. The buffers were
+        // filled by the parameter half and hold the whole block; a chunk is a
+        // contiguous run of rows, so its events are a contiguous slice.
+        let first_row = row;
+        let end_row = row + frames.div_ceil((ctx.quantum as usize).max(1));
+        let win = Window {
+            block,
+            start,
+            frames,
+        };
+
+        for op in &program.audio_ops[stage.audio.range()] {
             match op {
-                AudioOp::Silence { out } => self.fill(*out, frames, 0.0),
+                AudioOp::Silence { out } => self.fill(*out, win, 0.0),
                 AudioOp::Input { out, bus } => {
                     let width = program.buffers[*out as usize] as usize;
                     // daw_in holds interleaved planar buses.
                     let bus = *bus as usize;
                     let Some(&have) = self.daw_inputs.get(bus) else {
-                        self.fill(*out, frames, 0.0);
+                        self.fill(*out, win, 0.0);
                         continue;
                     };
-                    // The DAW's buffer is packed at the *block* length; the
-                    // pool is packed at the chunk's. This op is where the two
-                    // meet, and where `start` stops being the engine's problem.
+                    // Both sides are packed at the block's length, so the two
+                    // walk in step and only the bus base differs.
                     let base: usize = self.daw_inputs[..bus]
                         .iter()
                         .map(|&c| c as usize * block)
                         .sum();
                     for ch in 0..width.min(MAX_CHANNELS) {
-                        let to = self.at(*out, ch, frames);
+                        let to = self.at(*out, ch, win);
                         if ch >= have as usize {
                             self.pool[to..to + frames].fill(0.0);
                             continue;
@@ -631,7 +1143,7 @@ impl Engine {
                     }
                     let width = program.buffers[*a as usize] as usize;
                     for ch in 0..width.min(MAX_CHANNELS) {
-                        let from = self.at(*a, ch, frames);
+                        let from = self.at(*a, ch, win);
                         let to = ch * block + start;
                         if to + frames <= daw_out.len() {
                             daw_out[to..to + frames]
@@ -646,21 +1158,21 @@ impl Engine {
                     for &(from, want) in buses {
                         let have = program.buffers[from as usize];
                         for ch in 0..want {
-                            let to = self.at(*out, at + ch as usize, frames);
+                            let to = self.at(*out, at + ch as usize, win);
                             if have == 1 && want > 1 {
                                 // Mono into a wider bus: the same signal on
                                 // every channel, which is what a host does.
-                                let src = self.at(from, 0, frames);
+                                let src = self.at(from, 0, win);
                                 self.pool.copy_within(src..src + frames, to);
                             } else if want == 1 && have > 1 {
                                 // Wider into mono: averaged, the inverse of the
                                 // branch above, so a round trip keeps its
                                 // level. Taking the left channel alone would
                                 // ignore half the signal.
-                                let first = self.at(from, 0, frames);
+                                let first = self.at(from, 0, win);
                                 self.pool.copy_within(first..first + frames, to);
                                 for other in 1..have {
-                                    let src = self.at(from, other as usize, frames);
+                                    let src = self.at(from, other as usize, win);
                                     for i in 0..frames {
                                         self.pool[to + i] += self.pool[src + i];
                                     }
@@ -670,7 +1182,7 @@ impl Engine {
                                     self.pool[to + i] *= scale;
                                 }
                             } else if ch < have {
-                                let src = self.at(from, ch as usize, frames);
+                                let src = self.at(from, ch as usize, win);
                                 self.pool.copy_within(src..src + frames, to);
                             } else {
                                 self.pool[to..to + frames].fill(0.0);
@@ -688,8 +1200,8 @@ impl Engine {
                     // One bus out of a plugin's output region. No conversion:
                     // both sides are the width the plugin negotiated.
                     for ch in 0..*width as usize {
-                        let src = self.at(*from, *channel as usize + ch, frames);
-                        let dst = self.at(*out, ch, frames);
+                        let src = self.at(*from, *channel as usize + ch, win);
+                        let dst = self.at(*out, ch, win);
                         self.pool.copy_within(src..src + frames, dst);
                     }
                 }
@@ -701,6 +1213,9 @@ impl Engine {
                     output_buses,
                     notes,
                 } => {
+                    // Worked out before the pool is split, because that borrow
+                    // covers the rest of the arm.
+                    let heard = notes.map(|buf| self.note_slice(buf, first_row, end_row));
                     // The compiler guarantees these differ, so the two regions
                     // cannot overlap and `split_at_mut` is enough to prove it.
                     let span = MAX_BUFFER_CHANNELS * self.stride;
@@ -724,13 +1239,56 @@ impl Engine {
                     // pool; the region it owns is sized for its active buses.
                     let packed_in = in_width as usize * frames;
                     let packed_out = out_width as usize * frames;
-                    // The gate lane is sampled per chunk.
-                    let notes = notes.resolve(notes.gate.and_then(|lane| ctx.lane(row, lane)));
+                    // A plugin is handed its channels packed at the length of
+                    // the call, which is what every format's buffer layout
+                    // means. The pool packs at the block's length instead, so
+                    // that a buffer written whole can be read a sub-block at a
+                    // time. The two agree whenever the chunk *is* the block —
+                    // the common case, handed over where it lies — and a
+                    // shorter chunk is gathered into a scratch and scattered
+                    // back. Only a program with a feedback loop in it pays
+                    // that, and it is already paying for the extra calls.
+                    let short = frames != block;
+                    if short {
+                        for ch in 0..in_width as usize {
+                            let from = ch * block + start;
+                            let to = ch * frames;
+                            self.chunk_in[to..to + frames]
+                                .copy_from_slice(&source[from..from + frames]);
+                        }
+                    }
+                    // An unwired notes port hears nothing, which is not the
+                    // same as hearing an empty buffer only because this chunk
+                    // was quiet.
+                    let events: &[Event] = match (notes, heard) {
+                        (Some(buf), Some(range)) => &self.notes.bufs[*buf as usize].events[range],
+                        _ => &[],
+                    };
+                    // Counted here, where the note is actually handed over, and
+                    // not where a wire branches: a branch a gate later swallows
+                    // would never be counted back down, and the note would
+                    // never be reported ended.
+                    for event in events {
+                        if let Event::Note(NoteEvent::NoteOn {
+                            note_id: Some(id), ..
+                        }) = event
+                        {
+                            self.ledger.delivered(*id);
+                        }
+                    }
+                    let (heard_in, heard_out): (&[f32], &mut [f32]) = if short {
+                        (
+                            &self.chunk_in[..packed_in],
+                            &mut self.chunk_out[..packed_out],
+                        )
+                    } else {
+                        (&source[..packed_in], &mut dest[..packed_out])
+                    };
                     nodes.process(
                         *instance,
-                        notes,
-                        &source[..packed_in],
-                        &mut dest[..packed_out],
+                        events,
+                        heard_in,
+                        heard_out,
                         AudioChunk {
                             input_channels: in_width,
                             output_channels: out_width,
@@ -744,10 +1302,18 @@ impl Engine {
                             offset: start as u32,
                         },
                     );
+                    if short {
+                        for ch in 0..out_width as usize {
+                            let from = ch * frames;
+                            let to = ch * block + start;
+                            dest[to..to + frames]
+                                .copy_from_slice(&self.chunk_out[from..from + frames]);
+                        }
+                    }
                 }
                 AudioOp::Mix { out, inputs } => {
                     if inputs.is_empty() {
-                        self.fill(*out, frames, 0.0);
+                        self.fill(*out, win, 0.0);
                         continue;
                     }
                     let width = program.buffers[*out as usize] as usize;
@@ -758,8 +1324,8 @@ impl Engine {
                             .map(|db| db_to_linear(db) as f32)
                             .unwrap_or(input.gain as f32);
                         for ch in 0..width.min(MAX_CHANNELS) {
-                            let from = self.at(input.buf, ch, frames);
-                            let to = self.at(*out, ch, frames);
+                            let from = self.at(input.buf, ch, win);
+                            let to = self.at(*out, ch, win);
                             if from == to && gain == 1.0 {
                                 // Already in place and unchanged: unity gain on destination buffer.
                                 continue;
@@ -777,7 +1343,7 @@ impl Engine {
                 }
                 AudioOp::Compensate { buf, slot, samples } => {
                     let width = program.buffers[*buf as usize] as usize;
-                    self.compensate(*buf, *slot as usize, *samples as usize, width, frames);
+                    self.compensate(*buf, *slot as usize, *samples as usize, width, win);
                 }
                 AudioOp::DelayRead {
                     out,
@@ -793,7 +1359,7 @@ impl Engine {
                         .unwrap_or(*time)
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
-                    self.delay_read(*line as usize, index, *out, width, frames, {
+                    self.delay_read(*line as usize, index, *out, width, win, {
                         // Minimum floor in samples, plus the two samples the
                         // interpolator needs ahead of the read pointer.
                         let floor = frames as f64 + 2.0;
@@ -805,7 +1371,7 @@ impl Engine {
                 }
                 AudioOp::DelayWrite { line, a } => {
                     let width = program.buffers[*a as usize] as usize;
-                    self.delay_write(*line as usize, *a, width, frames);
+                    self.delay_write(*line as usize, *a, width, win);
                 }
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
@@ -814,19 +1380,18 @@ impl Engine {
         }
     }
 
-    /// Where one channel of one buffer starts in the pool.
+    /// Where this chunk of one channel of one buffer starts in the pool.
     ///
-    /// Each buffer owns a region sized for the longest block; the channels
-    /// inside it are packed at `frames`, so the region is always big enough and
-    /// the packed part is exactly what a sub-plugin expects to be handed.
-    fn at(&self, buf: Buf, channel: usize, frames: usize) -> usize {
-        buf as usize * MAX_BUFFER_CHANNELS * self.stride + channel * frames
+    /// Each buffer owns a region sized for the longest block, with the channels
+    /// packed at the block's length. See [`Window`].
+    fn at(&self, buf: Buf, channel: usize, win: Window) -> usize {
+        buf as usize * MAX_BUFFER_CHANNELS * self.stride + channel * win.block + win.start
     }
 
-    fn fill(&mut self, buf: Buf, frames: usize, value: f32) {
+    fn fill(&mut self, buf: Buf, win: Window, value: f32) {
         for ch in 0..MAX_CHANNELS {
-            let start = self.at(buf, ch, frames);
-            self.pool[start..start + frames].fill(value);
+            let start = self.at(buf, ch, win);
+            self.pool[start..start + win.frames].fill(value);
         }
     }
 
@@ -839,12 +1404,13 @@ impl Engine {
         tap: usize,
         buf: Buf,
         width: usize,
-        frames: usize,
+        win: Window,
         distance: f64,
     ) {
+        let frames = win.frames;
         let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
         if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
-            self.fill(buf, frames, 0.0);
+            self.fill(buf, win, 0.0);
             return;
         }
         // NaN on the first chunk after a swap, and on the very first block.
@@ -855,7 +1421,7 @@ impl Engine {
         let head = self.audio_ring_heads[line];
         for ch in 0..width.min(MAX_CHANNELS) {
             let ring = ch * ring_len;
-            let to = self.at(buf, ch, frames);
+            let to = self.at(buf, ch, win);
             for i in 0..frames {
                 // The sweep lands exactly on `distance` at the last sample.
                 let t = (i + 1) as f64 / frames as f64;
@@ -882,7 +1448,8 @@ impl Engine {
     /// back for exactly that reason — so the head this advances is the one the
     /// reads saw, and a delay of one chunk reads the chunk before it rather
     /// than itself.
-    fn delay_write(&mut self, line: usize, buf: Buf, width: usize, frames: usize) {
+    fn delay_write(&mut self, line: usize, buf: Buf, width: usize, win: Window) {
+        let frames = win.frames;
         let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
         if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
             return;
@@ -892,7 +1459,7 @@ impl Engine {
             let ring = ch * ring_len;
             // A channel the source does not have still has to be written, or
             // the line would keep replaying whatever a wider patch left there.
-            let from = self.at(buf, ch, frames);
+            let from = self.at(buf, ch, win);
             for i in 0..frames {
                 let at = (head + i) % ring_len;
                 self.audio_rings[line][ring + at] = if ch < width.min(MAX_CHANNELS) {
@@ -925,17 +1492,18 @@ impl Engine {
     }
 
     /// Delays a buffer in place by a fixed sample count for latency compensation.
-    fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, frames: usize) {
+    fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, win: Window) {
         if slot >= MAX_COMPENSATORS || samples == 0 || samples >= MAX_COMPENSATION {
             return;
         }
+        let frames = win.frames;
         let mut head = self.compensator_heads[slot];
         for ch in 0..width.min(MAX_CHANNELS) {
             // Every channel walks the same distance, so each starts from the
             // same head and only the last one leaves it moved.
             head = self.compensator_heads[slot];
             let ring = slot * MAX_CHANNELS * MAX_COMPENSATION + ch * MAX_COMPENSATION;
-            let signal = self.at(buf, ch, frames);
+            let signal = self.at(buf, ch, win);
             for i in 0..frames {
                 let read = (head + MAX_COMPENSATION - samples) % MAX_COMPENSATION;
                 let delayed = self.compensators[ring + read];
@@ -947,12 +1515,45 @@ impl Engine {
         self.compensator_heads[slot] = head;
     }
 
-    /// Evaluates parameter operations for one sub-block.
+    /// Every stage's parameter and note ops for one sub-block.
     ///
     /// Overwrites slot table values for lanes driven by the graph.
+    ///
+    /// Paired with [`run_audio`][Engine::run_audio] this puts every parameter
+    /// of the block before any of its audio, which is one block behind the
+    /// order the stages describe. What that costs depends on the graph:
+    ///
+    /// * with nothing reading a parameter off audio there is only one stage
+    ///   and the two orders are the same walk;
+    /// * with an [`Op::Follow`] whose value never comes back round to audio —
+    ///   a meter, or anything else the editor reads and the block does not —
+    ///   the audio is identical and the lane is a block old, which is what a
+    ///   meter is anyway;
+    /// * with one that *does* reach audio again, through a sub-plugin's
+    ///   parameter or a generated controller, the block is rendered against
+    ///   the level of the block before it.
+    ///
+    /// The buffer read is the pool as the last block left it, so that last
+    /// case is a block of latency rather than nonsense. A caller that wants
+    /// none of it walks the stages itself; see [`Engine::stages`].
     pub fn run(&mut self, ctx: &BlockContext, slots: &mut [f64]) {
+        for stage in 0..self.stages() {
+            self.run_stage(stage, ctx, slots);
+        }
+    }
+
+    /// One stage's parameter and note ops for one sub-block.
+    ///
+    /// Called once per sub-block, in order, before that stage's audio ops.
+    /// What a parameter op reads out of a note buffer is everything the buffer
+    /// holds, which is the stream up to the boundary this sub-block starts on.
+    pub fn run_stage(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
         // Moved out and put back rather than borrowed.
         let Some(program) = self.program.take() else {
+            return;
+        };
+        let Some(&stage) = program.stages.get(stage) else {
+            self.program = Some(program);
             return;
         };
         if program.is_empty() {
@@ -973,7 +1574,7 @@ impl Engine {
             0.0
         };
 
-        for op in &program.ops {
+        for op in &program.ops[stage.params.range()] {
             match *op {
                 Op::DelayRead {
                     out,
@@ -1010,9 +1611,6 @@ impl Engine {
                 Op::Const { out, value } => self.registers[out as usize] = value,
                 Op::Slot { out, slot } => {
                     self.registers[out as usize] = slots.get(slot as usize).copied().unwrap_or(0.0)
-                }
-                Op::Expr { out, source } => {
-                    self.registers[out as usize] = read_expression(&self.expressions, source)
                 }
                 Op::Lfo {
                     out,
@@ -1068,11 +1666,76 @@ impl Engine {
                         Operand::Value(value) => value,
                     };
                 }
-                Op::KeyHeld { out, key } => {
-                    self.registers[out as usize] = f64::from(self.held(key));
+                Op::KeyHeld { out, buf, key } => {
+                    self.registers[out as usize] = f64::from(self.held(buf, key));
                 }
-                Op::KeyStep { state, key, count } => {
-                    if self.struck(key)
+                Op::Follow {
+                    out,
+                    buf,
+                    state,
+                    detect,
+                    attack,
+                    release,
+                } => {
+                    let win = Window {
+                        block: ctx.block as usize,
+                        start: ctx.offset as usize,
+                        frames: ctx.frames as usize,
+                    };
+                    let width = program
+                        .buffers
+                        .get(buf as usize)
+                        .map_or(0, |&w| (w as usize).min(MAX_CHANNELS));
+                    let level = self.loudness(buf, width, win, detect);
+                    // One pole per sub-block, which is as often as a parameter
+                    // is allowed to move. `dt` is this sub-block's length, so
+                    // the times mean the same thing at any quantum and any
+                    // block size. A time of zero is a coefficient of zero,
+                    // which is following exactly.
+                    let held = self.latches.get(state as usize).copied().unwrap_or(0.0);
+                    let held = if held.is_finite() { held } else { 0.0 };
+                    let time = if level > held { attack } else { release };
+                    let value = if time > 0.0 && dt > 0.0 {
+                        let coeff = (-dt / time).exp();
+                        held + (level - held) * (1.0 - coeff)
+                    } else {
+                        level
+                    };
+                    if let Some(latch) = self.latches.get_mut(state as usize) {
+                        *latch = value;
+                    }
+                    self.registers[out as usize] = value;
+                }
+                Op::NoteFollow {
+                    out,
+                    buf,
+                    state,
+                    what,
+                } => {
+                    let index = buf as usize;
+                    self.registers[out as usize] = match what {
+                        Follow::Velocity => {
+                            self.notes.bufs.get(index).map_or(0.0, |buf| buf.velocity)
+                        }
+                        Follow::KeyTrack => self.notes.bufs.get(index).map_or(0.5, |buf| buf.key),
+                        Follow::Gate => f64::from(u8::from(
+                            self.notes.bufs.get(index).is_some_and(|buf| buf.count > 0),
+                        )),
+                    };
+                    // The latch is not read back — the tables above already
+                    // survive a program swap — but keeping the value in it
+                    // means the editor can show what the node is reading.
+                    if let Some(latch) = self.latches.get_mut(state as usize) {
+                        *latch = self.registers[out as usize];
+                    }
+                }
+                Op::KeyStep {
+                    state,
+                    buf,
+                    key,
+                    count,
+                } => {
+                    if self.struck(buf, key)
                         && count > 0
                         && let Some(latch) = self.latches.get_mut(state as usize)
                     {
@@ -1080,8 +1743,13 @@ impl Engine {
                         *latch = (at + 1.0).rem_euclid(f64::from(count));
                     }
                 }
-                Op::KeyLatch { state, key, value } => {
-                    if self.struck(key)
+                Op::KeyLatch {
+                    state,
+                    buf,
+                    key,
+                    value,
+                } => {
+                    if self.struck(buf, key)
                         && let Some(latch) = self.latches.get_mut(state as usize)
                     {
                         *latch = value;
@@ -1100,6 +1768,39 @@ impl Engine {
                         .unwrap_or(f64::NAN);
                     let at = if at.is_nan() { initial } else { at };
                     self.registers[out as usize] = f64::from(at == value);
+                }
+                Op::NoteCc {
+                    out,
+                    buf,
+                    state,
+                    channel,
+                    cc,
+                    initial,
+                } => {
+                    // The last matching event wins: within one sub-block a
+                    // controller may move several times, and what the boundary
+                    // carries is where it ended up.
+                    let latest = self
+                        .notes
+                        .bufs
+                        .get(buf as usize)
+                        .into_iter()
+                        .flat_map(|buf| buf.events.iter())
+                        .rev()
+                        .find_map(|event| match *event {
+                            Event::Note(NoteEvent::Cc {
+                                channel: on,
+                                cc: number,
+                                value,
+                                ..
+                            }) if number == cc && (channel < 0 || channel == on) => Some(value),
+                            _ => None,
+                        });
+                    let held = &mut self.latches[state as usize];
+                    if let Some(value) = latest {
+                        *held = value;
+                    }
+                    self.registers[out as usize] = if held.is_nan() { initial } else { *held };
                 }
                 Op::Latch {
                     out,
@@ -1166,19 +1867,89 @@ impl Engine {
             }
         }
 
-        self.keys_struck = 0;
+        // Last, so that a reader in *this* sub-block saw the previous one's
+        // stream. A parameter signal has sub-block resolution, so the value it
+        // wants is the one in effect at the boundary it just crossed, not one
+        // from the middle of the sub-block about to start.
+        //
+        // The buffers are appended to rather than refilled, so where they
+        // stand now is both what this row's ops must skip and where the audio
+        // half will later find this row's events.
+        let row = ctx.row as usize;
+        let mut base = [0usize; MAX_NOTE_BUFS];
+        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
+            *slot = buf.events.len();
+        }
+        // Only for the buffers this stage fills. A later stage passing over
+        // the same rows would otherwise overwrite every mark with the length
+        // the buffer finished at, and the audio half would read the whole
+        // block as one row.
+        if let Some(marks) = self.note_marks.get_mut(row) {
+            for (buf, mark) in marks.iter_mut().enumerate() {
+                if stage.note_bufs & (1 << buf) != 0 {
+                    *mark = base[buf] as u32;
+                }
+            }
+        }
+        // Two disjoint fields, which is the whole reason the note half's
+        // state is a type of its own: the pass wants the block's stream by
+        // shared reference and everything it fills by exclusive one.
+        self.notes.run_notes_step(
+            &program,
+            stage,
+            &self.translated,
+            ctx.offset,
+            ctx.frames,
+            slots,
+            &base,
+        );
+        self.note_rows = self.note_rows.max(row + 1);
 
         self.program = Some(program);
     }
 
-    /// Whether `key` is down. Out of range is never down.
-    fn held(&self, key: u8) -> bool {
-        key_bit(i16::from(key)).is_some_and(|bit| self.keys_held & bit != 0)
+    /// How loud one window of an audio buffer is, across its channels.
+    ///
+    /// Linear amplitude, not decibels: a parameter lane is a plain number and
+    /// the graph has arithmetic nodes for anyone who wants the log of it.
+    fn loudness(&self, buf: Buf, width: usize, win: Window, detect: Detect) -> f64 {
+        if width == 0 || win.frames == 0 {
+            return 0.0;
+        }
+        let mut peak = 0.0f32;
+        let mut sum = 0.0f64;
+        for ch in 0..width {
+            let at = self.at(buf, ch, win);
+            for &sample in &self.pool[at..at + win.frames] {
+                match detect {
+                    Detect::Peak => peak = peak.max(sample.abs()),
+                    Detect::Rms => sum += f64::from(sample) * f64::from(sample),
+                }
+            }
+        }
+        match detect {
+            Detect::Peak => f64::from(peak),
+            // Across every channel at once rather than per channel and
+            // averaged: what is wanted is how loud the signal is, and a stereo
+            // pair carrying the same thing twice is not twice as loud.
+            Detect::Rms => (sum / (width * win.frames) as f64).sqrt(),
+        }
     }
 
-    /// Whether `key` has been struck since the last evaluation.
-    fn struck(&self, key: u8) -> bool {
-        key_bit(i16::from(key)).is_some_and(|bit| self.keys_struck & bit != 0)
+    /// Whether `key` is down on `buf`. Out of range is never down.
+    fn held(&self, buf: u16, key: u8) -> bool {
+        let table = self.notes.bufs.get(buf as usize).map_or(0, |buf| buf.held);
+        key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
+    }
+
+    /// Whether `key` was struck in the sub-block `buf` last carried.
+    fn struck(&self, buf: u16, key: u8) -> bool {
+        let table = self
+            .notes
+            .bufs
+            .get(buf as usize)
+            .map_or(0, |buf| buf.struck);
+        key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
     }
 }
 
@@ -1188,21 +1959,6 @@ fn key_bit(key: i16) -> Option<u128> {
     (0..128).contains(&key).then(|| 1u128 << key)
 }
 
-fn read_expression(state: &Expressions, source: ExprSource) -> f64 {
-    match source {
-        ExprSource::Volume => state.values[0],
-        ExprSource::Pan => state.values[1],
-        ExprSource::Tuning => state.values[2],
-        ExprSource::Vibrato => state.values[3],
-        ExprSource::Expression => state.values[4],
-        ExprSource::Brightness => state.values[5],
-        ExprSource::Pressure => state.values[6],
-        ExprSource::Velocity => state.velocity,
-        ExprSource::Gate => f64::from(u8::from(state.held > 0)),
-        ExprSource::KeyTrack => state.key,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,12 +1966,12 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, Constant, DelayRead, DelayWrite, Expression, Gate, KeyParam,
-        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, ParamPort, Plugin,
-        PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, Gate, KeyParam,
+        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteFollow,
+        NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn, Switch,
+        linear_to_db,
     };
     use crate::port::PortType;
-    use subhost_adapter::NoteStream;
 
     const SLOTS: usize = 32;
 
@@ -1249,6 +2005,9 @@ mod tests {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames,
+            offset: 0,
+            row: 0,
+            block: frames,
         }
     }
 
@@ -1479,6 +2238,9 @@ mod tests {
                 sample_rate: 48_000.0,
                 tempo_bpm: 120.0,
                 frames: 6000,
+                offset: 0,
+                row: 0,
+                block: 6000,
             },
             &mut slots,
         );
@@ -1487,6 +2249,9 @@ mod tests {
                 sample_rate: 48_000.0,
                 tempo_bpm: 120.0,
                 frames: 1,
+                offset: 0,
+                row: 0,
+                block: 1,
             },
             &mut slots,
         );
@@ -1637,6 +2402,932 @@ mod tests {
         assert!(run(32, 3) > 0.5);
     }
 
+    /// An instrument: one stereo output, and a notes port.
+    fn note_plugin(graph: &mut Graph, instance: usize) -> NodeId {
+        graph.add(
+            NodeKind::Plugin(Plugin {
+                instance,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        )
+    }
+
+    /// Records the note stream each instance was handed, so the note half can
+    /// be read off a run.
+    #[derive(Default)]
+    struct Heard(std::collections::BTreeMap<u32, Vec<Event>>);
+
+    impl AudioInstances for Heard {
+        fn process(
+            &mut self,
+            instance: u32,
+            notes: &[Event],
+            _input: &[f32],
+            output: &mut [f32],
+            chunk: AudioChunk,
+        ) {
+            self.0.entry(instance).or_default().extend_from_slice(notes);
+            for ch in 0..chunk.output_channels {
+                output[chunk.channel(ch)].fill(0.0);
+            }
+        }
+    }
+
+    /// The note id an event carries, for reading a recorded stream back.
+    fn named(event: &Event) -> Option<i32> {
+        match event {
+            Event::Note(note) => note.note_id(),
+            Event::Param(_) => None,
+        }
+    }
+
+    fn note_on(key: i16, at: u32) -> Event {
+        Event::Note(NoteEvent::NoteOn {
+            note_id: None,
+            port: 0,
+            channel: 0,
+            key,
+            velocity: 1.0,
+            sample_offset: at,
+        })
+    }
+
+    fn note_off(key: i16, at: u32) -> Event {
+        Event::Note(NoteEvent::NoteOff {
+            note_id: None,
+            port: 0,
+            channel: 0,
+            key,
+            velocity: 0.0,
+            sample_offset: at,
+        })
+    }
+
+    /// Runs `graph` over one block with `events` on the DAW's note input, and
+    /// returns what each instance heard.
+    fn hear(graph: &Graph, events: &[Event], lanes: &[f64]) -> Heard {
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, graph);
+        let mut heard = Heard::default();
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut row = vec![0.0; width];
+        row[..lanes.len().min(width)].copy_from_slice(&lanes[..lanes.len().min(width)]);
+        // The wrapper's order: take the stream in, run the param half over the
+        // row the note filters read, then the audio half.
+        engine.begin_block(events);
+        engine.run(&ctx(8), &mut row);
+        engine.run_audio(
+            &AudioContext {
+                frames: 8,
+                quantum: 32,
+                sample_rate: RATE,
+                lanes: &row,
+                lanes_per_row: width,
+            },
+            &[0.0; 2 * 8],
+            &mut [0.0; 2 * 8],
+            &mut heard,
+        );
+        heard
+    }
+
+    /// A synth wired to the MIDI input hears the DAW; the one next to it does
+    /// not. This is the whole reason notes are routed rather than broadcast.
+    #[test]
+    fn only_the_wired_instrument_hears_the_daw() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let wired = note_plugin(&mut graph, 0);
+        let idle = note_plugin(&mut graph, 1);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, wired, 0);
+        graph.connect(wired, 0, mix, 0);
+        graph.connect(idle, 0, mix, 2);
+        graph.connect(mix, 0, out, 0);
+
+        let heard = hear(&graph, &[note_on(60, 0)], &[]);
+        assert_eq!(heard.0[&0].len(), 1);
+        assert!(
+            heard.0.get(&1).is_none_or(Vec::is_empty),
+            "an unwired notes port means silence, not everything"
+        );
+    }
+
+    /// A shut gate holds the note-ons back and lets the releases through, so a
+    /// note that was sounding when it closed still gets its note-off. Blocking
+    /// everything would leave a hung note behind whatever threw the gate.
+    #[test]
+    fn a_shut_note_gate_still_delivers_the_releases() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let events = [note_on(60, 0), note_off(55, 1)];
+
+        // Slot 0 is the gate's control, and it is read straight out of the
+        // lane row the DAW's automation rides in.
+        let open = hear(&graph, &events, &[1.0]);
+        assert_eq!(open.0[&0].len(), 2, "open, everything passes");
+
+        let shut = hear(&graph, &events, &[0.0]);
+        let seen = &shut.0[&0];
+        assert_eq!(seen.len(), 1, "only the release got through");
+        assert!(matches!(
+            seen[0],
+            Event::Note(NoteEvent::NoteOff { key: 55, .. })
+        ));
+    }
+
+    /// A key mute drops both halves of the keys it names — the note-on went
+    /// too, so nothing is left waiting for a release — and leaves everything
+    /// else, including events that have no key at all.
+    #[test]
+    fn a_key_mute_takes_both_halves_and_leaves_the_controllers() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let mute = graph.add(NodeKind::NoteMute(NoteMute { keys: vec![24] }), [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, mute, 0);
+        graph.connect(mute, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let sustain = Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: 64,
+            value: 1.0,
+            sample_offset: 2,
+        });
+        let heard = hear(
+            &graph,
+            &[note_on(24, 0), note_off(24, 1), sustain, note_on(60, 3)],
+            &[],
+        );
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2, "both halves of key 24 are gone: {seen:?}");
+        assert!(matches!(seen[0], Event::Note(NoteEvent::Cc { .. })));
+        assert!(matches!(
+            seen[1],
+            Event::Note(NoteEvent::NoteOn { key: 60, .. })
+        ));
+    }
+
+    /// A MIDI filter narrows the stream by channel and by controller number,
+    /// and judges each event only on what it actually has: a note has a
+    /// channel but no controller number, so a CC list must not swallow it.
+    #[test]
+    fn a_midi_filter_narrows_by_channel_and_controller() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let filter = graph.add(
+            NodeKind::NoteFilter(NoteFilter {
+                channels: vec![0],
+                channel_mode: crate::nodes::FilterMode::Keep,
+                controllers: vec![64],
+                controller_mode: crate::nodes::FilterMode::Keep,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, filter, 0);
+        graph.connect(filter, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let cc = |number: u8, channel: i16, at: u32| {
+            Event::Note(NoteEvent::Cc {
+                port: 0,
+                channel,
+                cc: number,
+                value: 1.0,
+                sample_offset: at,
+            })
+        };
+        let mut on_other_channel = note_on(60, 4);
+        if let Event::Note(NoteEvent::NoteOn { channel, .. }) = &mut on_other_channel {
+            *channel = 1;
+        }
+
+        let heard = hear(
+            &graph,
+            &[
+                note_on(60, 0),   // channel 0: passes
+                on_other_channel, // channel 1: dropped
+                cc(64, 0, 1),     // the sustain pedal: passes
+                cc(1, 0, 2),      // the mod wheel: dropped
+                cc(64, 1, 3),     // right controller, wrong channel
+            ],
+            &[],
+        );
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2, "expected the note and the pedal: {seen:?}");
+        assert!(matches!(
+            seen[0],
+            Event::Note(NoteEvent::NoteOn {
+                key: 60,
+                channel: 0,
+                ..
+            })
+        ));
+        assert!(matches!(seen[1], Event::Note(NoteEvent::Cc { cc: 64, .. })));
+    }
+
+    /// A parameter driving a controller: the value reaches the plugin as CC,
+    /// and joins the stream that was already flowing rather than replacing it.
+    #[test]
+    fn a_parameter_reaches_the_plugin_as_a_controller() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(notes, 0, pedal, 1);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let heard = hear(&graph, &[note_on(60, 2)], &[1.0]);
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2, "the pedal and the note: {seen:?}");
+        assert!(
+            matches!(
+                seen[0],
+                Event::Note(NoteEvent::Cc { cc: 64, value, sample_offset: 0, .. }) if value == 1.0
+            ),
+            "the controller comes first, at the sub-block start, so the \
+             buffer stays sorted: {seen:?}"
+        );
+        assert!(matches!(
+            seen[1],
+            Event::Note(NoteEvent::NoteOn { key: 60, .. })
+        ));
+    }
+
+    /// An unchanged controller is not an event. Re-sending it every sub-block
+    /// would fill a plugin's parameter queue with nothing and retrigger the
+    /// smoothing on plugins that ramp towards each incoming point.
+    #[test]
+    fn a_controller_is_sent_once_until_it_moves() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut heard = Heard::default();
+        let block = |engine: &mut Engine, value: f64, heard: &mut Heard| {
+            let mut row = vec![0.0; width];
+            row[0] = value;
+            engine.begin_block(&[]);
+            engine.run(&ctx(8), &mut row);
+            engine.run_audio(
+                &AudioContext {
+                    frames: 8,
+                    quantum: 32,
+                    sample_rate: RATE,
+                    lanes: &row,
+                    lanes_per_row: width,
+                },
+                &[0.0; 2 * 8],
+                &mut [0.0; 2 * 8],
+                heard,
+            );
+        };
+
+        block(&mut engine, 1.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 1, "the first value is always news");
+        block(&mut engine, 1.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 1, "and holding it is not");
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 2, "letting go is");
+    }
+
+    /// A generator follows its parameter at sub-block resolution even when the
+    /// plugins are called once for the whole block.
+    ///
+    /// Those are separate questions and must not be conflated: reading one
+    /// row's lane values and applying them to the whole chunk would make a
+    /// `Param → CC` send one value per block however fast the parameter moved.
+    /// The sub-plugin call rate is a cost decision; the resolution of what it
+    /// is told is not.
+    #[test]
+    fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
+        let mut graph = Graph::new();
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let pedal = graph.add(
+            NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 64 }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(control, 0, pedal, 0);
+        graph.connect(pedal, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+        assert_eq!(
+            engine.chunking(),
+            Chunking::WholeBlock,
+            "no feedback loop, so the plugin is called once for the block"
+        );
+
+        // Four sub-blocks of 16, with the control taking a different value in
+        // each. One whole-block chunk covers all four.
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let values = [0.0, 0.25, 0.25, 1.0];
+        let mut rows = vec![0.0; width * values.len()];
+        for (index, &value) in values.iter().enumerate() {
+            let row = &mut rows[index * width..(index + 1) * width];
+            row[0] = value;
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 16,
+                    offset: index as u32 * 16,
+                    row: index as u32,
+                    block: 64,
+                },
+                row,
+            );
+        }
+
+        let mut heard = Heard::default();
+        engine.run_audio(
+            &AudioContext {
+                frames: 64,
+                quantum: 16,
+                sample_rate: RATE,
+                lanes: &rows,
+                lanes_per_row: width,
+            },
+            &[0.0; 2 * 64],
+            &mut [0.0; 2 * 64],
+            &mut heard,
+        );
+
+        let seen = &heard.0[&0];
+        let sent: Vec<(u32, f64)> = seen
+            .iter()
+            .filter_map(|event| match *event {
+                Event::Note(NoteEvent::Cc {
+                    value,
+                    sample_offset,
+                    ..
+                }) => Some((sample_offset, value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![(0, 0.0), (16, 0.25), (48, 1.0)],
+            "one event per move, timed at the sub-block it happened in, and \
+             nothing for the sub-block where it held: {seen:?}"
+        );
+    }
+
+    /// A sub-plugin is handed the graph's own note id, not the DAW's — and
+    /// gets one even when the DAW supplied none, which is the normal case for
+    /// anything that arrived as raw MIDI.
+    #[test]
+    fn a_sub_plugin_is_handed_the_graphs_own_note_id() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        // Two overlapping notes on one key, neither carrying an id.
+        // Substituting the key number for a missing one would give both the
+        // same id and make them one note.
+        let heard = hear(&graph, &[note_on(60, 0), note_on(60, 1)], &[]);
+        let ids: Vec<Option<i32>> = heard.0[&0].iter().map(named).collect();
+        assert!(
+            ids.iter().all(Option::is_some),
+            "every note is named: {ids:?}"
+        );
+        assert_ne!(ids[0], ids[1], "and the two are told apart");
+    }
+
+    /// The note-off names the note the note-on opened, however little the DAW
+    /// said about it.
+    #[test]
+    fn a_note_off_reaches_the_plugin_naming_the_note_it_ends() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let heard = hear(&graph, &[note_on(60, 0), note_off(60, 1)], &[]);
+        let seen = &heard.0[&0];
+        assert_eq!(seen.len(), 2);
+        assert_eq!(named(&seen[0]), named(&seen[1]));
+    }
+
+    /// Every branch gated shut: the note reaches nobody, and the DAW is still
+    /// holding a voice for it. Telling it so at the end of the block is the
+    /// honest answer, and the only one that lets the voice go.
+    #[test]
+    fn a_note_that_reaches_no_plugin_is_reported_ended() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        // Shut, so the note-on is swallowed before it reaches the synth.
+        let mut heard = Heard::default();
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut row = vec![0.0; width];
+        engine.begin_block(&[note_on(60, 0)]);
+        engine.run(&ctx(8), &mut row);
+        engine.run_audio(
+            &AudioContext {
+                frames: 8,
+                quantum: 32,
+                sample_rate: RATE,
+                lanes: &row,
+                lanes_per_row: width,
+            },
+            &[0.0; 2 * 8],
+            &mut [0.0; 2 * 8],
+            &mut heard,
+        );
+        assert!(
+            heard.0.get(&0).is_none_or(Vec::is_empty),
+            "the gate held it back"
+        );
+
+        let mut ended = Vec::with_capacity(8);
+        engine.end_block(&[], &mut ended);
+        assert_eq!(ended.len(), 1, "and the DAW is told the note is over");
+        assert_eq!(ended[0].key, 60);
+    }
+
+    /// A note that did reach a plugin waits for the plugin to say it is done.
+    #[test]
+    fn a_delivered_note_is_reported_only_when_the_plugin_ends_it() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let mut heard = Heard::default();
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let row = vec![0.0; width];
+        engine.begin_block(&[note_on(60, 0)]);
+        engine.run(&ctx(8), &mut vec![0.0; width]);
+        engine.run_audio(
+            &AudioContext {
+                frames: 8,
+                quantum: 32,
+                sample_rate: RATE,
+                lanes: &row,
+                lanes_per_row: width,
+            },
+            &[0.0; 2 * 8],
+            &mut [0.0; 2 * 8],
+            &mut heard,
+        );
+        let id = named(&heard.0[&0][0]).expect("the synth was told a name");
+
+        let mut ended = Vec::with_capacity(8);
+        engine.end_block(&[], &mut ended);
+        assert!(ended.is_empty(), "the synth is still playing it");
+
+        // What a CLAP sub-plugin sends when its voice finishes.
+        engine.end_block(
+            &[Event::Note(NoteEvent::NoteEnd {
+                note_id: Some(id),
+                port: 0,
+                channel: 0,
+                key: 60,
+                sample_offset: 0,
+            })],
+            &mut ended,
+        );
+        assert_eq!(ended.len(), 1, "and now it is not");
+    }
+
+    /// Each sub-block gets its own events, once. Handing every chunk the whole
+    /// block would replay every note once per chunk.
+    #[test]
+    fn a_note_lands_in_one_sub_block_only() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+        let mut heard = Heard::default();
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        // A quantum of 4 cuts the block in two whatever the graph says, so the
+        // same note must not appear in both halves.
+        let mut row = vec![0.0; width * 2];
+        engine.begin_block(&[note_on(60, 0), note_on(61, 5)]);
+        for sub in 0..2 {
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 4,
+                    offset: sub as u32 * 4,
+                    row: sub as u32,
+                    block: 8,
+                },
+                &mut row[sub * width..(sub + 1) * width],
+            );
+        }
+        engine.run_audio(
+            &AudioContext {
+                frames: 8,
+                quantum: 4,
+                sample_rate: RATE,
+                lanes: &row,
+                lanes_per_row: width,
+            },
+            &[0.0; 2 * 8],
+            &mut [0.0; 2 * 8],
+            &mut heard,
+        );
+        assert_eq!(heard.0[&0].len(), 2, "each note once: {:?}", heard.0[&0]);
+    }
+
+    /// The last sub-block of a block is still readable at the start of the
+    /// next one, and is not played twice.
+    ///
+    /// The buffers carry that tail across the block boundary so a parameter op
+    /// reading at the first boundary of a block has the stream that was in
+    /// force there — without it every controller would snap back to its
+    /// starting value once per DAW block. The plugins were handed those events
+    /// last block and must not be handed them again, which is the half of the
+    /// arrangement nothing else would notice.
+    #[test]
+    fn the_boundary_a_block_starts_on_belongs_to_the_block_before() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut heard = Heard::default();
+        let block = |engine: &mut Engine, events: &[Event], heard: &mut Heard| {
+            let mut row = vec![0.0; width];
+            engine.begin_block(events);
+            engine.run(&ctx(8), &mut row);
+            engine.run_audio(
+                &AudioContext {
+                    frames: 8,
+                    quantum: 32,
+                    sample_rate: RATE,
+                    lanes: &row,
+                    lanes_per_row: width,
+                },
+                &[0.0; 2 * 8],
+                &mut [0.0; 2 * 8],
+                heard,
+            );
+        };
+
+        block(&mut engine, &[note_on(60, 0)], &mut heard);
+        assert_eq!(heard.0[&0].len(), 1, "the synth is played the note");
+        block(&mut engine, &[], &mut heard);
+        assert_eq!(
+            heard.0[&0].len(),
+            1,
+            "and not played it again: {:?}",
+            heard.0[&0]
+        );
+    }
+
+    /// A `CC In` reading the DAW's mod wheel into a parameter lane, one
+    /// sub-block behind the events — which is what a parameter signal's
+    /// resolution means, not a delay anybody chose.
+    #[test]
+    fn a_controller_becomes_a_parameter_at_the_next_boundary() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let wheel = graph.add(NodeKind::CcIn(CcIn::default()), [0.0, 0.0]);
+        let sink = param_sink(&mut graph);
+        graph.connect(notes, 0, wheel, 0);
+        graph.connect(wheel, 0, sink, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+
+        let wheel_at = |value: f64, at: u32| {
+            Event::Note(NoteEvent::Cc {
+                port: 0,
+                channel: 0,
+                cc: 1,
+                value,
+                sample_offset: at,
+            })
+        };
+        // Two sub-blocks of 8 frames each, with the wheel moving inside the
+        // first one.
+        let events = [wheel_at(1.0, 3)];
+        let mut rows = vec![0.0; (SLOTS + 1) * 2];
+        let width = SLOTS + 1;
+
+        engine.begin_block(&events);
+        for index in 0..2u32 {
+            let (head, tail) = rows.split_at_mut(index as usize * width);
+            let row = if index == 0 {
+                &mut head[..]
+            } else {
+                &mut tail[..width]
+            };
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 8,
+                    offset: index * 8,
+                    row: index,
+                    block: 16,
+                },
+                row,
+            );
+        }
+
+        assert_eq!(
+            rows[SINK], 0.0,
+            "the first sub-block carries the value in effect at its start"
+        );
+        assert_eq!(
+            rows[width + SINK],
+            1.0,
+            "the second carries where the wheel ended up in the first"
+        );
+    }
+
+    /// The stream a `CC In` reads is the routed one, so a filter upstream of it
+    /// changes what it sees. That is the whole reason it takes a note input
+    /// instead of reading whatever the DAW sent.
+    #[test]
+    fn a_filter_upstream_of_a_cc_in_changes_what_it_reads() {
+        let build = |keep: u8| {
+            let mut graph = Graph::new();
+            let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+            let filter = graph.add(
+                NodeKind::NoteFilter(NoteFilter {
+                    controllers: vec![keep],
+                    controller_mode: crate::nodes::FilterMode::Keep,
+                    ..NoteFilter::default()
+                }),
+                [0.0, 0.0],
+            );
+            let wheel = graph.add(NodeKind::CcIn(CcIn::default()), [0.0, 0.0]);
+            let sink = param_sink(&mut graph);
+            graph.connect(notes, 0, filter, 0);
+            graph.connect(filter, 0, wheel, 0);
+            graph.connect(wheel, 0, sink, 0);
+            graph
+        };
+
+        let events = [Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: 1,
+            value: 1.0,
+            sample_offset: 0,
+        })];
+        let read = |graph: &Graph| {
+            let mut engine = Engine::new();
+            engine.prepare(64, &[]);
+            load(&mut engine, graph);
+            let mut row = vec![0.0; SLOTS + 1];
+            engine.begin_block(&events);
+            // Twice: the first fills the buffers, the second reads them.
+            for index in 0..2u32 {
+                engine.run(
+                    &BlockContext {
+                        sample_rate: RATE,
+                        tempo_bpm: 120.0,
+                        frames: 8,
+                        offset: index * 8,
+                        row: index,
+                        block: 16,
+                    },
+                    &mut row,
+                );
+            }
+            row[SINK]
+        };
+
+        assert_eq!(read(&build(1)), 1.0, "CC1 is kept, so the wheel is read");
+        assert_eq!(
+            read(&build(64)),
+            0.0,
+            "keeping only CC64 takes the wheel out before it gets here"
+        );
+    }
+
+    /// A controller keeps its position between messages. A block with no CC in
+    /// it must hold the last value, not snap back to the starting one.
+    #[test]
+    fn a_controller_holds_its_position() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let wheel = graph.add(NodeKind::CcIn(CcIn::default()), [0.0, 0.0]);
+        let sink = param_sink(&mut graph);
+        graph.connect(notes, 0, wheel, 0);
+        graph.connect(wheel, 0, sink, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+
+        let moved = [Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: 1,
+            value: 0.75,
+            sample_offset: 0,
+        })];
+        let mut row = vec![0.0; SLOTS + 1];
+        let block = |engine: &mut Engine, events: &[Event], row: &mut Vec<f64>| {
+            engine.begin_block(events);
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 8,
+                    offset: 0,
+                    row: 0,
+                    block: 8,
+                },
+                row,
+            );
+        };
+
+        block(&mut engine, &moved, &mut row);
+        block(&mut engine, &[], &mut row);
+        assert_eq!(row[SINK], 0.75, "the wheel moved and the value took");
+        block(&mut engine, &[], &mut row);
+        assert_eq!(row[SINK], 0.75, "and stayed where it was left");
+    }
+
     /// A stand-in for the sub-plugins, so the engine's routing can be tested
     /// without one. Each instance adds its own number to every sample, which
     /// makes the order it ran in readable off the output.
@@ -1646,7 +3337,7 @@ mod tests {
         fn process(
             &mut self,
             instance: u32,
-            _notes: NoteStream,
+            _notes: &[Event],
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
@@ -1959,37 +3650,46 @@ mod tests {
         );
     }
 
-    #[test]
-    fn note_expression_reaches_the_graph() {
-        let mut graph = Graph::new();
-        let expr = graph.add(
-            NodeKind::Expression(Expression {
-                source: ExprSource::Pressure,
-            }),
-            [0.0, 0.0],
-        );
-        let out = param_sink(&mut graph);
-        graph.connect(expr, 0, out, 0);
+    /// Plays notes into the graph's MIDI input the way the wrapper does.
+    ///
+    /// Notes reach a parameter op one sub-block after they arrive — the note
+    /// half fills the buffers at the end of each sub-block's evaluation, so a
+    /// reader sees the stream in effect at the boundary it just crossed. That
+    /// is one sub-block of setup in every test that plays something, which
+    /// says nothing about what the test is checking, so it lives here.
+    #[derive(Default)]
+    struct Keyboard {
+        pending: Vec<Event>,
+    }
 
-        let mut engine = Engine::new();
-        load(&mut engine, &graph);
+    impl Keyboard {
+        fn note(&mut self, event: &NoteEvent) {
+            self.pending.push(Event::Note(*event));
+        }
 
-        let mut slots = lanes();
-        engine.note(&NoteEvent::Expression {
-            note_id: 1,
-            port: 0,
-            channel: 0,
-            key: 60,
-            expression: NoteExpression::Pressure,
-            value: 0.7,
-            sample_offset: 0,
-        });
-        engine.run(&ctx(32), &mut slots);
-        assert!((slots[SINK] - 0.7).abs() < 1e-12);
+        /// Evaluate over the two sub-blocks it takes for what has been played
+        /// to reach the parameter half.
+        fn run(&mut self, engine: &mut Engine, frames: u32, slots: &mut [f64]) {
+            engine.begin_block(&self.pending);
+            for (row, offset) in [0, frames].into_iter().enumerate() {
+                engine.run(
+                    &BlockContext {
+                        sample_rate: 48_000.0,
+                        tempo_bpm: 120.0,
+                        frames,
+                        offset,
+                        row: row as u32,
+                        block: frames * 2,
+                    },
+                    slots,
+                );
+            }
+            self.pending.clear();
+        }
     }
 
     /// A key switch watches one key, whatever has been played since — which
-    /// is exactly what `Expression`'s sources cannot answer.
+    /// is exactly what a follow of the newest note cannot answer.
     #[test]
     fn a_held_key_switch_follows_its_own_key() {
         let mut graph = Graph::new();
@@ -2028,62 +3728,63 @@ mod tests {
         let mut engine = Engine::new();
         engine.prepare(8, &[]);
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
 
         let program = compile(&graph, SLOTS).unwrap();
         let lane = program
-            .audio_ops
+            .note_ops
             .iter()
             .find_map(|op| match op {
-                AudioOp::Plugin { notes, .. } => notes.gate,
+                crate::ir::NoteOp::Filter { gate, .. } => *gate,
                 _ => None,
             })
             .expect("the key switch booked a gate lane") as usize;
 
         let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
         let mut lanes = vec![0.0; width];
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 0.0, "nothing is held yet");
 
-        engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+        keys.note(&NoteEvent::NoteOn {
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
             velocity: 1.0,
             sample_offset: 0,
         });
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 1.0, "the switch key is down");
 
         // A different key coming and going must not move it.
-        engine.note(&NoteEvent::NoteOn {
-            note_id: 2,
+        keys.note(&NoteEvent::NoteOn {
+            note_id: Some(2),
             port: 0,
             channel: 0,
             key: 60,
             velocity: 1.0,
             sample_offset: 0,
         });
-        engine.note(&NoteEvent::NoteOff {
-            note_id: 2,
+        keys.note(&NoteEvent::NoteOff {
+            note_id: Some(2),
             port: 0,
             channel: 0,
             key: 60,
             velocity: 0.0,
             sample_offset: 0,
         });
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 1.0, "another key came and went");
 
-        engine.note(&NoteEvent::NoteOff {
-            note_id: 1,
+        keys.note(&NoteEvent::NoteOff {
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
             velocity: 0.0,
             sample_offset: 0,
         });
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 0.0, "let go");
     }
 
@@ -2127,13 +3828,14 @@ mod tests {
         let mut engine = Engine::new();
         engine.prepare(8, &[]);
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
 
         let lane = compile(&graph, SLOTS)
             .unwrap()
-            .audio_ops
+            .note_ops
             .iter()
             .find_map(|op| match op {
-                AudioOp::Plugin { notes, .. } => notes.gate,
+                crate::ir::NoteOp::Filter { gate, .. } => *gate,
                 _ => None,
             })
             .expect("output b got a gate lane") as usize;
@@ -2141,7 +3843,7 @@ mod tests {
         let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
         let mut lanes = vec![0.0; width];
         let strike = NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2149,23 +3851,24 @@ mod tests {
             sample_offset: 0,
         };
 
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 0.0, "b is shut until the switch is thrown");
 
-        engine.note(&strike);
-        engine.run(&ctx(8), &mut lanes);
+        keys.note(&strike);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 1.0, "thrown");
-        engine.run(&ctx(8), &mut lanes);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 1.0, "and it stays thrown");
 
         // An unrelated edit, and the recompile it causes.
         graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0, 0.0]);
         load(&mut engine, &graph);
-        engine.run(&ctx(8), &mut lanes);
+        let mut keys = Keyboard::default();
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 1.0, "a recompile must not move the switch");
 
-        engine.note(&strike);
-        engine.run(&ctx(8), &mut lanes);
+        keys.note(&strike);
+        keys.run(&mut engine, 8, &mut lanes);
         assert_eq!(lanes[lane], 0.0, "thrown back");
     }
 
@@ -2190,9 +3893,10 @@ mod tests {
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
         let mut slots = lanes();
         let strike = NoteEvent::NoteOn {
-            note_id: 1,
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 24,
@@ -2200,17 +3904,17 @@ mod tests {
             sample_offset: 0,
         };
 
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.2, "untouched, it reads its first value");
 
-        engine.note(&strike);
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&strike);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.8);
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.8, "one strike is one step, not one per run");
 
-        engine.note(&strike);
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&strike);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.2, "and round again");
     }
 
@@ -2235,9 +3939,10 @@ mod tests {
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
         let mut slots = lanes();
         let strike = |key: i16| NoteEvent::NoteOn {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,
@@ -2245,20 +3950,20 @@ mod tests {
             sample_offset: 0,
         };
 
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.25);
 
-        engine.note(&strike(25));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&strike(25));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.5);
 
-        engine.note(&strike(26));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&strike(26));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 1.0);
 
         // A key the bank does not name changes nothing.
-        engine.note(&strike(60));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&strike(60));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 1.0);
     }
 
@@ -2282,17 +3987,18 @@ mod tests {
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
         let mut slots = lanes();
 
-        engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+        keys.note(&NoteEvent::NoteOn {
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 25,
             velocity: 1.0,
             sample_offset: 0,
         });
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.25);
     }
 
@@ -2321,38 +4027,40 @@ mod tests {
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
         let mut slots = lanes();
         slots[3] = 0.6;
-        engine.note(&NoteEvent::NoteOn {
-            note_id: 1,
+        keys.note(&NoteEvent::NoteOn {
+            note_id: Some(1),
             port: 0,
             channel: 0,
             key: 25,
             velocity: 1.0,
             sample_offset: 0,
         });
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.6, "the wired socket wins over the number");
     }
 
     #[test]
     fn the_gate_follows_held_notes() {
         let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let gate = graph.add(
-            NodeKind::Expression(Expression {
-                source: ExprSource::Gate,
-            }),
+            NodeKind::NoteFollow(NoteFollow { what: Follow::Gate }),
             [0.0, 0.0],
         );
         let out = param_sink(&mut graph);
+        graph.connect(notes, 0, gate, 0);
         graph.connect(gate, 0, out, 0);
 
         let mut engine = Engine::new();
         load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
         let mut slots = lanes();
 
         let on = |key: i16| NoteEvent::NoteOn {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,
@@ -2360,7 +4068,7 @@ mod tests {
             sample_offset: 0,
         };
         let off = |key: i16| NoteEvent::NoteOff {
-            note_id: key as i32,
+            note_id: Some(key as i32),
             port: 0,
             channel: 0,
             key,
@@ -2368,21 +4076,21 @@ mod tests {
             sample_offset: 0,
         };
 
-        engine.run(&ctx(32), &mut slots);
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.0);
 
-        engine.note(&on(60));
-        engine.note(&on(64));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&on(60));
+        keys.note(&on(64));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 1.0);
 
         // Releasing one of two held notes must not drop the gate.
-        engine.note(&off(60));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&off(60));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 1.0);
 
-        engine.note(&off(64));
-        engine.run(&ctx(32), &mut slots);
+        keys.note(&off(64));
+        keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.0);
     }
 
@@ -2416,6 +4124,352 @@ mod tests {
         engine.run(&ctx(32), &mut slots);
         assert!(slots.iter().all(|&v| v == 0.3));
         assert!(!engine.has_program());
+    }
+
+    /// A parameter read off audio, which only a program cut into stages can
+    /// express.
+    ///
+    /// And read without latency: the follower's stage runs after the stage
+    /// that made the sound, and that stage covered the whole block, so the
+    /// window read for a sub-block is that sub-block's own. The first row
+    /// already carries the level of the first row's audio.
+    #[test]
+    fn a_parameter_is_read_off_audio_in_the_sub_block_it_belongs_to() {
+        const BLOCK: u32 = 64;
+        const QUANTUM: u32 = 32;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+        let level = |detect: Detect, attack: f64, quiet_first: bool| -> [f64; 2] {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let follower = graph.add(
+                NodeKind::EnvelopeFollower(EnvelopeFollower {
+                    detect,
+                    attack,
+                    release: 0.0,
+                }),
+                [0.0, 0.0],
+            );
+            let sink = param_sink(&mut graph);
+            graph.connect(input, 0, follower, 0);
+            graph.connect(follower, 0, sink, 0);
+
+            let mut engine = Engine::new();
+            engine.prepare(BLOCK, &[2]);
+            load(&mut engine, &graph);
+
+            // Half scale, on the second sub-block only when asked: that is
+            // what tells a reading of *this* row from a reading of the last.
+            let mut daw_in = vec![0.5f32; 2 * BLOCK as usize];
+            if quiet_first {
+                for ch in 0..2usize {
+                    let at = ch * BLOCK as usize;
+                    daw_in[at..at + QUANTUM as usize].fill(0.0);
+                }
+            }
+            let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+            let mut lanes = vec![0.0; width * 2];
+
+            engine.begin_block(&[]);
+            for stage in 0..engine.stages() {
+                for row in 0..2usize {
+                    let context = BlockContext {
+                        sample_rate: RATE,
+                        tempo_bpm: 120.0,
+                        frames: QUANTUM,
+                        offset: row as u32 * QUANTUM,
+                        row: row as u32,
+                        block: BLOCK,
+                    };
+                    engine.run_stage(stage, &context, &mut lanes[row * width..(row + 1) * width]);
+                }
+                engine.run_audio_stage(
+                    stage,
+                    &AudioContext {
+                        frames: BLOCK,
+                        quantum: QUANTUM,
+                        sample_rate: RATE,
+                        lanes: &lanes,
+                        lanes_per_row: width,
+                    },
+                    &daw_in,
+                    &mut daw_out,
+                    &mut Adders,
+                );
+            }
+            [lanes[SINK], lanes[width + SINK]]
+        };
+
+        let steady = level(Detect::Peak, 0.0, false);
+        assert!(
+            (steady[0] - 0.5).abs() < 1e-6 && (steady[1] - 0.5).abs() < 1e-6,
+            "the peak of a half-scale signal is a half: {steady:?}"
+        );
+
+        // The one that would fail if the reading were a sub-block behind.
+        let late = level(Detect::Peak, 0.0, true);
+        assert!(
+            late[0] < 1e-6,
+            "the first sub-block was silent, so its level is nothing: {late:?}"
+        );
+        assert!(
+            (late[1] - 0.5).abs() < 1e-6,
+            "and the second is read in the sub-block it belongs to: {late:?}"
+        );
+
+        // RMS of a constant is that constant; what separates them is a
+        // transient, which the peak catches and the mean does not.
+        let mean = level(Detect::Rms, 0.0, true);
+        assert!(
+            (mean[1] - 0.5).abs() < 1e-6,
+            "the RMS of a steady half is a half: {mean:?}"
+        );
+
+        // An attack time holds the rise back, and never past the level.
+        let slow = level(Detect::Peak, 0.050, false);
+        assert!(
+            slow[0] > 0.0 && slow[0] < 0.5 && slow[1] > slow[0] && slow[1] < 0.5,
+            "an attack of 50 ms climbs towards the level over sub-blocks: {slow:?}"
+        );
+    }
+
+    /// What the all-stages helpers cost, which is nothing until a level comes
+    /// back round to audio.
+    ///
+    /// `run` + `run_audio` put every parameter of the block before any of its
+    /// audio, which is the order every caller with no audio to interleave
+    /// wants. The claim under test is where that parts company with the order
+    /// the stages describe: not wherever a follower appears, but only where
+    /// its value reaches audio again inside the same block.
+    #[test]
+    fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
+        const BLOCK: u32 = 64;
+        const QUANTUM: u32 = 32;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+        // A ramp, so every block is louder than the one before it and a block
+        // of latency cannot hide in a steady signal.
+        let played = |staged: bool, ducked: bool| -> Vec<f32> {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let output = stereo_out(&mut graph);
+            let follower = graph.add(
+                NodeKind::EnvelopeFollower(EnvelopeFollower {
+                    detect: Detect::Peak,
+                    attack: 0.0,
+                    release: 0.0,
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, follower, 0);
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 1,
+                    gains: vec![0.0],
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, mix, 0);
+            graph.connect(mix, 0, output, 0);
+            if ducked {
+                // The level drives the gain, so it reaches audio.
+                graph.connect(follower, 0, mix, 1);
+            } else {
+                // The level goes to a sub-plugin parameter on an instance the
+                // program has no audio for: read by the editor, and by nothing
+                // this block renders.
+                let sink = param_sink(&mut graph);
+                graph.connect(follower, 0, sink, 0);
+            }
+
+            let mut engine = Engine::new();
+            engine.prepare(BLOCK, &[2]);
+            load(&mut engine, &graph);
+
+            let mut heard = Vec::new();
+            let mut lanes = vec![0.0; width * 2];
+            for block in 0..4u32 {
+                let value = 0.1 * (block + 1) as f32;
+                let daw_in = vec![value; 2 * BLOCK as usize];
+                let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+                let context = |row: usize| BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: QUANTUM,
+                    offset: row as u32 * QUANTUM,
+                    row: row as u32,
+                    block: BLOCK,
+                };
+                let audio = AudioContext {
+                    frames: BLOCK,
+                    quantum: QUANTUM,
+                    sample_rate: RATE,
+                    lanes: &[],
+                    lanes_per_row: width,
+                };
+                engine.begin_block(&[]);
+                if staged {
+                    for stage in 0..engine.stages() {
+                        for row in 0..2usize {
+                            engine.run_stage(
+                                stage,
+                                &context(row),
+                                &mut lanes[row * width..(row + 1) * width],
+                            );
+                        }
+                        engine.run_audio_stage(
+                            stage,
+                            &AudioContext {
+                                lanes: &lanes,
+                                ..audio
+                            },
+                            &daw_in,
+                            &mut daw_out,
+                            &mut Adders,
+                        );
+                    }
+                } else {
+                    for row in 0..2usize {
+                        engine.run(&context(row), &mut lanes[row * width..(row + 1) * width]);
+                    }
+                    engine.run_audio(
+                        &AudioContext {
+                            lanes: &lanes,
+                            ..audio
+                        },
+                        &daw_in,
+                        &mut daw_out,
+                        &mut Adders,
+                    );
+                }
+                // The gain that came out, not the sample: what lags is the
+                // level read, and the signal it is applied to is this block's
+                // either way, so the two are not shifted copies of each other.
+                heard.push(daw_out[BLOCK as usize - 1] / value);
+            }
+            heard
+        };
+
+        // The level reaches nothing this block renders, so the two orders make
+        // the same sound and only the lane is a block old.
+        assert_eq!(
+            played(true, false),
+            played(false, false),
+            "a level nothing plays costs nothing to read late"
+        );
+
+        // And where it does reach audio, the batched order renders each block
+        // against the level of the one before it.
+        let staged = played(true, true);
+        let batched = played(false, true);
+        assert_ne!(staged, batched, "a gain read late is a different sound");
+        assert!(
+            batched
+                .iter()
+                .skip(1)
+                .zip(&staged)
+                .all(|(late, then)| (late - then).abs() < 1e-6),
+            "and late by exactly one block: {batched:?} against {staged:?}"
+        );
+    }
+
+    /// A second delay somewhere else in the patch does not change what the
+    /// first one does.
+    ///
+    /// Both loops run in the same stage, and a `DelayWrite` gives its source
+    /// buffer up as soon as it is *compiled*, while what it writes runs at the
+    /// end of the stage. Anything compiled in between can be handed that
+    /// buffer and fill it with something else, and the line then carries the
+    /// other loop's signal instead of its own.
+    ///
+    /// Three things have to line up for it: the write has to be the buffer's
+    /// last reader — a tap on the
+    /// delayed side rather than on the sum, which is an ordinary way to wire a
+    /// delay; the other loop has to be compiled after it; and it has to hold a
+    /// node that asks the pool for a buffer rather than accumulating into one
+    /// it already has, which a mix does and a plugin does not.
+    #[test]
+    fn a_second_delay_does_not_reach_into_the_first() {
+        // in ──> mix in 1 ──> write(0)       the sum goes only to the line
+        //        read(0) ─┬─> mix in 2
+        //                 └─> out            and the tap is on the delayed side
+        let patch = |second: bool| -> Vec<f32> {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let output = stereo_out(&mut graph);
+            let (write, read) = audio_delay(&mut graph, 32.0);
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: vec![0.0, linear_to_db(0.5)],
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, mix, 0);
+            graph.connect(read, 0, mix, 2);
+            graph.connect(mix, 0, write, 0);
+            graph.connect(read, 0, output, 0);
+
+            if second {
+                // A whole second loop, wired to nothing that is heard. It
+                // exists to be compiled after the first one's write and to ask
+                // the pool for a buffer while doing it.
+                let other = graph.add(
+                    NodeKind::DelayWrite(DelayWrite {
+                        line: 1,
+                        ty: PortType::STEREO,
+                    }),
+                    [0.0, 0.0],
+                );
+                let tap = graph.add(
+                    NodeKind::DelayRead(DelayRead {
+                        line: 1,
+                        ty: PortType::STEREO,
+                        max_time: 0.05,
+                        time: seconds(64.0),
+                    }),
+                    [0.0, 0.0],
+                );
+                let plugin = audio_plugin(&mut graph, 0, 0);
+                let sum = graph.add(
+                    NodeKind::Mix(Mix {
+                        channels: 2,
+                        inputs: 2,
+                        gains: vec![0.0, linear_to_db(0.5)],
+                    }),
+                    [0.0, 0.0],
+                );
+                graph.connect(input, 0, sum, 0);
+                graph.connect(tap, 0, plugin, 0);
+                graph.connect(plugin, 0, sum, 2);
+                graph.connect(sum, 0, other, 0);
+            }
+
+            let mut engine = Engine::new();
+            engine.prepare(128, &[2]);
+            load(&mut engine, &graph);
+            let mut heard = Vec::new();
+            for block in 0..3 {
+                let daw_in = if block == 0 {
+                    impulse(128, 0)
+                } else {
+                    vec![0.0; 2 * 128]
+                };
+                let mut daw_out = vec![0.0f32; 2 * 128];
+                engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+                heard.extend_from_slice(&daw_out[..128]);
+            }
+            heard
+        };
+
+        let alone = patch(false);
+        assert!(
+            alone.iter().filter(|v| v.abs() > 0.05).count() >= 3,
+            "the delay repeats on its own"
+        );
+        assert_eq!(alone, patch(true), "and repeats the same beside another");
     }
 
     fn stereo_in(graph: &mut Graph) -> NodeId {
@@ -2595,7 +4649,106 @@ mod tests {
         );
     }
 
-    /// Verifies that modulating delay time does not alter sub-plugin processing chunk count.
+    /// A plugin called for a sub-block is handed that sub-block, with its
+    /// channels where the format says they are.
+    ///
+    /// The pool packs channels at the DAW block's length so that a buffer
+    /// written whole can be read a piece at a time; a plugin wants them packed
+    /// at the length of the call. The two agree only when the chunk is the
+    /// whole block, which is every program without a feedback loop in it — so
+    /// the gather and scatter that bridge them are reached exactly when
+    /// nothing else in the suite looks, and a mistake there would put the
+    /// right samples on the wrong channel.
+    #[test]
+    fn a_plugin_called_for_a_sub_block_is_handed_that_sub_block() {
+        /// Records every input region it is given, channel by channel.
+        #[derive(Default)]
+        struct Records {
+            heard: Vec<Vec<f32>>,
+        }
+        impl AudioInstances for Records {
+            fn process(
+                &mut self,
+                _instance: u32,
+                _notes: &[Event],
+                input: &[f32],
+                output: &mut [f32],
+                chunk: AudioChunk,
+            ) {
+                self.heard.resize(chunk.input_channels as usize, Vec::new());
+                for ch in 0..chunk.input_channels {
+                    self.heard[ch as usize].extend_from_slice(&input[chunk.channel(ch)]);
+                }
+                for ch in 0..chunk.output_channels {
+                    output[chunk.channel(ch)].fill(0.0);
+                }
+            }
+        }
+
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let plugin = audio_plugin(&mut graph, 0, 0);
+        // The plugin sits *inside* the loop, which is the only way it runs at
+        // sub-block granularity. The delay is longer than the block, so within
+        // the one block played nothing has come back round yet and what
+        // reaches the plugin is the DAW's own input — anything summed into it
+        // would hide a packing mistake behind arithmetic.
+        let (write, read) = audio_delay(&mut graph, 4096.0);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, mix, 0);
+        graph.connect(read, 0, mix, 2);
+        graph.connect(mix, 0, plugin, 0);
+        graph.connect(plugin, 0, write, 0);
+        graph.connect(plugin, 0, output, 0);
+
+        const BLOCK: usize = 128;
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK as u32, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(
+            engine.chunking(),
+            Chunking::SubBlock,
+            "the loop is what makes the chunks short"
+        );
+
+        // Two channels a mixup could not confuse for one another.
+        let mut daw_in = vec![0.0f32; 2 * BLOCK];
+        for i in 0..BLOCK {
+            daw_in[i] = i as f32;
+            daw_in[BLOCK + i] = -(i as f32);
+        }
+        let mut records = Records::default();
+        engine.run_audio(
+            &audio_ctx(BLOCK as u32),
+            &daw_in,
+            &mut vec![0.0; 2 * BLOCK],
+            &mut records,
+        );
+
+        assert_eq!(records.heard.len(), 2, "a stereo plugin heard two channels");
+        assert_eq!(
+            records.heard[0],
+            daw_in[..BLOCK],
+            "the chunks join back into the block that was played"
+        );
+        assert_eq!(records.heard[1], daw_in[BLOCK..], "and so does the other");
+    }
+
+    /// How often a plugin is called is settled by the shape of the patch, not
+    /// by a number somebody is turning.
+    ///
+    /// The plugin here feeds a delay line and nothing brings its output back
+    /// round, so it is not in a loop and is called once for the block —
+    /// whatever the delay time is set to. A plugin that *is* in a loop is
+    /// covered by `a_plugin_called_for_a_sub_block_is_handed_that_sub_block`.
     #[test]
     fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
         struct Counting(usize);
@@ -2603,7 +4756,7 @@ mod tests {
             fn process(
                 &mut self,
                 _instance: u32,
-                _notes: NoteStream,
+                _notes: &[Event],
                 _input: &[f32],
                 output: &mut [f32],
                 chunk: AudioChunk,
@@ -2660,8 +4813,8 @@ mod tests {
         assert_eq!(run(seconds(64.0)), run(seconds(400.0)));
         assert_eq!(
             run(seconds(64.0)),
-            4,
-            "one call per sub-block, because of the loop"
+            1,
+            "one call for the block: the line carries nothing back to it"
         );
     }
 

@@ -10,71 +10,12 @@
 //! Everything crossing this line is a flat slice or a `Copy` value. That is a
 //! deliberate constraint, not a coincidence: it keeps the boundary workable if
 //! a sub-plugin is ever moved into a separate process, where a pointer or a
-//! borrow could not cross. It is also why notes cross as a *name* and a key
-//! mask rather than as a buffer — the caller routes without knowing what a
-//! note is, and this side turns the name into events.
+//! borrow could not cross. Notes cross as a slice of events for the same
+//! reason audio crosses as a slice of samples: the caller has already decided
+//! what this instance hears, and a name would put that decision on this side
+//! of the line where the graph cannot see it.
 
-use plugin_host::AuxBuses;
-
-/// Specifies the MIDI note event source for an instance.
-///
-/// An identity rather than a buffer, so that whatever the caller schedules
-/// never has to hold a pointer into an event stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NoteSource {
-    /// No note events are routed to this instance — not the DAW's, not
-    /// anyone's. Handing every instance every event the DAW sent is the
-    /// tempting default and the wrong one: two synths then play in unison
-    /// whatever the caller intended.
-    #[default]
-    None,
-    /// Route note events from the specified host DAW note bus.
-    Daw { bus: u16 },
-    /// Route only note-off / release events from the specified note bus,
-    /// suppressing note-ons. What a shut gate leaves.
-    ///
-    /// Blocking everything would be simpler and wrong: a note already sounding
-    /// when the gate closed would never get its note-off, and a hung note
-    /// outlives whatever caused it. Letting the releases through costs nothing
-    /// and means a gate can be thrown mid-phrase without leaving wreckage.
-    DawReleases { bus: u16 },
-}
-
-impl NoteSource {
-    /// Returns a variant of this source that delivers only note release
-    /// events — see [`NoteSource::DawReleases`]. Nothing is already nothing.
-    pub fn releases_only(self) -> NoteSource {
-        match self {
-            NoteSource::None => NoteSource::None,
-            NoteSource::Daw { bus } | NoteSource::DawReleases { bus } => {
-                NoteSource::DawReleases { bus }
-            }
-        }
-    }
-}
-
-/// Note source configuration and key-filtering mask for a sub-plugin instance.
-///
-/// `mute` is a 128-bit mask corresponding to MIDI note numbers 0..127. If bit
-/// `k` is set, note-on and note-off alike are suppressed for key `k`. Dropping
-/// both halves is what keeps it safe: the note-on went too, so no sounding
-/// voice is left waiting for its release — the opposite of the situation
-/// [`NoteSource::DawReleases`] exists for.
-///
-/// A mask rather than a list because it is copied per chunk and tested one bit
-/// per event, and because sixteen bytes is cheaper than a pointer plus the
-/// lifetime that would come with it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct NoteStream {
-    pub source: NoteSource,
-    pub mute: u128,
-}
-
-impl NoteStream {
-    pub fn from_source(source: NoteSource) -> NoteStream {
-        NoteStream { source, mute: 0 }
-    }
-}
+use plugin_host::{AuxBuses, Event};
 
 /// Buffer layout and timing geometry for an audio processing chunk.
 ///
@@ -128,14 +69,16 @@ pub trait AudioInstances {
     /// is whatever the pool held, so a plugin that produces nothing must clear
     /// it.
     ///
-    /// `notes` says which note stream this instance hears. It is a name and a
-    /// key mask, not a buffer: the caller routes notes without knowing what
-    /// one is, and the implementation turns the name into events and drops the
-    /// keys the mask names.
+    /// `notes` is exactly what this instance hears, already routed, gated and
+    /// filtered by the caller. Empty and unwired look the same from here and
+    /// mean the same thing: play nothing.
+    ///
+    /// Sample offsets are relative to the caller's whole block, not to
+    /// `chunk`; this side rebases them.
     fn process(
         &mut self,
         instance: u32,
-        notes: NoteStream,
+        notes: &[Event],
         input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
@@ -150,7 +93,7 @@ impl AudioInstances for NoInstances {
     fn process(
         &mut self,
         _instance: u32,
-        _notes: NoteStream,
+        _notes: &[Event],
         _input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,

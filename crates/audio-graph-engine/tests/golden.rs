@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    AudioIn, AudioOut, Constant, ExprSource, Expression, Gate, Graph, Lfo, Math, MathOp, Mix,
-    NodeId, NodeKind, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform,
+    AudioIn, AudioOut, Constant, Follow, Gate, Graph, Lfo, Math, MathOp, Mix, NodeId, NodeKind,
+    NoteFollow, ParamPort, Plugin, PluginPorts, PortType, RangeMap, Rate, SlotIn, Waveform,
     compile, linear_to_db,
 };
 
@@ -126,8 +126,8 @@ fn math_chain() {
     let mut graph = Graph::new();
     let slot = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
     let expr = graph.add(
-        NodeKind::Expression(Expression {
-            source: ExprSource::Velocity,
+        NodeKind::NoteFollow(NoteFollow {
+            what: Follow::Velocity,
         }),
         [0.0, 0.0],
     );
@@ -388,7 +388,7 @@ const EVERY_KIND: &str = r#"{
     {"id": 2, "pos": [0.0, 0.0], "kind": {"Lfo": {
       "waveform": "Triangle", "rate": {"Beats": 2.0},
       "phase": 0.25, "depth": 0.5, "offset": 0.5}}},
-    {"id": 3, "pos": [0.0, 0.0], "kind": {"Expression": {"source": "Pressure"}}},
+    {"id": 3, "pos": [0.0, 0.0], "kind": {"NoteFollow": {"what": "Velocity"}}},
     {"id": 4, "pos": [0.0, 0.0], "kind": {"Math": {"op": "Multiply", "b": 0.75}}},
     {"id": 5, "pos": [0.0, 0.0], "kind": {"RangeMap": {
       "in_lo": 0.0, "in_hi": 1.0, "out_lo": -1.0, "out_hi": 1.0, "clamp": true}}},
@@ -451,7 +451,7 @@ fn the_wire_form_is_pinned() {
             "Constant",
             "SlotIn",
             "Lfo",
-            "Expression",
+            "NoteFollow",
             "Math",
             "RangeMap",
             "AudioIn",

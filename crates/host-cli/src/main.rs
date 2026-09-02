@@ -16,7 +16,9 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Mix, NodeKind, SlotIn};
+use audio_graph_engine::{
+    AudioIn, AudioOut, DelayRead, EnvelopeFollower, Mix, NodeKind, RangeMap, SlotIn,
+};
 use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
 use subhost_adapter::SubHostConfig;
@@ -55,6 +57,10 @@ fn main() -> ExitCode {
         "params" => cmd_params(rest),
         "render" => cmd_render(rest),
         "synth" => cmd_synth(rest),
+        "sustain" => cmd_sustain(rest),
+        "pedal" => cmd_pedal(rest),
+        "wheel" => cmd_wheel(rest),
+        "ends" => cmd_ends(rest),
         "state" => cmd_state(rest),
         "twice" => cmd_twice(rest),
         "sweep" => cmd_sweep(rest),
@@ -66,6 +72,7 @@ fn main() -> ExitCode {
         "sidechain" => cmd_sidechain(rest),
         "aux" => cmd_aux(rest),
         "delay" => cmd_delay(rest),
+        "follow" => cmd_follow(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
         "automate" => cmd_automate(rest),
@@ -105,6 +112,17 @@ fn usage() {
                                     run audio through the plugin
   host-cli synth <PLUGIN> <OUT.wav> [ID]
                                     play a note into an instrument
+  host-cli sustain <PLUGIN> [ID]    hold CC64 past a note-off and check the
+                                    instrument keeps sounding
+  host-cli pedal <WRAPPER.vst3> <SYNTH>
+                                    drive the sub-plugin's sustain pedal from a
+                                    Param -> CC node inside the graph
+  host-cli wheel <WRAPPER.vst3> <SYNTH> <PARAM_ID>
+                                    drive a sub-plugin parameter from the DAW's
+                                    mod wheel through a CC In node
+  host-cli ends <WRAPPER.clap> <SYNTH>
+                                    check the wrapper tells the host when it
+                                    has finished with a note
   host-cli sweep [DIR...]           lifecycle-test every plugin, one child process each
   host-cli probe <PLUGIN>           lifecycle-test one module in this process
   host-cli nest <WRAPPER.vst3> [ID]
@@ -137,6 +155,9 @@ fn usage() {
   host-cli delay <WRAPPER.vst3>     check a feedback delay in the graph sounds the
                                     same at any block size, and that the mix's
                                     gains fade the repeats
+  host-cli follow <WRAPPER.vst3>    check a parameter can be read off audio: a
+                                    ducker made of graph nodes pulls a loud
+                                    passage down towards a quiet one
   host-cli editor <WRAPPER.vst3> <PLUGIN> [SECONDS]
                                     open the wrapper's editor with a plugin
                                     node already in the patch. Without SECONDS
@@ -396,6 +417,11 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
     println!("capabilities: {:?}", plugin.capabilities());
+    // Empty for VST3, which has one way to deliver a note and no name for it.
+    let dialects = SubPluginMain::note_dialects(&plugin);
+    if !dialects.is_empty() {
+        println!("note dialects: {}", dialects.join(", "));
+    }
     // Only CLAP instruments answer this, so most plugins print nothing rather
     // than a line of zeroes.
     if let Some(voices) = SubPluginMain::voice_info(&plugin) {
@@ -513,6 +539,58 @@ fn cmd_synth(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Send a note, hold the sustain pedal past its note-off, and listen.
+///
+/// This is the end-to-end check for the controller route. VST3 delivers no CC
+/// as a MIDI message at all — it has to become a parameter change through
+/// `IMidiMapping` — so a synth that rings on here proves the whole path, and
+/// one that cuts off proves nothing arrived.
+fn cmd_sustain(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("expected a plugin path")?;
+    let id = args.get(1).map(String::as_str);
+
+    let sample_rate = 48_000.0;
+    let frames = (sample_rate * 3.0) as usize;
+    let input = wav::Audio::silence(sample_rate, 2, frames);
+
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let note = render::note(60, at(0.2), at(0.3));
+
+    let tail_from = at(1.0);
+    let measure = |events: &[(usize, plugin_host::Event)]| -> Result<f32, String> {
+        let outcome = render::render(Path::new(path), id, &input, 512, events)?;
+        let audio = &outcome.audio;
+        let tail: f32 = (0..audio.channels as usize)
+            .flat_map(|ch| {
+                let start = ch * audio.frames;
+                audio.samples[start + tail_from..start + audio.frames].iter()
+            })
+            .fold(0.0f32, |peak, s| peak.max(s.abs()));
+        Ok(tail)
+    };
+
+    let dry = measure(&note)?;
+
+    // Pedal down before the note-off and released well after it, so anything
+    // still ringing at the measurement point is the pedal's doing.
+    let mut pedalled = note.clone();
+    pedalled.push(render::cc(64, 127, at(0.3)));
+    pedalled.push(render::cc(64, 0, at(2.5)));
+    pedalled.sort_by_key(|(at, _)| *at);
+    let wet = measure(&pedalled)?;
+
+    println!("  peak after the note-off, no pedal: {dry:.6}");
+    println!("  peak after the note-off, pedal held: {wet:.6}");
+
+    if wet > dry * 2.0 && wet > 1e-4 {
+        println!("the sustain pedal reaches the plugin");
+        return Ok(());
+    }
+    Err(format!(
+        "the pedal changed nothing (dry {dry:.6}, wet {wet:.6}); either CC64 is not          reaching the plugin, or this plugin has no sustain pedal — check it makes          a sound at all with `host-cli synth` first"
+    ))
 }
 
 fn report(outcome: &render::RenderOutcome, input: &wav::Audio) {
@@ -1851,6 +1929,364 @@ fn short(path: &str) -> String {
 
 /// Builds a patch with two instrument nodes mixed together into two serial effects,
 /// with note inputs routed to the specified instance (or neither).
+/// Drive a sub-plugin's sustain pedal from inside the graph.
+///
+/// The mirror of `sustain`, one level up: there the DAW sends CC64 and the
+/// question is whether the wrapper carries it; here nothing outside sends a
+/// controller at all, and a `Param → CC` node makes one. It is the end-to-end
+/// check that the graph can generate MIDI, not only pass it along.
+fn cmd_pedal(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0;
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let silence = wav::Audio::silence(sample_rate, 2, at(3.0));
+    let events = render::note(60, at(0.2), at(0.3));
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let tail_from = at(1.0);
+    let run = |held: f64| -> Result<f32, String> {
+        let patched = inject_pedal(&baseline_json, synth, held)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        let outcome = render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )?;
+        let audio = &outcome.audio;
+        Ok((0..audio.channels as usize)
+            .flat_map(|ch| {
+                let start = ch * audio.frames;
+                audio.samples[start + tail_from..start + audio.frames].iter()
+            })
+            .fold(0.0f32, |peak, s| peak.max(s.abs())))
+    };
+
+    let up = run(0.0)?;
+    let down = run(1.0)?;
+    println!("  peak after the note-off, pedal up: {up:.6}");
+    println!("  peak after the note-off, pedal down: {down:.6}");
+
+    if down > up * 2.0 && down > 1e-4 {
+        println!("a Param → CC node inside the graph reaches the sub-plugin");
+        return Ok(());
+    }
+    Err(format!(
+        "the node changed nothing (up {up:.6}, down {down:.6}); check the \
+         plugin has a sustain pedal at all with `host-cli sustain` first"
+    ))
+}
+
+/// MIDI In and a held constant into a `Param → CC`, then into the instrument.
+fn inject_pedal(state: &str, synth: &str, held: f64) -> Result<String, String> {
+    use std::sync::Arc;
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let (class, plugin) = render::load(Path::new(synth), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = plugin.io_layout();
+    let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
+    let notes_port = ports.audio_in.len() as u32;
+    drop(plugin);
+
+    value["sub_plugins"] = serde_json::json!([{
+        "instance": 0,
+        "reference": {
+            "format": class.format.tag(),
+            "plugin_id": class.id,
+            "path_hint": synth,
+            "display_name": class.name,
+        },
+    }]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],   "kind": "NoteIn" },
+            { "id": 1, "pos": [40.0, 200.0],  "kind": { "Constant": { "value": held } } },
+            { "id": 2, "pos": [220.0, 120.0], "kind": { "ParamToCc": { "channel": 0, "cc": 64 } } },
+            { "id": 3, "pos": [420.0, 40.0],  "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 4, "pos": [620.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": [
+            // Port 0 of the node is the value, port 1 the stream it joins.
+            { "from": 1, "from_port": 0, "to": 2, "to_port": 0 },
+            { "from": 0, "from_port": 0, "to": 2, "to_port": 1 },
+            { "from": 2, "from_port": 0, "to": 3, "to_port": notes_port },
+            { "from": 3, "from_port": 0, "to": 4, "to_port": 0 }
+        ],
+        "next_id": 5
+    });
+    Ok(value.to_string())
+}
+
+/// Drive a sub-plugin parameter from the DAW's mod wheel, through the graph.
+///
+/// The other direction from `pedal`: there a parameter became a controller,
+/// here a controller becomes a parameter. Together they close the loop — the
+/// note path carries controllers, the graph can read them and make them.
+///
+/// A parameter id is required because there is no way to guess which of a
+/// synth's parameters is audible; `host-cli params` lists them.
+fn cmd_wheel(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+    let param: u32 = args
+        .get(2)
+        .ok_or("expected a parameter id for the wheel to drive")?
+        .parse()
+        .map_err(|_| "the parameter id must be a number")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0;
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let silence = wav::Audio::silence(sample_rate, 2, at(3.0));
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+    let patched = inject_wheel(&baseline_json, synth, param)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let run = |wheel: u8| -> Result<wav::Audio, String> {
+        let mut events = render::note(60, at(0.2), at(2.0));
+        // Before the note, so the parameter is already where it belongs when
+        // the voice starts: many parameters are only read at note-on.
+        events.push(render::cc(1, wheel, at(0.05)));
+        events.sort_by_key(|(at, _)| *at);
+        Ok(render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )?
+        .audio)
+    };
+
+    let down = run(0)?;
+    let up = run(127)?;
+    println!("  peak, wheel down: {:.6}", down.peak());
+    println!("  peak, wheel up:   {:.6}", up.peak());
+
+    if down.peak() < 1e-4 && up.peak() < 1e-4 {
+        return Err("the instrument was silent either way; nothing here means anything".into());
+    }
+    let differs = (0..down.frames.min(up.frames))
+        .any(|i| (0..down.channels).any(|ch| down.channel(ch)[i] != up.channel(ch)[i]));
+    if differs {
+        println!("the mod wheel reaches the sub-plugin's parameter through the graph");
+        return Ok(());
+    }
+    Err(format!(
+        "moving the wheel changed nothing; parameter {param} may not be audible \
+         on its own — pick another from `host-cli params`"
+    ))
+}
+
+/// MIDI In into a `CC In`, whose value drives one of the instrument's
+/// parameters.
+fn inject_wheel(state: &str, synth: &str, param: u32) -> Result<String, String> {
+    use std::sync::Arc;
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let (class, plugin) = render::load(Path::new(synth), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = plugin.io_layout();
+    let mut ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
+    ports.params = vec![audio_graph_engine::ParamPort {
+        id: param,
+        name: "wheel".into(),
+    }];
+    // The parameter socket sits after the audio inputs and the notes port.
+    let notes_port = ports.audio_in.len() as u32;
+    let param_port = notes_port + 1;
+    drop(plugin);
+
+    value["sub_plugins"] = serde_json::json!([{
+        "instance": 0,
+        "reference": {
+            "format": class.format.tag(),
+            "plugin_id": class.id,
+            "path_hint": synth,
+            "display_name": class.name,
+        },
+    }]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],   "kind": "NoteIn" },
+            { "id": 1, "pos": [220.0, 200.0], "kind": { "CcIn": { "cc": 1, "channel": null, "initial": 0.0 } } },
+            { "id": 2, "pos": [420.0, 40.0],  "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 3, "pos": [620.0, 40.0],  "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": [
+            { "from": 0, "from_port": 0, "to": 1, "to_port": 0 },
+            { "from": 0, "from_port": 0, "to": 2, "to_port": notes_port },
+            { "from": 1, "from_port": 0, "to": 2, "to_port": param_port },
+            { "from": 2, "from_port": 0, "to": 3, "to_port": 0 }
+        ],
+        "next_id": 4
+    });
+    Ok(value.to_string())
+}
+
+/// Check that the wrapper tells the host when it has finished with a note.
+///
+/// CLAP hosts allocate something per note and wait for `NOTE_END` to let it
+/// go, so a plugin that never sends one leaks a voice per note played. There
+/// are two ways for a note to end here and both matter: the sub-plugin says it
+/// is done, or the note reached no sub-plugin at all because the graph gated
+/// every branch shut. The second is the one that is easy to get wrong — it
+/// looks like nothing happened, and the DAW waits forever.
+///
+/// Run against the CLAP build of the wrapper: VST3 has no `NOTE_END` to carry,
+/// so the report is correctly invisible from that side.
+fn cmd_ends(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path (.clap)")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0;
+    let at = |seconds: f64| (sample_rate * seconds) as usize;
+    let silence = wav::Audio::silence(sample_rate, 2, at(2.0));
+    let events = render::note(60, at(0.2), at(0.5));
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let run = |wired: bool| -> Result<Vec<plugin_host::Event>, String> {
+        let patched = inject_ends(&baseline_json, synth, wired)?;
+        let state = edit_wrapper_state(&baseline, &patched)?;
+        Ok(render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )?
+        .emitted)
+    };
+
+    let ends = |emitted: &[plugin_host::Event]| -> usize {
+        emitted
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    plugin_host::Event::Note(plugin_host::NoteEvent::NoteEnd { .. })
+                )
+            })
+            .count()
+    };
+
+    let played = run(true)?;
+    println!("  notes reaching the synth: {} ended", ends(&played));
+    if ends(&played) == 0 {
+        return Err(
+            "the wrapper never told the host the note was over; a CLAP host \
+             holds a voice per note waiting for that"
+                .into(),
+        );
+    }
+
+    let unwired = run(false)?;
+    println!("  notes reaching nothing:   {} ended", ends(&unwired));
+    if ends(&unwired) == 0 {
+        return Err(
+            "a note that reached no sub-plugin was never reported ended; the \
+             host waits forever for a note that made no sound"
+                .into(),
+        );
+    }
+
+    println!("the wrapper reports the notes it has finished with");
+    Ok(())
+}
+
+/// MIDI In into an instrument, or into nothing at all.
+fn inject_ends(state: &str, synth: &str, wired: bool) -> Result<String, String> {
+    use std::sync::Arc;
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+
+    let (class, plugin) = render::load(Path::new(synth), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let layout = plugin.io_layout();
+    let ports = audio_graph_engine::PluginPorts::from_layout(&layout, 0);
+    let notes_port = ports.audio_in.len() as u32;
+    drop(plugin);
+
+    value["sub_plugins"] = serde_json::json!([{
+        "instance": 0,
+        "reference": {
+            "format": class.format.tag(),
+            "plugin_id": class.id,
+            "path_hint": synth,
+            "display_name": class.name,
+        },
+    }]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    let mut links = vec![serde_json::json!({
+        "from": 1, "from_port": 0, "to": 2, "to_port": 0
+    })];
+    if wired {
+        links.push(serde_json::json!({
+            "from": 0, "from_port": 0, "to": 1, "to_port": notes_port
+        }));
+    }
+
+    value["graph"] = serde_json::json!({
+        "nodes": [
+            { "id": 0, "pos": [40.0, 40.0],  "kind": "NoteIn" },
+            { "id": 1, "pos": [240.0, 40.0], "kind": { "Plugin": { "instance": 0, "ports": ports } } },
+            { "id": 2, "pos": [440.0, 40.0], "kind": { "AudioOut": { "bus": 0, "channels": 2 } } }
+        ],
+        "links": links,
+        "next_id": 3
+    });
+    Ok(value.to_string())
+}
+
 fn inject_instrument(
     state: &str,
     synth: &str,
@@ -2255,6 +2691,147 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
     }
     println!("  ok");
     Ok(())
+}
+
+/// Check that a parameter can be read off audio, inside the wrapper.
+///
+/// The graph is a ducker with nothing in it but graph nodes: the input's own
+/// level, mapped to a gain, turned back on the input. It is expressible only
+/// because a program is cut into stages — a parameter op cannot read a buffer
+/// the audio half has not filled yet — and it runs here through the real
+/// wrapper rather than the engine alone.
+///
+/// A quiet half and a loud half go in. Both come out at about the same level,
+/// which is the whole claim: the gain moved because the signal did.
+fn cmd_follow(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f64;
+    let half = (sample_rate * 0.5) as usize;
+
+    // Quiet, then twenty times louder. A ducker worth the name closes most of
+    // that difference; a graph that ignored the follower would keep all of it.
+    const QUIET: f32 = 0.03;
+    const LOUD: f32 = 0.6;
+    let mut input = wav::Audio::silence(sample_rate, 2, half * 2);
+    for ch in 0..2usize {
+        let at = ch * half * 2;
+        for i in 0..half {
+            input.samples[at + i] = if i % 2 == 0 { QUIET } else { -QUIET };
+            input.samples[at + half + i] = if i % 2 == 0 { LOUD } else { -LOUD };
+        }
+    }
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let patched = inject_follow(&read_wrapper_state(&baseline)?)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let out =
+        render::render_with_state(Path::new(wrapper), None, Some(&state), &input, BLOCK, &[])?
+            .audio;
+
+    // Measured away from the boundaries, so the envelope has settled.
+    let peak = |from: usize, to: usize| -> f32 {
+        out.samples[from..to]
+            .iter()
+            .fold(0.0f32, |most, v| most.max(v.abs()))
+    };
+    let quiet = peak(half / 2, half - 1);
+    let loud = peak(half + half / 2, half * 2 - 1);
+    println!(
+        "  in:  quiet {QUIET:.3}, loud {LOUD:.3}  ({:.1}x)",
+        LOUD / QUIET
+    );
+    println!(
+        "  out: quiet {quiet:.4}, loud {loud:.4}  ({:.1}x)",
+        loud / quiet.max(1e-9)
+    );
+
+    if quiet < 1e-4 {
+        return Err("the quiet half came out silent; nothing reached the output".into());
+    }
+    let squeezed = (LOUD / QUIET) / (loud / quiet.max(1e-9));
+    if squeezed < 4.0 {
+        return Err(format!(
+            "the loud half was not pulled down: the gap shrank by {squeezed:.1}x, \
+             which is not a level the graph is reading"
+        ));
+    }
+    println!("  the gap shrank {squeezed:.1}x: the gain is following the signal");
+    Ok(())
+}
+
+/// A ducker made of graph nodes, with no sub-plugin anywhere in it.
+///
+/// ```text
+///   AudioIn ─┬─────────────────> Mix in 1 ──> AudioOut
+///            └─> Envelope ─> Map ─> Mix gain 1
+/// ```
+fn inject_follow(state: &str) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+    value["sub_plugins"] = serde_json::json!([]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    let mut graph = audio_graph_engine::Graph::new();
+    let input = graph.add(
+        audio_graph_engine::NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [40.0, 40.0],
+    );
+    let follower = graph.add(
+        audio_graph_engine::NodeKind::EnvelopeFollower(EnvelopeFollower {
+            detect: audio_graph_engine::Detect::Peak,
+            attack: 0.002,
+            release: 0.050,
+        }),
+        [240.0, 200.0],
+    );
+    // Level to gain, upside down: the louder it is, the more comes off. Two
+    // hundredths of full scale is left alone, full scale loses 26 dB.
+    let map = graph.add(
+        audio_graph_engine::NodeKind::RangeMap(RangeMap {
+            in_lo: 0.02,
+            in_hi: 1.0,
+            out_lo: 0.0,
+            out_hi: -26.0,
+            clamp: true,
+        }),
+        [440.0, 200.0],
+    );
+    let mix = graph.add(
+        audio_graph_engine::NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 1,
+            gains: vec![0.0],
+        }),
+        [640.0, 40.0],
+    );
+    let output = graph.add(
+        audio_graph_engine::NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [840.0, 40.0],
+    );
+    graph.connect(input, 0, follower, 0);
+    graph.connect(follower, 0, map, 0);
+    graph.connect(input, 0, mix, 0);
+    graph.connect(map, 0, mix, 1);
+    graph.connect(mix, 0, output, 0);
+
+    value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
+    Ok(value.to_string())
 }
 
 /// Injects a feedback delay patch into the wrapper's saved state.

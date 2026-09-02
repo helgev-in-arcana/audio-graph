@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
 use crate::state::WrapperState;
-use audio_graph_engine::{BlockContext, Engine, Graph};
+use audio_graph_engine::{BlockContext, Ended, Engine, Graph, MAX_LIVE_NOTES};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
@@ -45,6 +45,12 @@ pub struct Wrapper {
     daw_slots: Vec<f64>,
     events: Vec<Event>,
     out_events: EventSink,
+    /// Notes the graph has finished with, to be handed back to the DAW.
+    ///
+    /// Owned and sized at activate: the audio thread may not allocate, and the
+    /// list has to live somewhere between the engine filling it and the
+    /// wrapper sending it.
+    ended_notes: Vec<Ended>,
     input_scratch: Vec<f32>,
     /// Channel width of each of the wrapper's own input buses, main first.
     daw_inputs: Vec<u16>,
@@ -76,6 +82,7 @@ impl Default for Wrapper {
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
+            ended_notes: Vec::new(),
             input_scratch: Vec::new(),
             daw_inputs: Vec::new(),
             output_scratch: Vec::new(),
@@ -266,6 +273,7 @@ impl Wrapper {
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
         self.out_events = EventSink::with_capacity(256);
+        self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
@@ -385,20 +393,14 @@ impl Wrapper {
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
-        run_graph(
+        let runnable = begin_graph(
             &mut self.engine,
             &mut self.schedule,
             &self.daw_slots,
             &self.events,
             frames,
             self.shared.quantum(),
-            context.transport().sample_rate as f64,
-            context.transport().tempo.unwrap_or(120.0),
         );
-        // What the editor's meters show. The DAW's own parameter value stops
-        // being the answer the moment the graph drives a slot.
-        self.shared
-            .report_slots(self.schedule.block(self.schedule.blocks() - 1));
 
         // nice-plug hands out per-channel slices; the host API wants one flat
         // planar block, so the copy is the price of a boundary that could later
@@ -456,34 +458,31 @@ impl Wrapper {
         };
 
         self.out_events.clear();
-        let status = if self.engine.has_audio() {
-            // The graph decides where the audio goes and which plugins see it.
-            // Sub-plugins are reached through `AudioInstances`, so the engine
-            // still knows nothing about what a plugin is.
-            let mut loaded;
-            let mut empty = subhost_adapter::NoInstances;
-            let nodes: &mut dyn subhost_adapter::AudioInstances = match processor {
-                Some(processor) => {
-                    loaded =
-                        processor.bind(&self.schedule, &self.events, &time, &mut self.out_events);
-                    &mut loaded
-                }
-                None => &mut empty,
-            };
-            self.engine.run_audio(
-                &audio_graph_engine::AudioContext {
+        // The graph decides where the audio goes and which plugins see it.
+        // Sub-plugins are reached through `AudioInstances`, so the engine
+        // still knows nothing about what a plugin is.
+        if runnable {
+            run_stages(
+                &mut self.engine,
+                &mut self.schedule,
+                processor,
+                &mut self.out_events,
+                &time,
+                AudioIo {
                     frames,
-                    quantum: self.schedule.quantum(),
-                    sample_rate: transport.sample_rate as f64,
-                    // The same buffer the parameter lanes ride in. The audio
-                    // half reads only its own range of lane numbers out of it.
-                    lanes: self.schedule.rows(),
-                    lanes_per_row: LANES,
+                    daw_in: &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
+                    daw_out: &mut self.output_scratch[..(out_channels * frames) as usize],
                 },
-                &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
-                &mut self.output_scratch[..(out_channels * frames) as usize],
-                nodes,
+                transport.sample_rate as f64,
+                transport.tempo.unwrap_or(120.0),
             );
+        }
+        // What the editor's meters show. The DAW's own parameter value stops
+        // being the answer the moment the graph drives a slot.
+        self.shared
+            .report_slots(self.schedule.block(self.schedule.blocks() - 1));
+
+        let status = if self.engine.has_audio() {
             ApiStatus::Continue
         } else {
             // Nothing is drawn between the input and the output, so nothing
@@ -495,8 +494,23 @@ impl Wrapper {
             for ch in 0..channels as usize {
                 buffer.as_slice()[ch][..frame_len].fill(0.0);
             }
+            settle_notes(
+                &mut self.engine,
+                &self.out_events,
+                &mut self.ended_notes,
+                context,
+            );
             return ProcessStatus::Normal;
         };
+
+        // After the audio half, because that is where a note is handed to a
+        // sub-plugin and where the sub-plugin's answer comes back.
+        settle_notes(
+            &mut self.engine,
+            &self.out_events,
+            &mut self.ended_notes,
+            context,
+        );
 
         if status == ApiStatus::Error {
             // Silence rather than noise, and rather than a bypass nothing on
@@ -531,6 +545,37 @@ impl Wrapper {
     }
 }
 
+/// Tell the DAW about the notes the graph has finished with.
+///
+/// A sub-plugin's `NOTE_END` says it is done with a note; a note every
+/// sub-plugin is done with — or that reached none of them, because every branch
+/// was gated shut — is one the DAW can stop holding a voice for. Saying so is
+/// the honest answer either way, and CLAP asks for it.
+///
+/// VST3 has no `NOTE_END` to send back, so nothing arrives from that side; its
+/// backend ends the note when the note-off is delivered instead, which is the
+/// closest the format allows.
+///
+/// A free function rather than a method because the caller is holding a borrow
+/// of the shared audio state for the whole block.
+fn settle_notes<P: Plugin>(
+    engine: &mut Engine,
+    from_plugins: &EventSink,
+    ended: &mut Vec<Ended>,
+    context: &mut impl ProcessContext<P>,
+) {
+    ended.clear();
+    engine.end_block(from_plugins.events(), ended);
+    for note in ended.iter() {
+        context.send_event(NoteEvent::VoiceTerminated {
+            timing: 0,
+            voice_id: note.daw_id,
+            channel: note.channel.clamp(0, 15) as u8,
+            note: note.key.clamp(0, 127) as u8,
+        });
+    }
+}
+
 /// Fill the sub-block schedule with host automation and graph evaluation outputs.
 ///
 /// Note events are folded into the engine as the sub-block boundaries pass
@@ -541,16 +586,15 @@ impl Wrapper {
 /// `Wrapper` mutably at once while the audio lock is held, and spelling the
 /// borrows out is clearer than arguing with the compiler about them.
 #[allow(clippy::too_many_arguments)]
-fn run_graph(
+/// Sets the block's lane grid up. Returns false when there is nothing to run.
+fn begin_graph(
     engine: &mut Engine,
     schedule: &mut SlotSchedule,
     daw_slots: &[f64],
     events: &[Event],
     frames: u32,
     quantum: u32,
-    sample_rate: f64,
-    tempo_bpm: f64,
-) {
+) -> bool {
     if schedule.quantum() != quantum {
         // Allocation-free by construction; see `SlotSchedule`.
         schedule.set_quantum(quantum);
@@ -563,42 +607,107 @@ fn run_graph(
         // project with no graph behaves identically — including sending no more
         // events.
         schedule.fill(daw_slots);
-        return;
+        return false;
     }
 
-    let mut next_event = 0;
+    // The DAW's automation fills the slot lanes; the rest are the graph's own
+    // parameter lanes and start from nothing. Zeroing rather than leaving the
+    // previous sub-block's values means a lane the graph stops driving stops
+    // sending, instead of repeating a stale value. Done for every row up
+    // front, because the stages below write into these same rows and a second
+    // pass of zeroing would wipe what the stage before it left.
     for index in 0..blocks {
-        let start = schedule.offset(index);
-        while next_event < events.len() && events[next_event].sample_offset() <= start {
-            if let Event::Note(note) = events[next_event] {
-                engine.note(&note);
-            }
-            next_event += 1;
-        }
-
-        let context = BlockContext {
-            sample_rate,
-            tempo_bpm,
-            frames: schedule.frames_of(index),
-        };
         let values = schedule.block_mut(index);
-        // The DAW's automation fills the slot lanes; the rest are the graph's
-        // own parameter lanes and start from nothing. Zeroing rather than
-        // leaving the previous sub-block's values means a lane the graph stops
-        // driving stops sending, instead of repeating a stale value.
         let slots = daw_slots.len().min(values.len());
         values[..slots].copy_from_slice(&daw_slots[..slots]);
         values[slots..].fill(0.0);
-        engine.run(&context, values);
     }
 
-    // Whatever is left lands after the final boundary. Folding it in now means
-    // the next block starts from the right state rather than rediscovering it.
-    for event in &events[next_event..] {
-        if let Event::Note(note) = *event {
-            engine.note(&note);
+    // The whole block's stream goes in once, before anything runs: every
+    // note gets an id of the graph's own here, and every stage has to agree
+    // about which note is which. From here the events flow along the graph's
+    // own wires, and the only thing a row needs is where its sub-block sits.
+    engine.begin_block(events);
+    true
+}
+
+/// One DAW block: every stage, in order, over every sub-block.
+///
+/// A stage's parameters run for the whole block before its audio does, and its
+/// audio before the next stage's parameters — which is what lets a parameter
+/// be read off audio at all. Only the stage holding a feedback loop steps
+/// sub-block by sub-block; the rest are called once.
+///
+/// The sub-plugins are bound to the schedule *inside* the loop rather than
+/// once around it. The parameter half writes the lane rows and the adapter
+/// reads them, so the two borrows have to take turns; binding per stage is
+/// what keeps them from overlapping, and costs a few reference copies.
+#[allow(clippy::too_many_arguments)]
+fn run_stages(
+    engine: &mut Engine,
+    schedule: &mut SlotSchedule,
+    processor: Option<&mut subhost_adapter::SubHostProcessors>,
+    out_events: &mut EventSink,
+    time: &TimeContext,
+    audio: AudioIo<'_>,
+    sample_rate: f64,
+    tempo_bpm: f64,
+) {
+    let AudioIo {
+        frames,
+        daw_in,
+        daw_out,
+    } = audio;
+    let blocks = schedule.blocks();
+    let quantum = schedule.quantum();
+    engine.clear_output(daw_out);
+
+    let mut processor = processor;
+    for stage in 0..engine.stages() {
+        for index in 0..blocks {
+            let context = BlockContext {
+                sample_rate,
+                tempo_bpm,
+                frames: schedule.frames_of(index),
+                offset: schedule.offset(index),
+                row: index as u32,
+                block: frames,
+            };
+            engine.run_stage(stage, &context, schedule.block_mut(index));
         }
+
+        let mut loaded;
+        let mut empty = subhost_adapter::NoInstances;
+        let nodes: &mut dyn subhost_adapter::AudioInstances = match processor.as_deref_mut() {
+            Some(processor) => {
+                loaded = processor.bind(&*schedule, time, out_events);
+                &mut loaded
+            }
+            None => &mut empty,
+        };
+        engine.run_audio_stage(
+            stage,
+            &audio_graph_engine::AudioContext {
+                frames,
+                quantum,
+                sample_rate,
+                // The same buffer the parameter lanes ride in. The audio half
+                // reads only its own range of lane numbers out of it.
+                lanes: schedule.rows(),
+                lanes_per_row: LANES,
+            },
+            daw_in,
+            daw_out,
+            nodes,
+        );
     }
+}
+
+/// What one block of audio is, as far as [`run_stages`] is concerned.
+struct AudioIo<'a> {
+    frames: u32,
+    daw_in: &'a [f32],
+    daw_out: &'a mut [f32],
 }
 
 /// Leave the input alone (an effect) or silence the output (an instrument).
@@ -620,6 +729,10 @@ fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
 ///
 /// Forwards note-on, note-off, voice termination, and per-note expressions (pressure,
 /// volume, pan, tuning, vibrato, brightness) to the engine.
+/// The host's `voice_id` is passed through as-is, including its absence.
+/// Substituting the key number where the host supplies none would make an
+/// invented id indistinguishable from one the host actually numbered, and
+/// would collide the moment the same key overlapped itself.
 fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
     use plugin_host::NoteExpression as Expr;
 
@@ -634,7 +747,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
         value: f32,
     ) -> ApiNote {
         ApiNote::Expression {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -652,7 +765,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             note,
             velocity,
         } => ApiNote::NoteOn {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -666,7 +779,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             note,
             velocity,
         } => ApiNote::NoteOff {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -679,7 +792,7 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             channel,
             note,
         } => ApiNote::NoteEnd {
-            note_id: voice_id.unwrap_or(note as i32),
+            note_id: voice_id,
             port: 0,
             channel: channel as i16,
             key: note as i16,
@@ -741,10 +854,51 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             Expr::Brightness,
             brightness,
         ),
-        // CCs, pitch bend and sysex still go nowhere. They are host-level MIDI
-        // rather than per-note expression, and no node reads them; forwarding
-        // them to the sub-plugin blindly would be a separate decision about
-        // MIDI routing.
+        NoteEvent::MidiCC {
+            timing,
+            channel,
+            cc,
+            value,
+        } => ApiNote::Cc {
+            port: 0,
+            channel: channel as i16,
+            cc,
+            value: value as f64,
+            sample_offset: timing,
+        },
+        // nice-plug normalizes bend to `0..=1` with 0.5 at rest; the core model
+        // is signed, so centre lands on an exact zero either way.
+        NoteEvent::MidiPitchBend {
+            timing,
+            channel,
+            value,
+        } => ApiNote::PitchBend {
+            port: 0,
+            channel: channel as i16,
+            value: value as f64 * 2.0 - 1.0,
+            sample_offset: timing,
+        },
+        NoteEvent::MidiChannelPressure {
+            timing,
+            channel,
+            pressure,
+        } => ApiNote::ChannelPressure {
+            port: 0,
+            channel: channel as i16,
+            value: pressure as f64,
+            sample_offset: timing,
+        },
+        NoteEvent::MidiProgramChange {
+            timing,
+            channel,
+            program,
+        } => ApiNote::Midi {
+            port: 0,
+            data: [0xc0 | (channel & 0x0f), program & 0x7f, 0],
+            sample_offset: timing,
+        },
+        // SysEx is generic over the plugin's own message type, which we do not
+        // define, so there is nothing here to forward it as.
         _ => return None,
     })
 }
@@ -752,6 +906,62 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CC, bend and channel pressure reaching the graph is the whole point of
+    /// asking the host for `MidiConfig::MidiCCs`. Dropping them here instead
+    /// would leave nothing downstream able to observe the difference.
+    #[test]
+    fn controllers_convert_instead_of_being_dropped() {
+        let cc = convert_note(&NoteEvent::<()>::MidiCC {
+            timing: 3,
+            channel: 1,
+            cc: 64,
+            value: 1.0,
+        });
+        assert!(matches!(
+            cc,
+            Some(ApiNote::Cc {
+                channel: 1,
+                cc: 64,
+                value,
+                sample_offset: 3,
+                ..
+            }) if value == 1.0
+        ));
+
+        // nice-plug centres bend at 0.5; the core model centres it at zero.
+        let bend = convert_note(&NoteEvent::<()>::MidiPitchBend {
+            timing: 0,
+            channel: 0,
+            value: 0.5,
+        });
+        assert!(matches!(bend, Some(ApiNote::PitchBend { value, .. }) if value == 0.0));
+
+        let pressure = convert_note(&NoteEvent::<()>::MidiChannelPressure {
+            timing: 0,
+            channel: 0,
+            pressure: 0.25,
+        });
+        assert!(matches!(
+            pressure,
+            Some(ApiNote::ChannelPressure { value, .. }) if value == 0.25
+        ));
+    }
+
+    /// The host's answer about voice identity is passed through, absence
+    /// included. Substituting the key number here would make an invented id
+    /// indistinguishable from a real one.
+    #[test]
+    fn a_missing_voice_id_stays_missing() {
+        let on = convert_note(&NoteEvent::<()>::NoteOn {
+            timing: 0,
+            voice_id: None,
+            channel: 0,
+            note: 60,
+            velocity: 1.0,
+        });
+        assert!(matches!(on, Some(ApiNote::NoteOn { note_id: None, .. })));
+    }
     use audio_graph_engine::{
         Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,
     };
@@ -778,8 +988,30 @@ mod tests {
     /// The lane `param_sink`'s parameter is driven through.
     const SINK_LANE: usize = SLOT_COUNT;
 
-    /// Verifies that `run_graph` populates both DAW slot lanes and graph parameter
-    /// lanes across the full schedule width.
+    /// The parameter side of one block, driven the way `process` drives it.
+    ///
+    /// No audio between the stages, which is right for a graph that has none.
+    fn fill_lanes(engine: &mut Engine, schedule: &mut SlotSchedule, daw_slots: &[f64]) {
+        if !begin_graph(engine, schedule, daw_slots, &[], 128, 32) {
+            return;
+        }
+        for stage in 0..engine.stages() {
+            for index in 0..schedule.blocks() {
+                let context = BlockContext {
+                    sample_rate: 48_000.0,
+                    tempo_bpm: 120.0,
+                    frames: schedule.frames_of(index),
+                    offset: schedule.offset(index),
+                    row: index as u32,
+                    block: 128,
+                };
+                engine.run_stage(stage, &context, schedule.block_mut(index));
+            }
+        }
+    }
+
+    /// Every sub-block is filled to the schedule's width, whether or not a
+    /// graph is loaded.
     #[test]
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
@@ -788,16 +1020,7 @@ mod tests {
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.
-        run_graph(
-            &mut engine,
-            &mut schedule,
-            &daw_slots,
-            &[],
-            128,
-            32,
-            48_000.0,
-            120.0,
-        );
+        fill_lanes(&mut engine, &mut schedule, &daw_slots);
         assert!(schedule.blocks() > 0);
         for index in 0..schedule.blocks() {
             let block = schedule.block(index);
@@ -836,16 +1059,7 @@ mod tests {
         handoff.send(Box::new(compile(&graph, SLOT_COUNT).unwrap()));
         assert!(engine.adopt(&handoff));
 
-        run_graph(
-            &mut engine,
-            &mut schedule,
-            &daw_slots,
-            &[],
-            128,
-            32,
-            48_000.0,
-            120.0,
-        );
+        fill_lanes(&mut engine, &mut schedule, &daw_slots);
         for index in 0..schedule.blocks() {
             let block = schedule.block(index);
             assert_eq!(block.len(), LANES);

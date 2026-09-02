@@ -18,11 +18,16 @@
 //! rewrite.
 
 mod audio_op;
+mod note_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, NoteRoute};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn, Span, Stage};
+pub use note_op::{
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NoteBuf,
+    NoteOp,
+};
 
-pub use op::{ExprSource, MathOp, Op, Operand, RateSpec, Reg, Waveform};
+pub use op::{Detect, Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// Unique identifier for a node, persistent across graph recompilations.
@@ -154,6 +159,10 @@ pub struct Program {
     pub delay_nodes: Vec<NodeId>,
     /// Audio processing operations in topological execution order.
     pub audio_ops: Vec<AudioOp>,
+    /// The note half, run once per sub-block ahead of the audio ops.
+    pub note_ops: Vec<NoteOp>,
+    /// How many note buffers this program uses.
+    pub note_bufs: u16,
     /// Which sub-plugin parameter each graph-driven lane drives.
     ///
     /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
@@ -175,8 +184,9 @@ pub struct Program {
     pub instances: Vec<InstanceIo>,
     /// Channel width of each buffer in the audio pool.
     pub buffers: Vec<u16>,
-    /// Execution granularity for audio operations (sub-block vs whole block).
-    pub chunking: Chunking,
+    /// How the three op lists are cut into runs that execute together, in
+    /// the order they run. See [`Stage`].
+    pub stages: Vec<Stage>,
     /// What the wrapper should report to the DAW as its own latency: the longest
     /// path from an input to an output, after compensation.
     pub latency: u32,
@@ -201,11 +211,13 @@ impl Program {
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),
+            note_ops: Vec::new(),
+            note_bufs: 0,
             param_targets: Vec::new(),
             audio_lane_base: 0,
             instances: Vec::new(),
             buffers: Vec::new(),
-            chunking: Chunking::WholeBlock,
+            stages: Vec::new(),
             latency: 0,
             delay_nodes: Vec::new(),
             audio_delay_nodes: Vec::new(),

@@ -20,9 +20,9 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
+    AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
     MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteRoute, Op, Reg,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -34,39 +34,10 @@ use crate::ir::{
 /// was.
 const OUTPUT_SOCKET: u8 = 128;
 
-/// Walks up a note chain from `(node, port)` to whatever makes the notes.
-///
-/// Returns the source, the gate socket nearest the reader, and the accumulated
-/// key mute mask. Nearest, because each gate already folds the ones above it
-/// into its own condition, so the closest one is the whole answer.
-fn trace_notes(graph: &Graph, node: NodeId, port: u8) -> (NoteSource, Option<(NodeId, u8)>, u128) {
-    let mut at = graph.source_of(node, port);
-    let mut gate = None;
-    let mut mute = 0u128;
-    for _ in 0..=graph.nodes.len() {
-        let Some((from, from_port)) = at else {
-            return (NoteSource::None, gate, mute);
-        };
-        let Some(node) = graph.node(from) else {
-            return (NoteSource::None, gate, mute);
-        };
-        if let Some(source) = node.kind.note_identity() {
-            return (source, gate, mute);
-        }
-        let Some(input) = node.kind.note_passthrough(from_port) else {
-            return (NoteSource::None, gate, mute);
-        };
-        mute |= node.kind.note_mute(from_port);
-        if node.kind.note_gated(from_port) {
-            gate = gate.or(Some((from, from_port)));
-        }
-        at = graph.source_of(from, input);
-    }
-    (NoteSource::None, gate, mute)
-}
+use crate::compile::notes::Notes;
 use crate::nodes::NodeKind;
 use crate::port::PortType;
-use subhost_adapter::{InstanceIo, NoteSource, ParamTarget};
+use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// What a node is handed while the parameter half is being compiled.
 pub(crate) struct ParamCx<'a> {
@@ -80,6 +51,13 @@ pub(crate) struct ParamCx<'a> {
     reg_of: Vec<((NodeId, u8), Reg)>,
     ops: Vec<Op>,
     deferred: Vec<Op>,
+    /// The runs of `ops` closed so far, and where the open one starts. See
+    /// [`Stage`].
+    spans: Vec<Span>,
+    span_start: u32,
+    /// Ops waiting to be told which audio buffer they read, and the socket
+    /// that will say. See [`ParamCx::emit_follow`].
+    follows: Vec<(usize, (NodeId, u8))>,
     outputs: Vec<(u16, Reg)>,
     lfo_nodes: Vec<NodeId>,
     latch_nodes: Vec<NodeId>,
@@ -89,11 +67,17 @@ pub(crate) struct ParamCx<'a> {
     /// Read by the gate downstream of it, never by the audio half, which reads
     /// the lane instead.
     note_gates: Vec<((NodeId, u8), Reg)>,
+    notes: &'a Notes,
 }
 
 /// What the parameter half produced.
 pub(crate) struct ParamHalf {
     pub ops: Vec<Op>,
+    /// One per stage, in the order they run.
+    pub spans: Vec<Span>,
+    /// Op index → the socket whose buffer it reads. See
+    /// [`ParamCx::emit_follow`].
+    pub follows: Vec<(usize, (NodeId, u8))>,
     pub registers: usize,
     pub outputs: Vec<(u16, Reg)>,
     pub lfo_nodes: Vec<NodeId>,
@@ -103,7 +87,12 @@ pub(crate) struct ParamHalf {
 }
 
 impl<'a> ParamCx<'a> {
-    pub(crate) fn new(graph: &'a Graph, lines: &'a [Line], slot_count: usize) -> ParamCx<'a> {
+    pub(crate) fn new(
+        graph: &'a Graph,
+        lines: &'a [Line],
+        slot_count: usize,
+        notes: &'a Notes,
+    ) -> ParamCx<'a> {
         ParamCx {
             graph,
             lines,
@@ -113,12 +102,16 @@ impl<'a> ParamCx<'a> {
             reg_of: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            spans: Vec::new(),
+            span_start: 0,
+            follows: Vec::new(),
             outputs: Vec::new(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             param_targets: Vec::new(),
             audio_lanes: Vec::new(),
             note_gates: Vec::new(),
+            notes,
         }
     }
 
@@ -127,10 +120,25 @@ impl<'a> ParamCx<'a> {
         self.id = id;
     }
 
+    /// Ends the run of ops that execute together, and any writes it held
+    /// back. See [`AudioCx::close_stage`], which does the same job for the
+    /// same reason.
+    pub(crate) fn close_stage(&mut self) {
+        self.ops.append(&mut self.deferred);
+        let end = self.ops.len() as u32;
+        self.spans.push(Span {
+            start: self.span_start,
+            end,
+        });
+        self.span_start = end;
+    }
+
     pub(crate) fn finish(mut self) -> ParamHalf {
         self.ops.append(&mut self.deferred);
         self.outputs.sort_unstable();
         ParamHalf {
+            spans: self.spans,
+            follows: self.follows,
             ops: self.ops,
             registers: self.next_reg,
             outputs: self.outputs,
@@ -167,15 +175,6 @@ impl<'a> ParamCx<'a> {
         }
     }
 
-    /// Whether anything is wired to input `port`.
-    ///
-    /// For the sockets that carry no register — a notes port — where
-    /// [`ParamCx::input`] cannot tell "nothing wired" from "wired to something
-    /// that binds no register".
-    pub(crate) fn has_input(&self, port: u8) -> bool {
-        self.graph.source_of(self.id, port).is_some()
-    }
-
     /// A register holding zero, for an input nobody has connected yet.
     ///
     /// Reused across the program if one was already needed: constants are free
@@ -206,6 +205,22 @@ impl<'a> ParamCx<'a> {
         let reg = self.next_reg as Reg;
         self.next_reg += 1;
         Ok(reg)
+    }
+
+    /// Emits an op that reads an audio buffer, with the buffer left blank.
+    ///
+    /// The audio half hands buffers out and runs after this one, so a
+    /// parameter op that reads audio cannot know its buffer yet. It books the
+    /// socket instead and `resolve_follows` fills the hole — the mirror of
+    /// what the note half does with the lanes this pass books for *it*.
+    pub(crate) fn emit_follow(&mut self, op: Op, socket: (NodeId, u8)) {
+        self.follows.push((self.ops.len(), socket));
+        self.ops.push(op);
+    }
+
+    /// The socket wired into this node's audio input `port`, if anything is.
+    pub(crate) fn audio_source_of(&self, port: u8) -> Option<(NodeId, u8)> {
+        self.graph.source_of(self.id, port)
     }
 
     pub(crate) fn emit(&mut self, op: Op) {
@@ -313,19 +328,13 @@ impl<'a> ParamCx<'a> {
         Ok(())
     }
 
-    /// The gate condition on the note chain feeding this node's input `port`,
-    /// if there is one upstream.
+    /// The note buffer wired into this node's input `port`, for a node that
+    /// reads the stream as a parameter signal.
     ///
-    /// A gate node asks for this so it can fold the gates above it into its own
-    /// condition: two gates in series pass notes only when both are open, and
-    /// one register saying so is cheaper than the audio half carrying a list.
-    pub(crate) fn upstream_note_gate(&self, port: u8) -> Option<Reg> {
-        let (_, socket, _) = trace_notes(self.graph, self.id, port);
-        let socket = socket?;
-        self.note_gates
-            .iter()
-            .find(|&&(key, _)| key == socket)
-            .map(|&(_, reg)| reg)
+    /// The note pass settled this before either half ran, which is the whole
+    /// reason it is a pass of its own.
+    pub(crate) fn note_source_of(&self, port: u8) -> Option<NoteBuf> {
+        self.notes.source_of(self.graph, self.id, port)
     }
 
     /// Says that the notes leaving this node's output `port` pass only while
@@ -498,12 +507,19 @@ pub(crate) struct AudioCx<'a> {
     produced: Vec<Produced>,
     ops: Vec<AudioOp>,
     deferred: Vec<AudioOp>,
+    /// The runs of `ops` closed so far, and where the open one starts.
+    spans: Vec<Span>,
+    span_start: u32,
+    /// Buffers a deferred op still has to read. See [`AudioCx::consume_later`].
+    held: Vec<Buf>,
     instances: Vec<InstanceIo>,
     latency: u32,
     compensators: u16,
     audio_lines: Vec<LineId>,
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
+
+    notes: &'a Notes,
 }
 
 impl<'a> AudioCx<'a> {
@@ -512,6 +528,7 @@ impl<'a> AudioCx<'a> {
         lines: &'a [Line],
         order: &'a [NodeId],
         lanes: &'a [((NodeId, u8), u16)],
+        notes: &'a Notes,
     ) -> AudioCx<'a> {
         AudioCx {
             graph,
@@ -527,12 +544,16 @@ impl<'a> AudioCx<'a> {
             produced: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            spans: Vec::new(),
+            span_start: 0,
+            held: Vec::new(),
             instances: Vec::new(),
             latency: 0,
             compensators: 0,
             audio_lines: Vec::new(),
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
+            notes,
         }
     }
 
@@ -582,10 +603,10 @@ impl<'a> AudioCx<'a> {
     }
 
     pub(crate) fn finish(mut self) -> Audio {
-        self.ops.append(&mut self.deferred);
-
         // A line nobody writes still has to advance: its ring outlives the
-        // program it was filled by.
+        // program it was filled by. Nothing carries anything back through such
+        // a line, so the head may as well move where the tail of the program
+        // runs.
         for index in 0..self.audio_lines.len() as u16 {
             let written = self
                 .ops
@@ -595,26 +616,25 @@ impl<'a> AudioCx<'a> {
                 self.ops.push(AudioOp::DelaySilence { line: index });
             }
         }
-
-        // An audio line with both halves present closes a loop, and then every
-        // plugin in the program has to run at sub-block granularity.
-        let looped = self
-            .lines
-            .iter()
-            .any(|line| matches!(line.ty, PortType::Audio { .. }) && line.writer != NO_WRITER);
+        // Onto the tail of the last stage, which is where the program ends.
+        if let Some(last) = self.spans.last_mut() {
+            last.end = self.ops.len() as u32;
+        }
 
         self.instances.sort_unstable_by_key(|i| i.instance);
+        let sockets = self
+            .produced
+            .iter()
+            .map(|out| ((out.node, out.port), out.buf))
+            .collect();
         Audio {
             instances: self.instances,
+            sockets,
             ops: self.ops,
+            spans: self.spans,
             delay_nodes: self.delay_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
-            chunking: if looped {
-                Chunking::SubBlock
-            } else {
-                Chunking::WholeBlock
-            },
             latency: self.latency,
         }
     }
@@ -714,23 +734,10 @@ impl<'a> AudioCx<'a> {
             .map(|&(_, lane)| lane)
     }
 
-    /// How notes reach this node's input `port`.
-    ///
-    /// `None` when nothing is connected, which is the answer that makes an
-    /// unwired instrument silent rather than making it play whatever the DAW
-    /// happened to send. Only `NoteIn` produces notes today; a plugin's own
-    /// note output would need the engine to carry event buffers. What sits
-    /// between the source and here — gates — comes back as a lane number for
-    /// the audio half to read each chunk.
-    pub(crate) fn note_route(&self, port: u8) -> NoteRoute {
-        let (source, socket, mute) = trace_notes(self.graph, self.id, port);
-        let gate = socket.and_then(|(node, out_port)| {
-            self.lanes
-                .iter()
-                .find(|&&(key, _)| key == (node, OUTPUT_SOCKET + out_port))
-                .map(|&(_, lane)| lane)
-        });
-        NoteRoute { source, gate, mute }
+    /// The note buffer wired into this node's input `port`, from the layout
+    /// the note pass settled before either half ran.
+    pub(crate) fn note_source_of(&self, port: u8) -> Option<NoteBuf> {
+        self.notes.source_of(self.graph, self.id, port)
     }
 
     // --- buffers ----------------------------------------------------------
@@ -758,20 +765,61 @@ impl<'a> AudioCx<'a> {
         self.pool.consume(buf);
     }
 
+    /// Says this buffer is read by an op held back to the end of the stage.
+    ///
+    /// The pool hands a buffer out again once every reader it counted has
+    /// taken it, and a reader takes it when it is *compiled*. That is the same
+    /// moment the op runs for everything except a deferred write, which runs
+    /// at the end of the stage instead — so a node compiled in between could
+    /// be handed the buffer and fill it with something else, and the line
+    /// would carry that. Held until the stage closes, which is when the write
+    /// has actually happened.
+    pub(crate) fn consume_later(&mut self, buf: Buf) {
+        self.held.push(buf);
+    }
+
     // --- emitting ---------------------------------------------------------
 
     pub(crate) fn emit(&mut self, op: AudioOp) {
         self.ops.push(op);
     }
 
-    /// Emits an op that runs after every other op in the chunk.
+    /// Emits an op that runs after every other op of its stage in the chunk.
     ///
     /// Only delay writes use this, for the reason the param half holds its
     /// writes back: within one chunk every read must see the line as it stood
     /// before this chunk was written, or a delay of exactly one chunk would
     /// read back what it had just written.
+    ///
+    /// Held back to the end of its own stage rather than of the program: a
+    /// closed line's write and its reads are in the same stage by
+    /// construction, and a later stage cannot be reading the line or it would
+    /// be in that stage too.
     pub(crate) fn emit_deferred(&mut self, op: AudioOp) {
         self.deferred.push(op);
+    }
+
+    /// Ends the run of ops that share a granularity, and any writes it held
+    /// back. See [`Stage`].
+    ///
+    /// The compiler walks the order once per stage rather than emitting
+    /// everything and sorting afterwards, because the buffer pool hands a
+    /// buffer out again the moment its last reader has been *compiled*.
+    /// Emitting in an order the audio thread will not follow lets a buffer be
+    /// reused while something still to run is holding it, which reads as a
+    /// delay writing back its own output.
+    pub(crate) fn close_stage(&mut self) {
+        self.ops.append(&mut self.deferred);
+        // The writes have run, so what they were reading is free now.
+        for buf in std::mem::take(&mut self.held) {
+            self.pool.consume(buf);
+        }
+        let end = self.ops.len() as u32;
+        self.spans.push(Span {
+            start: self.span_start,
+            end,
+        });
+        self.span_start = end;
     }
 
     /// Says what this node leaves in `buf` on its output socket `port`, and how

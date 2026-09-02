@@ -7,10 +7,12 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
+use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
-use crate::ir::{AudioOp, Chunking};
+use crate::ir::{AudioOp, Span};
 use subhost_adapter::InstanceIo;
 
+use crate::compile::notes::Notes;
 use crate::compile::{AudioCx, CompileError, Line};
 
 /// The audio half of a `Program`.
@@ -23,7 +25,11 @@ pub(crate) struct Audio {
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
-    pub chunking: Chunking,
+    /// Output socket → the buffer leaving it, for the parameter ops that read
+    /// audio. See `ParamCx::emit_follow`.
+    pub sockets: Vec<((NodeId, u8), crate::ir::Buf)>,
+    /// One per stage, in the order they run.
+    pub spans: Vec<Span>,
     pub latency: u32,
     pub instances: Vec<InstanceIo>,
 }
@@ -37,14 +43,26 @@ pub(crate) struct Audio {
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
+    plan: &Plan,
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
+    notes: &Notes,
 ) -> Result<Audio, CompileError> {
-    let mut cx = AudioCx::new(graph, lines, order, audio_lanes);
-    for &id in order {
-        let node = graph.node(id).expect("ordering only contains real nodes");
-        cx.begin(id, &node.kind);
-        node.kind.compile_audio(&mut cx)?;
+    // Once per stage, rather than once with a sort afterwards: the pool
+    // frees a buffer as soon as its last reader is compiled, so the order ops
+    // are emitted in has to be the order they will run in. See
+    // [`AudioCx::close_stage`].
+    let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
+    for stage in 0..plan.stages.len() {
+        for (index, &id) in order.iter().enumerate() {
+            if plan.of[index] != stage {
+                continue;
+            }
+            let node = graph.node(id).expect("ordering only contains real nodes");
+            cx.begin(id, &node.kind);
+            node.kind.compile_audio(&mut cx)?;
+        }
+        cx.close_stage();
     }
     Ok(cx.finish())
 }
@@ -67,13 +85,13 @@ mod tests {
     use super::*;
     use crate::compile::compile;
     use crate::engine::AudioContext;
-    use crate::ir::{AudioOp, NoteRoute};
+    use crate::ir::{AudioOp, NoteOp};
     use crate::nodes::{
         AudioIn, AudioOut, DelayRead, DelayWrite, KeyParam, KeyParamMode, KeySwitch, KeySwitchMode,
         Mix, NodeKind, NoteGate, NoteMute, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
-    use subhost_adapter::{AudioChunk, AudioInstances, NoteSource, NoteStream};
+    use subhost_adapter::{AudioChunk, AudioInstances};
 
     const SLOTS: usize = 32;
 
@@ -474,9 +492,35 @@ mod tests {
         assert_eq!(program.latency, 64);
     }
 
+    /// The finest granularity anything in a program runs at.
+    fn grain(program: &crate::ir::Program) -> crate::ir::Chunking {
+        use crate::ir::Chunking;
+        if program
+            .stages
+            .iter()
+            .any(|stage| stage.chunking == Chunking::SubBlock)
+        {
+            Chunking::SubBlock
+        } else {
+            Chunking::WholeBlock
+        }
+    }
+
+    /// Every op that runs a sub-block at a time.
+    fn fine(program: &crate::ir::Program) -> Vec<&AudioOp> {
+        use crate::ir::Chunking;
+        program
+            .stages
+            .iter()
+            .filter(|stage| stage.chunking == Chunking::SubBlock)
+            .flat_map(|stage| &program.audio_ops[stage.audio.range()])
+            .collect()
+    }
+
     /// A graph with no audio loop is not made to pay for one.
     #[test]
     fn only_an_audio_loop_forces_the_fine_grain() {
+        use crate::ir::Chunking;
         let mut graph = Graph::new();
         let input = stereo_in(&mut graph);
         let node = plugin(&mut graph, 0, 0);
@@ -484,7 +528,7 @@ mod tests {
         graph.connect(input, 0, node, 0);
         graph.connect(node, 0, output, 0);
         assert_eq!(
-            compile(&graph, SLOTS).unwrap().chunking,
+            grain(&compile(&graph, SLOTS).unwrap()),
             Chunking::WholeBlock
         );
 
@@ -518,7 +562,74 @@ mod tests {
         graph.connect(mix, 0, node, 0);
         graph.connect(node, 0, write, 0);
 
-        assert_eq!(compile(&graph, SLOTS).unwrap().chunking, Chunking::SubBlock);
+        assert_eq!(grain(&compile(&graph, SLOTS).unwrap()), Chunking::SubBlock);
+    }
+
+    /// The loop pays for itself and nothing else does.
+    ///
+    /// A patch is one canvas: a feedback delay in a corner of it must not put
+    /// every plugin in the program on sub-block granularity, or adding an echo
+    /// to one channel would make a synth on another cost sixteen times as
+    /// much.
+    #[test]
+    fn a_loop_does_not_drag_the_rest_of_the_patch_down_with_it() {
+        let mut graph = Graph::new();
+        let output = stereo_out(&mut graph);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(mix, 0, output, 0);
+
+        // One branch: a synth, wired to nothing that loops.
+        let voice = synth(&mut graph, 0);
+        graph.connect(voice, 0, mix, 0);
+
+        // The other: an input through a feedback delay.
+        let input = stereo_in(&mut graph);
+        let echo = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let read = graph.add(
+            NodeKind::DelayRead(DelayRead {
+                line: 0,
+                ty: PortType::STEREO,
+                max_time: 1.0,
+                time: 0.01,
+            }),
+            [0.0, 0.0],
+        );
+        let write = graph.add(
+            NodeKind::DelayWrite(DelayWrite {
+                line: 0,
+                ty: PortType::STEREO,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, echo, 0);
+        graph.connect(read, 0, echo, 2);
+        graph.connect(echo, 0, write, 0);
+        graph.connect(echo, 0, mix, 2);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let fine = fine(&program);
+        assert!(
+            !fine.is_empty(),
+            "the loop itself does run a sub-block at a time"
+        );
+        assert!(
+            !fine.iter().any(|op| matches!(op, AudioOp::Plugin { .. })),
+            "and the synth beside it is still called once: {fine:?}"
+        );
     }
 
     /// A param feedback loop is not an audio loop, and must not drag the audio
@@ -551,8 +662,76 @@ mod tests {
         graph.connect(read, 0, write, 0);
 
         assert_eq!(
-            compile(&graph, SLOTS).unwrap().chunking,
-            Chunking::WholeBlock
+            grain(&compile(&graph, SLOTS).unwrap()),
+            crate::ir::Chunking::WholeBlock
+        );
+    }
+
+    /// Two delays in series leave what sits between them alone.
+    ///
+    /// A node is inside a loop when it lies between the two ends of *one*
+    /// line. Asking that question of every line's ends at once, as one set,
+    /// answers yes for anything on a path from one loop to another — so a
+    /// chorus between two feedback delays would be called sixteen times a
+    /// block for belonging to neither of them.
+    #[test]
+    fn a_node_between_two_loops_is_in_neither() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+
+        // Two feedback delays, and a plugin in the middle of the chain.
+        let between = plugin(&mut graph, 0, 0);
+        let loop_at = |graph: &mut Graph, line: u32, from: NodeId| -> NodeId {
+            let read = graph.add(
+                NodeKind::DelayRead(DelayRead {
+                    line,
+                    ty: PortType::STEREO,
+                    max_time: 1.0,
+                    time: 0.01,
+                }),
+                [0.0, 0.0],
+            );
+            let write = graph.add(
+                NodeKind::DelayWrite(DelayWrite {
+                    line,
+                    ty: PortType::STEREO,
+                }),
+                [0.0, 0.0],
+            );
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: Vec::new(),
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(from, 0, mix, 0);
+            graph.connect(read, 0, mix, 2);
+            graph.connect(mix, 0, write, 0);
+            mix
+        };
+        let first = loop_at(&mut graph, 0, input);
+        graph.connect(first, 0, between, 0);
+        let second = loop_at(&mut graph, 1, between);
+        graph.connect(second, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            !fine(&program)
+                .iter()
+                .any(|op| matches!(op, AudioOp::Plugin { .. })),
+            "the plugin belongs to neither loop: {:?}",
+            fine(&program)
+        );
+        assert_eq!(
+            fine(&program)
+                .iter()
+                .filter(|op| matches!(op, AudioOp::DelayWrite { .. }))
+                .count(),
+            2,
+            "and both loops still run a sub-block at a time"
         );
     }
 
@@ -573,7 +752,9 @@ mod tests {
         )
     }
 
-    fn note_sources(program: &crate::ir::Program) -> Vec<(u32, NoteRoute)> {
+    /// Instance → the note buffer it was given, or `None` for an unwired
+    /// notes port.
+    fn note_bufs(program: &crate::ir::Program) -> Vec<(u32, Option<u16>)> {
         program
             .audio_ops
             .iter()
@@ -582,6 +763,54 @@ mod tests {
                     instance, notes, ..
                 } => Some((*instance, *notes)),
                 _ => None,
+            })
+            .collect()
+    }
+
+    /// Every op that had a hand in filling `buf`, source first.
+    ///
+    /// A buffer is written by exactly one op, and a filter names the buffer it
+    /// read, so the chain is a walk back through `a` — the note half's
+    /// equivalent of tracing a signal.
+    fn note_chain(program: &crate::ir::Program, buf: u16) -> Vec<NoteOp> {
+        let mut chain = Vec::new();
+        let mut at = Some(buf);
+        while let Some(want) = at {
+            let op = program
+                .note_ops
+                .iter()
+                .find(|op| match op {
+                    NoteOp::Input { out, .. }
+                    | NoteOp::Filter { out, .. }
+                    | NoteOp::Emit { out, .. } => *out == want,
+                })
+                .copied()
+                .expect("every note buffer a program names is written by an op");
+            chain.push(op);
+            at = match op {
+                NoteOp::Filter { a, .. } => Some(a),
+                NoteOp::Emit { a, .. } => a,
+                NoteOp::Input { .. } => None,
+            };
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// The chain feeding the one instance in a single-synth graph.
+    fn only_chain(program: &crate::ir::Program) -> Vec<NoteOp> {
+        let bufs = note_bufs(program);
+        assert_eq!(bufs.len(), 1);
+        note_chain(program, bufs[0].1.expect("the synth is wired to notes"))
+    }
+
+    /// The filters on a chain, nearest the source first.
+    fn filters(chain: &[NoteOp]) -> Vec<(Option<u16>, u128)> {
+        chain
+            .iter()
+            .filter_map(|op| match *op {
+                NoteOp::Filter { gate, mute, .. } => Some((gate, mute)),
+                NoteOp::Input { .. } | NoteOp::Emit { .. } => None,
             })
             .collect()
     }
@@ -630,10 +859,10 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        assert_eq!(
-            note_sources(&program),
-            vec![(0, NoteRoute::from_source(NoteSource::Daw { bus: 0 }))]
-        );
+        assert!(matches!(
+            only_chain(&program).as_slice(),
+            [NoteOp::Input { bus: 0, .. }]
+        ));
     }
 
     /// An unwired notes port has to mean silence. Handing every instance every
@@ -660,22 +889,16 @@ mod tests {
         graph.connect(mix, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let mut sources = note_sources(&program);
-        sources.sort_by_key(|&(i, _)| i);
-        assert_eq!(
-            sources,
-            vec![
-                (0, NoteRoute::from_source(NoteSource::Daw { bus: 0 })),
-                (1, NoteRoute::default())
-            ]
-        );
+        let mut bufs = note_bufs(&program);
+        bufs.sort_by_key(|&(i, _)| i);
+        assert!(bufs[0].1.is_some(), "the wired synth gets a buffer");
+        assert_eq!(bufs[1].1, None, "the unwired one gets nothing at all");
     }
 
-    /// A gate on the way does not change *where* the notes come from — it adds
-    /// a lane the audio half reads each chunk to decide whether they get
-    /// through.
+    /// A gate becomes a filter with a lane the audio half reads each chunk to
+    /// decide whether the stream passes.
     #[test]
-    fn a_note_gate_leaves_the_source_and_adds_a_lane() {
+    fn a_note_gate_becomes_a_filter_with_a_lane() {
         let mut graph = Graph::new();
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
@@ -694,11 +917,12 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let routes = note_sources(&program);
-        assert_eq!(routes.len(), 1);
-        let route = routes[0].1;
-        assert_eq!(route.source, NoteSource::Daw { bus: 0 });
-        let lane = route.gate.expect("the gate booked a lane");
+        let chain = only_chain(&program);
+        assert!(matches!(chain[0], NoteOp::Input { bus: 0, .. }));
+        let [(gate_lane, 0)] = filters(&chain)[..] else {
+            panic!("expected one filter with no key mask, got {chain:?}");
+        };
+        let lane = gate_lane.expect("the gate booked a lane");
         assert!(
             lane >= program.audio_lane_base,
             "a note gate's lane is an audio lane, not a parameter one"
@@ -707,21 +931,12 @@ mod tests {
             program.outputs.iter().any(|&(l, _)| l == lane),
             "the parameter half drives the lane it booked"
         );
-        // Shut, the stream keeps its releases so nothing hangs.
-        assert_eq!(
-            route.resolve(Some(0.0)),
-            NoteStream::from_source(NoteSource::DawReleases { bus: 0 })
-        );
-        assert_eq!(
-            route.resolve(Some(1.0)),
-            NoteStream::from_source(NoteSource::Daw { bus: 0 })
-        );
     }
 
-    /// Two gates in series pass notes only when both are open, and they say so
-    /// in one lane: the nearer gate folds the further one into its condition.
+    /// Two gates in series each filter the stream, so notes pass only when
+    /// both are open — without either having to know the other is there.
     #[test]
-    fn gates_in_series_become_one_lane() {
+    fn gates_in_series_each_filter_the_stream() {
         let mut graph = Graph::new();
         let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
         let first = graph.add(
@@ -746,21 +961,18 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let route = note_sources(&program)[0].1;
-        assert_eq!(route.source, NoteSource::Daw { bus: 0 });
-        assert!(route.gate.is_some());
-        assert!(
-            program
-                .ops
-                .iter()
-                .any(|op| matches!(op, crate::ir::Op::Math { .. })),
-            "the second gate multiplies the first one's condition into its own"
+        let chain = only_chain(&program);
+        let lanes = filters(&chain);
+        assert_eq!(lanes.len(), 2, "one filter each");
+        assert_ne!(
+            lanes[0].0, lanes[1].0,
+            "each gate reads its own condition; nothing is folded"
         );
     }
 
     /// A selecting key switch has one output per destination, all carrying one
-    /// stream, and each gated by a lane of its own: whichever way the switch
-    /// stands, one synth hears the notes and the other does not.
+    /// stream, and each gated on its own: whichever way the switch stands, one
+    /// synth hears the notes and the other does not.
     #[test]
     fn a_selecting_key_switch_gates_each_output_of_its_own() {
         let mut graph = Graph::new();
@@ -797,18 +1009,14 @@ mod tests {
             vec![switch],
             "the switch keeps a latch"
         );
-        let mut routes = note_sources(&program);
-        routes.sort_by_key(|&(i, _)| i);
-        let (a, b) = (routes[0].1, routes[1].1);
-        assert_eq!(a.source, NoteSource::Daw { bus: 0 });
-        assert_eq!(b.source, NoteSource::Daw { bus: 0 });
-        assert_ne!(
-            a.gate, b.gate,
-            "the two outputs are gated by different lanes"
-        );
+        let mut bufs = note_bufs(&program);
+        bufs.sort_by_key(|&(i, _)| i);
+        let a = filters(&note_chain(&program, bufs[0].1.unwrap()));
+        let b = filters(&note_chain(&program, bufs[1].1.unwrap()));
+        assert_ne!(a[0].0, b[0].0, "the two outputs read different lanes");
         let expected = (1u128 << 24) | (1u128 << 25);
         assert_eq!(
-            (a.mute, b.mute),
+            (a[0].1, b[0].1),
             (expected, expected),
             "switching keys are filtered from the sounding note stream"
         );
@@ -835,8 +1043,9 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let routes = note_sources(&program);
-        assert_eq!(routes[0].1.mute, 0);
+        let chain = only_chain(&program);
+        assert_eq!(filters(&chain).len(), 1, "still gated");
+        assert_eq!(filters(&chain)[0].1, 0, "but nothing is swallowed");
     }
 
     /// A key parameter hands the stream on through a notes output of its own,
@@ -861,16 +1070,15 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let routes = note_sources(&program);
-        assert_eq!(routes[0].1.source, NoteSource::Daw { bus: 0 });
         assert_eq!(
-            routes[0].1.mute,
-            (1u128 << 24) | (1u128 << 25),
+            filters(&only_chain(&program)),
+            vec![(None, (1u128 << 24) | (1u128 << 25))],
             "picking keys are filtered from the sounding note stream"
         );
     }
 
-    /// Clearing `mute_keys` puts the picking keys back.
+    /// Clearing `mute_keys` puts the picking keys back — and then the node
+    /// drops nothing and gates nothing, so it costs no buffer and no copy.
     #[test]
     fn an_unmuted_key_parameter_passes_its_own_keys() {
         let mut graph = Graph::new();
@@ -891,8 +1099,11 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let routes = note_sources(&program);
-        assert_eq!(routes[0].1.mute, 0);
+        assert!(matches!(
+            only_chain(&program).as_slice(),
+            [NoteOp::Input { bus: 0, .. }]
+        ));
+        assert_eq!(program.note_bufs, 1);
     }
 
     /// A key mute takes its keys out and leaves everything else alone,
@@ -920,13 +1131,15 @@ mod tests {
         graph.connect(synth, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        let routes = note_sources(&program);
-        assert_eq!(routes[0].1.source, NoteSource::Daw { bus: 0 });
-        assert_eq!(routes[0].1.mute, (1u128 << 24) | (1u128 << 26));
+        let chain = only_chain(&program);
+        let [(gate_lane, 0), (None, keys)] = filters(&chain)[..] else {
+            panic!("expected a gate then a mute, got {chain:?}");
+        };
         assert!(
-            routes[0].1.gate.is_some(),
+            gate_lane.is_some(),
             "the gate upstream of the mute still reaches the synth"
         );
+        assert_eq!(keys, (1u128 << 24) | (1u128 << 26));
     }
 
     /// The notes port sits after the audio inputs, so an effect that also takes
@@ -957,8 +1170,9 @@ mod tests {
 
         let program = compile(&graph, SLOTS).unwrap();
         assert_eq!(
-            note_sources(&program),
-            vec![(0, NoteRoute::from_source(NoteSource::Daw { bus: 0 }))]
+            note_bufs(&program),
+            vec![(0, Some(0))],
+            "the notes port is found past the audio inputs"
         );
     }
 
@@ -974,7 +1188,7 @@ mod tests {
         graph.connect(node, 0, output, 0);
 
         let program = compile(&graph, SLOTS).unwrap();
-        assert_eq!(note_sources(&program), vec![(0, NoteRoute::default())]);
+        assert_eq!(note_bufs(&program), vec![(0, None)]);
     }
 
     /// Instrument -> effect -> effect. Only the instrument hears the notes, and
@@ -994,12 +1208,8 @@ mod tests {
 
         let program = compile(&graph, SLOTS).unwrap();
         assert_eq!(
-            note_sources(&program),
-            vec![
-                (0, NoteRoute::from_source(NoteSource::Daw { bus: 0 })),
-                (1, NoteRoute::default()),
-                (2, NoteRoute::default())
-            ],
+            note_bufs(&program),
+            vec![(0, Some(0)), (1, None), (2, None)],
             "the order is the order they run in, and only the synth hears notes"
         );
     }
@@ -1257,7 +1467,7 @@ mod tests {
         fn process(
             &mut self,
             _instance: u32,
-            _notes: NoteStream,
+            _notes: &[plugin_host::Event],
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
@@ -1284,7 +1494,7 @@ mod tests {
         fn process(
             &mut self,
             _instance: u32,
-            _notes: NoteStream,
+            _notes: &[plugin_host::Event],
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,

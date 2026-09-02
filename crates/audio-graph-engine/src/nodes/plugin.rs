@@ -334,7 +334,7 @@ impl Node for Plugin {
         let single = out_buses.len() == 1;
         let readers = cx.readers();
         let output = cx.alloc_avoiding(out_total, if single { readers } else { 1 }, &[input])?;
-        let notes = cx.note_route(self.ports.audio_in.len() as u8);
+        let notes = cx.note_source_of(self.ports.audio_in.len() as u8);
         cx.emit(AudioOp::Plugin {
             instance: self.instance as u32,
             input,

@@ -15,11 +15,13 @@
 
 mod audio;
 mod cx;
+mod notes;
+mod stages;
 
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
 use crate::graph::{Graph, LineId, NodeId};
-use crate::ir::Program;
+use crate::ir::{MAX_NOTE_BUFS, NoteOp, Op, Program, Stage};
 use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,26 +117,76 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         visit(graph, &index, root, &mut mark, &mut order)?;
     }
 
-    let mut cx = ParamCx::new(graph, &lines, slot_count);
-    for &id in &order {
-        let node = graph.node(id).expect("ordering only contains real nodes");
-        cx.begin(id);
-        node.kind.compile(&mut cx)?;
+    // Where the graph has to be cut, and what each piece runs at. All three
+    // passes below cut their ops the same way, so that a stage is one
+    // contiguous run of each list.
+    let plan = stages::plan(graph, &order, &lines);
+
+    // Notes first: both halves below need to be able to name a note buffer,
+    // and which buffer leaves which socket is pure topology.
+    let mut notes = notes::compile_notes(graph, &order, &plan)?;
+
+    let mut cx = ParamCx::new(graph, &lines, slot_count, &notes);
+    for stage in 0..plan.stages.len() {
+        for (index, &id) in order.iter().enumerate() {
+            if plan.of[index] != stage {
+                continue;
+            }
+            let node = graph.node(id).expect("ordering only contains real nodes");
+            cx.begin(id);
+            node.kind.compile(&mut cx)?;
+        }
+        cx.close_stage();
     }
     let param = cx.finish();
 
-    let audio = audio::compile_audio(graph, &order, &lines, &param.audio_lanes)?;
+    // The gates and generators booked their lanes during the pass above.
+    notes::resolve_lanes(&mut notes, plan.stages.len(), &param.audio_lanes);
+
+    let mut param = param;
+    let audio = audio::compile_audio(graph, &order, &plan, &lines, &param.audio_lanes, &notes)?;
+
+    // And now the other direction: the parameter ops that read audio learn
+    // which buffer they read.
+    resolve_follows(&mut param, &audio.sockets);
+
+    // Dropped when all three of a stage's lists are empty, which is most of
+    // them, most of the time.
+    let program_stages: Vec<Stage> = plan
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, &chunking)| Stage {
+            params: param.spans[index],
+            notes: notes.spans[index],
+            audio: audio.spans[index],
+            note_bufs: notes.ops[notes.spans[index].range()]
+                .iter()
+                .map(|op| match *op {
+                    NoteOp::Input { out, .. }
+                    | NoteOp::Emit { out, .. }
+                    | NoteOp::Filter { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
+                })
+                .fold(0, |mask, bit| mask | bit),
+            chunking,
+        })
+        .filter(|stage| {
+            !(stage.params.is_empty() && stage.notes.is_empty() && stage.audio.is_empty())
+        })
+        .collect();
 
     Ok(Program {
         ops: param.ops,
         registers: param.registers,
         outputs: param.outputs,
         audio_ops: audio.ops,
+        note_ops: notes.ops,
+        note_bufs: notes.bufs,
         param_targets: param.param_targets,
         audio_lane_base: (slot_count + crate::ir::MAX_GRAPH_PARAMS) as u16,
         instances: audio.instances,
         buffers: audio.buffers,
-        chunking: audio.chunking,
+        stages: program_stages,
         latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         audio_delay_nodes: audio.delay_nodes,
@@ -147,6 +199,33 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         lfo_nodes: param.lfo_nodes,
         latch_nodes: param.latch_nodes,
     })
+}
+
+/// Tell each parameter op that reads audio which buffer it reads.
+///
+/// The mirror of [`notes::resolve_lanes`]: that pass books a lane the
+/// parameter half will fill, this one books a buffer the audio half will. An
+/// op whose socket produced nothing is turned into a constant zero rather than
+/// left pointing at buffer nothing — an unwired input is silence, and silence
+/// is as loud as nothing.
+fn resolve_follows(param: &mut cx::ParamHalf, sockets: &[((NodeId, u8), crate::ir::Buf)]) {
+    for &(index, socket) in &param.follows {
+        let found = sockets
+            .iter()
+            .find(|&&(key, _)| key == socket)
+            .map(|&(_, buf)| buf);
+        match (found, &mut param.ops[index]) {
+            (Some(found), Op::Follow { buf, .. }) => *buf = found,
+            (None, op) => {
+                let out = match *op {
+                    Op::Follow { out, .. } => out,
+                    _ => continue,
+                };
+                *op = Op::Const { out, value: 0.0 };
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One delay line, as the compiler sees it.
@@ -598,11 +677,13 @@ mod tests {
             Op::Const { .. }
             | Op::Slot { .. }
             | Op::Lfo { .. }
-            | Op::Expr { .. }
+            | Op::NoteFollow { .. }
+            | Op::Follow { .. }
             | Op::KeyHeld { .. }
             | Op::KeyStep { .. }
             | Op::KeyLatch { .. }
             | Op::Latch { .. }
+            | Op::NoteCc { .. }
             | Op::LatchIs { .. } => Vec::new(),
             Op::Math { a, b, .. } => match b {
                 Operand::Reg(b) => vec![a, b],
@@ -635,12 +716,14 @@ mod tests {
             Op::Const { out, .. }
             | Op::Slot { out, .. }
             | Op::Lfo { out, .. }
-            | Op::Expr { out, .. }
+            | Op::NoteFollow { out, .. }
+            | Op::Follow { out, .. }
             | Op::Select { out, .. }
             | Op::Math { out, .. }
             | Op::Range { out, .. }
             | Op::KeyHeld { out, .. }
             | Op::Latch { out, .. }
+            | Op::NoteCc { out, .. }
             | Op::LatchIs { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
             Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,

@@ -62,6 +62,12 @@ pub struct RenderOutcome {
     pub latency: u32,
     pub blocks: usize,
     pub host_log: Vec<String>,
+    /// What the plugin sent back, gathered across every block.
+    ///
+    /// A backend clears the sink each call, so watching one block would only
+    /// ever show the last one's worth. This is how a note the plugin says it
+    /// has finished with becomes visible from outside.
+    pub emitted: Vec<Event>,
 }
 
 /// Run `input` (or silence, for an instrument) through the plugin.
@@ -130,6 +136,7 @@ pub fn render_with_state(
     let mut in_scratch = vec![0.0f32; (input_channels.max(1) * block_size) as usize];
     let mut out_scratch = vec![0.0f32; (output_channels * block_size) as usize];
     let mut sink = EventSink::with_capacity(256);
+    let mut emitted: Vec<Event> = Vec::new();
     let mut block_events: Vec<Event> = Vec::with_capacity(256);
 
     let mut context = TimeContext {
@@ -171,6 +178,7 @@ pub fn render_with_state(
         );
 
         let status = processor.process(&mut buffers, &block_events, &context, &mut sink);
+        emitted.extend_from_slice(sink.events());
         if status == ProcessStatus::Error {
             plugin.deactivate(processor);
             return Err(format!("plugin returned an error at sample {position}"));
@@ -193,6 +201,7 @@ pub fn render_with_state(
         latency,
         blocks,
         host_log: host.take_log(),
+        emitted,
     })
 }
 
@@ -236,8 +245,25 @@ fn offset_event(event: Event, sample_offset: u32) -> Event {
             value,
             sample_offset,
         }),
+        // Everything else is rebased through the core model's own accessor,
+        // which knows every variant and does not have to be extended here.
+        Event::Note(n) => Event::Note(n.at_offset(sample_offset)),
         other => other,
     }
+}
+
+/// A control change at an absolute time, as a 0..127 MIDI value.
+pub fn cc(number: u8, value: u8, at: usize) -> (usize, Event) {
+    (
+        at,
+        Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: number,
+            value: f64::from(value) / 127.0,
+            sample_offset: 0,
+        }),
+    )
 }
 
 /// A held note, as a pair of absolute-time events.
@@ -246,7 +272,7 @@ pub fn note(key: i16, start: usize, length: usize) -> Vec<(usize, Event)> {
         (
             start,
             Event::Note(NoteEvent::NoteOn {
-                note_id: key as i32,
+                note_id: Some(key as i32),
                 port: 0,
                 channel: 0,
                 key,
@@ -257,7 +283,7 @@ pub fn note(key: i16, start: usize, length: usize) -> Vec<(usize, Event)> {
         (
             start + length,
             Event::Note(NoteEvent::NoteOff {
-                note_id: key as i32,
+                note_id: Some(key as i32),
                 port: 0,
                 channel: 0,
                 key,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
-use crate::ir::{MathOp, Op, Operand, Reg};
+use crate::ir::Op;
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{NodeUi, combo, key_control};
@@ -136,13 +136,22 @@ impl Node for KeySwitch {
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        // A switch answers to the stream wired into it. Nothing wired means no
+        // keys to watch, so it rests where it is rather than following a
+        // keyboard it is not connected to.
+        let Some(buf) = cx.note_source_of(0) else {
+            return Ok(());
+        };
         match self.mode {
             KeySwitchMode::Hold => {
                 for (port, &key) in self.keys.iter().enumerate() {
                     let held = cx.alloc()?;
-                    cx.emit(Op::KeyHeld { out: held, key });
-                    let condition = fold_upstream(cx, held)?;
-                    cx.bind_note_gate(port as u8, condition)?;
+                    cx.emit(Op::KeyHeld {
+                        out: held,
+                        buf,
+                        key,
+                    });
+                    cx.bind_note_gate(port as u8, held)?;
                 }
                 Ok(())
             }
@@ -156,6 +165,7 @@ impl Node for KeySwitch {
                 match self.mode {
                     KeySwitchMode::Toggle => cx.emit(Op::KeyStep {
                         state,
+                        buf,
                         key: self.keys[0],
                         count: self.keys.len() as u16,
                     }),
@@ -163,6 +173,7 @@ impl Node for KeySwitch {
                         for (port, &key) in self.keys.iter().enumerate() {
                             cx.emit(Op::KeyLatch {
                                 state,
+                                buf,
                                 key,
                                 value: port as f64,
                             });
@@ -180,8 +191,7 @@ impl Node for KeySwitch {
                         // otherwise.
                         initial: 0.0,
                     });
-                    let condition = fold_upstream(cx, chosen)?;
-                    cx.bind_note_gate(port as u8, condition)?;
+                    cx.bind_note_gate(port as u8, chosen)?;
                 }
                 Ok(())
             }
@@ -253,22 +263,6 @@ impl Node for KeySwitch {
         self.keys.remove(index);
         1
     }
-}
-
-/// Multiplies a gate condition by whatever gate is already on the chain, so
-/// gates in series pass notes only when every one of them is open.
-fn fold_upstream(cx: &mut ParamCx, condition: Reg) -> Result<Reg, CompileError> {
-    let Some(upstream) = cx.upstream_note_gate(0) else {
-        return Ok(condition);
-    };
-    let both = cx.alloc()?;
-    cx.emit(Op::Math {
-        out: both,
-        a: condition,
-        b: Operand::Reg(upstream),
-        op: MathOp::Multiply,
-    });
-    Ok(both)
 }
 
 /// The default for [`KeySwitch::mute_keys`], as a function because serde cannot
