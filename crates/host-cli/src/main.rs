@@ -2696,10 +2696,10 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
 /// Check that a parameter can be read off audio, inside the wrapper.
 ///
 /// The graph is a ducker with nothing in it but graph nodes: the input's own
-/// level, mapped to a gain, turned back on the input. Nothing about it was
-/// expressible before a program was cut into stages — a parameter op cannot
-/// read a buffer the audio half has not filled yet — so this is the end of
-/// that path, run through the real wrapper rather than the engine alone.
+/// level, mapped to a gain, turned back on the input. It is expressible only
+/// because a program is cut into stages — a parameter op cannot read a buffer
+/// the audio half has not filled yet — and it runs here through the real
+/// wrapper rather than the engine alone.
 ///
 /// A quiet half and a loud half go in. Both come out at about the same level,
 /// which is the whole claim: the gain moved because the signal did.

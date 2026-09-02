@@ -11,12 +11,11 @@ use crate::port::{Port, PortType};
 /// Follows the notes on a stream: how hard, whether any are down, or which key.
 ///
 /// The three readings that still mean something when polyphony is flattened.
-/// This node replaces an earlier `Expression` node that offered these
-/// alongside the per-note controllers — pressure, tuning, brightness and the
-/// rest — reduced to "the newest note wins". That reduction was not musical:
-/// it gave one number for a chord and nothing on the canvas said which note it
-/// came from. The per-note readings are gone until there is a per-voice engine
-/// to give them to; these three are monophonic by nature and keep working.
+/// The per-note controllers — pressure, tuning, brightness and the rest —
+/// deliberately have no place here: reducing them to "the newest note wins" is
+/// not musical, giving one number for a chord with nothing on the canvas to
+/// say which note it came from. They wait for a per-voice engine to be given
+/// to; these three are monophonic by nature and keep working without one.
 ///
 /// The stream is an input rather than an assumption, so a filter or a gate
 /// upstream changes what this follows.

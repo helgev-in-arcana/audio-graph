@@ -10,8 +10,8 @@
 //! one), so the only way a value reaches itself is through a line, and finding
 //! what runs inside a loop is two reachability sweeps from the line's ends
 //! rather than anything cleverer. That is a reason to call *those* ops more
-//! often. It has never been a reason to call a synth in another corner of the
-//! patch sixteen times for one block, which is what a program-wide answer did.
+//! often. It is never a reason to call a synth in another corner of the patch
+//! sixteen times for one block, which is what a program-wide answer would do.
 //!
 //! And a parameter read off audio cannot be worked out until that audio
 //! exists. That cut is the whole point of an envelope follower: the stage

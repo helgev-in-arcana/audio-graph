@@ -67,7 +67,8 @@ pub enum Op {
     /// `high` at the threshold and above, `low` below it.
     ///
     /// A `>=` rather than a `>` so that a control reaching exactly 1.0 — which a
-    /// gate wired from `Expression`'s `Gate` does — switches.
+    /// gate driven by an [`Op::NoteFollow`] reading [`Follow::Gate`] does —
+    /// switches.
     Select {
         out: Reg,
         control: Reg,
@@ -77,10 +78,10 @@ pub enum Op {
     },
     /// 1 while `key` is held, 0 otherwise.
     ///
-    /// The one thing the graph could not otherwise ask about a note stream:
-    /// `Expression` answers for the newest note whatever it was, and a key
-    /// switch is a question about one particular key regardless of what has been
-    /// played since.
+    /// The one thing the graph could not otherwise ask about a note stream: an
+    /// [`Op::NoteFollow`] answers for the newest note whatever it was, and a
+    /// key switch is a question about one particular key regardless of what has
+    /// been played since.
     KeyHeld {
         out: Reg,
         /// The note buffer to watch. A key switch answers to the stream wired
@@ -169,9 +170,9 @@ pub enum Op {
     ///
     /// Monophonic on purpose. These three are the ones that still mean
     /// something when polyphony is flattened — how hard the player is playing,
-    /// whether they are playing at all, and where on the keyboard — which is
-    /// why they survived the per-note expression node that used to carry them
-    /// alongside sources that did not.
+    /// whether they are playing at all, and where on the keyboard. A per-note
+    /// reading that loses its meaning in that flattening does not belong
+    /// here.
     ///
     /// `state` is a latch: velocity and key hold their last value between
     /// notes, and the gate holds a count of what is down.

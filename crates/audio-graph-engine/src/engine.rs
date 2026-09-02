@@ -176,9 +176,9 @@ fn passes(event: &Event, keys: u128, channels: u16, controllers: u128) -> bool {
 /// index into five different tables.
 ///
 /// The tables are per buffer rather than per engine because a stream is
-/// something the graph routes: there used to be one for the whole program, fed
-/// straight from the DAW, which meant a key switch fired on keys a filter
-/// upstream of it had already taken out.
+/// something the graph routes. One table for the whole program, fed straight
+/// from the DAW, would make a key switch fire on keys a filter upstream of it
+/// had already taken out.
 #[derive(Debug)]
 struct NoteBuf {
     /// One whole DAW block of events, appended a sub-block at a time as the
@@ -227,20 +227,19 @@ impl NoteBuf {
 /// Held apart from the stream it reads ([`Engine::translated`]) rather than
 /// beside it, and that is the whole point of the split: the note pass wants
 /// the stream by shared reference and this by exclusive one, and a method
-/// taking `&mut self` on an engine that owned both could be given neither
-/// without a dance.
+/// taking `&mut self` on a type that owned both could be given neither without
+/// a dance.
 ///
-/// The note ops used to run twice for every sub-block — once at the end of the
-/// parameter half so a reader in the next sub-block had a stream, once in the
-/// audio half for the plugins — into buffers cleared before each replay. That
-/// copied every event twice per note op, and forced the generating ops to keep
-/// a private "did it move" state per replay or the first would eat the edge
-/// the second had to send. Running it once leaves the two readers differing
-/// only in where they look: a parameter op reads everything the buffer holds,
-/// which is the stream up to the boundary it just crossed — the value in force
-/// at that instant, which is what a parameter signal's sub-block resolution
-/// means. The audio half reads the rows of its own chunk, found through
-/// [`Engine::note_marks`].
+/// The note ops run once for a sub-block, appending to what the buffers
+/// already hold, and the two readers differ only in where they look: a
+/// parameter op reads everything the buffer holds, which is the stream up to
+/// the boundary it just crossed — the value in force at that instant, which is
+/// what a parameter signal's sub-block resolution means. The audio half reads
+/// the rows of its own chunk, found through [`Engine::note_marks`]. Replaying
+/// them per reader instead, into buffers cleared before each replay, would
+/// copy every event twice per note op, and force the generating ops to keep a
+/// private "did it move" state per replay or the first replay would eat the
+/// edge the second has to send.
 #[derive(Debug)]
 struct NoteState {
     /// One per note buffer, allocated in [`Engine::new`] and only ever cleared
@@ -500,8 +499,8 @@ pub struct Engine {
     ///
     /// Translated once, before either half runs, because both of them read it
     /// and they must agree about which note is which. Doing it inside the note
-    /// pass would hand out two ids for the same note-on, the pass running
-    /// twice.
+    /// pass would hand out a fresh id for the same note-on in every stage that
+    /// walks over it.
     translated: Vec<Event>,
     /// Who is who, and who still owes an ending. See [`crate::notes`].
     ledger: NoteLedger,
@@ -2786,9 +2785,9 @@ mod tests {
     /// A generator follows its parameter at sub-block resolution even when the
     /// plugins are called once for the whole block.
     ///
-    /// Those are separate questions and the note half used to conflate them:
-    /// it read one row's lane values and applied them to the entire chunk, so a
-    /// `Param → CC` sent one value per block however fast the parameter moved.
+    /// Those are separate questions and must not be conflated: reading one
+    /// row's lane values and applying them to the whole chunk would make a
+    /// `Param → CC` send one value per block however fast the parameter moved.
     /// The sub-plugin call rate is a cost decision; the resolution of what it
     /// is told is not.
     #[test]
@@ -2893,8 +2892,9 @@ mod tests {
         graph.connect(notes, 0, synth, 0);
         graph.connect(synth, 0, out, 0);
 
-        // Two overlapping notes on one key, neither carrying an id. The old
-        // wrapper gave both the key number and they became one note.
+        // Two overlapping notes on one key, neither carrying an id.
+        // Substituting the key number for a missing one would give both the
+        // same id and make them one note.
         let heard = hear(&graph, &[note_on(60, 0), note_on(60, 1)], &[]);
         let ids: Vec<Option<i32>> = heard.0[&0].iter().map(named).collect();
         assert!(
@@ -3689,7 +3689,7 @@ mod tests {
     }
 
     /// A key switch watches one key, whatever has been played since — which
-    /// is exactly what `Expression`'s sources cannot answer.
+    /// is exactly what a follow of the newest note cannot answer.
     #[test]
     fn a_held_key_switch_follows_its_own_key() {
         let mut graph = Graph::new();
@@ -4126,8 +4126,8 @@ mod tests {
         assert!(!engine.has_program());
     }
 
-    /// A parameter read off audio, which the graph could not express at all
-    /// until a program was cut into stages.
+    /// A parameter read off audio, which only a program cut into stages can
+    /// express.
     ///
     /// And read without latency: the follower's stage runs after the stage
     /// that made the sound, and that stage covered the whole block, so the
@@ -4237,11 +4237,10 @@ mod tests {
     /// back round to audio.
     ///
     /// `run` + `run_audio` put every parameter of the block before any of its
-    /// audio. That is the order the engine had before it was cut into stages,
-    /// and it is still the order every caller with no audio to interleave
-    /// wants. The claim under test is where the two orders part company: not
-    /// wherever a follower appears, but only where its value reaches audio
-    /// again inside the same block.
+    /// audio, which is the order every caller with no audio to interleave
+    /// wants. The claim under test is where that parts company with the order
+    /// the stages describe: not wherever a follower appears, but only where
+    /// its value reaches audio again inside the same block.
     #[test]
     fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
         const BLOCK: u32 = 64;
@@ -4384,8 +4383,8 @@ mod tests {
     /// buffer and fill it with something else, and the line then carries the
     /// other loop's signal instead of its own.
     ///
-    /// Three things have to line up for it, which is why nothing caught it
-    /// before: the write has to be the buffer's last reader — a tap on the
+    /// Three things have to line up for it: the write has to be the buffer's
+    /// last reader — a tap on the
     /// delayed side rather than on the sum, which is an ordinary way to wire a
     /// delay; the other loop has to be compiled after it; and it has to hold a
     /// node that asks the pool for a buffer rather than accumulating into one

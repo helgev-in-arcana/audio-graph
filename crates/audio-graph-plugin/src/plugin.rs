@@ -625,9 +625,8 @@ fn begin_graph(
 
     // The whole block's stream goes in once, before anything runs: every
     // note gets an id of the graph's own here, and every stage has to agree
-    // about which note is which. It used to be folded into global state one
-    // event at a time before each row; now the events flow along the graph's
-    // own wires and the only thing a row needs is where its sub-block sits.
+    // about which note is which. From here the events flow along the graph's
+    // own wires, and the only thing a row needs is where its sub-block sits.
     engine.begin_block(events);
     true
 }
@@ -730,10 +729,10 @@ fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
 ///
 /// Forwards note-on, note-off, voice termination, and per-note expressions (pressure,
 /// volume, pan, tuning, vibrato, brightness) to the engine.
-/// The host's `voice_id` is passed through as-is, including its absence. It
-/// used to be replaced with the key number when the host supplied none, which
-/// made a note we invented an id for indistinguishable from one the host
-/// actually numbered — and collided the moment the same key overlapped itself.
+/// The host's `voice_id` is passed through as-is, including its absence.
+/// Substituting the key number where the host supplies none would make an
+/// invented id indistinguishable from one the host actually numbered, and
+/// would collide the moment the same key overlapped itself.
 fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
     use plugin_host::NoteExpression as Expr;
 
@@ -909,8 +908,8 @@ mod tests {
     use super::*;
 
     /// CC, bend and channel pressure reaching the graph is the whole point of
-    /// asking the host for `MidiConfig::MidiCCs`; before that they were dropped
-    /// here, so nothing downstream could have observed the difference.
+    /// asking the host for `MidiConfig::MidiCCs`. Dropping them here instead
+    /// would leave nothing downstream able to observe the difference.
     #[test]
     fn controllers_convert_instead_of_being_dropped() {
         let cc = convert_note(&NoteEvent::<()>::MidiCC {
@@ -950,7 +949,7 @@ mod tests {
     }
 
     /// The host's answer about voice identity is passed through, absence
-    /// included. Substituting the key number here used to make an invented id
+    /// included. Substituting the key number here would make an invented id
     /// indistinguishable from a real one.
     #[test]
     fn a_missing_voice_id_stays_missing() {

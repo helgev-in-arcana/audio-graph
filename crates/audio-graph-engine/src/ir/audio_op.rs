@@ -68,11 +68,11 @@ impl Span {
 /// an envelope follower expressible at all: the stage holding it runs after
 /// the stage that made the sound it is measuring.
 ///
-/// Granularity used to be one answer for the whole program, which meant a
-/// delay line anywhere in a patch called every plugin in it once per
-/// sub-block. How often a sub-plugin is called is a cost; how short a delay
-/// the graph can express is not the same question, and should not be paid for
-/// by everything that asked neither.
+/// Granularity is per stage rather than per program. One answer for the whole
+/// program would mean a delay line anywhere in a patch calling every plugin in
+/// it once per sub-block. How often a sub-plugin is called is a cost; how short
+/// a delay the graph can express is not the same question, and should not be
+/// paid for by everything that asked neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stage {
     /// Where this stage's ops sit in `Program::ops`.

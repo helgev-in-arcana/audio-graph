@@ -567,9 +567,10 @@ mod tests {
 
     /// The loop pays for itself and nothing else does.
     ///
-    /// A patch is one canvas: a feedback delay in a corner of it used to put
-    /// every plugin in the program on sub-block granularity, so adding an echo
-    /// to one channel made a synth on another cost sixteen times as much.
+    /// A patch is one canvas: a feedback delay in a corner of it must not put
+    /// every plugin in the program on sub-block granularity, or adding an echo
+    /// to one channel would make a synth on another cost sixteen times as
+    /// much.
     #[test]
     fn a_loop_does_not_drag_the_rest_of_the_patch_down_with_it() {
         let mut graph = Graph::new();
@@ -671,8 +672,8 @@ mod tests {
     /// A node is inside a loop when it lies between the two ends of *one*
     /// line. Asking that question of every line's ends at once, as one set,
     /// answers yes for anything on a path from one loop to another — so a
-    /// chorus between two feedback delays was called sixteen times a block for
-    /// belonging to neither of them.
+    /// chorus between two feedback delays would be called sixteen times a
+    /// block for belonging to neither of them.
     #[test]
     fn a_node_between_two_loops_is_in_neither() {
         let mut graph = Graph::new();

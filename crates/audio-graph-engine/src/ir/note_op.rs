@@ -1,15 +1,15 @@
 //! The note half of a program.
 //!
-//! Notes used to have no runtime existence at all. A plugin carried a
-//! `NoteRoute` — a source name, a gate lane and a key mask — that the compiler
-//! folded out of the whole chain of nodes between the MIDI input and the
-//! plugin, and the adapter turned back into events. Nothing flowed anywhere.
+//! Notes flow along buffers, the way audio does, and the nodes between them
+//! are ops that read one and write another.
 //!
-//! That works only as long as every note node is a filter on one stream from
-//! one source. It cannot express merging two streams, a node that *makes*
-//! notes, or a control change turned into a signal, because there is no place
-//! for the result to be. So notes get buffers, the way audio has buffers, and
-//! the nodes between become ops that read one and write another.
+//! Folding the chain away instead — compiling every node between a MIDI input
+//! and a plugin down to a source name, a gate lane and a key mask that the
+//! adapter turns back into events — costs nothing at runtime, and works only
+//! as long as every note node is a filter on one stream from one source. It
+//! cannot express merging two streams, a node that *makes* notes, or a control
+//! change turned into a signal, because there is no place for the result to
+//! be.
 //!
 //! These run once per sub-block, before the audio ops of the same sub-block,
 //! so a gate's decision is as current as any other parameter's.

@@ -766,8 +766,8 @@ mod tests {
                 data: [0xc0, 5, 0],
                 sample_offset: 15,
             }),
-            // Note-on carrying no id, which is what raw MIDI produces and what
-            // the old `unwrap_or(key)` used to hide.
+            // Note-on carrying no id, which is what raw MIDI produces and
+            // what an `unwrap_or(key)` would silently hide.
             Event::Note(NoteEvent::NoteOn {
                 note_id: None,
                 port: 0,

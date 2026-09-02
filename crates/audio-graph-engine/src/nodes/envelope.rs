@@ -12,12 +12,11 @@ use crate::port::{Port, PortType};
 
 /// How loud what is wired into it is, as a parameter.
 ///
-/// The node the graph was missing. Every other node either carries audio or
-/// carries a value; this one turns the first into the second, which is what a
-/// sidechain, a ducker, a level meter and an auto-gain all need and none of
-/// them could be drawn. The alternative — a compressor plugin with a hidden
-/// sidechain input — is exactly the invisible route the canvas exists to
-/// replace.
+/// Every other node either carries audio or carries a value; this one turns
+/// the first into the second, which is what a sidechain, a ducker, a level
+/// meter and an auto-gain all need to be drawable at all. The alternative — a
+/// compressor plugin with a hidden sidechain input — is exactly the invisible
+/// route the canvas exists to replace.
 ///
 /// The reading is per sub-block, because that is what a parameter is: the
 /// value in force at a boundary. So the attack and release cannot be shorter
