@@ -89,6 +89,28 @@ impl AudioContext<'_> {
 /// stream, not ours: a dense controller lane is what makes the number matter.
 const MAX_BLOCK_EVENTS: usize = 1024;
 
+/// Where one chunk of a block sits inside the buffer pool.
+///
+/// Channels are packed at the DAW's block length, never at the chunk's, so
+/// where a sample lives does not depend on how big the call that wrote it was.
+/// A buffer filled in one go has to be readable a sub-block at a time, and the
+/// other way round, the moment two parts of a program run at different
+/// granularities.
+///
+/// The sub-plugin boundary is the one place that still wants the chunk's own
+/// packing, because that is what every plugin format's buffer layout means.
+/// See [`AudioOp::Plugin`] in `run_chunk`.
+#[derive(Clone, Copy)]
+struct Window {
+    /// Frames in the DAW's block: the distance between one channel and the
+    /// next inside a buffer.
+    block: usize,
+    /// Where this chunk starts inside the block.
+    start: usize,
+    /// Frames this chunk covers.
+    frames: usize,
+}
+
 /// Two disjoint `&mut` into one pool, for an op that copies between buffers.
 ///
 /// The compiler never gives a filter the same buffer for both ends — a filter
@@ -166,6 +188,11 @@ pub struct Engine {
     /// index. Sized by [`prepare`][Engine::prepare], which is the only place in
     /// this type that allocates.
     pool: Vec<f32>,
+    /// One sub-plugin call's channels, packed at the chunk's length rather
+    /// than the block's. Used only when a chunk is shorter than the block it
+    /// sits in; see [`Window`] and the `Plugin` arm of `run_chunk`.
+    chunk_in: Vec<f32>,
+    chunk_out: Vec<f32>,
     /// The note buffer pool: `MAX_NOTE_BUFS` buffers of `NOTE_BUF_CAPACITY`,
     /// allocated at `prepare` and only ever cleared and refilled after that.
     /// A program swap happens on the audio thread, so nothing here may be
@@ -405,6 +432,8 @@ impl Engine {
             note_pool: (0..MAX_NOTE_BUFS)
                 .map(|_| Vec::with_capacity(NOTE_BUF_CAPACITY))
                 .collect(),
+            chunk_in: Vec::new(),
+            chunk_out: Vec::new(),
             note_emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             note_marks: Vec::new(),
             note_rows: 0,
@@ -578,6 +607,10 @@ impl Engine {
         self.pool.clear();
         self.pool
             .resize(MAX_BUFFERS * MAX_BUFFER_CHANNELS * self.stride, 0.0);
+        for scratch in [&mut self.chunk_in, &mut self.chunk_out] {
+            scratch.clear();
+            scratch.resize(MAX_BUFFER_CHANNELS * self.stride, 0.0);
+        }
         for buf in &mut self.note_pool {
             buf.clear();
         }
@@ -904,27 +937,31 @@ impl Engine {
         // contiguous run of rows, so its events are a contiguous slice.
         let first_row = row;
         let end_row = row + frames.div_ceil((ctx.quantum as usize).max(1));
+        let win = Window {
+            block,
+            start,
+            frames,
+        };
 
         for op in &program.audio_ops {
             match op {
-                AudioOp::Silence { out } => self.fill(*out, frames, 0.0),
+                AudioOp::Silence { out } => self.fill(*out, win, 0.0),
                 AudioOp::Input { out, bus } => {
                     let width = program.buffers[*out as usize] as usize;
                     // daw_in holds interleaved planar buses.
                     let bus = *bus as usize;
                     let Some(&have) = self.daw_inputs.get(bus) else {
-                        self.fill(*out, frames, 0.0);
+                        self.fill(*out, win, 0.0);
                         continue;
                     };
-                    // The DAW's buffer is packed at the *block* length; the
-                    // pool is packed at the chunk's. This op is where the two
-                    // meet, and where `start` stops being the engine's problem.
+                    // Both sides are packed at the block's length, so the two
+                    // walk in step and only the bus base differs.
                     let base: usize = self.daw_inputs[..bus]
                         .iter()
                         .map(|&c| c as usize * block)
                         .sum();
                     for ch in 0..width.min(MAX_CHANNELS) {
-                        let to = self.at(*out, ch, frames);
+                        let to = self.at(*out, ch, win);
                         if ch >= have as usize {
                             self.pool[to..to + frames].fill(0.0);
                             continue;
@@ -941,7 +978,7 @@ impl Engine {
                     }
                     let width = program.buffers[*a as usize] as usize;
                     for ch in 0..width.min(MAX_CHANNELS) {
-                        let from = self.at(*a, ch, frames);
+                        let from = self.at(*a, ch, win);
                         let to = ch * block + start;
                         if to + frames <= daw_out.len() {
                             daw_out[to..to + frames]
@@ -956,21 +993,21 @@ impl Engine {
                     for &(from, want) in buses {
                         let have = program.buffers[from as usize];
                         for ch in 0..want {
-                            let to = self.at(*out, at + ch as usize, frames);
+                            let to = self.at(*out, at + ch as usize, win);
                             if have == 1 && want > 1 {
                                 // Mono into a wider bus: the same signal on
                                 // every channel, which is what a host does.
-                                let src = self.at(from, 0, frames);
+                                let src = self.at(from, 0, win);
                                 self.pool.copy_within(src..src + frames, to);
                             } else if want == 1 && have > 1 {
                                 // Wider into mono: averaged, the inverse of the
                                 // branch above, so a round trip keeps its
                                 // level. Taking the left channel alone would
                                 // ignore half the signal.
-                                let first = self.at(from, 0, frames);
+                                let first = self.at(from, 0, win);
                                 self.pool.copy_within(first..first + frames, to);
                                 for other in 1..have {
-                                    let src = self.at(from, other as usize, frames);
+                                    let src = self.at(from, other as usize, win);
                                     for i in 0..frames {
                                         self.pool[to + i] += self.pool[src + i];
                                     }
@@ -980,7 +1017,7 @@ impl Engine {
                                     self.pool[to + i] *= scale;
                                 }
                             } else if ch < have {
-                                let src = self.at(from, ch as usize, frames);
+                                let src = self.at(from, ch as usize, win);
                                 self.pool.copy_within(src..src + frames, to);
                             } else {
                                 self.pool[to..to + frames].fill(0.0);
@@ -998,8 +1035,8 @@ impl Engine {
                     // One bus out of a plugin's output region. No conversion:
                     // both sides are the width the plugin negotiated.
                     for ch in 0..*width as usize {
-                        let src = self.at(*from, *channel as usize + ch, frames);
-                        let dst = self.at(*out, ch, frames);
+                        let src = self.at(*from, *channel as usize + ch, win);
+                        let dst = self.at(*out, ch, win);
                         self.pool.copy_within(src..src + frames, dst);
                     }
                 }
@@ -1037,6 +1074,24 @@ impl Engine {
                     // pool; the region it owns is sized for its active buses.
                     let packed_in = in_width as usize * frames;
                     let packed_out = out_width as usize * frames;
+                    // A plugin is handed its channels packed at the length of
+                    // the call, which is what every format's buffer layout
+                    // means. The pool packs at the block's length instead, so
+                    // that a buffer written whole can be read a sub-block at a
+                    // time. The two agree whenever the chunk *is* the block —
+                    // the common case, handed over where it lies — and a
+                    // shorter chunk is gathered into a scratch and scattered
+                    // back. Only a program with a feedback loop in it pays
+                    // that, and it is already paying for the extra calls.
+                    let short = frames != block;
+                    if short {
+                        for ch in 0..in_width as usize {
+                            let from = ch * block + start;
+                            let to = ch * frames;
+                            self.chunk_in[to..to + frames]
+                                .copy_from_slice(&source[from..from + frames]);
+                        }
+                    }
                     // An unwired notes port hears nothing, which is not the
                     // same as hearing an empty buffer only because this chunk
                     // was quiet.
@@ -1056,11 +1111,19 @@ impl Engine {
                             self.ledger.delivered(*id);
                         }
                     }
+                    let (heard_in, heard_out): (&[f32], &mut [f32]) = if short {
+                        (
+                            &self.chunk_in[..packed_in],
+                            &mut self.chunk_out[..packed_out],
+                        )
+                    } else {
+                        (&source[..packed_in], &mut dest[..packed_out])
+                    };
                     nodes.process(
                         *instance,
                         events,
-                        &source[..packed_in],
-                        &mut dest[..packed_out],
+                        heard_in,
+                        heard_out,
                         AudioChunk {
                             input_channels: in_width,
                             output_channels: out_width,
@@ -1074,10 +1137,18 @@ impl Engine {
                             offset: start as u32,
                         },
                     );
+                    if short {
+                        for ch in 0..out_width as usize {
+                            let from = ch * frames;
+                            let to = ch * block + start;
+                            dest[to..to + frames]
+                                .copy_from_slice(&self.chunk_out[from..from + frames]);
+                        }
+                    }
                 }
                 AudioOp::Mix { out, inputs } => {
                     if inputs.is_empty() {
-                        self.fill(*out, frames, 0.0);
+                        self.fill(*out, win, 0.0);
                         continue;
                     }
                     let width = program.buffers[*out as usize] as usize;
@@ -1088,8 +1159,8 @@ impl Engine {
                             .map(|db| db_to_linear(db) as f32)
                             .unwrap_or(input.gain as f32);
                         for ch in 0..width.min(MAX_CHANNELS) {
-                            let from = self.at(input.buf, ch, frames);
-                            let to = self.at(*out, ch, frames);
+                            let from = self.at(input.buf, ch, win);
+                            let to = self.at(*out, ch, win);
                             if from == to && gain == 1.0 {
                                 // Already in place and unchanged: unity gain on destination buffer.
                                 continue;
@@ -1107,7 +1178,7 @@ impl Engine {
                 }
                 AudioOp::Compensate { buf, slot, samples } => {
                     let width = program.buffers[*buf as usize] as usize;
-                    self.compensate(*buf, *slot as usize, *samples as usize, width, frames);
+                    self.compensate(*buf, *slot as usize, *samples as usize, width, win);
                 }
                 AudioOp::DelayRead {
                     out,
@@ -1123,7 +1194,7 @@ impl Engine {
                         .unwrap_or(*time)
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
-                    self.delay_read(*line as usize, index, *out, width, frames, {
+                    self.delay_read(*line as usize, index, *out, width, win, {
                         // Minimum floor in samples, plus the two samples the
                         // interpolator needs ahead of the read pointer.
                         let floor = frames as f64 + 2.0;
@@ -1135,7 +1206,7 @@ impl Engine {
                 }
                 AudioOp::DelayWrite { line, a } => {
                     let width = program.buffers[*a as usize] as usize;
-                    self.delay_write(*line as usize, *a, width, frames);
+                    self.delay_write(*line as usize, *a, width, win);
                 }
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
@@ -1144,19 +1215,18 @@ impl Engine {
         }
     }
 
-    /// Where one channel of one buffer starts in the pool.
+    /// Where this chunk of one channel of one buffer starts in the pool.
     ///
-    /// Each buffer owns a region sized for the longest block; the channels
-    /// inside it are packed at `frames`, so the region is always big enough and
-    /// the packed part is exactly what a sub-plugin expects to be handed.
-    fn at(&self, buf: Buf, channel: usize, frames: usize) -> usize {
-        buf as usize * MAX_BUFFER_CHANNELS * self.stride + channel * frames
+    /// Each buffer owns a region sized for the longest block, with the channels
+    /// packed at the block's length. See [`Window`].
+    fn at(&self, buf: Buf, channel: usize, win: Window) -> usize {
+        buf as usize * MAX_BUFFER_CHANNELS * self.stride + channel * win.block + win.start
     }
 
-    fn fill(&mut self, buf: Buf, frames: usize, value: f32) {
+    fn fill(&mut self, buf: Buf, win: Window, value: f32) {
         for ch in 0..MAX_CHANNELS {
-            let start = self.at(buf, ch, frames);
-            self.pool[start..start + frames].fill(value);
+            let start = self.at(buf, ch, win);
+            self.pool[start..start + win.frames].fill(value);
         }
     }
 
@@ -1169,12 +1239,13 @@ impl Engine {
         tap: usize,
         buf: Buf,
         width: usize,
-        frames: usize,
+        win: Window,
         distance: f64,
     ) {
+        let frames = win.frames;
         let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
         if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
-            self.fill(buf, frames, 0.0);
+            self.fill(buf, win, 0.0);
             return;
         }
         // NaN on the first chunk after a swap, and on the very first block.
@@ -1185,7 +1256,7 @@ impl Engine {
         let head = self.audio_ring_heads[line];
         for ch in 0..width.min(MAX_CHANNELS) {
             let ring = ch * ring_len;
-            let to = self.at(buf, ch, frames);
+            let to = self.at(buf, ch, win);
             for i in 0..frames {
                 // The sweep lands exactly on `distance` at the last sample.
                 let t = (i + 1) as f64 / frames as f64;
@@ -1212,7 +1283,8 @@ impl Engine {
     /// back for exactly that reason — so the head this advances is the one the
     /// reads saw, and a delay of one chunk reads the chunk before it rather
     /// than itself.
-    fn delay_write(&mut self, line: usize, buf: Buf, width: usize, frames: usize) {
+    fn delay_write(&mut self, line: usize, buf: Buf, width: usize, win: Window) {
+        let frames = win.frames;
         let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
         if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
             return;
@@ -1222,7 +1294,7 @@ impl Engine {
             let ring = ch * ring_len;
             // A channel the source does not have still has to be written, or
             // the line would keep replaying whatever a wider patch left there.
-            let from = self.at(buf, ch, frames);
+            let from = self.at(buf, ch, win);
             for i in 0..frames {
                 let at = (head + i) % ring_len;
                 self.audio_rings[line][ring + at] = if ch < width.min(MAX_CHANNELS) {
@@ -1255,17 +1327,18 @@ impl Engine {
     }
 
     /// Delays a buffer in place by a fixed sample count for latency compensation.
-    fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, frames: usize) {
+    fn compensate(&mut self, buf: Buf, slot: usize, samples: usize, width: usize, win: Window) {
         if slot >= MAX_COMPENSATORS || samples == 0 || samples >= MAX_COMPENSATION {
             return;
         }
+        let frames = win.frames;
         let mut head = self.compensator_heads[slot];
         for ch in 0..width.min(MAX_CHANNELS) {
             // Every channel walks the same distance, so each starts from the
             // same head and only the last one leaves it moved.
             head = self.compensator_heads[slot];
             let ring = slot * MAX_CHANNELS * MAX_COMPENSATION + ch * MAX_COMPENSATION;
-            let signal = self.at(buf, ch, frames);
+            let signal = self.at(buf, ch, win);
             for i in 0..frames {
                 let read = (head + MAX_COMPENSATION - samples) % MAX_COMPENSATION;
                 let delayed = self.compensators[ring + read];
@@ -3970,6 +4043,98 @@ mod tests {
             big.iter().filter(|v| v.abs() > 0.5).count() >= 4,
             "the loop repeated"
         );
+    }
+
+    /// A plugin called for a sub-block is handed that sub-block, with its
+    /// channels where the format says they are.
+    ///
+    /// The pool packs channels at the DAW block's length so that a buffer
+    /// written whole can be read a piece at a time; a plugin wants them packed
+    /// at the length of the call. The two agree only when the chunk is the
+    /// whole block, which is every program without a feedback loop in it — so
+    /// the gather and scatter that bridge them are reached exactly when
+    /// nothing else in the suite looks, and a mistake there would put the
+    /// right samples on the wrong channel.
+    #[test]
+    fn a_plugin_called_for_a_sub_block_is_handed_that_sub_block() {
+        /// Records every input region it is given, channel by channel.
+        #[derive(Default)]
+        struct Records {
+            heard: Vec<Vec<f32>>,
+        }
+        impl AudioInstances for Records {
+            fn process(
+                &mut self,
+                _instance: u32,
+                _notes: &[Event],
+                input: &[f32],
+                output: &mut [f32],
+                chunk: AudioChunk,
+            ) {
+                self.heard.resize(chunk.input_channels as usize, Vec::new());
+                for ch in 0..chunk.input_channels {
+                    self.heard[ch as usize].extend_from_slice(&input[chunk.channel(ch)]);
+                }
+                for ch in 0..chunk.output_channels {
+                    output[chunk.channel(ch)].fill(0.0);
+                }
+            }
+        }
+
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let plugin = audio_plugin(&mut graph, 0, 0);
+        // A loop, so the program runs a sub-block at a time. The plugin sits
+        // ahead of it, so what reaches it is the DAW's own input and nothing
+        // else — anything the loop fed back would hide a packing mistake
+        // behind arithmetic.
+        let (write, read) = audio_delay(&mut graph, 64.0);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, plugin, 0);
+        graph.connect(plugin, 0, mix, 0);
+        graph.connect(read, 0, mix, 2);
+        graph.connect(mix, 0, write, 0);
+        graph.connect(mix, 0, output, 0);
+
+        const BLOCK: usize = 128;
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK as u32, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(
+            engine.chunking(),
+            Chunking::SubBlock,
+            "the loop is what makes the chunks short"
+        );
+
+        // Two channels a mixup could not confuse for one another.
+        let mut daw_in = vec![0.0f32; 2 * BLOCK];
+        for i in 0..BLOCK {
+            daw_in[i] = i as f32;
+            daw_in[BLOCK + i] = -(i as f32);
+        }
+        let mut records = Records::default();
+        engine.run_audio(
+            &audio_ctx(BLOCK as u32),
+            &daw_in,
+            &mut vec![0.0; 2 * BLOCK],
+            &mut records,
+        );
+
+        assert_eq!(records.heard.len(), 2, "a stereo plugin heard two channels");
+        assert_eq!(
+            records.heard[0],
+            daw_in[..BLOCK],
+            "the chunks join back into the block that was played"
+        );
+        assert_eq!(records.heard[1], daw_in[BLOCK..], "and so does the other");
     }
 
     /// Verifies that modulating delay time does not alter sub-plugin processing chunk count.
