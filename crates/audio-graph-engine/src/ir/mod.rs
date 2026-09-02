@@ -27,7 +27,7 @@ pub use note_op::{
     NoteOp,
 };
 
-pub use op::{Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};
+pub use op::{Detect, Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};
 
 /// Unique identifier for a node, persistent across graph recompilations.

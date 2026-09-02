@@ -18,6 +18,7 @@ mod audio_io;
 mod cc_in;
 mod constant;
 mod delay;
+mod envelope;
 mod gate;
 mod key_param;
 mod key_switch;
@@ -39,6 +40,7 @@ pub use audio_io::{AudioIn, AudioOut};
 pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
+pub use envelope::EnvelopeFollower;
 pub use gate::Gate;
 pub use key_param::{KeyParam, KeyParamMode};
 pub use key_switch::{KeySwitch, KeySwitchMode};
@@ -307,6 +309,7 @@ pub enum NodeKind {
     SlotIn(SlotIn),
     Lfo(Lfo),
     NoteFollow(NoteFollow),
+    EnvelopeFollower(EnvelopeFollower),
     Math(Math),
     RangeMap(RangeMap),
     Switch(Switch),
@@ -346,6 +349,7 @@ macro_rules! for_kind {
             NodeKind::SlotIn($node) => $body,
             NodeKind::Lfo($node) => $body,
             NodeKind::NoteFollow($node) => $body,
+            NodeKind::EnvelopeFollower($node) => $body,
             NodeKind::Math($node) => $body,
             NodeKind::RangeMap($node) => $body,
             NodeKind::Switch($node) => $body,
@@ -670,6 +674,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         NoteFollow::catalogue_defaults(),
         NodeKind::NoteFollow,
+    );
+    take(
+        &mut out,
+        NodeGroup::Param,
+        EnvelopeFollower::catalogue_defaults(),
+        NodeKind::EnvelopeFollower,
     );
 
     // Parameter.

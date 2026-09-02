@@ -672,6 +672,7 @@ fn run_stages(
                 frames: schedule.frames_of(index),
                 offset: schedule.offset(index),
                 row: index as u32,
+                block: frames,
             };
             engine.run_stage(stage, &context, schedule.block_mut(index));
         }
@@ -1003,6 +1004,7 @@ mod tests {
                     frames: schedule.frames_of(index),
                     offset: schedule.offset(index),
                     row: index as u32,
+                    block: 128,
                 };
                 engine.run_stage(stage, &context, schedule.block_mut(index));
             }

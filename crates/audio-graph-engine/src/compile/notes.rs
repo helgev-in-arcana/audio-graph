@@ -15,7 +15,7 @@
 //! parameter pass needs buffers — down to one deferred field rather than a
 //! second traversal.
 
-use crate::compile::stages::{Place, RUN_ORDER};
+use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp, Span,
@@ -54,7 +54,7 @@ pub(crate) struct Notes {
     pub bufs: u16,
     /// Which stage each op belongs to, and the spans that fall out of it once
     /// `resolve_lanes` has dropped the ops whose lane never materialised.
-    places: Vec<Place>,
+    stages: Vec<usize>,
     pub spans: Vec<Span>,
     /// Output socket → the note buffer leaving it.
     ///
@@ -85,12 +85,12 @@ impl Notes {
 pub(crate) fn compile_notes(
     graph: &Graph,
     order: &[NodeId],
-    places: &[Place],
+    plan: &Plan,
 ) -> Result<Notes, CompileError> {
     let mut notes = Notes {
         ops: Vec::new(),
         bufs: 0,
-        places: Vec::new(),
+        stages: Vec::new(),
         spans: Vec::new(),
         outputs: Vec::new(),
         pending: Vec::new(),
@@ -101,16 +101,14 @@ pub(crate) fn compile_notes(
     // contiguous for the engine to slice rather than filter, and walking the
     // order this way gets that without a sort. It stays a topological order
     // because no edge points from a later stage to an earlier one.
-    for place in RUN_ORDER {
+    for stage in 0..plan.stages.len() {
         for (index, &id) in order.iter().enumerate() {
-            if places[index] != place {
+            if plan.of[index] != stage {
                 continue;
             }
             let node = graph.node(id).expect("ordering only contains real nodes");
-            let before = notes.ops.len();
             route(graph, order, &mut notes, id, &node.kind)?;
-            notes.places.resize(notes.ops.len(), place);
-            debug_assert!(notes.ops.len() >= before);
+            notes.stages.resize(notes.ops.len(), stage);
         }
     }
     Ok(notes)
@@ -122,7 +120,7 @@ pub(crate) fn compile_notes(
 /// hole: for a generator that means the node had no value wired and there is
 /// nothing to send, and for a gate it would mean a program the engine should
 /// not have been handed.
-pub(crate) fn resolve_lanes(notes: &mut Notes, lanes: &[((NodeId, u8), u16)]) {
+pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId, u8), u16)]) {
     let mut drop = Vec::new();
     for pending in &notes.pending {
         let socket = match pending.wants {
@@ -147,28 +145,27 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, lanes: &[((NodeId, u8), u16)]) {
     drop.dedup();
     for op in drop.into_iter().rev() {
         notes.ops.remove(op);
-        notes.places.remove(op);
+        notes.stages.remove(op);
     }
 
     // The spans are worked out here rather than while emitting, because the
-    // removal above moves everything after a dropped op.
-    notes.spans = RUN_ORDER
-        .iter()
-        .map(|place| {
-            let start = notes.places.iter().position(|at| at == place);
-            match start {
-                Some(start) => Span {
-                    start: start as u32,
-                    end: (start
-                        + notes.places[start..]
-                            .iter()
-                            .filter(|at| *at == place)
-                            .count()) as u32,
-                },
-                None => Span::default(),
-            }
-        })
-        .collect();
+    // removal above moves everything after a dropped op. A stage nothing
+    // landed in gets an empty span where it would have started, so the spans
+    // stay one per stage however many of those there are.
+    let mut spans = Vec::with_capacity(stages);
+    let mut at = 0usize;
+    for stage in 0..stages {
+        let len = notes.stages[at..]
+            .iter()
+            .take_while(|&&which| which == stage)
+            .count();
+        spans.push(Span {
+            start: at as u32,
+            end: (at + len) as u32,
+        });
+        at += len;
+    }
+    notes.spans = spans;
 }
 
 /// One node's share of the note half.

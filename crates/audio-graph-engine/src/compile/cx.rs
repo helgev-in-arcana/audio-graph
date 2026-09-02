@@ -55,6 +55,9 @@ pub(crate) struct ParamCx<'a> {
     /// [`Stage`].
     spans: Vec<Span>,
     span_start: u32,
+    /// Ops waiting to be told which audio buffer they read, and the socket
+    /// that will say. See [`ParamCx::emit_follow`].
+    follows: Vec<(usize, (NodeId, u8))>,
     outputs: Vec<(u16, Reg)>,
     lfo_nodes: Vec<NodeId>,
     latch_nodes: Vec<NodeId>,
@@ -72,6 +75,9 @@ pub(crate) struct ParamHalf {
     pub ops: Vec<Op>,
     /// One per stage, in the order they run.
     pub spans: Vec<Span>,
+    /// Op index → the socket whose buffer it reads. See
+    /// [`ParamCx::emit_follow`].
+    pub follows: Vec<(usize, (NodeId, u8))>,
     pub registers: usize,
     pub outputs: Vec<(u16, Reg)>,
     pub lfo_nodes: Vec<NodeId>,
@@ -98,6 +104,7 @@ impl<'a> ParamCx<'a> {
             deferred: Vec::new(),
             spans: Vec::new(),
             span_start: 0,
+            follows: Vec::new(),
             outputs: Vec::new(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
@@ -131,6 +138,7 @@ impl<'a> ParamCx<'a> {
         self.outputs.sort_unstable();
         ParamHalf {
             spans: self.spans,
+            follows: self.follows,
             ops: self.ops,
             registers: self.next_reg,
             outputs: self.outputs,
@@ -197,6 +205,22 @@ impl<'a> ParamCx<'a> {
         let reg = self.next_reg as Reg;
         self.next_reg += 1;
         Ok(reg)
+    }
+
+    /// Emits an op that reads an audio buffer, with the buffer left blank.
+    ///
+    /// The audio half hands buffers out and runs after this one, so a
+    /// parameter op that reads audio cannot know its buffer yet. It books the
+    /// socket instead and `resolve_follows` fills the hole — the mirror of
+    /// what the note half does with the lanes this pass books for *it*.
+    pub(crate) fn emit_follow(&mut self, op: Op, socket: (NodeId, u8)) {
+        self.follows.push((self.ops.len(), socket));
+        self.ops.push(op);
+    }
+
+    /// The socket wired into this node's audio input `port`, if anything is.
+    pub(crate) fn audio_source_of(&self, port: u8) -> Option<(NodeId, u8)> {
+        self.graph.source_of(self.id, port)
     }
 
     pub(crate) fn emit(&mut self, op: Op) {
@@ -595,8 +619,14 @@ impl<'a> AudioCx<'a> {
         }
 
         self.instances.sort_unstable_by_key(|i| i.instance);
+        let sockets = self
+            .produced
+            .iter()
+            .map(|out| ((out.node, out.port), out.buf))
+            .collect();
         Audio {
             instances: self.instances,
+            sockets,
             ops: self.ops,
             spans: self.spans,
             delay_nodes: self.delay_nodes,

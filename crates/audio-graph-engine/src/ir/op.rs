@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 /// An index into the register file.
 pub type Reg = u16;
 
+/// What "how loud" means to an [`Op::Follow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Detect {
+    /// The largest sample in the window. What catches a transient, and what a
+    /// peak meter or a limiter's sidechain reads.
+    #[default]
+    Peak,
+    /// The root mean square of the window. Closer to how loud something
+    /// sounds, and steadier, which is what a compressor usually wants.
+    Rms,
+}
+
 /// A math operand: either another node's output register or an immediate constant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operand {
@@ -127,6 +139,30 @@ pub enum Op {
         cc: u8,
         /// What the controller reads as before it has ever been moved.
         initial: f64,
+    },
+    /// How loud audio buffer `buf` is over this sub-block.
+    ///
+    /// The one op that reads the audio pool, and the reason a program is cut
+    /// into stages at all: how loud a signal is cannot be known before the
+    /// signal is, so this runs in a stage after the one that made it. Every
+    /// audio op of that stage has covered the whole block by then, so the
+    /// window read here is this sub-block's own — no lookahead and nothing
+    /// held back, which a sidechain wants and a limiter would want more of.
+    ///
+    /// The floor on the attack and release times is one sub-block: the value
+    /// only moves at a boundary, because that is what a parameter is.
+    ///
+    /// `state` is a latch, so the envelope carries on across blocks and
+    /// survives the recompile that happens on every drag of every control.
+    Follow {
+        out: Reg,
+        buf: u16,
+        state: u16,
+        detect: Detect,
+        /// Seconds to rise, and to fall. Zero for either means follow it
+        /// exactly, which is what a meter wants and a compressor does not.
+        attack: f64,
+        release: f64,
     },
     /// Follow the notes on buffer `buf`: how hard, whether any are down, or
     /// which key.

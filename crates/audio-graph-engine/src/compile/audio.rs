@@ -7,7 +7,7 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::compile::stages::RUN_ORDER;
+use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{AudioOp, Span};
 use subhost_adapter::InstanceIo;
@@ -25,6 +25,9 @@ pub(crate) struct Audio {
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
+    /// Output socket → the buffer leaving it, for the parameter ops that read
+    /// audio. See `ParamCx::emit_follow`.
+    pub sockets: Vec<((NodeId, u8), crate::ir::Buf)>,
     /// One per stage, in the order they run.
     pub spans: Vec<Span>,
     pub latency: u32,
@@ -40,7 +43,7 @@ pub(crate) struct Audio {
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
-    places: &[crate::compile::stages::Place],
+    plan: &Plan,
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
     notes: &Notes,
@@ -50,9 +53,9 @@ pub(crate) fn compile_audio(
     // are emitted in has to be the order they will run in. See
     // [`AudioCx::close_stage`].
     let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
-    for place in RUN_ORDER {
+    for stage in 0..plan.stages.len() {
         for (index, &id) in order.iter().enumerate() {
-            if places[index] != place {
+            if plan.of[index] != stage {
                 continue;
             }
             let node = graph.node(id).expect("ordering only contains real nodes");

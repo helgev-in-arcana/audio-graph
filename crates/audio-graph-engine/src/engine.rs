@@ -22,10 +22,10 @@ use plugin_host::{Event, NoteEvent};
 
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioOp, Buf, Chunking, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
-    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
-    MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, Op,
-    Operand, Program, RateSpec, Stage, Waveform,
+    AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
+    MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
+    MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
+    NoteOp, Op, Operand, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -54,6 +54,10 @@ pub struct BlockContext {
     pub frames: u32,
     /// Where this sub-block starts inside the DAW's block.
     pub offset: u32,
+    /// Frames in the whole DAW block, which is how the audio buffers are
+    /// packed. Only [`Op::Follow`] needs it — it is the one parameter op that
+    /// reads one. See [`Window`].
+    pub block: u32,
     /// Which sub-block this is, counting from the start of the DAW's block.
     ///
     /// The same number as the lane grid's row. Carried rather than divided out
@@ -1553,6 +1557,43 @@ impl Engine {
                 Op::KeyHeld { out, buf, key } => {
                     self.registers[out as usize] = f64::from(self.held(buf, key));
                 }
+                Op::Follow {
+                    out,
+                    buf,
+                    state,
+                    detect,
+                    attack,
+                    release,
+                } => {
+                    let win = Window {
+                        block: ctx.block as usize,
+                        start: ctx.offset as usize,
+                        frames: ctx.frames as usize,
+                    };
+                    let width = program
+                        .buffers
+                        .get(buf as usize)
+                        .map_or(0, |&w| (w as usize).min(MAX_CHANNELS));
+                    let level = self.loudness(buf, width, win, detect);
+                    // One pole per sub-block, which is as often as a parameter
+                    // is allowed to move. `dt` is this sub-block's length, so
+                    // the times mean the same thing at any quantum and any
+                    // block size. A time of zero is a coefficient of zero,
+                    // which is following exactly.
+                    let held = self.latches.get(state as usize).copied().unwrap_or(0.0);
+                    let held = if held.is_finite() { held } else { 0.0 };
+                    let time = if level > held { attack } else { release };
+                    let value = if time > 0.0 && dt > 0.0 {
+                        let coeff = (-dt / time).exp();
+                        held + (level - held) * (1.0 - coeff)
+                    } else {
+                        level
+                    };
+                    if let Some(latch) = self.latches.get_mut(state as usize) {
+                        *latch = value;
+                    }
+                    self.registers[out as usize] = value;
+                }
                 Op::NoteFollow {
                     out,
                     buf,
@@ -1745,6 +1786,34 @@ impl Engine {
         self.program = Some(program);
     }
 
+    /// How loud one window of an audio buffer is, across its channels.
+    ///
+    /// Linear amplitude, not decibels: a parameter lane is a plain number and
+    /// the graph has arithmetic nodes for anyone who wants the log of it.
+    fn loudness(&self, buf: Buf, width: usize, win: Window, detect: Detect) -> f64 {
+        if width == 0 || win.frames == 0 {
+            return 0.0;
+        }
+        let mut peak = 0.0f32;
+        let mut sum = 0.0f64;
+        for ch in 0..width {
+            let at = self.at(buf, ch, win);
+            for &sample in &self.pool[at..at + win.frames] {
+                match detect {
+                    Detect::Peak => peak = peak.max(sample.abs()),
+                    Detect::Rms => sum += f64::from(sample) * f64::from(sample),
+                }
+            }
+        }
+        match detect {
+            Detect::Peak => f64::from(peak),
+            // Across every channel at once rather than per channel and
+            // averaged: what is wanted is how loud the signal is, and a stereo
+            // pair carrying the same thing twice is not twice as loud.
+            Detect::Rms => (sum / (width * win.frames) as f64).sqrt(),
+        }
+    }
+
     /// Whether `key` is down on `buf`. Out of range is never down.
     fn held(&self, buf: u16, key: u8) -> bool {
         let table = self.keys_held.get(buf as usize).copied().unwrap_or(0);
@@ -1818,9 +1887,10 @@ mod tests {
     use crate::graph::{Graph, NodeId};
     use crate::ir::MathOp;
     use crate::nodes::{
-        AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, Gate, KeyParam, KeyParamMode,
-        KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate,
-        NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn, Switch, linear_to_db,
+        AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, Gate, KeyParam,
+        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteFollow,
+        NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn, Switch,
+        linear_to_db,
     };
     use crate::port::PortType;
 
@@ -1858,6 +1928,7 @@ mod tests {
             frames,
             offset: 0,
             row: 0,
+            block: frames,
         }
     }
 
@@ -2090,6 +2161,7 @@ mod tests {
                 frames: 6000,
                 offset: 0,
                 row: 0,
+                block: 6000,
             },
             &mut slots,
         );
@@ -2100,6 +2172,7 @@ mod tests {
                 frames: 1,
                 offset: 0,
                 row: 0,
+                block: 1,
             },
             &mut slots,
         );
@@ -2682,6 +2755,7 @@ mod tests {
                     frames: 16,
                     offset: index as u32 * 16,
                     row: index as u32,
+                    block: 64,
                 },
                 row,
             );
@@ -2925,6 +2999,7 @@ mod tests {
                     frames: 4,
                     offset: sub as u32 * 4,
                     row: sub as u32,
+                    block: 8,
                 },
                 &mut row[sub * width..(sub + 1) * width],
             );
@@ -3049,6 +3124,7 @@ mod tests {
                     frames: 8,
                     offset: index * 8,
                     row: index,
+                    block: 16,
                 },
                 row,
             );
@@ -3111,6 +3187,7 @@ mod tests {
                         frames: 8,
                         offset: index * 8,
                         row: index,
+                        block: 16,
                     },
                     &mut row,
                 );
@@ -3158,6 +3235,7 @@ mod tests {
                     frames: 8,
                     offset: 0,
                     row: 0,
+                    block: 8,
                 },
                 row,
             );
@@ -3521,6 +3599,7 @@ mod tests {
                         frames,
                         offset,
                         row: row as u32,
+                        block: frames * 2,
                     },
                     slots,
                 );
@@ -3965,6 +4044,113 @@ mod tests {
         engine.run(&ctx(32), &mut slots);
         assert!(slots.iter().all(|&v| v == 0.3));
         assert!(!engine.has_program());
+    }
+
+    /// A parameter read off audio, which the graph could not express at all
+    /// until a program was cut into stages.
+    ///
+    /// And read without latency: the follower's stage runs after the stage
+    /// that made the sound, and that stage covered the whole block, so the
+    /// window read for a sub-block is that sub-block's own. The first row
+    /// already carries the level of the first row's audio.
+    #[test]
+    fn a_parameter_is_read_off_audio_in_the_sub_block_it_belongs_to() {
+        const BLOCK: u32 = 64;
+        const QUANTUM: u32 = 32;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+        let level = |detect: Detect, attack: f64, quiet_first: bool| -> [f64; 2] {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let follower = graph.add(
+                NodeKind::EnvelopeFollower(EnvelopeFollower {
+                    detect,
+                    attack,
+                    release: 0.0,
+                }),
+                [0.0, 0.0],
+            );
+            let sink = param_sink(&mut graph);
+            graph.connect(input, 0, follower, 0);
+            graph.connect(follower, 0, sink, 0);
+
+            let mut engine = Engine::new();
+            engine.prepare(BLOCK, &[2]);
+            load(&mut engine, &graph);
+
+            // Half scale, on the second sub-block only when asked: that is
+            // what tells a reading of *this* row from a reading of the last.
+            let mut daw_in = vec![0.5f32; 2 * BLOCK as usize];
+            if quiet_first {
+                for ch in 0..2usize {
+                    let at = ch * BLOCK as usize;
+                    daw_in[at..at + QUANTUM as usize].fill(0.0);
+                }
+            }
+            let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+            let mut lanes = vec![0.0; width * 2];
+
+            engine.begin_block(&[]);
+            for stage in 0..engine.stages() {
+                for row in 0..2usize {
+                    let context = BlockContext {
+                        sample_rate: RATE,
+                        tempo_bpm: 120.0,
+                        frames: QUANTUM,
+                        offset: row as u32 * QUANTUM,
+                        row: row as u32,
+                        block: BLOCK,
+                    };
+                    engine.run_stage(stage, &context, &mut lanes[row * width..(row + 1) * width]);
+                }
+                engine.run_audio_stage(
+                    stage,
+                    &AudioContext {
+                        frames: BLOCK,
+                        quantum: QUANTUM,
+                        sample_rate: RATE,
+                        lanes: &lanes,
+                        lanes_per_row: width,
+                    },
+                    &daw_in,
+                    &mut daw_out,
+                    &mut Adders,
+                );
+            }
+            [lanes[SINK], lanes[width + SINK]]
+        };
+
+        let steady = level(Detect::Peak, 0.0, false);
+        assert!(
+            (steady[0] - 0.5).abs() < 1e-6 && (steady[1] - 0.5).abs() < 1e-6,
+            "the peak of a half-scale signal is a half: {steady:?}"
+        );
+
+        // The one that would fail if the reading were a sub-block behind.
+        let late = level(Detect::Peak, 0.0, true);
+        assert!(
+            late[0] < 1e-6,
+            "the first sub-block was silent, so its level is nothing: {late:?}"
+        );
+        assert!(
+            (late[1] - 0.5).abs() < 1e-6,
+            "and the second is read in the sub-block it belongs to: {late:?}"
+        );
+
+        // RMS of a constant is that constant; what separates them is a
+        // transient, which the peak catches and the mean does not.
+        let mean = level(Detect::Rms, 0.0, true);
+        assert!(
+            (mean[1] - 0.5).abs() < 1e-6,
+            "the RMS of a steady half is a half: {mean:?}"
+        );
+
+        // An attack time holds the rise back, and never past the level.
+        let slow = level(Detect::Peak, 0.050, false);
+        assert!(
+            slow[0] > 0.0 && slow[0] < 0.5 && slow[1] > slow[0] && slow[1] < 0.5,
+            "an attack of 50 ms climbs towards the level over sub-blocks: {slow:?}"
+        );
     }
 
     fn stereo_in(graph: &mut Graph) -> NodeId {

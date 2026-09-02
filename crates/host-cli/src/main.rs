@@ -16,7 +16,9 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Mix, NodeKind, SlotIn};
+use audio_graph_engine::{
+    AudioIn, AudioOut, DelayRead, EnvelopeFollower, Mix, NodeKind, RangeMap, SlotIn,
+};
 use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
 use subhost_adapter::SubHostConfig;
@@ -70,6 +72,7 @@ fn main() -> ExitCode {
         "sidechain" => cmd_sidechain(rest),
         "aux" => cmd_aux(rest),
         "delay" => cmd_delay(rest),
+        "follow" => cmd_follow(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
         "automate" => cmd_automate(rest),
@@ -152,6 +155,9 @@ fn usage() {
   host-cli delay <WRAPPER.vst3>     check a feedback delay in the graph sounds the
                                     same at any block size, and that the mix's
                                     gains fade the repeats
+  host-cli follow <WRAPPER.vst3>    check a parameter can be read off audio: a
+                                    ducker made of graph nodes pulls a loud
+                                    passage down towards a quiet one
   host-cli editor <WRAPPER.vst3> <PLUGIN> [SECONDS]
                                     open the wrapper's editor with a plugin
                                     node already in the patch. Without SECONDS
@@ -2685,6 +2691,147 @@ fn cmd_delay(args: &[String]) -> Result<(), String> {
     }
     println!("  ok");
     Ok(())
+}
+
+/// Check that a parameter can be read off audio, inside the wrapper.
+///
+/// The graph is a ducker with nothing in it but graph nodes: the input's own
+/// level, mapped to a gain, turned back on the input. Nothing about it was
+/// expressible before a program was cut into stages — a parameter op cannot
+/// read a buffer the audio half has not filled yet — so this is the end of
+/// that path, run through the real wrapper rather than the engine alone.
+///
+/// A quiet half and a loud half go in. Both come out at about the same level,
+/// which is the whole claim: the gain moved because the signal did.
+fn cmd_follow(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    const BLOCK: u32 = 512;
+    let sample_rate = 48_000.0f64;
+    let half = (sample_rate * 0.5) as usize;
+
+    // Quiet, then twenty times louder. A ducker worth the name closes most of
+    // that difference; a graph that ignored the follower would keep all of it.
+    const QUIET: f32 = 0.03;
+    const LOUD: f32 = 0.6;
+    let mut input = wav::Audio::silence(sample_rate, 2, half * 2);
+    for ch in 0..2usize {
+        let at = ch * half * 2;
+        for i in 0..half {
+            input.samples[at + i] = if i % 2 == 0 { QUIET } else { -QUIET };
+            input.samples[at + half + i] = if i % 2 == 0 { LOUD } else { -LOUD };
+        }
+    }
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let patched = inject_follow(&read_wrapper_state(&baseline)?)?;
+    let state = edit_wrapper_state(&baseline, &patched)?;
+
+    let out =
+        render::render_with_state(Path::new(wrapper), None, Some(&state), &input, BLOCK, &[])?
+            .audio;
+
+    // Measured away from the boundaries, so the envelope has settled.
+    let peak = |from: usize, to: usize| -> f32 {
+        out.samples[from..to]
+            .iter()
+            .fold(0.0f32, |most, v| most.max(v.abs()))
+    };
+    let quiet = peak(half / 2, half - 1);
+    let loud = peak(half + half / 2, half * 2 - 1);
+    println!(
+        "  in:  quiet {QUIET:.3}, loud {LOUD:.3}  ({:.1}x)",
+        LOUD / QUIET
+    );
+    println!(
+        "  out: quiet {quiet:.4}, loud {loud:.4}  ({:.1}x)",
+        loud / quiet.max(1e-9)
+    );
+
+    if quiet < 1e-4 {
+        return Err("the quiet half came out silent; nothing reached the output".into());
+    }
+    let squeezed = (LOUD / QUIET) / (loud / quiet.max(1e-9));
+    if squeezed < 4.0 {
+        return Err(format!(
+            "the loud half was not pulled down: the gap shrank by {squeezed:.1}x, \
+             which is not a level the graph is reading"
+        ));
+    }
+    println!("  the gap shrank {squeezed:.1}x: the gain is following the signal");
+    Ok(())
+}
+
+/// A ducker made of graph nodes, with no sub-plugin anywhere in it.
+///
+/// ```text
+///   AudioIn ─┬─────────────────> Mix in 1 ──> AudioOut
+///            └─> Envelope ─> Map ─> Mix gain 1
+/// ```
+fn inject_follow(state: &str) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(state).map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+    value["sub_plugins"] = serde_json::json!([]);
+    value["sub_plugin"] = serde_json::Value::Null;
+    value["sub_state"] = serde_json::Value::Null;
+
+    let mut graph = audio_graph_engine::Graph::new();
+    let input = graph.add(
+        audio_graph_engine::NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [40.0, 40.0],
+    );
+    let follower = graph.add(
+        audio_graph_engine::NodeKind::EnvelopeFollower(EnvelopeFollower {
+            detect: audio_graph_engine::Detect::Peak,
+            attack: 0.002,
+            release: 0.050,
+        }),
+        [240.0, 200.0],
+    );
+    // Level to gain, upside down: the louder it is, the more comes off. Two
+    // hundredths of full scale is left alone, full scale loses 26 dB.
+    let map = graph.add(
+        audio_graph_engine::NodeKind::RangeMap(RangeMap {
+            in_lo: 0.02,
+            in_hi: 1.0,
+            out_lo: 0.0,
+            out_hi: -26.0,
+            clamp: true,
+        }),
+        [440.0, 200.0],
+    );
+    let mix = graph.add(
+        audio_graph_engine::NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 1,
+            gains: vec![0.0],
+        }),
+        [640.0, 40.0],
+    );
+    let output = graph.add(
+        audio_graph_engine::NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [840.0, 40.0],
+    );
+    graph.connect(input, 0, follower, 0);
+    graph.connect(follower, 0, map, 0);
+    graph.connect(input, 0, mix, 0);
+    graph.connect(map, 0, mix, 1);
+    graph.connect(mix, 0, output, 0);
+
+    value["graph"] = serde_json::to_value(&graph).map_err(|e| e.to_string())?;
+    Ok(value.to_string())
 }
 
 /// Injects a feedback delay patch into the wrapper's saved state.
