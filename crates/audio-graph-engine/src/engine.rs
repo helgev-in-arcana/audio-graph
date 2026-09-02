@@ -168,6 +168,285 @@ fn passes(event: &Event, keys: u128, channels: u16, controllers: u128) -> bool {
     true
 }
 
+/// One note buffer: the events it holds, and what they amount to.
+///
+/// Kept together rather than as one array per reading. Every reader — a key
+/// switch, a gate, a velocity follow, a controller latch — asks about one
+/// buffer at a time, so what it wants is one of these rather than the same
+/// index into five different tables.
+///
+/// The tables are per buffer rather than per engine because a stream is
+/// something the graph routes: there used to be one for the whole program, fed
+/// straight from the DAW, which meant a key switch fired on keys a filter
+/// upstream of it had already taken out.
+#[derive(Debug)]
+struct NoteBuf {
+    /// One whole DAW block of events, appended a sub-block at a time as the
+    /// parameter half walks the rows, plus the last sub-block of the block
+    /// before it. See [`NoteState`] and [`Engine::note_marks`].
+    events: Vec<Event>,
+    /// Which keys are down, one bit each.
+    held: u128,
+    /// Which keys were struck in the sub-block this buffer last carried, so an
+    /// op sees each note-on exactly once.
+    struck: u128,
+    /// How many notes are down.
+    count: u32,
+    /// Velocity of the most recent note-on, and the key it was on, normalized.
+    /// Both held between notes.
+    velocity: f64,
+    key: f64,
+}
+
+impl NoteBuf {
+    fn new() -> NoteBuf {
+        NoteBuf {
+            events: Vec::with_capacity(NOTE_BUF_CAPACITY),
+            held: 0,
+            struck: 0,
+            count: 0,
+            velocity: 0.0,
+            // The absence of a note is not the bottom of the keyboard, for the
+            // same reason a pan sits in the middle.
+            key: 0.5,
+        }
+    }
+
+    /// Forget what is being played, without touching what is in the buffer.
+    fn silence(&mut self) {
+        self.held = 0;
+        self.struck = 0;
+        self.count = 0;
+        self.velocity = 0.0;
+        self.key = 0.5;
+    }
+}
+
+/// What the note half fills in as it runs.
+///
+/// Held apart from the stream it reads ([`Engine::translated`]) rather than
+/// beside it, and that is the whole point of the split: the note pass wants
+/// the stream by shared reference and this by exclusive one, and a method
+/// taking `&mut self` on an engine that owned both could be given neither
+/// without a dance.
+///
+/// The note ops used to run twice for every sub-block — once at the end of the
+/// parameter half so a reader in the next sub-block had a stream, once in the
+/// audio half for the plugins — into buffers cleared before each replay. That
+/// copied every event twice per note op, and forced the generating ops to keep
+/// a private "did it move" state per replay or the first would eat the edge
+/// the second had to send. Running it once leaves the two readers differing
+/// only in where they look: a parameter op reads everything the buffer holds,
+/// which is the stream up to the boundary it just crossed — the value in force
+/// at that instant, which is what a parameter signal's sub-block resolution
+/// means. The audio half reads the rows of its own chunk, found through
+/// [`Engine::note_marks`].
+#[derive(Debug)]
+struct NoteState {
+    /// One per note buffer, allocated in [`Engine::new`] and only ever cleared
+    /// and refilled after that. A program swap happens on the audio thread, so
+    /// nothing here may be sized from the program.
+    bufs: Vec<NoteBuf>,
+    /// Last value each controller-generating op sent, or NaN before its first.
+    /// Forgotten on a program swap; see [`NoteOp::Emit`].
+    emitted: Vec<f64>,
+    /// Events dropped because a buffer was full, since the last reset.
+    ///
+    /// Counted rather than silently swallowed: an overflow is a real fault and
+    /// the number is the only way anyone would find out.
+    dropped: u64,
+}
+
+impl NoteState {
+    fn new() -> NoteState {
+        NoteState {
+            bufs: (0..MAX_NOTE_BUFS).map(|_| NoteBuf::new()).collect(),
+            emitted: vec![f64::NAN; MAX_NOTE_EMITS],
+            dropped: 0,
+        }
+    }
+
+    /// Appends unless the buffer is full. Dropping an event is bad; growing a
+    /// `Vec` on the audio thread is worse.
+    fn push(buf: &mut Vec<Event>, dropped: &mut u64, event: Event) {
+        if buf.len() < buf.capacity() {
+            buf.push(event);
+        } else {
+            *dropped += 1;
+        }
+    }
+
+    /// One sub-block's worth of the note half, appended to what the buffers
+    /// already hold. `base` is where each of them stood beforehand.
+    ///
+    /// On [`NoteState`] rather than on the engine, so the stream it reads can
+    /// be handed in by shared reference from the same call. An engine method
+    /// would borrow the whole engine, `translated` included, and the stream
+    /// would have to be moved out and put back around every call.
+    #[allow(clippy::too_many_arguments)]
+    fn run_notes_step(
+        &mut self,
+        program: &Program,
+        stage: Stage,
+        events: &[Event],
+        start: u32,
+        frames: u32,
+        lanes: &[f64],
+        base: &[usize; MAX_NOTE_BUFS],
+    ) {
+        for op in &program.note_ops[stage.notes.range()] {
+            match *op {
+                NoteOp::Input { out, bus } => {
+                    // One note bus so far. A second would be a second DAW note
+                    // input, which the wrapper does not offer yet.
+                    if bus != 0 {
+                        continue;
+                    }
+                    // The stream is sorted, so the chunk is a range rather
+                    // than a filter — and on the common block where every
+                    // event falls in the first chunk, no per-event work at
+                    // all.
+                    let from = events.partition_point(|e| e.sample_offset() < start);
+                    let to = events.partition_point(|e| e.sample_offset() < start + frames);
+                    for &event in &events[from..to.max(from)] {
+                        NoteState::push(
+                            &mut self.bufs[out as usize].events,
+                            &mut self.dropped,
+                            event,
+                        );
+                    }
+                    self.follow_notes(out, base[out as usize]);
+                }
+                NoteOp::Emit {
+                    a,
+                    out,
+                    lane,
+                    state,
+                    channel,
+                    cc,
+                } => {
+                    let value = lanes.get(lane as usize).copied().unwrap_or(0.0);
+                    let value = value.clamp(0.0, 1.0);
+                    let last = &mut self.emitted[state as usize];
+                    // NaN on the left of a comparison is never equal, which is
+                    // what makes the first sub-block after a swap send.
+                    let moved = *last != value;
+                    *last = value;
+
+                    let event = Event::Note(NoteEvent::Cc {
+                        port: 0,
+                        channel: i16::from(channel),
+                        cc,
+                        value,
+                        // The lane's value became true at the start of this
+                        // sub-block, and writing it before the stream keeps
+                        // the buffer sorted.
+                        sample_offset: start,
+                    });
+                    match a {
+                        Some(a) => {
+                            let from = base[a as usize];
+                            let (source, dest) =
+                                index_two(&mut self.bufs, a as usize, out as usize);
+                            let (source, dest) = (&source.events, &mut dest.events);
+                            if moved {
+                                NoteState::push(dest, &mut self.dropped, event);
+                            }
+                            for &passed in &source[from.min(source.len())..] {
+                                NoteState::push(dest, &mut self.dropped, passed);
+                            }
+                        }
+                        None => {
+                            let dropped = &mut self.dropped;
+                            if moved {
+                                NoteState::push(
+                                    &mut self.bufs[out as usize].events,
+                                    dropped,
+                                    event,
+                                );
+                            }
+                        }
+                    }
+                }
+                NoteOp::Filter {
+                    a,
+                    out,
+                    gate,
+                    mute,
+                    channels,
+                    controllers,
+                } => {
+                    // Below 0.5 the gate is shut. A gate whose lane is missing
+                    // is a program the engine should not have been handed;
+                    // shutting the stream is the quiet failure rather than the
+                    // loud one.
+                    let shut = gate
+                        .is_some_and(|lane| !lanes.get(lane as usize).is_some_and(|&v| v >= 0.5));
+                    let from = base[a as usize];
+                    let (source, dest) = index_two(&mut self.bufs, a as usize, out as usize);
+                    let (source, dest) = (&source.events, &mut dest.events);
+                    for &event in &source[from.min(source.len())..] {
+                        if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
+                            continue;
+                        }
+                        if !passes(&event, mute, channels, controllers) {
+                            continue;
+                        }
+                        NoteState::push(dest, &mut self.dropped, event);
+                    }
+                    self.follow_notes(out, base[out as usize]);
+                }
+            }
+        }
+    }
+
+    /// Fold a buffer's notes into the tables the key and follow ops read.
+    ///
+    /// Called once per buffer per sub-block, over the events that sub-block
+    /// appended and no others: the tables are a running total, and folding an
+    /// event into them twice would leave a key held after it was let go.
+    fn follow_notes(&mut self, buf: u16, from: usize) {
+        let Some(buf) = self.bufs.get_mut(buf as usize) else {
+            return;
+        };
+        let events = &buf.events[from.min(buf.events.len())..];
+        let mut struck = 0u128;
+        let mut held = buf.held;
+        let mut count = buf.count;
+        let mut velocity = buf.velocity;
+        let mut key_track = buf.key;
+        for event in events {
+            match *event {
+                Event::Note(NoteEvent::NoteOn {
+                    key, velocity: v, ..
+                }) => {
+                    velocity = v;
+                    key_track = f64::from(key).clamp(0.0, 127.0) / 127.0;
+                    count = count.saturating_add(1);
+                    if let Some(bit) = key_bit(key) {
+                        held |= bit;
+                        struck |= bit;
+                    }
+                }
+                // NoteEnd is the plugin saying a voice finished, which is not
+                // the player letting go; only a note-off lifts a key.
+                Event::Note(NoteEvent::NoteOff { key, .. }) => {
+                    count = count.saturating_sub(1);
+                    if let Some(bit) = key_bit(key) {
+                        held &= !bit;
+                    }
+                }
+                _ => {}
+            }
+        }
+        buf.struck = struck;
+        buf.held = held;
+        buf.count = count;
+        buf.velocity = velocity;
+        buf.key = key_track;
+    }
+}
+
 pub struct Engine {
     program: Option<Box<Program>>,
     registers: Vec<f64>,
@@ -204,30 +483,8 @@ pub struct Engine {
     /// sits in; see [`Window`] and the `Plugin` arm of `run_chunk`.
     chunk_in: Vec<f32>,
     chunk_out: Vec<f32>,
-    /// The note buffer pool: `MAX_NOTE_BUFS` buffers of `NOTE_BUF_CAPACITY`,
-    /// allocated at `prepare` and only ever cleared and refilled after that.
-    /// A program swap happens on the audio thread, so nothing here may be
-    /// sized from the program.
-    ///
-    /// A buffer holds one whole DAW block, appended to a sub-block at a time
-    /// as the parameter half walks the rows. The note half used to run twice
-    /// for every sub-block — once at the end of the parameter half so a reader
-    /// in the next sub-block had a stream, once in the audio half for the
-    /// plugins — into buffers cleared before each replay. That copied every
-    /// event twice per note op, and forced the generating ops to keep a
-    /// private "did it move" state per replay or the first would eat the edge
-    /// the second had to send.
-    ///
-    /// Running it once leaves the two readers differing only in where they
-    /// look: a parameter op reads everything the buffer holds, which is the
-    /// stream up to the boundary it just crossed — the value in force at that
-    /// instant, which is what a parameter signal's sub-block resolution means.
-    /// The audio half reads the rows of its own chunk, found through
-    /// [`Engine::note_marks`].
-    note_pool: Vec<Vec<Event>>,
-    /// Last value each controller-generating op sent, or NaN before its
-    /// first. Forgotten on a program swap; see [`NoteOp::Emit`].
-    note_emitted: Vec<f64>,
+    /// What the note half fills in. See [`NoteState`].
+    notes: NoteState,
     /// Where each note buffer stood before each sub-block was appended to it.
     ///
     /// One row per sub-block the schedule can produce, sized in `prepare`. It
@@ -248,11 +505,6 @@ pub struct Engine {
     translated: Vec<Event>,
     /// Who is who, and who still owes an ending. See [`crate::notes`].
     ledger: NoteLedger,
-    /// Events dropped because a note buffer was full, since the last reset.
-    ///
-    /// Counted rather than silently swallowed: an overflow is a real fault and
-    /// the number is the only way anyone would find out.
-    notes_dropped: u64,
     /// Frames one buffer's channel holds. Zero until `prepare`.
     stride: usize,
     /// Channel width of each of the wrapper's own input buses, main first. Set
@@ -280,23 +532,6 @@ pub struct Engine {
     /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
-    /// Which keys are down on each note buffer, one bit each. 128 keys, which
-    /// is the whole MIDI range, so a `u128` is the table.
-    ///
-    /// Per buffer rather than per engine: a key switch answers to the stream
-    /// wired into it. There used to be one table for the whole graph, fed
-    /// straight from the DAW, which meant a switch fired on keys that a filter
-    /// upstream of it had already taken out.
-    keys_held: Vec<u128>,
-    /// Which keys were struck in the sub-block each buffer last carried, so an
-    /// op sees each note-on exactly once.
-    keys_struck: Vec<u128>,
-    /// Velocity of the most recent note-on on each buffer, and the key it was
-    /// on, normalized. Held between notes.
-    last_velocity: Vec<f64>,
-    last_key: Vec<f64>,
-    /// How many notes each buffer has down.
-    held_count: Vec<u32>,
     /// One value per latch, or NaN for a latch nothing has set yet.
     latches: Vec<f64>,
     /// Which node each latch belongs to, so a program swap can carry it over.
@@ -440,25 +675,13 @@ impl Engine {
             // it still evaluates note ops.
             translated: Vec::with_capacity(MAX_BLOCK_EVENTS),
             ledger: NoteLedger::new(),
-            note_pool: (0..MAX_NOTE_BUFS)
-                .map(|_| Vec::with_capacity(NOTE_BUF_CAPACITY))
-                .collect(),
+            notes: NoteState::new(),
             chunk_in: Vec::new(),
             chunk_out: Vec::new(),
-            note_emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             note_marks: Vec::new(),
             note_rows: 0,
-            notes_dropped: 0,
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
-            keys_held: vec![0; MAX_NOTE_BUFS],
-            keys_struck: vec![0; MAX_NOTE_BUFS],
-            last_velocity: vec![0.0; MAX_NOTE_BUFS],
-            // Middle C-ish rather than the bottom of the range: a graph
-            // reading key track before anything has been played should read
-            // "the middle", the way a pan does.
-            last_key: vec![0.5; MAX_NOTE_BUFS],
-            held_count: vec![0; MAX_NOTE_BUFS],
             latches: vec![f64::NAN; MAX_LATCHES],
             latch_nodes: vec![u32::MAX; MAX_LATCHES],
             latch_carry: vec![(u32::MAX, f64::NAN); MAX_LATCHES],
@@ -595,11 +818,7 @@ impl Engine {
     pub fn reset(&mut self) {
         self.ledger.clear();
         self.translated.clear();
-        self.keys_held.iter_mut().for_each(|k| *k = 0);
-        self.keys_struck.iter_mut().for_each(|k| *k = 0);
-        self.last_velocity.iter_mut().for_each(|v| *v = 0.0);
-        self.last_key.iter_mut().for_each(|k| *k = 0.5);
-        self.held_count.iter_mut().for_each(|h| *h = 0);
+        self.notes.bufs.iter_mut().for_each(NoteBuf::silence);
         self.phases.iter_mut().for_each(|p| *p = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
@@ -622,10 +841,10 @@ impl Engine {
             scratch.clear();
             scratch.resize(MAX_BUFFER_CHANNELS * self.stride, 0.0);
         }
-        for buf in &mut self.note_pool {
-            buf.clear();
+        for buf in &mut self.notes.bufs {
+            buf.events.clear();
         }
-        self.note_emitted.iter_mut().for_each(|v| *v = f64::NAN);
+        self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
         // One row per sub-block the schedule can cut the block into, at the
         // finest quantum it offers, plus one so a chunk ending on the last row
         // still has a row to ask about.
@@ -633,7 +852,7 @@ impl Engine {
         self.note_marks
             .resize(self.stride / MIN_QUANTUM as usize + 2, [0; MAX_NOTE_BUFS]);
         self.note_rows = 0;
-        self.notes_dropped = 0;
+        self.notes.dropped = 0;
         self.compensators.clear();
         self.compensators
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
@@ -660,7 +879,7 @@ impl Engine {
     /// because its rows start at `note_marks[0]`, which is recorded after the
     /// carry-over is already in place.
     pub fn begin_block(&mut self, events: &[Event]) {
-        for (buf, pool) in self.note_pool.iter_mut().enumerate() {
+        for (buf, pool) in self.notes.bufs.iter_mut().enumerate() {
             // Everything before the last row starts is spent: the parameter
             // half has read past it and the plugins have been handed it.
             let spent = match self.note_rows.checked_sub(1) {
@@ -668,17 +887,17 @@ impl Engine {
                     .note_marks
                     .get(last)
                     .and_then(|marks| marks.get(buf))
-                    .map_or(0, |&at| (at as usize).min(pool.len())),
+                    .map_or(0, |&at| (at as usize).min(pool.events.len())),
                 // No row ran, so there is no boundary to carry.
-                None => pool.len(),
+                None => pool.events.len(),
             };
-            pool.drain(..spent);
+            pool.events.drain(..spent);
         }
         self.note_rows = 0;
         self.translated.clear();
         for &event in events {
             if self.translated.len() == self.translated.capacity() {
-                self.notes_dropped += 1;
+                self.notes.dropped += 1;
                 continue;
             }
             self.translated.push(match event {
@@ -834,7 +1053,11 @@ impl Engine {
     /// is what makes the last chunk right whether or not the block divides
     /// evenly by the quantum.
     fn note_slice(&self, buf: u16, first: usize, end: usize) -> std::ops::Range<usize> {
-        let len = self.note_pool.get(buf as usize).map_or(0, Vec::len);
+        let len = self
+            .notes
+            .bufs
+            .get(buf as usize)
+            .map_or(0, |buf| buf.events.len());
         let mark = |row: usize| {
             self.note_marks
                 .get(row)
@@ -853,132 +1076,9 @@ impl Engine {
         from..to.max(from)
     }
 
-    /// One sub-block's worth of the note half, appended to what the buffers
-    /// already hold. `base` is where each of them stood beforehand.
-    #[allow(clippy::too_many_arguments)]
-    fn run_notes_step(
-        &mut self,
-        program: &Program,
-        stage: Stage,
-        events: &[Event],
-        start: u32,
-        frames: u32,
-        lanes: &[f64],
-        base: &[usize; MAX_NOTE_BUFS],
-    ) {
-        for op in &program.note_ops[stage.notes.range()] {
-            match *op {
-                NoteOp::Input { out, bus } => {
-                    // One note bus so far. A second would be a second DAW note
-                    // input, which the wrapper does not offer yet.
-                    if bus != 0 {
-                        continue;
-                    }
-                    // The stream is sorted, so the chunk is a range rather
-                    // than a filter — and on the common block where every
-                    // event falls in the first chunk, no per-event work at
-                    // all.
-                    let from = events.partition_point(|e| e.sample_offset() < start);
-                    let to = events.partition_point(|e| e.sample_offset() < start + frames);
-                    for &event in &events[from..to.max(from)] {
-                        Self::push_note(
-                            &mut self.note_pool[out as usize],
-                            &mut self.notes_dropped,
-                            event,
-                        );
-                    }
-                    self.follow_notes(out, base[out as usize]);
-                }
-                NoteOp::Emit {
-                    a,
-                    out,
-                    lane,
-                    state,
-                    channel,
-                    cc,
-                } => {
-                    let value = lanes.get(lane as usize).copied().unwrap_or(0.0);
-                    let value = value.clamp(0.0, 1.0);
-                    let last = &mut self.note_emitted[state as usize];
-                    // NaN on the left of a comparison is never equal, which is
-                    // what makes the first sub-block after a swap send.
-                    let moved = *last != value;
-                    *last = value;
-
-                    let event = Event::Note(NoteEvent::Cc {
-                        port: 0,
-                        channel: i16::from(channel),
-                        cc,
-                        value,
-                        // The lane's value became true at the start of this
-                        // sub-block, and writing it before the stream keeps
-                        // the buffer sorted.
-                        sample_offset: start,
-                    });
-                    match a {
-                        Some(a) => {
-                            let from = base[a as usize];
-                            let (source, dest) =
-                                index_two(&mut self.note_pool, a as usize, out as usize);
-                            if moved {
-                                Self::push_note(dest, &mut self.notes_dropped, event);
-                            }
-                            for &passed in &source[from.min(source.len())..] {
-                                Self::push_note(dest, &mut self.notes_dropped, passed);
-                            }
-                        }
-                        None => {
-                            let dropped = &mut self.notes_dropped;
-                            if moved {
-                                Self::push_note(&mut self.note_pool[out as usize], dropped, event);
-                            }
-                        }
-                    }
-                }
-                NoteOp::Filter {
-                    a,
-                    out,
-                    gate,
-                    mute,
-                    channels,
-                    controllers,
-                } => {
-                    // Below 0.5 the gate is shut. A gate whose lane is missing
-                    // is a program the engine should not have been handed;
-                    // shutting the stream is the quiet failure rather than the
-                    // loud one.
-                    let shut = gate
-                        .is_some_and(|lane| !lanes.get(lane as usize).is_some_and(|&v| v >= 0.5));
-                    let from = base[a as usize];
-                    let (source, dest) = index_two(&mut self.note_pool, a as usize, out as usize);
-                    for &event in &source[from.min(source.len())..] {
-                        if shut && matches!(event, Event::Note(NoteEvent::NoteOn { .. })) {
-                            continue;
-                        }
-                        if !passes(&event, mute, channels, controllers) {
-                            continue;
-                        }
-                        Self::push_note(dest, &mut self.notes_dropped, event);
-                    }
-                    self.follow_notes(out, base[out as usize]);
-                }
-            }
-        }
-    }
-
-    /// Appends unless the buffer is full. Dropping an event is bad; growing a
-    /// `Vec` on the audio thread is worse.
-    fn push_note(buf: &mut Vec<Event>, dropped: &mut u64, event: Event) {
-        if buf.len() < buf.capacity() {
-            buf.push(event);
-        } else {
-            *dropped += 1;
-        }
-    }
-
     /// How many events have been dropped for want of buffer space.
     pub fn notes_dropped(&self) -> u64 {
-        self.notes_dropped
+        self.notes.dropped
     }
 
     /// One chunk of `run_audio`: every op, over `len` frames starting at
@@ -1162,7 +1262,7 @@ impl Engine {
                     // same as hearing an empty buffer only because this chunk
                     // was quiet.
                     let events: &[Event] = match (notes, heard) {
-                        (Some(buf), Some(range)) => &self.note_pool[*buf as usize][range],
+                        (Some(buf), Some(range)) => &self.notes.bufs[*buf as usize].events[range],
                         _ => &[],
                     };
                     // Counted here, where the note is actually handed over, and
@@ -1615,10 +1715,12 @@ impl Engine {
                 } => {
                     let index = buf as usize;
                     self.registers[out as usize] = match what {
-                        Follow::Velocity => self.last_velocity.get(index).copied().unwrap_or(0.0),
-                        Follow::KeyTrack => self.last_key.get(index).copied().unwrap_or(0.5),
+                        Follow::Velocity => {
+                            self.notes.bufs.get(index).map_or(0.0, |buf| buf.velocity)
+                        }
+                        Follow::KeyTrack => self.notes.bufs.get(index).map_or(0.5, |buf| buf.key),
                         Follow::Gate => f64::from(u8::from(
-                            self.held_count.get(index).copied().unwrap_or(0) > 0,
+                            self.notes.bufs.get(index).is_some_and(|buf| buf.count > 0),
                         )),
                     };
                     // The latch is not read back — the tables above already
@@ -1680,10 +1782,11 @@ impl Engine {
                     // controller may move several times, and what the boundary
                     // carries is where it ended up.
                     let latest = self
-                        .note_pool
+                        .notes
+                        .bufs
                         .get(buf as usize)
                         .into_iter()
-                        .flatten()
+                        .flat_map(|buf| buf.events.iter())
                         .rev()
                         .find_map(|event| match *event {
                             Event::Note(NoteEvent::Cc {
@@ -1775,8 +1878,8 @@ impl Engine {
         // half will later find this row's events.
         let row = ctx.row as usize;
         let mut base = [0usize; MAX_NOTE_BUFS];
-        for (slot, buf) in base.iter_mut().zip(self.note_pool.iter()) {
-            *slot = buf.len();
+        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
+            *slot = buf.events.len();
         }
         // Only for the buffers this stage fills. A later stage passing over
         // the same rows would otherwise overwrite every mark with the length
@@ -1789,11 +1892,18 @@ impl Engine {
                 }
             }
         }
-        let events = std::mem::take(&mut self.translated);
-        self.run_notes_step(
-            &program, stage, &events, ctx.offset, ctx.frames, slots, &base,
+        // Two disjoint fields, which is the whole reason the note half's
+        // state is a type of its own: the pass wants the block's stream by
+        // shared reference and everything it fills by exclusive one.
+        self.notes.run_notes_step(
+            &program,
+            stage,
+            &self.translated,
+            ctx.offset,
+            ctx.frames,
+            slots,
+            &base,
         );
-        self.translated = events;
         self.note_rows = self.note_rows.max(row + 1);
 
         self.program = Some(program);
@@ -1829,61 +1939,18 @@ impl Engine {
 
     /// Whether `key` is down on `buf`. Out of range is never down.
     fn held(&self, buf: u16, key: u8) -> bool {
-        let table = self.keys_held.get(buf as usize).copied().unwrap_or(0);
+        let table = self.notes.bufs.get(buf as usize).map_or(0, |buf| buf.held);
         key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
     }
 
     /// Whether `key` was struck in the sub-block `buf` last carried.
     fn struck(&self, buf: u16, key: u8) -> bool {
-        let table = self.keys_struck.get(buf as usize).copied().unwrap_or(0);
+        let table = self
+            .notes
+            .bufs
+            .get(buf as usize)
+            .map_or(0, |buf| buf.struck);
         key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
-    }
-
-    /// Fold a buffer's notes into the tables the key and follow ops read.
-    ///
-    /// Called once per buffer per sub-block, over the events that sub-block
-    /// appended and no others: the tables are a running total, and folding an
-    /// event into them twice would leave a key held after it was let go.
-    fn follow_notes(&mut self, buf: u16, from: usize) {
-        let index = buf as usize;
-        let Some(events) = self.note_pool.get(index) else {
-            return;
-        };
-        let events = &events[from.min(events.len())..];
-        let mut struck = 0u128;
-        let mut held = self.keys_held[index];
-        let mut count = self.held_count[index];
-        let mut velocity = self.last_velocity[index];
-        let mut key_track = self.last_key[index];
-        for event in events {
-            match *event {
-                Event::Note(NoteEvent::NoteOn {
-                    key, velocity: v, ..
-                }) => {
-                    velocity = v;
-                    key_track = f64::from(key).clamp(0.0, 127.0) / 127.0;
-                    count = count.saturating_add(1);
-                    if let Some(bit) = key_bit(key) {
-                        held |= bit;
-                        struck |= bit;
-                    }
-                }
-                // NoteEnd is the plugin saying a voice finished, which is not
-                // the player letting go; only a note-off lifts a key.
-                Event::Note(NoteEvent::NoteOff { key, .. }) => {
-                    count = count.saturating_sub(1);
-                    if let Some(bit) = key_bit(key) {
-                        held &= !bit;
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.keys_struck[index] = struck;
-        self.keys_held[index] = held;
-        self.held_count[index] = count;
-        self.last_velocity[index] = velocity;
-        self.last_key[index] = key_track;
     }
 }
 
