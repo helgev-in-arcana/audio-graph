@@ -1,0 +1,14 @@
+# The compiler every build uses: CI, the release, and the checkout on your own
+# desk. A release organised by whatever `stable` happened to be that morning is
+# one nobody can reproduce, and a compiler that differs between CI and the
+# release makes "green there, broken here" a thing that can happen at all.
+#
+# Raising this is a deliberate step, taken in a pull request: bump it, let the
+# six targets say what the new compiler thinks, and settle what it finds before
+# it can settle a tag instead.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+# Nothing here reads rustc's own docs or sources, so the smaller install is the
+# one that costs less on every runner.
+profile = "minimal"

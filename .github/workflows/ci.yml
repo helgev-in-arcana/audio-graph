@@ -1,11 +1,11 @@
 name: CI
 
-# PR とmainへのpushで動く。検査はすべてここにある — リリースのワークフローは
-# 組んで梱包するだけで、テストを持たない。だからここが緑であることが、配って
-# よいという判断のすべてになる。
+# Runs on pull requests and on pushes to main. Every check this project has
+# lives here: the release workflow builds and packages and does nothing else,
+# so a green run here is the whole of what says a commit is fit to ship.
 #
-# ビルドはリリースと同じ6ターゲットで、同じ手順で回す。タグを打ってから
-# 「Linuxでコンパイルが通らない」と気付くのは遅すぎる。
+# The build covers the same six targets as the release, by the same steps.
+# Finding out at the tag that the code does not compile on Linux is too late.
 on:
   pull_request:
   push:
@@ -17,42 +17,48 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # PR は続けて push した時、古い方に用がない。main は違う。リリースの門番は
-  # 「そのコミットで CI が緑になったか」を見るので、main への push を取り消すと
-  # 検査された記録を持たないコミットができ、そこにタグを打てなくなる。
+  # A pull request has no use for the older run once a newer push supersedes
+  # it. main is not the same: the release guard asks whether CI went green for
+  # the commit being tagged, so cancelling a run there would leave commits that
+  # no run ever finished judging, and a commit like that cannot be released.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 書式と lint はプラットフォームに依らないので1回だけ。
+  # Formatting and lints do not vary by platform, so they run once.
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      # Third-party actions are pinned by commit, not by tag: a tag can be
+      # moved to point at other code, and this workflow is a step away from one
+      # that signs binaries other people install. The version beside each is
+      # what the commit was released as.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # `rust-toolchain.toml` names the version. This installs what it names,
+      # components and all, so the workflow never has to repeat the number.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Format
         run: cargo fmt --all -- --check
 
-      # 警告ゼロを維持する。新しい警告は PR の時点で落とす。
-      # clippy はこのジョブにしか置かない。test ジョブにも置くと、
-      # ビルドが壊れたのか lint に引っかかっただけなのかがログから
-      # 読み取りにくくなる。
+      # Hold the warning count at zero, so a new warning is dealt with while
+      # the pull request is open. clippy lives in this job alone. Putting it in
+      # the test job as well costs the log its legibility: whether the build
+      # broke or a lint merely fired stops being answerable at a glance.
       #
-      # 代償として、ここは ubuntu なので Windows 限定のコードは lint
-      # されない。そこは各 OS の build/test が拾う。
+      # The price is that this runs on ubuntu, so Windows-only code goes
+      # unlinted. The per-OS jobs below are what catch it.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # リリースと同じ6ターゲット。ここが緑なら、タグを打った時に
-  # 初めて知るコンパイルエラーは残っていない。
+  # The same six targets the release builds for. When this is green there is no
+  # compile error left to learn about at the tag.
   test:
     strategy:
       fail-fast: false
@@ -66,29 +72,32 @@ jobs:
           - macos-14
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.os }}
 
-      # X11 のヘッダはエディタまわりが要求する。Linux ランナーには入っていない。
-      # Xvfb はテスト用。理由は下の Test ステップ。
+      # The X11 headers are what the editor side asks for, and the Linux
+      # runners do not carry them. Xvfb is for the tests; the reason is on the
+      # Test step below.
       - name: Install the Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcb1-dev pkg-config xvfb
 
-      # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
-      # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
-      # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
+      # clap-host's tests load clap-test-plugin's cdylib. cargo will not build
+      # another package's cdylib on its own, so it is built once before the
+      # tests run.
       #
-      # `--locked` はここだけでよい。通れば Cargo.lock は解決済みの形と一致して
-      # いるので、後続の cargo は lock を書き換えない。ロックの綻びをタグの時
-      # ではなく PR の時点で見つけるための一語。
+      # `--locked` belongs on this call and no other: once it passes, Cargo.lock
+      # already agrees with the resolved graph, so nothing later in the run can
+      # rewrite it. One word, and a lock that has come loose is found while the
+      # pull request is open rather than at the tag.
       - name: Build the test fixtures
         run: cargo build --workspace --locked
 
@@ -96,30 +105,32 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test --workspace
 
-      # Linux のウィンドウのテストは本物の X ウィンドウを開くので、
-      # ランナーには X サーバが要る。ここを Xvfb で走らせることで、
-      # 「ウィンドウを開くテストが CI で 1 つも走らない」という穴が
-      # Linux については塞がる。
+      # The Linux window tests open real X windows, so the runner needs an X
+      # server. Running them under Xvfb is what keeps "not one test in CI opens
+      # a window" from being true of Linux.
       - name: Test (under an X server)
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo test --workspace
 
-      # リリースで実際に配るのは release ビルドなので、そこまで確かめる。
+      # What the release actually hands out is a release build, so the check
+      # goes that far.
       - name: Build release
         run: cargo build --workspace --release
 
-      # 配るのは素の共有ライブラリではなくバンドルなので、梱包まで CI で通す。
-      # バンドラが壊れているのをタグを打ってから知るのは遅い。
+      # What is handed out is a bundle rather than a bare shared library, so
+      # the packing is exercised here too. Learning at the tag that the bundler
+      # is broken is late.
       - name: Bundle
         run: cargo xtask bundle audio-graph-plugin --release
 
-      # 出る形式はバイナリのエクスポート記号で決まる。片方だけ消えるのは
-      # ここでしか気付けないので、両方あることを確かめる。
+      # Which formats appear is decided by the symbols the binary exports.
+      # Losing one of the two shows up nowhere else, so both are checked for.
       #
-      # 名前だけでなく中身まで見る。ホストが読むのはバンドルの中のバイナリで、
-      # 器だけのディレクトリは名前の上では揃って見えるのに読み込みでは空振り
-      # する。VST3 はどの OS でもバンドル、CLAP は macOS だけがバンドルで
-      # 他は共有ライブラリそのもの、という違いがあるので両方を許す。
+      # By their contents, not merely their names. What a host loads is the
+      # binary inside the bundle, and an empty shell of a directory looks
+      # present by name while coming up empty on load. VST3 is a bundle on
+      # every OS; CLAP is a bundle on macOS alone and the shared library itself
+      # elsewhere, so both shapes are allowed.
       - name: Verify both bundles exist
         shell: bash
         run: |

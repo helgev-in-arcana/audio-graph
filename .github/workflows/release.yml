@@ -1,14 +1,15 @@
 name: Release
 
-# `v1.2.3` を打った時だけ動く。タグの glob はブランチを絞れないので、
-# main に含まれるコミットかどうかは最初のジョブで実際に確認する。
+# Runs only when a `v1.2.3` tag is pushed. A tag glob cannot be narrowed to a
+# branch, so whether the commit is one of main's is checked for real in the
+# first job.
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
 
-# リリースの作成とアセットのアップロードにだけ書き込みが要る。
+# Only creating the release and uploading its assets needs write.
 permissions:
   contents: read
 
@@ -20,17 +21,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 配ってよいコミットかどうかを決める門番。見るのは二つ、main から生えている
-  # ことと、そのコミットで CI が通っていること。どちらも満たさないタグは
-  # ビルドまで進まない。
+  # The gate that decides whether a commit may be handed out. It asks two
+  # things: that the commit is on main, and that CI went green for it. A tag
+  # that fails either never reaches the build.
   guard:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # CI の結果を問い合わせるのに要る。
+      # Asking after a CI run needs this.
       actions: read
     steps:
-      - uses: actions/checkout@v5
+      # Third-party actions are pinned by commit, not by tag: a tag can be
+      # moved to point at other code, and this workflow hands binaries to
+      # people who install them. The version beside each is what that commit
+      # was released as.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -42,18 +47,19 @@ jobs:
             exit 1
           fi
 
-      # 検査は CI の仕事で、リリースはその結果を当てにして組むだけ。当てにする
-      # 以上、本当に通ったのかはここで確かめる。誰も検査していないコミットから
-      # 配布物が出る経路を残さないため。
+      # Checking is CI's work, and the release takes that result on trust. To
+      # take it on trust is to owe the question asked here: did it actually
+      # pass? Otherwise a commit nobody checked has a route to becoming
+      # something people download.
       #
-      # CI が走るのは push された先端なので、複数コミットをまとめて push した
-      # 時の中間のコミットにタグを打つとここで止まる。打ち直す先は CI が実際に
-      # 検査した SHA。
+      # CI runs on the tip that was pushed, so tagging a commit from the middle
+      # of a batch of pushed commits stops here. The tag belongs on a SHA that
+      # CI has really seen.
       - name: Verify CI passed for this commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 「この SHA の CI で成功した実行が 1 つ以上あるか」を数える。
+          # How many runs of CI for this SHA finished green.
           query="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
           query="${query}?head_sha=${GITHUB_SHA}&status=success"
           runs=$(gh api "$query" --jq '.total_count')
@@ -62,13 +68,15 @@ jobs:
             exit 1
           fi
 
-  # ターゲットごとにネイティブのランナーで組む。xtask のバンドラは組み上がった
-  # バイナリを読んでターゲットを判定するのでクロスコンパイル自体は妨げないが、
-  # ネイティブに組めばその OS のリンカとシステムライブラリがそのまま使える。
+  # Each target is built on a runner of its own architecture. The bundler reads
+  # the built binary to decide the target, so cross-compiling is not what
+  # stands in the way; building natively is what lets each OS's own linker and
+  # system libraries be the ones used.
   #
-  # ここでするのは組んで梱包することだけ。テストは guard が確かめた CI が
-  # 同じ6ターゲットで済ませている。同じものを二度走らせても、遅くなるのと
-  # 「タグを打ってから初めて赤くなる」経路が増えるのとで、損しかない。
+  # All this job does is build and package. The checking was done by the CI run
+  # the guard asked after, across these same six targets. Doing it twice buys
+  # nothing but a slower release and one more way to go red only once the tag
+  # is cut.
   build:
     needs: guard
     strategy:
@@ -89,33 +97,41 @@ jobs:
             name: aarch64-macos
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # `rust-toolchain.toml` names the version. This installs what it names,
+      # so the compiler behind a release is the one the repository records
+      # rather than whichever stable the runner happened to meet that morning.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.name }}
+      # No build cache here, unlike CI. A cache is worth having where a run's
+      # product is a verdict; what this run produces is the file people
+      # install, and that should owe nothing to what an earlier run left lying
+      # about.
 
-      # X11 のヘッダはエディタまわりが要求する。Linux ランナーには入っていない。
+      # The X11 headers are what the editor side asks for, and the Linux
+      # runners do not carry them.
       - name: Install the Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
 
-      # タグとクレートのバージョンがずれると、`v0.2.0` を名乗るリリースの中身が
-      # 0.1.0 を報告するプラグイン、という追いにくい形で食い違う。
+      # A tag and a crate version that disagree make a release calling itself
+      # `v0.2.0` whose plugin reports 0.1.0 — a mismatch that is hard to chase
+      # from either end.
       - name: Verify the tag matches the crate version
         shell: bash
         run: |
-          # `-alpha` のような接尾辞は Cargo.toml 側にある場合とない場合があるので、
-          # 両側から落として x.y.z だけを突き合わせる。
+          # A suffix like `-alpha` may or may not be present on the Cargo.toml
+          # side, so both are trimmed to x.y.z before comparing.
           tag="${GITHUB_REF_NAME#v}"
           tag="${tag%%-*}"
-          # `pkgid` はディレクトリ名がクレート名と一致するかで
-          # `...#audio-graph-plugin@0.1.0` と `...#0.1.0` を返し分けるので、
-          # 最後の `#` か `@` 以降を取る。JSON を読むより追加のツールが要らない。
+          # `pkgid` answers `...#audio-graph-plugin@0.1.0` or `...#0.1.0`
+          # depending on whether the directory name matches the crate name, so
+          # take whatever follows the last `#` or `@`. Cheaper than reading
+          # JSON, which would want another tool.
           crate=$(cargo pkgid -p audio-graph-plugin)
           crate="${crate##*[#@]}"
           crate="${crate%%-*}"
@@ -124,19 +140,22 @@ jobs:
             exit 1
           fi
 
-      # DAW が期待するのは素の共有ライブラリではなくバンドル。xtask が
-      # cargo build と梱包をまとめて面倒を見るので、配るものはこの一手で出る。
-      # 出力は target/bundled/ で、どの形式が出るかはバイナリがエクスポート
-      # している記号で決まる。audio-graph-plugin は VST3 と CLAP の両方を出す。
+      # What a DAW expects is a bundle rather than a bare shared library. xtask
+      # sees to the cargo build and the packing together, so what ships comes
+      # out of this one call. The output is target/bundled/, and which formats
+      # appear is decided by the symbols the binary exports: audio-graph-plugin
+      # emits both a VST3 and a CLAP.
       #
-      # `--locked` は配るものと Cargo.lock を食い違わせないため。ロックが古い
-      # 時、cargo は黙って解決し直すので、リポジトリが記録しているのとは違う
-      # 依存で組まれたバイナリが出ていく。
+      # `--locked` is what keeps what ships and what Cargo.lock records from
+      # parting ways. Where the lock is stale cargo resolves again without
+      # saying so, and out goes a binary built against dependencies the
+      # repository never recorded.
       - name: Bundle the VST3 and the CLAP
         run: cargo xtask bundle audio-graph-plugin --release --locked
 
-      # 片方しか出ていなければ、リリースまで進む前にここで気付きたい。
-      # CLAP は Windows / Linux では単一ファイル、macOS ではバンドルディレクトリ。
+      # If only one of the two came out, this is where to notice, before the
+      # release itself. CLAP is a single file on Windows and Linux and a bundle
+      # directory on macOS.
       - name: Verify both bundles exist
         shell: bash
         run: |
@@ -147,8 +166,8 @@ jobs:
             fi
           done
 
-      # Windows のランナーには zip が入っていないので pwsh で固める。
-      # ライセンスと著作権表示はバイナリと一緒に配る。
+      # The Windows runners have no zip, so pwsh does the packing. The licences
+      # and the attribution travel with the binaries.
       - name: Package
         if: runner.os == 'Windows'
         shell: pwsh
@@ -158,8 +177,8 @@ jobs:
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
             Out-File -Encoding ascii "$name.zip.sha256"
 
-      # Unix 側は zip でまとめる。Compress-Archive と違い実行ビットとシンボリック
-      # リンクを保てるので、macOS のバンドルがそのまま展開できる。
+      # Unix packs with zip. Unlike Compress-Archive it keeps the executable
+      # bit and symbolic links, so the macOS bundle survives the round trip.
       - name: Package
         if: runner.os != 'Windows'
         shell: bash
@@ -173,7 +192,7 @@ jobs:
             shasum -a 256 "$name.zip" > "$name.zip.sha256"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundles-${{ matrix.name }}
           path: |
@@ -181,23 +200,27 @@ jobs:
             *.zip.sha256
           if-no-files-found: error
 
-  # 未検証のプラットフォームが 1 つ落ちただけで、動作確認済みの Windows まで
-  # リリースが出ないのは困る。組めたものだけを配り、欠けた分は本文で分かる
-  # ようにする。guard が落ちた場合だけは何も出さない。
+  # One unverified platform failing should not hold back a release for the
+  # platforms that were verified. What built is handed out, and what is missing
+  # is legible from the body. Only a failed guard means nothing goes out at all.
+  #
+  # `!cancelled()` rather than `always()`: a run someone stopped by hand should
+  # not go on to publish whichever half of the targets had finished by then.
   release:
     needs: [guard, build]
-    if: always() && needs.guard.result == 'success'
+    if: ${{ !cancelled() && needs.guard.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
 
-      # 全滅した時に空のリリースを作らないための確認。ついでに、何が欠けたかを
-      # サマリに残す。ここを読めば、どのターゲットを追いかければいいか分かる。
+      # So that a total failure does not produce an empty release, and so that
+      # what is missing is written down. Reading this says which target to go
+      # after.
       - name: Check what was built
         run: |
           shopt -s nullglob
@@ -216,9 +239,9 @@ jobs:
             echo "一部のターゲットはビルドに失敗しました。" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # リリースノートは自動生成せず、本文は手で書く。
-      # `-rc.1` のような接尾辞が付いたタグはプレリリース扱いにする。
-      - uses: softprops/action-gh-release@v2
+      # Release notes are not generated; the body is written by hand. A tag
+      # carrying a suffix like `-rc.1` is published as a prerelease.
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}
