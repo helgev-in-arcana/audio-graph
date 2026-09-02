@@ -58,7 +58,7 @@ Program {
     audio_lane_base: 96,
     instances: [],
     buffers: [],
-    chunking: WholeBlock,
+    stages: [],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

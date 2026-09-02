@@ -67,7 +67,13 @@ Program {
         2,
         2,
     ],
-    chunking: WholeBlock,
+    stages: [
+        Stage {
+            start: 0,
+            end: 6,
+            chunking: WholeBlock,
+        },
+    ],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

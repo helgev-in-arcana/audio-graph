@@ -22,7 +22,7 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
     MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Stage,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -461,6 +461,9 @@ pub(crate) struct AudioCx<'a> {
     produced: Vec<Produced>,
     ops: Vec<AudioOp>,
     deferred: Vec<AudioOp>,
+    /// The runs of `ops` closed so far, and where the open one starts.
+    stages: Vec<Stage>,
+    stage_start: u32,
     instances: Vec<InstanceIo>,
     latency: u32,
     compensators: u16,
@@ -493,6 +496,8 @@ impl<'a> AudioCx<'a> {
             produced: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            stages: Vec::new(),
+            stage_start: 0,
             instances: Vec::new(),
             latency: 0,
             compensators: 0,
@@ -549,10 +554,10 @@ impl<'a> AudioCx<'a> {
     }
 
     pub(crate) fn finish(mut self) -> Audio {
-        self.ops.append(&mut self.deferred);
-
         // A line nobody writes still has to advance: its ring outlives the
-        // program it was filled by.
+        // program it was filled by. Nothing carries anything back through such
+        // a line, so the head may as well move where the tail of the program
+        // runs.
         for index in 0..self.audio_lines.len() as u16 {
             let written = self
                 .ops
@@ -562,26 +567,28 @@ impl<'a> AudioCx<'a> {
                 self.ops.push(AudioOp::DelaySilence { line: index });
             }
         }
-
-        // An audio line with both halves present closes a loop, and then every
-        // plugin in the program has to run at sub-block granularity.
-        let looped = self
-            .lines
-            .iter()
-            .any(|line| matches!(line.ty, PortType::Audio { .. }) && line.writer != NO_WRITER);
+        let end = self.ops.len() as u32;
+        if end > self.stage_start {
+            match self.stages.last_mut() {
+                // Folded in when the last stage already runs at that rate, so
+                // a program does not grow a stage for a head that only moves.
+                Some(last) if last.chunking == Chunking::WholeBlock => last.end = end,
+                _ => self.stages.push(Stage {
+                    start: self.stage_start,
+                    end,
+                    chunking: Chunking::WholeBlock,
+                }),
+            }
+        }
 
         self.instances.sort_unstable_by_key(|i| i.instance);
         Audio {
             instances: self.instances,
             ops: self.ops,
+            stages: self.stages,
             delay_nodes: self.delay_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
-            chunking: if looped {
-                Chunking::SubBlock
-            } else {
-                Chunking::WholeBlock
-            },
             latency: self.latency,
         }
     }
@@ -718,14 +725,41 @@ impl<'a> AudioCx<'a> {
         self.ops.push(op);
     }
 
-    /// Emits an op that runs after every other op in the chunk.
+    /// Emits an op that runs after every other op of its stage in the chunk.
     ///
     /// Only delay writes use this, for the reason the param half holds its
     /// writes back: within one chunk every read must see the line as it stood
     /// before this chunk was written, or a delay of exactly one chunk would
     /// read back what it had just written.
+    ///
+    /// Held back to the end of its own stage rather than of the program: a
+    /// closed line's write and its reads are in the same stage by
+    /// construction, and a later stage cannot be reading the line or it would
+    /// be in that stage too.
     pub(crate) fn emit_deferred(&mut self, op: AudioOp) {
         self.deferred.push(op);
+    }
+
+    /// Ends the run of ops that share a granularity, and any writes it held
+    /// back. See [`Stage`].
+    ///
+    /// The compiler walks the order once per stage rather than emitting
+    /// everything and sorting afterwards, because the buffer pool hands a
+    /// buffer out again the moment its last reader has been *compiled*.
+    /// Emitting in an order the audio thread will not follow lets a buffer be
+    /// reused while something still to run is holding it, which reads as a
+    /// delay writing back its own output.
+    pub(crate) fn close_stage(&mut self, chunking: Chunking) {
+        self.ops.append(&mut self.deferred);
+        let end = self.ops.len() as u32;
+        if end > self.stage_start {
+            self.stages.push(Stage {
+                start: self.stage_start,
+                end,
+                chunking,
+            });
+        }
+        self.stage_start = end;
     }
 
     /// Says what this node leaves in `buf` on its output socket `port`, and how

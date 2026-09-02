@@ -82,7 +82,13 @@ Program {
         1,
         4,
     ],
-    chunking: WholeBlock,
+    stages: [
+        Stage {
+            start: 0,
+            end: 5,
+            chunking: WholeBlock,
+        },
+    ],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

@@ -30,10 +30,36 @@ pub enum Chunking {
     /// call a plugin more often than the DAW does.
     #[default]
     WholeBlock,
-    /// Once per sub-block. Required as soon as an audio feedback loop exists:
-    /// the rule that a delay must be at least one chunk long binds the plugins
-    /// in the loop too.
+    /// Once per sub-block. What the two ends of a delay line need, because a
+    /// delay is at least one chunk long and a whole-block chunk would put the
+    /// floor at ten milliseconds.
     SubBlock,
+}
+
+/// A run of audio ops sharing a granularity.
+///
+/// A program's audio ops are one topological order cut into stages, and every
+/// stage covers the whole DAW block before the next one starts. What differs
+/// is whether its ops are called once for the block or once per sub-block.
+///
+/// This used to be one answer for the whole program, which meant a delay line
+/// anywhere in a patch called every plugin in it once per sub-block. How often
+/// a sub-plugin is called is a cost; how short a delay the graph can express
+/// is not the same question, and should not be paid for by everything that
+/// asked neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage {
+    /// Where this stage starts in `Program::audio_ops`.
+    pub start: u32,
+    /// Where it ends.
+    pub end: u32,
+    pub chunking: Chunking,
+}
+
+impl Stage {
+    pub fn ops(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
 }
 
 /// One step of the audio half of a program.

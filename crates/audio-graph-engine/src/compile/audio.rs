@@ -7,8 +7,9 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
+use crate::compile::stages::Place;
 use crate::graph::{Graph, NodeId};
-use crate::ir::{AudioOp, Chunking};
+use crate::ir::{AudioOp, Chunking, Stage};
 use subhost_adapter::InstanceIo;
 
 use crate::compile::notes::Notes;
@@ -24,7 +25,8 @@ pub(crate) struct Audio {
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
-    pub chunking: Chunking,
+    /// How `ops` is cut into runs of one granularity, in the order they run.
+    pub stages: Vec<Stage>,
     pub latency: u32,
     pub instances: Vec<InstanceIo>,
 }
@@ -42,11 +44,25 @@ pub(crate) fn compile_audio(
     audio_lanes: &[((NodeId, u8), u16)],
     notes: &Notes,
 ) -> Result<Audio, CompileError> {
+    // Once per stage, rather than once with a sort afterwards: the pool
+    // frees a buffer as soon as its last reader is compiled, so the order ops
+    // are emitted in has to be the order they will run in. See
+    // [`AudioCx::close_stage`].
+    let places = super::stages::places(graph, order, lines);
     let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
-    for &id in order {
-        let node = graph.node(id).expect("ordering only contains real nodes");
-        cx.begin(id, &node.kind);
-        node.kind.compile_audio(&mut cx)?;
+    for place in [Place::Before, Place::Looped, Place::After] {
+        for (index, &id) in order.iter().enumerate() {
+            if places[index] != place {
+                continue;
+            }
+            let node = graph.node(id).expect("ordering only contains real nodes");
+            cx.begin(id, &node.kind);
+            node.kind.compile_audio(&mut cx)?;
+        }
+        cx.close_stage(match place {
+            Place::Looped => Chunking::SubBlock,
+            _ => Chunking::WholeBlock,
+        });
     }
     Ok(cx.finish())
 }
@@ -476,9 +492,35 @@ mod tests {
         assert_eq!(program.latency, 64);
     }
 
+    /// The finest granularity anything in a program runs at.
+    fn grain(program: &crate::ir::Program) -> crate::ir::Chunking {
+        use crate::ir::Chunking;
+        if program
+            .stages
+            .iter()
+            .any(|stage| stage.chunking == Chunking::SubBlock)
+        {
+            Chunking::SubBlock
+        } else {
+            Chunking::WholeBlock
+        }
+    }
+
+    /// Every op that runs a sub-block at a time.
+    fn fine(program: &crate::ir::Program) -> Vec<&AudioOp> {
+        use crate::ir::Chunking;
+        program
+            .stages
+            .iter()
+            .filter(|stage| stage.chunking == Chunking::SubBlock)
+            .flat_map(|stage| &program.audio_ops[stage.ops()])
+            .collect()
+    }
+
     /// A graph with no audio loop is not made to pay for one.
     #[test]
     fn only_an_audio_loop_forces_the_fine_grain() {
+        use crate::ir::Chunking;
         let mut graph = Graph::new();
         let input = stereo_in(&mut graph);
         let node = plugin(&mut graph, 0, 0);
@@ -486,7 +528,7 @@ mod tests {
         graph.connect(input, 0, node, 0);
         graph.connect(node, 0, output, 0);
         assert_eq!(
-            compile(&graph, SLOTS).unwrap().chunking,
+            grain(&compile(&graph, SLOTS).unwrap()),
             Chunking::WholeBlock
         );
 
@@ -520,7 +562,73 @@ mod tests {
         graph.connect(mix, 0, node, 0);
         graph.connect(node, 0, write, 0);
 
-        assert_eq!(compile(&graph, SLOTS).unwrap().chunking, Chunking::SubBlock);
+        assert_eq!(grain(&compile(&graph, SLOTS).unwrap()), Chunking::SubBlock);
+    }
+
+    /// The loop pays for itself and nothing else does.
+    ///
+    /// A patch is one canvas: a feedback delay in a corner of it used to put
+    /// every plugin in the program on sub-block granularity, so adding an echo
+    /// to one channel made a synth on another cost sixteen times as much.
+    #[test]
+    fn a_loop_does_not_drag_the_rest_of_the_patch_down_with_it() {
+        let mut graph = Graph::new();
+        let output = stereo_out(&mut graph);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(mix, 0, output, 0);
+
+        // One branch: a synth, wired to nothing that loops.
+        let voice = synth(&mut graph, 0);
+        graph.connect(voice, 0, mix, 0);
+
+        // The other: an input through a feedback delay.
+        let input = stereo_in(&mut graph);
+        let echo = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let read = graph.add(
+            NodeKind::DelayRead(DelayRead {
+                line: 0,
+                ty: PortType::STEREO,
+                max_time: 1.0,
+                time: 0.01,
+            }),
+            [0.0, 0.0],
+        );
+        let write = graph.add(
+            NodeKind::DelayWrite(DelayWrite {
+                line: 0,
+                ty: PortType::STEREO,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, echo, 0);
+        graph.connect(read, 0, echo, 2);
+        graph.connect(echo, 0, write, 0);
+        graph.connect(echo, 0, mix, 2);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        let fine = fine(&program);
+        assert!(
+            !fine.is_empty(),
+            "the loop itself does run a sub-block at a time"
+        );
+        assert!(
+            !fine.iter().any(|op| matches!(op, AudioOp::Plugin { .. })),
+            "and the synth beside it is still called once: {fine:?}"
+        );
     }
 
     /// A param feedback loop is not an audio loop, and must not drag the audio
@@ -553,8 +661,8 @@ mod tests {
         graph.connect(read, 0, write, 0);
 
         assert_eq!(
-            compile(&graph, SLOTS).unwrap().chunking,
-            Chunking::WholeBlock
+            grain(&compile(&graph, SLOTS).unwrap()),
+            crate::ir::Chunking::WholeBlock
         );
     }
 

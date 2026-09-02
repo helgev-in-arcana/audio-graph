@@ -40,13 +40,13 @@ Program {
                 },
             ],
         },
-        Output {
-            a: 0,
-            bus: 0,
-        },
         DelayWrite {
             line: 0,
             a: 0,
+        },
+        Output {
+            a: 0,
+            bus: 0,
         },
     ],
     note_ops: [],
@@ -58,7 +58,23 @@ Program {
         2,
         2,
     ],
-    chunking: SubBlock,
+    stages: [
+        Stage {
+            start: 0,
+            end: 1,
+            chunking: WholeBlock,
+        },
+        Stage {
+            start: 1,
+            end: 4,
+            chunking: SubBlock,
+        },
+        Stage {
+            start: 4,
+            end: 5,
+            chunking: WholeBlock,
+        },
+    ],
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],

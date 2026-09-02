@@ -16,6 +16,7 @@
 mod audio;
 mod cx;
 mod notes;
+mod stages;
 
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
@@ -144,7 +145,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_lane_base: (slot_count + crate::ir::MAX_GRAPH_PARAMS) as u16,
         instances: audio.instances,
         buffers: audio.buffers,
-        chunking: audio.chunking,
+        stages: audio.stages,
         latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         audio_delay_nodes: audio.delay_nodes,

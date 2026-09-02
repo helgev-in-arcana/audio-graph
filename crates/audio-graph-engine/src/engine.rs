@@ -25,7 +25,7 @@ use crate::ir::{
     AudioOp, Buf, Chunking, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_LATCHES,
     MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, Op,
-    Operand, Program, RateSpec, Waveform,
+    Operand, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -711,11 +711,22 @@ impl Engine {
             .is_some_and(|p| !p.audio_ops.is_empty())
     }
 
-    /// Returns the evaluation chunking granularity required by the active program.
+    /// The finest granularity anything in the active program runs at.
+    ///
+    /// A summary: the program is cut into stages and only the one holding a
+    /// delay line's two ends runs a sub-block at a time. See [`Stage`].
     pub fn chunking(&self) -> Chunking {
-        self.program
-            .as_ref()
-            .map_or(Chunking::WholeBlock, |p| p.chunking)
+        let looped = self.program.as_ref().is_some_and(|program| {
+            program
+                .stages
+                .iter()
+                .any(|stage| stage.chunking == Chunking::SubBlock)
+        });
+        if looped {
+            Chunking::SubBlock
+        } else {
+            Chunking::WholeBlock
+        }
     }
 
     /// Executes the audio pipeline for a block provided by the audio host.
@@ -746,18 +757,29 @@ impl Engine {
         // is silence, not whatever the caller's buffer already held.
         daw_out.fill(0.0);
 
-        let step = match program.chunking {
-            Chunking::WholeBlock => total.max(1),
-            // The last chunk is short whenever the block is not a multiple of the quantum.
-            Chunking::SubBlock => (ctx.quantum as usize).max(1),
-        };
-        let mut start = 0usize;
-        let mut row = 0usize;
-        while start < total {
-            let len = step.min(total - start);
-            self.run_chunk(&program, ctx, nodes, daw_in, daw_out, start, len, row);
-            start += len;
-            row += 1;
+        // Each stage covers the whole block before the next one starts, so a
+        // stage that runs a sub-block at a time hands the one after it a
+        // finished buffer. Only the stage holding a delay line's two ends
+        // needs that; the rest of the program is called once, however many
+        // loops are drawn elsewhere in the patch.
+        for index in 0..program.stages.len() {
+            let stage = program.stages[index];
+            let step = match stage.chunking {
+                Chunking::WholeBlock => total.max(1),
+                // The last chunk is short whenever the block is not a multiple
+                // of the quantum.
+                Chunking::SubBlock => (ctx.quantum as usize).max(1),
+            };
+            let mut start = 0usize;
+            let mut row = 0usize;
+            while start < total {
+                let len = step.min(total - start);
+                self.run_chunk(
+                    &program, stage, ctx, nodes, daw_in, daw_out, start, len, row,
+                );
+                start += len;
+                row += 1;
+            }
         }
 
         self.program = Some(program);
@@ -922,6 +944,7 @@ impl Engine {
     fn run_chunk(
         &mut self,
         program: &Program,
+        stage: Stage,
         ctx: &AudioContext<'_>,
         nodes: &mut dyn AudioInstances,
         daw_in: &[f32],
@@ -943,7 +966,7 @@ impl Engine {
             frames,
         };
 
-        for op in &program.audio_ops {
+        for op in &program.audio_ops[stage.ops()] {
             match op {
                 AudioOp::Silence { out } => self.fill(*out, win, 0.0),
                 AudioOp::Input { out, bus } => {
@@ -4085,11 +4108,12 @@ mod tests {
         let input = stereo_in(&mut graph);
         let output = stereo_out(&mut graph);
         let plugin = audio_plugin(&mut graph, 0, 0);
-        // A loop, so the program runs a sub-block at a time. The plugin sits
-        // ahead of it, so what reaches it is the DAW's own input and nothing
-        // else — anything the loop fed back would hide a packing mistake
-        // behind arithmetic.
-        let (write, read) = audio_delay(&mut graph, 64.0);
+        // The plugin sits *inside* the loop, which is the only way it runs at
+        // sub-block granularity. The delay is longer than the block, so within
+        // the one block played nothing has come back round yet and what
+        // reaches the plugin is the DAW's own input — anything summed into it
+        // would hide a packing mistake behind arithmetic.
+        let (write, read) = audio_delay(&mut graph, 4096.0);
         let mix = graph.add(
             NodeKind::Mix(Mix {
                 channels: 2,
@@ -4098,11 +4122,11 @@ mod tests {
             }),
             [0.0, 0.0],
         );
-        graph.connect(input, 0, plugin, 0);
-        graph.connect(plugin, 0, mix, 0);
+        graph.connect(input, 0, mix, 0);
         graph.connect(read, 0, mix, 2);
-        graph.connect(mix, 0, write, 0);
-        graph.connect(mix, 0, output, 0);
+        graph.connect(mix, 0, plugin, 0);
+        graph.connect(plugin, 0, write, 0);
+        graph.connect(plugin, 0, output, 0);
 
         const BLOCK: usize = 128;
         let mut engine = Engine::new();
@@ -4137,7 +4161,13 @@ mod tests {
         assert_eq!(records.heard[1], daw_in[BLOCK..], "and so does the other");
     }
 
-    /// Verifies that modulating delay time does not alter sub-plugin processing chunk count.
+    /// How often a plugin is called is settled by the shape of the patch, not
+    /// by a number somebody is turning.
+    ///
+    /// The plugin here feeds a delay line and nothing brings its output back
+    /// round, so it is not in a loop and is called once for the block —
+    /// whatever the delay time is set to. A plugin that *is* in a loop is
+    /// covered by `a_plugin_called_for_a_sub_block_is_handed_that_sub_block`.
     #[test]
     fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
         struct Counting(usize);
@@ -4202,8 +4232,8 @@ mod tests {
         assert_eq!(run(seconds(64.0)), run(seconds(400.0)));
         assert_eq!(
             run(seconds(64.0)),
-            4,
-            "one call per sub-block, because of the loop"
+            1,
+            "one call for the block: the line carries nothing back to it"
         );
     }
 
