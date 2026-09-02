@@ -22,13 +22,17 @@ pub type NoteBuf = u16;
 /// than taking a buffer of its own, so a long chain of open gates costs one.
 pub const MAX_NOTE_BUFS: usize = 16;
 
-/// How many events one note buffer holds for one sub-block.
+/// How many events one note buffer holds.
+///
+/// One whole DAW block, plus the last sub-block of the block before it, which
+/// is carried over so a parameter op reading at the first boundary of a block
+/// has the stream that was in force there.
 ///
 /// Neither format can be told "I consumed fewer than you gave me", so there is
-/// no back pressure to apply and nothing to carry over — an overflow is a drop,
-/// counted and shown, never a `Vec` growing on the audio thread. A dense
-/// controller lane is what makes this number matter; it is sized generously
-/// rather than tightly because the memory is trivial next to the audio pool.
+/// no back pressure to apply — an overflow is a drop, counted and shown, never
+/// a `Vec` growing on the audio thread. A dense controller lane is what makes
+/// this number matter; it is sized generously rather than tightly because the
+/// memory is trivial next to the audio pool.
 pub const NOTE_BUF_CAPACITY: usize = 256;
 
 /// Every MIDI channel. What a node that has no opinion about channels says.
