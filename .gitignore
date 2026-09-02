@@ -6,3 +6,6 @@
 
 # Temporary files.
 /temp/
+
+# agents
+CLAUDE.md
