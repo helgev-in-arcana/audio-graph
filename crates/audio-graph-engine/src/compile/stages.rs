@@ -35,6 +35,9 @@ pub(crate) enum Place {
     After,
 }
 
+/// The places in the order their ops run.
+pub(crate) const RUN_ORDER: [Place; 3] = [Place::Before, Place::Looped, Place::After];
+
 /// One [`Place`] per entry of `order`.
 ///
 /// `Looped` is the set of nodes lying between the ends of some closed audio

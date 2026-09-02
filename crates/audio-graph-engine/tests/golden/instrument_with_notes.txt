@@ -52,8 +52,19 @@ Program {
     ],
     stages: [
         Stage {
-            start: 0,
-            end: 3,
+            params: Span {
+                start: 0,
+                end: 0,
+            },
+            notes: Span {
+                start: 0,
+                end: 1,
+            },
+            audio: Span {
+                start: 0,
+                end: 3,
+            },
+            note_bufs: 1,
             chunking: WholeBlock,
         },
     ],

@@ -20,9 +20,9 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, Chunking, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
+    AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
     MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Stage,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -51,6 +51,10 @@ pub(crate) struct ParamCx<'a> {
     reg_of: Vec<((NodeId, u8), Reg)>,
     ops: Vec<Op>,
     deferred: Vec<Op>,
+    /// The runs of `ops` closed so far, and where the open one starts. See
+    /// [`Stage`].
+    spans: Vec<Span>,
+    span_start: u32,
     outputs: Vec<(u16, Reg)>,
     lfo_nodes: Vec<NodeId>,
     latch_nodes: Vec<NodeId>,
@@ -66,6 +70,8 @@ pub(crate) struct ParamCx<'a> {
 /// What the parameter half produced.
 pub(crate) struct ParamHalf {
     pub ops: Vec<Op>,
+    /// One per stage, in the order they run.
+    pub spans: Vec<Span>,
     pub registers: usize,
     pub outputs: Vec<(u16, Reg)>,
     pub lfo_nodes: Vec<NodeId>,
@@ -90,6 +96,8 @@ impl<'a> ParamCx<'a> {
             reg_of: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            spans: Vec::new(),
+            span_start: 0,
             outputs: Vec::new(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
@@ -105,10 +113,24 @@ impl<'a> ParamCx<'a> {
         self.id = id;
     }
 
+    /// Ends the run of ops that execute together, and any writes it held
+    /// back. See [`AudioCx::close_stage`], which does the same job for the
+    /// same reason.
+    pub(crate) fn close_stage(&mut self) {
+        self.ops.append(&mut self.deferred);
+        let end = self.ops.len() as u32;
+        self.spans.push(Span {
+            start: self.span_start,
+            end,
+        });
+        self.span_start = end;
+    }
+
     pub(crate) fn finish(mut self) -> ParamHalf {
         self.ops.append(&mut self.deferred);
         self.outputs.sort_unstable();
         ParamHalf {
+            spans: self.spans,
             ops: self.ops,
             registers: self.next_reg,
             outputs: self.outputs,
@@ -462,8 +484,8 @@ pub(crate) struct AudioCx<'a> {
     ops: Vec<AudioOp>,
     deferred: Vec<AudioOp>,
     /// The runs of `ops` closed so far, and where the open one starts.
-    stages: Vec<Stage>,
-    stage_start: u32,
+    spans: Vec<Span>,
+    span_start: u32,
     instances: Vec<InstanceIo>,
     latency: u32,
     compensators: u16,
@@ -496,8 +518,8 @@ impl<'a> AudioCx<'a> {
             produced: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
-            stages: Vec::new(),
-            stage_start: 0,
+            spans: Vec::new(),
+            span_start: 0,
             instances: Vec::new(),
             latency: 0,
             compensators: 0,
@@ -567,25 +589,16 @@ impl<'a> AudioCx<'a> {
                 self.ops.push(AudioOp::DelaySilence { line: index });
             }
         }
-        let end = self.ops.len() as u32;
-        if end > self.stage_start {
-            match self.stages.last_mut() {
-                // Folded in when the last stage already runs at that rate, so
-                // a program does not grow a stage for a head that only moves.
-                Some(last) if last.chunking == Chunking::WholeBlock => last.end = end,
-                _ => self.stages.push(Stage {
-                    start: self.stage_start,
-                    end,
-                    chunking: Chunking::WholeBlock,
-                }),
-            }
+        // Onto the tail of the last stage, which is where the program ends.
+        if let Some(last) = self.spans.last_mut() {
+            last.end = self.ops.len() as u32;
         }
 
         self.instances.sort_unstable_by_key(|i| i.instance);
         Audio {
             instances: self.instances,
             ops: self.ops,
-            stages: self.stages,
+            spans: self.spans,
             delay_nodes: self.delay_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
@@ -749,17 +762,14 @@ impl<'a> AudioCx<'a> {
     /// Emitting in an order the audio thread will not follow lets a buffer be
     /// reused while something still to run is holding it, which reads as a
     /// delay writing back its own output.
-    pub(crate) fn close_stage(&mut self, chunking: Chunking) {
+    pub(crate) fn close_stage(&mut self) {
         self.ops.append(&mut self.deferred);
         let end = self.ops.len() as u32;
-        if end > self.stage_start {
-            self.stages.push(Stage {
-                start: self.stage_start,
-                end,
-                chunking,
-            });
-        }
-        self.stage_start = end;
+        self.spans.push(Span {
+            start: self.span_start,
+            end,
+        });
+        self.span_start = end;
     }
 
     /// Says what this node leaves in `buf` on its output socket `port`, and how

@@ -54,6 +54,13 @@ pub struct BlockContext {
     pub frames: u32,
     /// Where this sub-block starts inside the DAW's block.
     pub offset: u32,
+    /// Which sub-block this is, counting from the start of the DAW's block.
+    ///
+    /// The same number as the lane grid's row. Carried rather than divided out
+    /// of `offset`, because the last sub-block of a block is short whenever the
+    /// block is not a multiple of the quantum, and because each stage walks the
+    /// sub-blocks from the start again so a counter would not do either.
+    pub row: u32,
 }
 
 /// Context for evaluating one whole block of audio.
@@ -711,6 +718,16 @@ impl Engine {
             .is_some_and(|p| !p.audio_ops.is_empty())
     }
 
+    /// How many stages the active program is cut into.
+    ///
+    /// A caller that runs audio walks these itself, alternating
+    /// [`run_stage`][Engine::run_stage] over the sub-blocks with
+    /// [`run_audio_stage`][Engine::run_audio_stage], because a stage's
+    /// parameters may be read off the audio the stage before it made.
+    pub fn stages(&self) -> usize {
+        self.program.as_ref().map_or(0, |p| p.stages.len())
+    }
+
     /// The finest granularity anything in the active program runs at.
     ///
     /// A summary: the program is cut into stages and only the one holding a
@@ -738,8 +755,40 @@ impl Engine {
     /// [`run`][Engine::run] per sub-block, in that order. The note buffers are
     /// filled by those calls and read here; calling this without them hands
     /// the sub-plugins the previous block's events, or none at all.
+    ///
+    /// Every stage in one call, which is right for as long as nothing reads a
+    /// parameter off audio. A caller that wants a stage's parameters to see
+    /// the stage before it drives them itself; see [`Engine::stages`].
     pub fn run_audio(
         &mut self,
+        ctx: &AudioContext<'_>,
+        daw_in: &[f32],
+        daw_out: &mut [f32],
+        nodes: &mut dyn AudioInstances,
+    ) {
+        self.clear_output(daw_out);
+        for stage in 0..self.stages() {
+            self.run_audio_stage(stage, ctx, daw_in, daw_out, nodes);
+        }
+    }
+
+    /// The block is the program's to fill: a channel no `Output` op reaches is
+    /// silence, not whatever the caller's buffer already held. Called once
+    /// before the stages, because each of them writes only its own part.
+    pub fn clear_output(&self, daw_out: &mut [f32]) {
+        daw_out.fill(0.0);
+    }
+
+    /// One stage's audio ops, over the whole block.
+    ///
+    /// A stage covers the block before the next one starts, so a stage that
+    /// steps a sub-block at a time hands the one after it a finished buffer.
+    /// Only the stage holding a delay line's two ends steps; the rest of the
+    /// program is called once, however many loops are drawn elsewhere in the
+    /// patch.
+    pub fn run_audio_stage(
+        &mut self,
+        stage: usize,
         ctx: &AudioContext<'_>,
         daw_in: &[f32],
         daw_out: &mut [f32],
@@ -752,18 +801,7 @@ impl Engine {
         let Some(program) = self.program.take() else {
             return;
         };
-
-        // The block is the program's to fill: a channel no `Output` op reaches
-        // is silence, not whatever the caller's buffer already held.
-        daw_out.fill(0.0);
-
-        // Each stage covers the whole block before the next one starts, so a
-        // stage that runs a sub-block at a time hands the one after it a
-        // finished buffer. Only the stage holding a delay line's two ends
-        // needs that; the rest of the program is called once, however many
-        // loops are drawn elsewhere in the patch.
-        for index in 0..program.stages.len() {
-            let stage = program.stages[index];
+        if let Some(&stage) = program.stages.get(stage) {
             let step = match stage.chunking {
                 Chunking::WholeBlock => total.max(1),
                 // The last chunk is short whenever the block is not a multiple
@@ -814,16 +852,18 @@ impl Engine {
 
     /// One sub-block's worth of the note half, appended to what the buffers
     /// already hold. `base` is where each of them stood beforehand.
+    #[allow(clippy::too_many_arguments)]
     fn run_notes_step(
         &mut self,
         program: &Program,
+        stage: Stage,
         events: &[Event],
         start: u32,
         frames: u32,
         lanes: &[f64],
         base: &[usize; MAX_NOTE_BUFS],
     ) {
-        for op in &program.note_ops {
+        for op in &program.note_ops[stage.notes.range()] {
             match *op {
                 NoteOp::Input { out, bus } => {
                     // One note bus so far. A second would be a second DAW note
@@ -966,7 +1006,7 @@ impl Engine {
             frames,
         };
 
-        for op in &program.audio_ops[stage.ops()] {
+        for op in &program.audio_ops[stage.audio.range()] {
             match op {
                 AudioOp::Silence { out } => self.fill(*out, win, 0.0),
                 AudioOp::Input { out, bus } => {
@@ -1373,12 +1413,31 @@ impl Engine {
         self.compensator_heads[slot] = head;
     }
 
-    /// Evaluates parameter operations for one sub-block.
+    /// Every stage's parameter and note ops for one sub-block.
     ///
     /// Overwrites slot table values for lanes driven by the graph.
+    ///
+    /// Right for as long as nothing reads a parameter off audio, which is what
+    /// puts a stage boundary between the two. A caller that runs audio should
+    /// walk the stages itself; see [`Engine::stages`].
     pub fn run(&mut self, ctx: &BlockContext, slots: &mut [f64]) {
+        for stage in 0..self.stages() {
+            self.run_stage(stage, ctx, slots);
+        }
+    }
+
+    /// One stage's parameter and note ops for one sub-block.
+    ///
+    /// Called once per sub-block, in order, before that stage's audio ops.
+    /// What a parameter op reads out of a note buffer is everything the buffer
+    /// holds, which is the stream up to the boundary this sub-block starts on.
+    pub fn run_stage(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
         // Moved out and put back rather than borrowed.
         let Some(program) = self.program.take() else {
+            return;
+        };
+        let Some(&stage) = program.stages.get(stage) else {
+            self.program = Some(program);
             return;
         };
         if program.is_empty() {
@@ -1399,7 +1458,7 @@ impl Engine {
             0.0
         };
 
-        for op in &program.ops {
+        for op in &program.ops[stage.params.range()] {
             match *op {
                 Op::DelayRead {
                     out,
@@ -1660,20 +1719,28 @@ impl Engine {
         // The buffers are appended to rather than refilled, so where they
         // stand now is both what this row's ops must skip and where the audio
         // half will later find this row's events.
-        let row = self.note_rows;
+        let row = ctx.row as usize;
         let mut base = [0usize; MAX_NOTE_BUFS];
         for (slot, buf) in base.iter_mut().zip(self.note_pool.iter()) {
             *slot = buf.len();
         }
+        // Only for the buffers this stage fills. A later stage passing over
+        // the same rows would otherwise overwrite every mark with the length
+        // the buffer finished at, and the audio half would read the whole
+        // block as one row.
         if let Some(marks) = self.note_marks.get_mut(row) {
-            for (mark, &at) in marks.iter_mut().zip(base.iter()) {
-                *mark = at as u32;
+            for (buf, mark) in marks.iter_mut().enumerate() {
+                if stage.note_bufs & (1 << buf) != 0 {
+                    *mark = base[buf] as u32;
+                }
             }
         }
         let events = std::mem::take(&mut self.translated);
-        self.run_notes_step(&program, &events, ctx.offset, ctx.frames, slots, &base);
+        self.run_notes_step(
+            &program, stage, &events, ctx.offset, ctx.frames, slots, &base,
+        );
         self.translated = events;
-        self.note_rows = row + 1;
+        self.note_rows = self.note_rows.max(row + 1);
 
         self.program = Some(program);
     }
@@ -1790,6 +1857,7 @@ mod tests {
             tempo_bpm: 120.0,
             frames,
             offset: 0,
+            row: 0,
         }
     }
 
@@ -2021,6 +2089,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 frames: 6000,
                 offset: 0,
+                row: 0,
             },
             &mut slots,
         );
@@ -2030,6 +2099,7 @@ mod tests {
                 tempo_bpm: 120.0,
                 frames: 1,
                 offset: 0,
+                row: 0,
             },
             &mut slots,
         );
@@ -2611,6 +2681,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     frames: 16,
                     offset: index as u32 * 16,
+                    row: index as u32,
                 },
                 row,
             );
@@ -2853,6 +2924,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     frames: 4,
                     offset: sub as u32 * 4,
+                    row: sub as u32,
                 },
                 &mut row[sub * width..(sub + 1) * width],
             );
@@ -2976,6 +3048,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     frames: 8,
                     offset: index * 8,
+                    row: index,
                 },
                 row,
             );
@@ -3037,6 +3110,7 @@ mod tests {
                         tempo_bpm: 120.0,
                         frames: 8,
                         offset: index * 8,
+                        row: index,
                     },
                     &mut row,
                 );
@@ -3083,6 +3157,7 @@ mod tests {
                     tempo_bpm: 120.0,
                     frames: 8,
                     offset: 0,
+                    row: 0,
                 },
                 row,
             );
@@ -3438,13 +3513,14 @@ mod tests {
         /// to reach the parameter half.
         fn run(&mut self, engine: &mut Engine, frames: u32, slots: &mut [f64]) {
             engine.begin_block(&self.pending);
-            for offset in [0, frames] {
+            for (row, offset) in [0, frames].into_iter().enumerate() {
                 engine.run(
                     &BlockContext {
                         sample_rate: 48_000.0,
                         tempo_bpm: 120.0,
                         frames,
                         offset,
+                        row: row as u32,
                     },
                     slots,
                 );

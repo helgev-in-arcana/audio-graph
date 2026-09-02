@@ -21,7 +21,7 @@ mod audio_op;
 mod note_op;
 mod op;
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, Stage};
+pub use audio_op::{AudioOp, Buf, Chunking, MixIn, Span, Stage};
 pub use note_op::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NoteBuf,
     NoteOp,
@@ -184,8 +184,8 @@ pub struct Program {
     pub instances: Vec<InstanceIo>,
     /// Channel width of each buffer in the audio pool.
     pub buffers: Vec<u16>,
-    /// How `audio_ops` is cut into runs of one granularity, in the order
-    /// they run. See [`Stage`].
+    /// How the three op lists are cut into runs that execute together, in
+    /// the order they run. See [`Stage`].
     pub stages: Vec<Stage>,
     /// What the wrapper should report to the DAW as its own latency: the longest
     /// path from an input to an output, after compensation.

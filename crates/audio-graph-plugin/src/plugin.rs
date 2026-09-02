@@ -393,20 +393,14 @@ impl Wrapper {
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
-        run_graph(
+        let runnable = begin_graph(
             &mut self.engine,
             &mut self.schedule,
             &self.daw_slots,
             &self.events,
             frames,
             self.shared.quantum(),
-            context.transport().sample_rate as f64,
-            context.transport().tempo.unwrap_or(120.0),
         );
-        // What the editor's meters show. The DAW's own parameter value stops
-        // being the answer the moment the graph drives a slot.
-        self.shared
-            .report_slots(self.schedule.block(self.schedule.blocks() - 1));
 
         // nice-plug hands out per-channel slices; the host API wants one flat
         // planar block, so the copy is the price of a boundary that could later
@@ -464,33 +458,31 @@ impl Wrapper {
         };
 
         self.out_events.clear();
-        let status = if self.engine.has_audio() {
-            // The graph decides where the audio goes and which plugins see it.
-            // Sub-plugins are reached through `AudioInstances`, so the engine
-            // still knows nothing about what a plugin is.
-            let mut loaded;
-            let mut empty = subhost_adapter::NoInstances;
-            let nodes: &mut dyn subhost_adapter::AudioInstances = match processor {
-                Some(processor) => {
-                    loaded = processor.bind(&self.schedule, &time, &mut self.out_events);
-                    &mut loaded
-                }
-                None => &mut empty,
-            };
-            self.engine.run_audio(
-                &audio_graph_engine::AudioContext {
+        // The graph decides where the audio goes and which plugins see it.
+        // Sub-plugins are reached through `AudioInstances`, so the engine
+        // still knows nothing about what a plugin is.
+        if runnable {
+            run_stages(
+                &mut self.engine,
+                &mut self.schedule,
+                processor,
+                &mut self.out_events,
+                &time,
+                AudioIo {
                     frames,
-                    quantum: self.schedule.quantum(),
-                    sample_rate: transport.sample_rate as f64,
-                    // The same buffer the parameter lanes ride in. The audio
-                    // half reads only its own range of lane numbers out of it.
-                    lanes: self.schedule.rows(),
-                    lanes_per_row: LANES,
+                    daw_in: &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
+                    daw_out: &mut self.output_scratch[..(out_channels * frames) as usize],
                 },
-                &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
-                &mut self.output_scratch[..(out_channels * frames) as usize],
-                nodes,
+                transport.sample_rate as f64,
+                transport.tempo.unwrap_or(120.0),
             );
+        }
+        // What the editor's meters show. The DAW's own parameter value stops
+        // being the answer the moment the graph drives a slot.
+        self.shared
+            .report_slots(self.schedule.block(self.schedule.blocks() - 1));
+
+        let status = if self.engine.has_audio() {
             ApiStatus::Continue
         } else {
             // Nothing is drawn between the input and the output, so nothing
@@ -594,16 +586,15 @@ fn settle_notes<P: Plugin>(
 /// `Wrapper` mutably at once while the audio lock is held, and spelling the
 /// borrows out is clearer than arguing with the compiler about them.
 #[allow(clippy::too_many_arguments)]
-fn run_graph(
+/// Sets the block's lane grid up. Returns false when there is nothing to run.
+fn begin_graph(
     engine: &mut Engine,
     schedule: &mut SlotSchedule,
     daw_slots: &[f64],
     events: &[Event],
     frames: u32,
     quantum: u32,
-    sample_rate: f64,
-    tempo_bpm: f64,
-) {
+) -> bool {
     if schedule.quantum() != quantum {
         // Allocation-free by construction; see `SlotSchedule`.
         schedule.set_quantum(quantum);
@@ -616,34 +607,107 @@ fn run_graph(
         // project with no graph behaves identically — including sending no more
         // events.
         schedule.fill(daw_slots);
-        return;
+        return false;
+    }
+
+    // The DAW's automation fills the slot lanes; the rest are the graph's own
+    // parameter lanes and start from nothing. Zeroing rather than leaving the
+    // previous sub-block's values means a lane the graph stops driving stops
+    // sending, instead of repeating a stale value. Done for every row up
+    // front, because the stages below write into these same rows and a second
+    // pass of zeroing would wipe what the stage before it left.
+    for index in 0..blocks {
+        let values = schedule.block_mut(index);
+        let slots = daw_slots.len().min(values.len());
+        values[..slots].copy_from_slice(&daw_slots[..slots]);
+        values[slots..].fill(0.0);
     }
 
     // The whole block's stream goes in once, before anything runs: every
-    // note gets an id of the graph's own here, and both halves have to agree
+    // note gets an id of the graph's own here, and every stage has to agree
     // about which note is which. It used to be folded into global state one
     // event at a time before each row; now the events flow along the graph's
     // own wires and the only thing a row needs is where its sub-block sits.
     engine.begin_block(events);
+    true
+}
 
-    for index in 0..blocks {
-        let start = schedule.offset(index);
-        let context = BlockContext {
-            sample_rate,
-            tempo_bpm,
-            frames: schedule.frames_of(index),
-            offset: start,
+/// One DAW block: every stage, in order, over every sub-block.
+///
+/// A stage's parameters run for the whole block before its audio does, and its
+/// audio before the next stage's parameters — which is what lets a parameter
+/// be read off audio at all. Only the stage holding a feedback loop steps
+/// sub-block by sub-block; the rest are called once.
+///
+/// The sub-plugins are bound to the schedule *inside* the loop rather than
+/// once around it. The parameter half writes the lane rows and the adapter
+/// reads them, so the two borrows have to take turns; binding per stage is
+/// what keeps them from overlapping, and costs a few reference copies.
+#[allow(clippy::too_many_arguments)]
+fn run_stages(
+    engine: &mut Engine,
+    schedule: &mut SlotSchedule,
+    processor: Option<&mut subhost_adapter::SubHostProcessors>,
+    out_events: &mut EventSink,
+    time: &TimeContext,
+    audio: AudioIo<'_>,
+    sample_rate: f64,
+    tempo_bpm: f64,
+) {
+    let AudioIo {
+        frames,
+        daw_in,
+        daw_out,
+    } = audio;
+    let blocks = schedule.blocks();
+    let quantum = schedule.quantum();
+    engine.clear_output(daw_out);
+
+    let mut processor = processor;
+    for stage in 0..engine.stages() {
+        for index in 0..blocks {
+            let context = BlockContext {
+                sample_rate,
+                tempo_bpm,
+                frames: schedule.frames_of(index),
+                offset: schedule.offset(index),
+                row: index as u32,
+            };
+            engine.run_stage(stage, &context, schedule.block_mut(index));
+        }
+
+        let mut loaded;
+        let mut empty = subhost_adapter::NoInstances;
+        let nodes: &mut dyn subhost_adapter::AudioInstances = match processor.as_deref_mut() {
+            Some(processor) => {
+                loaded = processor.bind(&*schedule, time, out_events);
+                &mut loaded
+            }
+            None => &mut empty,
         };
-        let values = schedule.block_mut(index);
-        // The DAW's automation fills the slot lanes; the rest are the graph's
-        // own parameter lanes and start from nothing. Zeroing rather than
-        // leaving the previous sub-block's values means a lane the graph stops
-        // driving stops sending, instead of repeating a stale value.
-        let slots = daw_slots.len().min(values.len());
-        values[..slots].copy_from_slice(&daw_slots[..slots]);
-        values[slots..].fill(0.0);
-        engine.run(&context, values);
+        engine.run_audio_stage(
+            stage,
+            &audio_graph_engine::AudioContext {
+                frames,
+                quantum,
+                sample_rate,
+                // The same buffer the parameter lanes ride in. The audio half
+                // reads only its own range of lane numbers out of it.
+                lanes: schedule.rows(),
+                lanes_per_row: LANES,
+            },
+            daw_in,
+            daw_out,
+            nodes,
+        );
     }
+}
+
+/// What one block of audio is, as far as [`run_stages`] is concerned.
+struct AudioIo<'a> {
+    frames: u32,
+    daw_in: &'a [f32],
+    daw_out: &'a mut [f32],
 }
 
 /// Leave the input alone (an effect) or silence the output (an instrument).
@@ -924,8 +988,29 @@ mod tests {
     /// The lane `param_sink`'s parameter is driven through.
     const SINK_LANE: usize = SLOT_COUNT;
 
-    /// Verifies that `run_graph` populates both DAW slot lanes and graph parameter
-    /// lanes across the full schedule width.
+    /// The parameter side of one block, driven the way `process` drives it.
+    ///
+    /// No audio between the stages, which is right for a graph that has none.
+    fn fill_lanes(engine: &mut Engine, schedule: &mut SlotSchedule, daw_slots: &[f64]) {
+        if !begin_graph(engine, schedule, daw_slots, &[], 128, 32) {
+            return;
+        }
+        for stage in 0..engine.stages() {
+            for index in 0..schedule.blocks() {
+                let context = BlockContext {
+                    sample_rate: 48_000.0,
+                    tempo_bpm: 120.0,
+                    frames: schedule.frames_of(index),
+                    offset: schedule.offset(index),
+                    row: index as u32,
+                };
+                engine.run_stage(stage, &context, schedule.block_mut(index));
+            }
+        }
+    }
+
+    /// Every sub-block is filled to the schedule's width, whether or not a
+    /// graph is loaded.
     #[test]
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
@@ -934,16 +1019,7 @@ mod tests {
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.
-        run_graph(
-            &mut engine,
-            &mut schedule,
-            &daw_slots,
-            &[],
-            128,
-            32,
-            48_000.0,
-            120.0,
-        );
+        fill_lanes(&mut engine, &mut schedule, &daw_slots);
         assert!(schedule.blocks() > 0);
         for index in 0..schedule.blocks() {
             let block = schedule.block(index);
@@ -982,16 +1058,7 @@ mod tests {
         handoff.send(Box::new(compile(&graph, SLOT_COUNT).unwrap()));
         assert!(engine.adopt(&handoff));
 
-        run_graph(
-            &mut engine,
-            &mut schedule,
-            &daw_slots,
-            &[],
-            128,
-            32,
-            48_000.0,
-            120.0,
-        );
+        fill_lanes(&mut engine, &mut schedule, &daw_slots);
         for index in 0..schedule.blocks() {
             let block = schedule.block(index);
             assert_eq!(block.len(), LANES);

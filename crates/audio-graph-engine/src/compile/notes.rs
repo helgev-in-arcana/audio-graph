@@ -15,8 +15,11 @@
 //! parameter pass needs buffers — down to one deferred field rather than a
 //! second traversal.
 
+use crate::compile::stages::{Place, RUN_ORDER};
 use crate::graph::{Graph, NodeId};
-use crate::ir::{ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp};
+use crate::ir::{
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp, Span,
+};
 use crate::nodes::NodeKind;
 
 use super::CompileError;
@@ -49,6 +52,10 @@ struct Pending {
 pub(crate) struct Notes {
     pub ops: Vec<NoteOp>,
     pub bufs: u16,
+    /// Which stage each op belongs to, and the spans that fall out of it once
+    /// `resolve_lanes` has dropped the ops whose lane never materialised.
+    places: Vec<Place>,
+    pub spans: Vec<Span>,
     /// Output socket → the note buffer leaving it.
     ///
     /// A filter that drops nothing binds its input's buffer rather than one of
@@ -75,18 +82,36 @@ impl Notes {
 }
 
 /// Walk the order and lay out the note half.
-pub(crate) fn compile_notes(graph: &Graph, order: &[NodeId]) -> Result<Notes, CompileError> {
+pub(crate) fn compile_notes(
+    graph: &Graph,
+    order: &[NodeId],
+    places: &[Place],
+) -> Result<Notes, CompileError> {
     let mut notes = Notes {
         ops: Vec::new(),
         bufs: 0,
+        places: Vec::new(),
+        spans: Vec::new(),
         outputs: Vec::new(),
         pending: Vec::new(),
         states: 0,
     };
 
-    for &id in order {
-        let node = graph.node(id).expect("ordering only contains real nodes");
-        route(graph, order, &mut notes, id, &node.kind)?;
+    // Once per stage rather than once through: a stage's ops have to be
+    // contiguous for the engine to slice rather than filter, and walking the
+    // order this way gets that without a sort. It stays a topological order
+    // because no edge points from a later stage to an earlier one.
+    for place in RUN_ORDER {
+        for (index, &id) in order.iter().enumerate() {
+            if places[index] != place {
+                continue;
+            }
+            let node = graph.node(id).expect("ordering only contains real nodes");
+            let before = notes.ops.len();
+            route(graph, order, &mut notes, id, &node.kind)?;
+            notes.places.resize(notes.ops.len(), place);
+            debug_assert!(notes.ops.len() >= before);
+        }
     }
     Ok(notes)
 }
@@ -122,7 +147,28 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, lanes: &[((NodeId, u8), u16)]) {
     drop.dedup();
     for op in drop.into_iter().rev() {
         notes.ops.remove(op);
+        notes.places.remove(op);
     }
+
+    // The spans are worked out here rather than while emitting, because the
+    // removal above moves everything after a dropped op.
+    notes.spans = RUN_ORDER
+        .iter()
+        .map(|place| {
+            let start = notes.places.iter().position(|at| at == place);
+            match start {
+                Some(start) => Span {
+                    start: start as u32,
+                    end: (start
+                        + notes.places[start..]
+                            .iter()
+                            .filter(|at| *at == place)
+                            .count()) as u32,
+                },
+                None => Span::default(),
+            }
+        })
+        .collect();
 }
 
 /// One node's share of the note half.

@@ -7,9 +7,9 @@
 //! lines up paths of unequal latency, and it decides how often the whole thing
 //! runs.
 
-use crate::compile::stages::Place;
+use crate::compile::stages::RUN_ORDER;
 use crate::graph::{Graph, NodeId};
-use crate::ir::{AudioOp, Chunking, Stage};
+use crate::ir::{AudioOp, Span};
 use subhost_adapter::InstanceIo;
 
 use crate::compile::notes::Notes;
@@ -25,8 +25,8 @@ pub(crate) struct Audio {
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,
     pub buffers: Vec<u16>,
-    /// How `ops` is cut into runs of one granularity, in the order they run.
-    pub stages: Vec<Stage>,
+    /// One per stage, in the order they run.
+    pub spans: Vec<Span>,
     pub latency: u32,
     pub instances: Vec<InstanceIo>,
 }
@@ -40,6 +40,7 @@ pub(crate) struct Audio {
 pub(crate) fn compile_audio(
     graph: &Graph,
     order: &[NodeId],
+    places: &[crate::compile::stages::Place],
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
     notes: &Notes,
@@ -48,9 +49,8 @@ pub(crate) fn compile_audio(
     // frees a buffer as soon as its last reader is compiled, so the order ops
     // are emitted in has to be the order they will run in. See
     // [`AudioCx::close_stage`].
-    let places = super::stages::places(graph, order, lines);
     let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
-    for place in [Place::Before, Place::Looped, Place::After] {
+    for place in RUN_ORDER {
         for (index, &id) in order.iter().enumerate() {
             if places[index] != place {
                 continue;
@@ -59,10 +59,7 @@ pub(crate) fn compile_audio(
             cx.begin(id, &node.kind);
             node.kind.compile_audio(&mut cx)?;
         }
-        cx.close_stage(match place {
-            Place::Looped => Chunking::SubBlock,
-            _ => Chunking::WholeBlock,
-        });
+        cx.close_stage();
     }
     Ok(cx.finish())
 }
@@ -513,7 +510,7 @@ mod tests {
             .stages
             .iter()
             .filter(|stage| stage.chunking == Chunking::SubBlock)
-            .flat_map(|stage| &program.audio_ops[stage.ops()])
+            .flat_map(|stage| &program.audio_ops[stage.audio.range()])
             .collect()
     }
 

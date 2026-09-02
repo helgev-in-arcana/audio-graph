@@ -20,8 +20,9 @@ mod stages;
 
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
+use crate::compile::stages::{Place, RUN_ORDER};
 use crate::graph::{Graph, LineId, NodeId};
-use crate::ir::Program;
+use crate::ir::{Chunking, MAX_NOTE_BUFS, NoteOp, Program, Stage};
 use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,22 +118,60 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         visit(graph, &index, root, &mut mark, &mut order)?;
     }
 
+    // Which part of the graph has to run a sub-block at a time, and what has
+    // to wait for it. All three passes below cut their ops the same way, so
+    // that a stage is one contiguous run of each list.
+    let places = stages::places(graph, &order, &lines);
+
     // Notes first: both halves below need to be able to name a note buffer,
     // and which buffer leaves which socket is pure topology.
-    let mut notes = notes::compile_notes(graph, &order)?;
+    let mut notes = notes::compile_notes(graph, &order, &places)?;
 
     let mut cx = ParamCx::new(graph, &lines, slot_count, &notes);
-    for &id in &order {
-        let node = graph.node(id).expect("ordering only contains real nodes");
-        cx.begin(id);
-        node.kind.compile(&mut cx)?;
+    for place in RUN_ORDER {
+        for (index, &id) in order.iter().enumerate() {
+            if places[index] != place {
+                continue;
+            }
+            let node = graph.node(id).expect("ordering only contains real nodes");
+            cx.begin(id);
+            node.kind.compile(&mut cx)?;
+        }
+        cx.close_stage();
     }
     let param = cx.finish();
 
     // The gates and generators booked their lanes during the pass above.
     notes::resolve_lanes(&mut notes, &param.audio_lanes);
 
-    let audio = audio::compile_audio(graph, &order, &lines, &param.audio_lanes, &notes)?;
+    let audio = audio::compile_audio(graph, &order, &places, &lines, &param.audio_lanes, &notes)?;
+
+    // One stage per place, dropped when all three of its lists are empty —
+    // which is most of them, most of the time.
+    let program_stages: Vec<Stage> = RUN_ORDER
+        .iter()
+        .enumerate()
+        .map(|(index, place)| Stage {
+            params: param.spans[index],
+            notes: notes.spans[index],
+            audio: audio.spans[index],
+            note_bufs: notes.ops[notes.spans[index].range()]
+                .iter()
+                .map(|op| match *op {
+                    NoteOp::Input { out, .. }
+                    | NoteOp::Emit { out, .. }
+                    | NoteOp::Filter { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
+                })
+                .fold(0, |mask, bit| mask | bit),
+            chunking: match place {
+                Place::Looped => Chunking::SubBlock,
+                _ => Chunking::WholeBlock,
+            },
+        })
+        .filter(|stage| {
+            !(stage.params.is_empty() && stage.notes.is_empty() && stage.audio.is_empty())
+        })
+        .collect();
 
     Ok(Program {
         ops: param.ops,
@@ -145,7 +184,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_lane_base: (slot_count + crate::ir::MAX_GRAPH_PARAMS) as u16,
         instances: audio.instances,
         buffers: audio.buffers,
-        stages: audio.stages,
+        stages: program_stages,
         latency: audio.latency,
         delay_nodes: lines.iter().map(|l| l.writer).collect(),
         audio_delay_nodes: audio.delay_nodes,

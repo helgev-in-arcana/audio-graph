@@ -27,8 +27,19 @@ Program {
     ],
     stages: [
         Stage {
-            start: 0,
-            end: 2,
+            params: Span {
+                start: 0,
+                end: 0,
+            },
+            notes: Span {
+                start: 0,
+                end: 0,
+            },
+            audio: Span {
+                start: 0,
+                end: 2,
+            },
+            note_bufs: 0,
             chunking: WholeBlock,
         },
     ],

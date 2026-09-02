@@ -36,30 +36,60 @@ pub enum Chunking {
     SubBlock,
 }
 
-/// A run of audio ops sharing a granularity.
-///
-/// A program's audio ops are one topological order cut into stages, and every
-/// stage covers the whole DAW block before the next one starts. What differs
-/// is whether its ops are called once for the block or once per sub-block.
-///
-/// This used to be one answer for the whole program, which meant a delay line
-/// anywhere in a patch called every plugin in it once per sub-block. How often
-/// a sub-plugin is called is a cost; how short a delay the graph can express
-/// is not the same question, and should not be paid for by everything that
-/// asked neither.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stage {
-    /// Where this stage starts in `Program::audio_ops`.
+/// A run of one op list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
     pub start: u32,
-    /// Where it ends.
     pub end: u32,
-    pub chunking: Chunking,
 }
 
-impl Stage {
-    pub fn ops(&self) -> std::ops::Range<usize> {
+impl Span {
+    pub fn range(&self) -> std::ops::Range<usize> {
         self.start as usize..self.end as usize
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+}
+
+/// One slice of a program: the parameter, note and audio ops that run
+/// together, at one granularity.
+///
+/// A program's three lists are one topological order between them, cut into
+/// stages. A stage covers the whole DAW block before the next one starts, and
+/// inside it the order is parameters, then notes, then audio — the order a
+/// signal changes rate in. What differs from one stage to the next is whether
+/// its audio ops are called once for the block or once per sub-block.
+///
+/// Two things ask for a cut. A delay line's two ends have to run at the
+/// quantum, because a delay is at least one chunk long. And a parameter read
+/// off audio cannot be worked out until that audio exists, which is what makes
+/// an envelope follower expressible at all: the stage holding it runs after
+/// the stage that made the sound it is measuring.
+///
+/// Granularity used to be one answer for the whole program, which meant a
+/// delay line anywhere in a patch called every plugin in it once per
+/// sub-block. How often a sub-plugin is called is a cost; how short a delay
+/// the graph can express is not the same question, and should not be paid for
+/// by everything that asked neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stage {
+    /// Where this stage's ops sit in `Program::ops`.
+    pub params: Span,
+    /// Its ops in `Program::note_ops`.
+    pub notes: Span,
+    /// Its ops in `Program::audio_ops`.
+    pub audio: Span,
+    /// Which note buffers those note ops write, one bit each.
+    ///
+    /// The engine records where a buffer stood before each sub-block so the
+    /// audio half can find its own rows again. Only the stage that fills a
+    /// buffer may write that mark: a later stage passing over the same rows
+    /// would overwrite every one of them with the length the buffer finished
+    /// at, and the audio half would read the whole block as one row.
+    pub note_bufs: u16,
+    pub chunking: Chunking,
 }
 
 /// One step of the audio half of a program.
