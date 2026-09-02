@@ -760,9 +760,8 @@ impl Engine {
     /// filled by those calls and read here; calling this without them hands
     /// the sub-plugins the previous block's events, or none at all.
     ///
-    /// Every stage in one call, which is right for as long as nothing reads a
-    /// parameter off audio. A caller that wants a stage's parameters to see
-    /// the stage before it drives them itself; see [`Engine::stages`].
+    /// Every stage in one call. See [`Engine::run`] for what that costs and
+    /// when it costs nothing.
     pub fn run_audio(
         &mut self,
         ctx: &AudioContext<'_>,
@@ -1421,9 +1420,23 @@ impl Engine {
     ///
     /// Overwrites slot table values for lanes driven by the graph.
     ///
-    /// Right for as long as nothing reads a parameter off audio, which is what
-    /// puts a stage boundary between the two. A caller that runs audio should
-    /// walk the stages itself; see [`Engine::stages`].
+    /// Paired with [`run_audio`][Engine::run_audio] this puts every parameter
+    /// of the block before any of its audio, which is one block behind the
+    /// order the stages describe. What that costs depends on the graph:
+    ///
+    /// * with nothing reading a parameter off audio there is only one stage
+    ///   and the two orders are the same walk;
+    /// * with an [`Op::Follow`] whose value never comes back round to audio —
+    ///   a meter, or anything else the editor reads and the block does not —
+    ///   the audio is identical and the lane is a block old, which is what a
+    ///   meter is anyway;
+    /// * with one that *does* reach audio again, through a sub-plugin's
+    ///   parameter or a generated controller, the block is rendered against
+    ///   the level of the block before it.
+    ///
+    /// The buffer read is the pool as the last block left it, so that last
+    /// case is a block of latency rather than nonsense. A caller that wants
+    /// none of it walks the stages itself; see [`Engine::stages`].
     pub fn run(&mut self, ctx: &BlockContext, slots: &mut [f64]) {
         for stage in 0..self.stages() {
             self.run_stage(stage, ctx, slots);
@@ -4150,6 +4163,148 @@ mod tests {
         assert!(
             slow[0] > 0.0 && slow[0] < 0.5 && slow[1] > slow[0] && slow[1] < 0.5,
             "an attack of 50 ms climbs towards the level over sub-blocks: {slow:?}"
+        );
+    }
+
+    /// What the all-stages helpers cost, which is nothing until a level comes
+    /// back round to audio.
+    ///
+    /// `run` + `run_audio` put every parameter of the block before any of its
+    /// audio. That is the order the engine had before it was cut into stages,
+    /// and it is still the order every caller with no audio to interleave
+    /// wants. The claim under test is where the two orders part company: not
+    /// wherever a follower appears, but only where its value reaches audio
+    /// again inside the same block.
+    #[test]
+    fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
+        const BLOCK: u32 = 64;
+        const QUANTUM: u32 = 32;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+        // A ramp, so every block is louder than the one before it and a block
+        // of latency cannot hide in a steady signal.
+        let played = |staged: bool, ducked: bool| -> Vec<f32> {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let output = stereo_out(&mut graph);
+            let follower = graph.add(
+                NodeKind::EnvelopeFollower(EnvelopeFollower {
+                    detect: Detect::Peak,
+                    attack: 0.0,
+                    release: 0.0,
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, follower, 0);
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 1,
+                    gains: vec![0.0],
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, mix, 0);
+            graph.connect(mix, 0, output, 0);
+            if ducked {
+                // The level drives the gain, so it reaches audio.
+                graph.connect(follower, 0, mix, 1);
+            } else {
+                // The level goes to a sub-plugin parameter on an instance the
+                // program has no audio for: read by the editor, and by nothing
+                // this block renders.
+                let sink = param_sink(&mut graph);
+                graph.connect(follower, 0, sink, 0);
+            }
+
+            let mut engine = Engine::new();
+            engine.prepare(BLOCK, &[2]);
+            load(&mut engine, &graph);
+
+            let mut heard = Vec::new();
+            let mut lanes = vec![0.0; width * 2];
+            for block in 0..4u32 {
+                let value = 0.1 * (block + 1) as f32;
+                let daw_in = vec![value; 2 * BLOCK as usize];
+                let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+                let context = |row: usize| BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: QUANTUM,
+                    offset: row as u32 * QUANTUM,
+                    row: row as u32,
+                    block: BLOCK,
+                };
+                let audio = AudioContext {
+                    frames: BLOCK,
+                    quantum: QUANTUM,
+                    sample_rate: RATE,
+                    lanes: &[],
+                    lanes_per_row: width,
+                };
+                engine.begin_block(&[]);
+                if staged {
+                    for stage in 0..engine.stages() {
+                        for row in 0..2usize {
+                            engine.run_stage(
+                                stage,
+                                &context(row),
+                                &mut lanes[row * width..(row + 1) * width],
+                            );
+                        }
+                        engine.run_audio_stage(
+                            stage,
+                            &AudioContext {
+                                lanes: &lanes,
+                                ..audio
+                            },
+                            &daw_in,
+                            &mut daw_out,
+                            &mut Adders,
+                        );
+                    }
+                } else {
+                    for row in 0..2usize {
+                        engine.run(&context(row), &mut lanes[row * width..(row + 1) * width]);
+                    }
+                    engine.run_audio(
+                        &AudioContext {
+                            lanes: &lanes,
+                            ..audio
+                        },
+                        &daw_in,
+                        &mut daw_out,
+                        &mut Adders,
+                    );
+                }
+                // The gain that came out, not the sample: what lags is the
+                // level read, and the signal it is applied to is this block's
+                // either way, so the two are not shifted copies of each other.
+                heard.push(daw_out[BLOCK as usize - 1] / value);
+            }
+            heard
+        };
+
+        // The level reaches nothing this block renders, so the two orders make
+        // the same sound and only the lane is a block old.
+        assert_eq!(
+            played(true, false),
+            played(false, false),
+            "a level nothing plays costs nothing to read late"
+        );
+
+        // And where it does reach audio, the batched order renders each block
+        // against the level of the one before it.
+        let staged = played(true, true);
+        let batched = played(false, true);
+        assert_ne!(staged, batched, "a gain read late is a different sound");
+        assert!(
+            batched
+                .iter()
+                .skip(1)
+                .zip(&staged)
+                .all(|(late, then)| (late - then).abs() < 1e-6),
+            "and late by exactly one block: {batched:?} against {staged:?}"
         );
     }
 
