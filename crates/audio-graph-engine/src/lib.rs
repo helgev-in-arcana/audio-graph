@@ -30,6 +30,7 @@ mod graph;
 mod handoff;
 mod ir;
 mod nodes;
+mod notes;
 mod port;
 
 pub use compile::{CompileError, compile};
@@ -52,4 +53,5 @@ pub use nodes::{
     NodeGroup, catalogue,
     widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
 };
+pub use notes::{Ended, MAX_LIVE_NOTES};
 pub use port::{Port, PortType};

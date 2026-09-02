@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
 use crate::state::WrapperState;
-use audio_graph_engine::{BlockContext, Engine, Graph};
+use audio_graph_engine::{BlockContext, Ended, Engine, Graph, MAX_LIVE_NOTES};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
@@ -45,6 +45,12 @@ pub struct Wrapper {
     daw_slots: Vec<f64>,
     events: Vec<Event>,
     out_events: EventSink,
+    /// Notes the graph has finished with, to be handed back to the DAW.
+    ///
+    /// Owned and sized at activate: the audio thread may not allocate, and the
+    /// list has to live somewhere between the engine filling it and the
+    /// wrapper sending it.
+    ended_notes: Vec<Ended>,
     input_scratch: Vec<f32>,
     /// Channel width of each of the wrapper's own input buses, main first.
     daw_inputs: Vec<u16>,
@@ -76,6 +82,7 @@ impl Default for Wrapper {
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
+            ended_notes: Vec::new(),
             input_scratch: Vec::new(),
             daw_inputs: Vec::new(),
             output_scratch: Vec::new(),
@@ -266,6 +273,7 @@ impl Wrapper {
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
         self.out_events = EventSink::with_capacity(256);
+        self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
@@ -478,7 +486,6 @@ impl Wrapper {
                     // half reads only its own range of lane numbers out of it.
                     lanes: self.schedule.rows(),
                     lanes_per_row: LANES,
-                    events: &self.events,
                 },
                 &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
                 &mut self.output_scratch[..(out_channels * frames) as usize],
@@ -495,8 +502,23 @@ impl Wrapper {
             for ch in 0..channels as usize {
                 buffer.as_slice()[ch][..frame_len].fill(0.0);
             }
+            settle_notes(
+                &mut self.engine,
+                &self.out_events,
+                &mut self.ended_notes,
+                context,
+            );
             return ProcessStatus::Normal;
         };
+
+        // After the audio half, because that is where a note is handed to a
+        // sub-plugin and where the sub-plugin's answer comes back.
+        settle_notes(
+            &mut self.engine,
+            &self.out_events,
+            &mut self.ended_notes,
+            context,
+        );
 
         if status == ApiStatus::Error {
             // Silence rather than noise, and rather than a bypass nothing on
@@ -528,6 +550,37 @@ impl Wrapper {
     /// Latency the sub-plugin asked to change since the last check.
     pub fn take_latency_change(&self) -> Option<u32> {
         self.context.take_latency_change()
+    }
+}
+
+/// Tell the DAW about the notes the graph has finished with.
+///
+/// A sub-plugin's `NOTE_END` says it is done with a note; a note every
+/// sub-plugin is done with — or that reached none of them, because every branch
+/// was gated shut — is one the DAW can stop holding a voice for. Saying so is
+/// the honest answer either way, and CLAP asks for it.
+///
+/// VST3 has no `NOTE_END` to send back, so nothing arrives from that side; its
+/// backend ends the note when the note-off is delivered instead, which is the
+/// closest the format allows.
+///
+/// A free function rather than a method because the caller is holding a borrow
+/// of the shared audio state for the whole block.
+fn settle_notes<P: Plugin>(
+    engine: &mut Engine,
+    from_plugins: &EventSink,
+    ended: &mut Vec<Ended>,
+    context: &mut impl ProcessContext<P>,
+) {
+    ended.clear();
+    engine.end_block(from_plugins.events(), ended);
+    for note in ended.iter() {
+        context.send_event(NoteEvent::VoiceTerminated {
+            timing: 0,
+            voice_id: note.daw_id,
+            channel: note.channel.clamp(0, 15) as u8,
+            note: note.key.clamp(0, 127) as u8,
+        });
     }
 }
 
@@ -566,19 +619,20 @@ fn run_graph(
         return;
     }
 
+    // The whole block's stream goes in once, before anything runs: every
+    // note gets an id of the graph's own here, and both halves have to agree
+    // about which note is which. It used to be folded into global state one
+    // event at a time before each row; now the events flow along the graph's
+    // own wires and the only thing a row needs is where its sub-block sits.
+    engine.begin_block(events);
+
     for index in 0..blocks {
         let start = schedule.offset(index);
-        // The whole block's stream goes in, and the engine cuts it to the
-        // sub-block itself. It used to be folded into global state here, one
-        // event at a time, before each row; now the events flow along the
-        // graph's own wires and the only thing the engine needs is where the
-        // sub-block sits.
         let context = BlockContext {
             sample_rate,
             tempo_bpm,
             frames: schedule.frames_of(index),
             offset: start,
-            events,
         };
         let values = schedule.block_mut(index);
         // The DAW's automation fills the slot lanes; the rest are the graph's

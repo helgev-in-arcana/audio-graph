@@ -821,6 +821,10 @@ impl SubPluginProcessor for Vst3Processor {
             &self.input_changes,
             &self.input_events,
         );
+        // The format cannot tell us when a voice finishes, so the note-off is
+        // the last thing we will ever know about the note. See
+        // `end_notes_offered`.
+        vst_events::end_notes_offered(events, out_events);
 
         // Channel pointers into the caller's flat planar storage.
         let frame_len = frames as usize;

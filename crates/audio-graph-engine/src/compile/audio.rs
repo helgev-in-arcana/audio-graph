@@ -64,7 +64,6 @@ mod tests {
             sample_rate: 48_000.0,
             lanes: &[],
             lanes_per_row: 0,
-            events: &[],
         }
     }
     use super::*;

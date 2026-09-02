@@ -234,6 +234,38 @@ pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
     }
 }
 
+/// Say a note has ended for every note-off handed to the plugin.
+///
+/// VST3 has no counterpart to CLAP's `NOTE_END`: `EventTypes` simply has no
+/// such event, so a VST3 plugin has no way to tell a host that a voice has
+/// finished ringing. Without this, a caller counting how many plugins still
+/// hold a note would wait forever on every VST3 in the graph.
+///
+/// Ending it at the note-off is early — the voice is usually still in its
+/// release — and it is the closest the format allows. The alternative is not
+/// a later answer but no answer.
+pub fn end_notes_offered(events: &[ApiEvent], sink: &mut EventSink) {
+    for event in events {
+        if let ApiEvent::Note(NoteEvent::NoteOff {
+            note_id,
+            port,
+            channel,
+            key,
+            sample_offset,
+            ..
+        }) = *event
+        {
+            sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
+                note_id,
+                port,
+                channel,
+                key,
+                sample_offset,
+            }));
+        }
+    }
+}
+
 /// Build VST3's `ProcessContext` from the core's transport snapshot.
 pub fn to_process_context(context: &TimeContext, sample_rate: f64) -> ProcessContext {
     let mut out: ProcessContext = unsafe { std::mem::zeroed() };
