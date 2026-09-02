@@ -666,6 +666,74 @@ mod tests {
         );
     }
 
+    /// Two delays in series leave what sits between them alone.
+    ///
+    /// A node is inside a loop when it lies between the two ends of *one*
+    /// line. Asking that question of every line's ends at once, as one set,
+    /// answers yes for anything on a path from one loop to another — so a
+    /// chorus between two feedback delays was called sixteen times a block for
+    /// belonging to neither of them.
+    #[test]
+    fn a_node_between_two_loops_is_in_neither() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+
+        // Two feedback delays, and a plugin in the middle of the chain.
+        let between = plugin(&mut graph, 0, 0);
+        let loop_at = |graph: &mut Graph, line: u32, from: NodeId| -> NodeId {
+            let read = graph.add(
+                NodeKind::DelayRead(DelayRead {
+                    line,
+                    ty: PortType::STEREO,
+                    max_time: 1.0,
+                    time: 0.01,
+                }),
+                [0.0, 0.0],
+            );
+            let write = graph.add(
+                NodeKind::DelayWrite(DelayWrite {
+                    line,
+                    ty: PortType::STEREO,
+                }),
+                [0.0, 0.0],
+            );
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: Vec::new(),
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(from, 0, mix, 0);
+            graph.connect(read, 0, mix, 2);
+            graph.connect(mix, 0, write, 0);
+            mix
+        };
+        let first = loop_at(&mut graph, 0, input);
+        graph.connect(first, 0, between, 0);
+        let second = loop_at(&mut graph, 1, between);
+        graph.connect(second, 0, output, 0);
+
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(
+            !fine(&program)
+                .iter()
+                .any(|op| matches!(op, AudioOp::Plugin { .. })),
+            "the plugin belongs to neither loop: {:?}",
+            fine(&program)
+        );
+        assert_eq!(
+            fine(&program)
+                .iter()
+                .filter(|op| matches!(op, AudioOp::DelayWrite { .. }))
+                .count(),
+            2,
+            "and both loops still run a sub-block at a time"
+        );
+    }
+
     /// A synth node with an instrument's ports.
     fn synth(graph: &mut Graph, instance: usize) -> NodeId {
         graph.add(

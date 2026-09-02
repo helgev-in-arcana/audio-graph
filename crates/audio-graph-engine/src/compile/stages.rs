@@ -33,32 +33,30 @@ pub(crate) struct Plan {
     pub of: Vec<usize>,
 }
 
-/// Where a node sits relative to the program's delay lines.
+/// Which loop a node belongs to, if any.
 ///
-/// A valid order to run them in: no edge points from a later one to an earlier
-/// one. `Looped` holds the nodes between the two ends of some closed audio
-/// line — reachable from an end and reaching an end. For a feedback loop that
-/// is the whole loop; for a plain delay, where the read cannot reach the
-/// write, it is just the two ends, and everything they are wired to keeps
-/// running once a block.
+/// A node is inside a loop when it lies between the two ends of *one* line:
+/// reachable from an end of that line and reaching an end of it. Asking the
+/// question of every line's ends at once, as one set, answers yes for anything
+/// on a path from one loop to another — so a chorus between two feedback
+/// delays would be called sixteen times a block for belonging to neither.
 ///
-/// Nothing in `Looped` points into `Before`: an edge from a looped node to a
-/// node that reaches a looped node would put its own target in the set.
-/// Nothing in `After` points into either, because a node that reaches the set
-/// is in `Before` by definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Place {
-    Before,
-    Looped,
-    After,
-}
+/// Loops sharing a node are one component, because a value in either reaches
+/// itself through the other and no member can be said to come first.
+type Component = Option<usize>;
 
 /// Cuts the graph into stages.
 ///
-/// A node's stage is the pair `(level, place)`: how many times the signal has
-/// changed rate on the longest path to it, and where it sits relative to the
-/// loops. Each respects the topological order on its own, so the pair does
-/// too, and sorting by it gives an order every edge points forwards along.
+/// A node's stage is the pair `(level, inside a loop)`. The level is how many
+/// boundaries the longest path to it crosses, and a boundary is either a
+/// change of rate — audio into something that makes anything else — or a step
+/// into or out of a loop, which has to be a stage of its own because a stage
+/// runs at one granularity.
+///
+/// Two nodes at one level with an edge between them are on the same side of
+/// that pair by construction: an edge crossing it would have been a boundary
+/// and put them on different levels. So sorting by the pair gives an order
+/// every edge points forwards along, whichever way the second half is read.
 pub(crate) fn plan(graph: &Graph, order: &[NodeId], lines: &[Line]) -> Plan {
     let n = order.len();
     let at = |id: NodeId| order.iter().position(|&node| node == id);
@@ -77,12 +75,13 @@ pub(crate) fn plan(graph: &Graph, order: &[NodeId], lines: &[Line]) -> Plan {
         backward[to].push(from);
     }
 
-    let looped = looped(graph, order, lines, &forward, &backward, &at);
-    let places = places(&looped, &backward, n);
-    let levels = levels(&looped, &forward, &cuts, n);
+    let components = components(graph, order, lines, &forward, &backward, &at);
+    let levels = levels(&components, &forward, &cuts, n);
 
     // One stage per distinct key, in the order they run.
-    let keys: Vec<(u16, Place)> = (0..n).map(|i| (levels[i], places[i])).collect();
+    let keys: Vec<(u16, bool)> = (0..n)
+        .map(|index| (levels[index], components[index].is_some()))
+        .collect();
     let mut distinct = keys.clone();
     distinct.sort_unstable();
     distinct.dedup();
@@ -90,9 +89,12 @@ pub(crate) fn plan(graph: &Graph, order: &[NodeId], lines: &[Line]) -> Plan {
     Plan {
         stages: distinct
             .iter()
-            .map(|&(_, place)| match place {
-                Place::Looped => Chunking::SubBlock,
-                _ => Chunking::WholeBlock,
+            .map(|&(_, looped)| {
+                if looped {
+                    Chunking::SubBlock
+                } else {
+                    Chunking::WholeBlock
+                }
             })
             .collect(),
         of: keys
@@ -128,26 +130,26 @@ fn rate_cut(graph: &Graph, from: NodeId, from_port: u8, to: NodeId) -> bool {
     carries_audio && makes_something_else
 }
 
-/// The nodes lying between the two ends of some closed audio line.
-fn looped(
+/// Which loop each node belongs to. See [`Component`].
+fn components(
     graph: &Graph,
     order: &[NodeId],
     lines: &[Line],
     forward: &[Vec<usize>],
     backward: &[Vec<usize>],
     at: &impl Fn(NodeId) -> Option<usize>,
-) -> Vec<bool> {
+) -> Vec<Component> {
     let n = order.len();
 
-    // Both ends of every audio line that has both. A line missing one end can
+    // One region per audio line that has both its ends. A line missing one can
     // carry nothing back: an unread write is dropped on the floor, and an
     // unwritten read is silence whenever it is asked.
-    let mut ends = Vec::new();
+    let mut regions: Vec<Vec<bool>> = Vec::new();
     for line in lines {
         if !matches!(line.ty, PortType::Audio { .. }) || line.writer == NO_WRITER {
             continue;
         }
-        let readers: Vec<usize> = order
+        let mut ends: Vec<usize> = order
             .iter()
             .enumerate()
             .filter(|&(_, &id)| {
@@ -156,69 +158,101 @@ fn looped(
             })
             .map(|(index, _)| index)
             .collect();
-        if readers.is_empty() {
+        if ends.is_empty() {
             continue;
         }
-        ends.extend(readers);
         ends.extend(at(line.writer));
-    }
-    if ends.is_empty() {
-        return vec![false; n];
+
+        let downstream = spread(&ends, forward, n);
+        let upstream = spread(&ends, backward, n);
+        regions.push(
+            (0..n)
+                .map(|index| downstream[index] && upstream[index])
+                .collect(),
+        );
     }
 
-    let downstream = spread(&ends, forward, n);
-    let upstream = spread(&ends, backward, n);
-    (0..n).map(|i| downstream[i] && upstream[i]).collect()
-}
-
-/// `Before` for what feeds the loops, `After` for the rest.
-fn places(looped: &[bool], backward: &[Vec<usize>], n: usize) -> Vec<Place> {
-    let seeds: Vec<usize> = (0..n).filter(|&i| looped[i]).collect();
-    if seeds.is_empty() {
-        return vec![Place::Before; n];
-    }
-    let feeds = spread(&seeds, backward, n);
-    (0..n)
-        .map(|index| {
-            if looped[index] {
-                Place::Looped
-            } else if feeds[index] {
-                Place::Before
-            } else {
-                Place::After
+    // Two lines sharing a node are one loop: a value in either comes back to
+    // itself through the other, so neither can be said to run first.
+    let mut merged = true;
+    while merged {
+        merged = false;
+        for a in 0..regions.len() {
+            for b in (a + 1)..regions.len() {
+                if (0..n).any(|index| regions[a][index] && regions[b][index]) {
+                    let other = regions.swap_remove(b);
+                    for (into, from) in regions[a].iter_mut().zip(other) {
+                        *into |= from;
+                    }
+                    merged = true;
+                    break;
+                }
             }
-        })
-        .collect()
+            if merged {
+                break;
+            }
+        }
+    }
+
+    let mut components = vec![None; n];
+    for (which, region) in regions.iter().enumerate() {
+        for (index, &inside) in region.iter().enumerate() {
+            if inside {
+                components[index] = Some(which);
+            }
+        }
+    }
+    components
 }
 
-/// How many rate changes the longest path to each node crosses.
+/// How many boundaries the longest path to each node crosses.
 ///
-/// Everything inside a loop shares one level, because a loop runs as a piece:
-/// a value in it reaches itself, so no member can be said to come before
-/// another. Relaxed to a fixed point rather than walked in order, because
-/// collapsing the loop that way is what makes an order exist at all.
-fn levels(looped: &[bool], forward: &[Vec<usize>], cuts: &[Vec<bool>], n: usize) -> Vec<u16> {
+/// A boundary is a change of rate, or a step into or out of a loop — the
+/// second because a stage runs at one granularity, so a loop cannot share one
+/// with what feeds it or what it feeds.
+///
+/// Everything inside one loop ends up on the same level, because a loop runs
+/// as a piece: a value in it reaches itself, so no member can be said to come
+/// before another. Levelling them by hand is what makes that true — a member
+/// with an upstream neighbour outside the loop would otherwise sit a level
+/// above one without. Relaxed to a fixed point rather than walked in order,
+/// because collapsing the loops that way is what makes an order exist at all.
+fn levels(
+    components: &[Component],
+    forward: &[Vec<usize>],
+    cuts: &[Vec<bool>],
+    n: usize,
+) -> Vec<u16> {
+    let loops = components
+        .iter()
+        .flatten()
+        .copied()
+        .max()
+        .map_or(0, |m| m + 1);
     let mut levels = vec![0u16; n];
     for _ in 0..=n {
         let mut moved = false;
         for from in 0..n {
             for (&next, &cut) in forward[from].iter().zip(&cuts[from]) {
-                let want = levels[from] + u16::from(cut);
+                let boundary = cut || components[from] != components[next];
+                let want = levels[from] + u16::from(boundary);
                 if levels[next] < want {
                     levels[next] = want;
                     moved = true;
                 }
             }
         }
-        let inside = (0..n)
-            .filter(|&index| looped[index])
-            .map(|index| levels[index])
-            .max()
-            .unwrap_or(0);
-        for (index, level) in levels.iter_mut().enumerate() {
-            if looped[index] && *level < inside {
-                *level = inside;
-                moved = true;
+        for which in 0..loops {
+            let inside = (0..n)
+                .filter(|&index| components[index] == Some(which))
+                .map(|index| levels[index])
+                .max()
+                .unwrap_or(0);
+            for (index, level) in levels.iter_mut().enumerate() {
+                if components[index] == Some(which) && *level < inside {
+                    *level = inside;
+                    moved = true;
+                }
             }
         }
         if !moved {
