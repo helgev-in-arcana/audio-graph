@@ -54,6 +54,13 @@ struct Entry {
     voices: u16,
     /// Whether the DAW's note-off for this note has come through.
     released: bool,
+    /// Whether the block this note arrived in is still being processed.
+    ///
+    /// Kept on the entry rather than looked up in a list of arrivals: the
+    /// end-of-block sweep already walks every entry, and searching a list
+    /// inside that walk makes the whole thing quadratic in the number of live
+    /// notes — on the audio thread, every block.
+    fresh: bool,
     /// Whether any sub-plugin was ever handed it. A note that reached one and
     /// has now been let go is finished; a note that never reached one is
     /// finished as soon as the block it arrived in is over.
@@ -82,6 +89,7 @@ impl Entry {
         next: None,
         voices: 0,
         released: false,
+        fresh: false,
         ever_delivered: false,
         reported: false,
         voice_slot: None,
@@ -106,9 +114,6 @@ pub struct NoteLedger {
     /// `(channel, key)` → the oldest live note at that address.
     head: Vec<Option<Idx>>,
     next_serial: u64,
-    /// Notes whose note-on arrived during the block being processed, so the
-    /// end-of-block sweep knows which ones to judge for "reached nobody".
-    arrived: Vec<Idx>,
     /// Ids the graph handed out but the pool could not hold, since the last
     /// reset. A stolen note is a real fault and the number is the only way
     /// anyone would find out.
@@ -128,7 +133,6 @@ impl NoteLedger {
             free: (0..MAX_LIVE_NOTES as Idx).rev().collect(),
             head: vec![None; CHANNELS * KEYS],
             next_serial: 0,
-            arrived: Vec::with_capacity(MAX_LIVE_NOTES),
             stolen: 0,
         }
     }
@@ -140,7 +144,6 @@ impl NoteLedger {
         self.free.clear();
         self.free.extend((0..MAX_LIVE_NOTES as Idx).rev());
         self.head.iter_mut().for_each(|h| *h = None);
-        self.arrived.clear();
         self.next_serial = 0;
     }
 
@@ -233,12 +236,12 @@ impl NoteLedger {
             next: None,
             voices: 0,
             released: false,
+            fresh: true,
             ever_delivered: false,
             reported: false,
             voice_slot: None,
             live: true,
         };
-        self.arrived.push(index);
 
         // The tail, so the chain reads oldest first and a note-off with no id
         // to go on releases the note that has been sounding longest — which is
@@ -412,7 +415,7 @@ impl NoteLedger {
             }
             // Either it has been somewhere and come back, or the block it
             // arrived in is over and it never went anywhere at all.
-            let settled = entry.ever_delivered || self.arrived.contains(&(index as Idx));
+            let settled = entry.ever_delivered || entry.fresh;
             if !entry.reported && entry.voices == 0 && settled {
                 if out.len() < out.capacity() {
                     out.push(Ended {
@@ -424,6 +427,7 @@ impl NoteLedger {
                 }
                 self.entries[index].reported = true;
             }
+            self.entries[index].fresh = false;
             let entry = self.entries[index];
             if entry.reported && entry.released && entry.voices == 0 {
                 self.unlink(index as Idx);
@@ -431,7 +435,6 @@ impl NoteLedger {
                 self.free.push(index as Idx);
             }
         }
-        self.arrived.clear();
     }
 }
 
