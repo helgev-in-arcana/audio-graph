@@ -77,7 +77,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | num-conv | 0.2.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
-| open | 5.4.2 | MIT |
+| open | 5.4.3 | MIT |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 |
 | peniko | 0.6.1 | Apache-2.0 OR MIT |
@@ -98,7 +98,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 | serde_json | 1.0.151 | MIT OR Apache-2.0 |
 | sharded-slab | 0.1.7 | MIT |
 | skrifa | 0.44.0 | MIT OR Apache-2.0 |
-| smallvec | 1.15.2 | MIT OR Apache-2.0 |
+| smallvec | 1.16.0 | MIT OR Apache-2.0 |
 | symlink | 0.1.0 | MIT/Apache-2.0 |
 | syn | 1.0.109 | MIT OR Apache-2.0 |
 | syn | 2.0.119 | MIT OR Apache-2.0 |
@@ -190,7 +190,7 @@ AudioGraph 自身のライセンスは [LICENSE-MIT](LICENSE-MIT) および
 - parking_lot_core 0.9.12 (LICENSE-APACHE)
 - rustc-demangle 0.1.28 (LICENSE-APACHE)
 - scopeguard 1.2.0 (LICENSE-APACHE)
-- smallvec 1.15.2 (LICENSE-APACHE)
+- smallvec 1.16.0 (LICENSE-APACHE)
 - symlink 0.1.0 (LICENSE-APACHE)
 - syn 1.0.109 (LICENSE-APACHE)
 - thread_local 1.1.10 (LICENSE-APACHE)
@@ -3961,7 +3961,7 @@ SOFTWARE.
 
 適用先:
 
-- open 5.4.2 (LICENSE.md)
+- open 5.4.3 (LICENSE.md)
 
 ```
 The MIT License (MIT)
@@ -4693,7 +4693,7 @@ THE SOFTWARE.
 
 適用先:
 
-- smallvec 1.15.2 (LICENSE-MIT)
+- smallvec 1.16.0 (LICENSE-MIT)
 
 ```
 Copyright (c) 2018 The Servo Project Developers

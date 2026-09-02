@@ -22,5 +22,5 @@ clap-sys.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [target."cfg(all(unix, not(target_os = \"macos\")))".dependencies]
-x11rb = "0.13"
+x11rb = "0.14"
 libc = "0.2"
