@@ -20,14 +20,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # main から生えていないタグでリリースを作らないための門番。
-  # 誤ったブランチのタグはここで落ちて、ビルドまで進まない。
+  # 配ってよいコミットかどうかを決める門番。見るのは二つ、main から生えている
+  # ことと、そのコミットで CI が通っていること。どちらも満たさないタグは
+  # ビルドまで進まない。
   guard:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # CI の結果を問い合わせるのに要る。
+      actions: read
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
       - name: Verify the tag is on main
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
@@ -36,9 +42,33 @@ jobs:
             exit 1
           fi
 
+      # 検査は CI の仕事で、リリースはその結果を当てにして組むだけ。当てにする
+      # 以上、本当に通ったのかはここで確かめる。誰も検査していないコミットから
+      # 配布物が出る経路を残さないため。
+      #
+      # CI が走るのは push された先端なので、複数コミットをまとめて push した
+      # 時の中間のコミットにタグを打つとここで止まる。打ち直す先は CI が実際に
+      # 検査した SHA。
+      - name: Verify CI passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 「この SHA の CI で成功した実行が 1 つ以上あるか」を数える。
+          query="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
+          query="${query}?head_sha=${GITHUB_SHA}&status=success"
+          runs=$(gh api "$query" --jq '.total_count')
+          if [ "$runs" -eq 0 ]; then
+            echo "::error::${GITHUB_SHA} で CI が成功していません。検査を通してからタグを打ってください。"
+            exit 1
+          fi
+
   # ターゲットごとにネイティブのランナーで組む。xtask のバンドラは組み上がった
   # バイナリを読んでターゲットを判定するのでクロスコンパイル自体は妨げないが、
-  # 各アーキテクチャで実際にテストを通してから配りたいので、ランナーを並べる。
+  # ネイティブに組めばその OS のリンカとシステムライブラリがそのまま使える。
+  #
+  # ここでするのは組んで梱包することだけ。テストは guard が確かめた CI が
+  # 同じ6ターゲットで済ませている。同じものを二度走らせても、遅くなるのと
+  # 「タグを打ってから初めて赤くなる」経路が増えるのとで、損しかない。
   build:
     needs: guard
     strategy:
@@ -94,26 +124,16 @@ jobs:
             exit 1
           fi
 
-      # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
-      # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
-      # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
-      - name: Build the test fixtures
-        run: cargo build --workspace
-
-      # 壊れたバイナリを配らないための最低限の関門。
-      # fmt / clippy は普段の CI 側の仕事なのでここには置かない。
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Build
-        run: cargo build --workspace --release
-
       # DAW が期待するのは素の共有ライブラリではなくバンドル。xtask が
-      # cargo build と梱包をまとめて面倒を見る。出力は target/bundled/ で、
-      # どの形式が出るかはバイナリがエクスポートしている記号で決まる。
-      # audio-graph-plugin は VST3 と CLAP の両方を出す。
+      # cargo build と梱包をまとめて面倒を見るので、配るものはこの一手で出る。
+      # 出力は target/bundled/ で、どの形式が出るかはバイナリがエクスポート
+      # している記号で決まる。audio-graph-plugin は VST3 と CLAP の両方を出す。
+      #
+      # `--locked` は配るものと Cargo.lock を食い違わせないため。ロックが古い
+      # 時、cargo は黙って解決し直すので、リポジトリが記録しているのとは違う
+      # 依存で組まれたバイナリが出ていく。
       - name: Bundle the VST3 and the CLAP
-        run: cargo xtask bundle audio-graph-plugin --release
+        run: cargo xtask bundle audio-graph-plugin --release --locked
 
       # 片方しか出ていなければ、リリースまで進む前にここで気付きたい。
       # CLAP は Windows / Linux では単一ファイル、macOS ではバンドルディレクトリ。

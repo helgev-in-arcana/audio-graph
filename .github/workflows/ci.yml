@@ -1,8 +1,11 @@
 name: CI
 
-# PR とmainへのpushで動く。リリースのタグを打ってから
-# 「Linuxでコンパイルが通らない」と気付くのは遅すぎるので、
-# ビルドはリリースと同じ6ターゲットで、同じ手順で回す。
+# PR とmainへのpushで動く。検査はすべてここにある — リリースのワークフローは
+# 組んで梱包するだけで、テストを持たない。だからここが緑であることが、配って
+# よいという判断のすべてになる。
+#
+# ビルドはリリースと同じ6ターゲットで、同じ手順で回す。タグを打ってから
+# 「Linuxでコンパイルが通らない」と気付くのは遅すぎる。
 on:
   pull_request:
   push:
@@ -12,10 +15,12 @@ on:
 permissions:
   contents: read
 
-# 同じブランチに続けてpushした時、古い方は用がない。
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # PR は続けて push した時、古い方に用がない。main は違う。リリースの門番は
+  # 「そのコミットで CI が緑になったか」を見るので、main への push を取り消すと
+  # 検査された記録を持たないコミットができ、そこにタグを打てなくなる。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -80,8 +85,12 @@ jobs:
       # clap-host のテストは clap-test-plugin の cdylib を読む。cargo は他の
       # パッケージの cdylib を勝手には組まないので、テストより先に一度組む。
       # memo/CHECKS.md が手元の手順として言っているのと同じ理由。
+      #
+      # `--locked` はここだけでよい。通れば Cargo.lock は解決済みの形と一致して
+      # いるので、後続の cargo は lock を書き換えない。ロックの綻びをタグの時
+      # ではなく PR の時点で見つけるための一語。
       - name: Build the test fixtures
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Test
         if: runner.os != 'Linux'
