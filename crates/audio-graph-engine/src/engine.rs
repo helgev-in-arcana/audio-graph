@@ -4308,6 +4308,104 @@ mod tests {
         );
     }
 
+    /// A second delay somewhere else in the patch does not change what the
+    /// first one does.
+    ///
+    /// Both loops run in the same stage, and a `DelayWrite` gives its source
+    /// buffer up as soon as it is *compiled*, while what it writes runs at the
+    /// end of the stage. Anything compiled in between can be handed that
+    /// buffer and fill it with something else, and the line then carries the
+    /// other loop's signal instead of its own.
+    ///
+    /// Three things have to line up for it, which is why nothing caught it
+    /// before: the write has to be the buffer's last reader — a tap on the
+    /// delayed side rather than on the sum, which is an ordinary way to wire a
+    /// delay; the other loop has to be compiled after it; and it has to hold a
+    /// node that asks the pool for a buffer rather than accumulating into one
+    /// it already has, which a mix does and a plugin does not.
+    #[test]
+    fn a_second_delay_does_not_reach_into_the_first() {
+        // in ──> mix in 1 ──> write(0)       the sum goes only to the line
+        //        read(0) ─┬─> mix in 2
+        //                 └─> out            and the tap is on the delayed side
+        let patch = |second: bool| -> Vec<f32> {
+            let mut graph = Graph::new();
+            let input = stereo_in(&mut graph);
+            let output = stereo_out(&mut graph);
+            let (write, read) = audio_delay(&mut graph, 32.0);
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: vec![0.0, linear_to_db(0.5)],
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(input, 0, mix, 0);
+            graph.connect(read, 0, mix, 2);
+            graph.connect(mix, 0, write, 0);
+            graph.connect(read, 0, output, 0);
+
+            if second {
+                // A whole second loop, wired to nothing that is heard. It
+                // exists to be compiled after the first one's write and to ask
+                // the pool for a buffer while doing it.
+                let other = graph.add(
+                    NodeKind::DelayWrite(DelayWrite {
+                        line: 1,
+                        ty: PortType::STEREO,
+                    }),
+                    [0.0, 0.0],
+                );
+                let tap = graph.add(
+                    NodeKind::DelayRead(DelayRead {
+                        line: 1,
+                        ty: PortType::STEREO,
+                        max_time: 0.05,
+                        time: seconds(64.0),
+                    }),
+                    [0.0, 0.0],
+                );
+                let plugin = audio_plugin(&mut graph, 0, 0);
+                let sum = graph.add(
+                    NodeKind::Mix(Mix {
+                        channels: 2,
+                        inputs: 2,
+                        gains: vec![0.0, linear_to_db(0.5)],
+                    }),
+                    [0.0, 0.0],
+                );
+                graph.connect(input, 0, sum, 0);
+                graph.connect(tap, 0, plugin, 0);
+                graph.connect(plugin, 0, sum, 2);
+                graph.connect(sum, 0, other, 0);
+            }
+
+            let mut engine = Engine::new();
+            engine.prepare(128, &[2]);
+            load(&mut engine, &graph);
+            let mut heard = Vec::new();
+            for block in 0..3 {
+                let daw_in = if block == 0 {
+                    impulse(128, 0)
+                } else {
+                    vec![0.0; 2 * 128]
+                };
+                let mut daw_out = vec![0.0f32; 2 * 128];
+                engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+                heard.extend_from_slice(&daw_out[..128]);
+            }
+            heard
+        };
+
+        let alone = patch(false);
+        assert!(
+            alone.iter().filter(|v| v.abs() > 0.05).count() >= 3,
+            "the delay repeats on its own"
+        );
+        assert_eq!(alone, patch(true), "and repeats the same beside another");
+    }
+
     fn stereo_in(graph: &mut Graph) -> NodeId {
         graph.add(
             NodeKind::AudioIn(AudioIn {

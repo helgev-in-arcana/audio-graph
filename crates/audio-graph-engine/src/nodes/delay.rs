@@ -82,7 +82,9 @@ impl Node for DelayWrite {
         }
         let line = cx.audio_line(self.line)?;
         if let Some((buf, _)) = cx.source_at_socket_width(0)? {
-            cx.consume(buf);
+            // Held rather than consumed: the write runs at the end of the
+            // stage, so the buffer is not free until then.
+            cx.consume_later(buf);
             cx.emit_deferred(AudioOp::DelayWrite { line, a: buf });
         }
         Ok(())

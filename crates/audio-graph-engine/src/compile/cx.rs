@@ -510,6 +510,8 @@ pub(crate) struct AudioCx<'a> {
     /// The runs of `ops` closed so far, and where the open one starts.
     spans: Vec<Span>,
     span_start: u32,
+    /// Buffers a deferred op still has to read. See [`AudioCx::consume_later`].
+    held: Vec<Buf>,
     instances: Vec<InstanceIo>,
     latency: u32,
     compensators: u16,
@@ -544,6 +546,7 @@ impl<'a> AudioCx<'a> {
             deferred: Vec::new(),
             spans: Vec::new(),
             span_start: 0,
+            held: Vec::new(),
             instances: Vec::new(),
             latency: 0,
             compensators: 0,
@@ -762,6 +765,19 @@ impl<'a> AudioCx<'a> {
         self.pool.consume(buf);
     }
 
+    /// Says this buffer is read by an op held back to the end of the stage.
+    ///
+    /// The pool hands a buffer out again once every reader it counted has
+    /// taken it, and a reader takes it when it is *compiled*. That is the same
+    /// moment the op runs for everything except a deferred write, which runs
+    /// at the end of the stage instead — so a node compiled in between could
+    /// be handed the buffer and fill it with something else, and the line
+    /// would carry that. Held until the stage closes, which is when the write
+    /// has actually happened.
+    pub(crate) fn consume_later(&mut self, buf: Buf) {
+        self.held.push(buf);
+    }
+
     // --- emitting ---------------------------------------------------------
 
     pub(crate) fn emit(&mut self, op: AudioOp) {
@@ -794,6 +810,10 @@ impl<'a> AudioCx<'a> {
     /// delay writing back its own output.
     pub(crate) fn close_stage(&mut self) {
         self.ops.append(&mut self.deferred);
+        // The writes have run, so what they were reading is free now.
+        for buf in std::mem::take(&mut self.held) {
+            self.pool.consume(buf);
+        }
         let end = self.ops.len() as u32;
         self.spans.push(Span {
             start: self.span_start,
