@@ -37,8 +37,9 @@ jobs:
       # what the commit was released as.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # `rust-toolchain.toml` names the version. This installs what it names,
-      # components and all, so the workflow never has to repeat the number.
+      # Not the composite action the build jobs use. Nothing here links, so the
+      # system libraries a link wants are not wanted here, and installing them
+      # would cost every run a minute for nothing.
       - name: Install the pinned toolchain
         run: rustup toolchain install
 
@@ -74,21 +75,15 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
+      # Xvfb because this job runs the tests, and the Linux window tests open
+      # real X windows. The reason is on the Test step below.
+      - uses: ./.github/actions/rust
+        with:
+          xvfb: "true"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.os }}
-
-      # The X11 headers are what the editor side asks for, and the Linux
-      # runners do not carry them. Xvfb is for the tests; the reason is on the
-      # Test step below.
-      - name: Install the Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config xvfb
 
       # clap-host's tests load clap-test-plugin's cdylib. cargo will not build
       # another package's cdylib on its own, so it is built once before the
@@ -120,33 +115,8 @@ jobs:
       # What is handed out is a bundle rather than a bare shared library, so
       # the packing is exercised here too. Learning at the tag that the bundler
       # is broken is late.
+      #
+      # What came out is xtask's own business to check, and it does: a bundle
+      # that is a name with nothing loadable inside fails this step.
       - name: Bundle
         run: cargo xtask bundle audio-graph-plugin --release
-
-      # Which formats appear is decided by the symbols the binary exports.
-      # Losing one of the two shows up nowhere else, so both are checked for.
-      #
-      # By their contents, not merely their names. What a host loads is the
-      # binary inside the bundle, and an empty shell of a directory looks
-      # present by name while coming up empty on load. VST3 is a bundle on
-      # every OS; CLAP is a bundle on macOS alone and the shared library itself
-      # elsewhere, so both shapes are allowed.
-      - name: Verify both bundles exist
-        shell: bash
-        run: |
-          for bundle in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
-            if [ -d "$bundle" ]; then
-              binary=$(find "$bundle/Contents" -type f -size +0 2>/dev/null | head -n 1)
-              if [ -z "$binary" ]; then
-                echo "::error::$bundle の中にバイナリがありません。"
-                ls -R "$bundle" || true
-                exit 1
-              fi
-              echo "$bundle: $binary"
-            elif [ -s "$bundle" ]; then
-              echo "$bundle: 共有ライブラリ"
-            else
-              echo "::error::$bundle が生成されていません。"
-              exit 1
-            fi
-          done

@@ -1,0 +1,37 @@
+name: Set up a Rust build
+description: >
+  Installs the compiler this repository names and the system libraries a build
+  of it needs. One definition rather than a block in each workflow, so that a
+  dependency added for one job cannot go missing from the other.
+
+inputs:
+  xvfb:
+    description: >
+      Install Xvfb as well. The window tests open real X windows, so a job that
+      runs the tests on Linux needs a display of some kind; a job that only
+      builds does not.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # `rust-toolchain.toml` names the version. This installs what it names,
+    # components and all, so no workflow has to repeat the number.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: rustup toolchain install
+
+    # The X11 headers are what the editor side asks for, and the Linux runners
+    # do not carry them. It is linking that wants them, which is why a job that
+    # only lints can do without this step entirely.
+    - name: Install the Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
+        # An input arrives as a string whatever it was written as, so this is a
+        # comparison against one. `if: inputs.xvfb` would be true for "false".
+        if [ "${{ inputs.xvfb }}" = "true" ]; then
+          sudo apt-get install -y xvfb
+        fi

@@ -99,24 +99,16 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # `rust-toolchain.toml` names the version. This installs what it names,
-      # so the compiler behind a release is the one the repository records
-      # rather than whichever stable the runner happened to meet that morning.
-      - name: Install the pinned toolchain
-        run: rustup toolchain install
+      # The same setup the CI build jobs get, minus Xvfb: nothing here runs a
+      # test, so nothing here wants a display. The compiler is the one
+      # `rust-toolchain.toml` names rather than whichever stable the runner
+      # happened to meet that morning.
+      - uses: ./.github/actions/rust
 
-      # No build cache here, unlike CI. A cache is worth having where a run's
+      # No build cache, unlike CI. A cache is worth having where a run's
       # product is a verdict; what this run produces is the file people
       # install, and that should owe nothing to what an earlier run left lying
       # about.
-
-      # The X11 headers are what the editor side asks for, and the Linux
-      # runners do not carry them.
-      - name: Install the Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcb1-dev pkg-config
 
       # A tag and a crate version that disagree make a release calling itself
       # `v0.2.0` whose plugin reports 0.1.0 — a mismatch that is hard to chase
@@ -150,21 +142,12 @@ jobs:
       # parting ways. Where the lock is stale cargo resolves again without
       # saying so, and out goes a binary built against dependencies the
       # repository never recorded.
+      #
+      # xtask checks what it produced, so a format that went missing, or a
+      # bundle that is a name with nothing loadable inside, fails here rather
+      # than in someone's plugin folder.
       - name: Bundle the VST3 and the CLAP
         run: cargo xtask bundle audio-graph-plugin --release --locked
-
-      # If only one of the two came out, this is where to notice, before the
-      # release itself. CLAP is a single file on Windows and Linux and a bundle
-      # directory on macOS.
-      - name: Verify both bundles exist
-        shell: bash
-        run: |
-          for f in target/bundled/AudioGraph.vst3 target/bundled/AudioGraph.clap; do
-            if [ ! -e "$f" ]; then
-              echo "::error::$f が生成されていません。"
-              exit 1
-            fi
-          done
 
       # The Windows runners have no zip, so pwsh does the packing. The licences
       # and the attribution travel with the binaries.
