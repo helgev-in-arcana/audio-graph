@@ -107,7 +107,7 @@ checksum = "21e4227379beff4205943696e6c3e0cd809bacdf3f0edd6e3dd153e2269571a4"
 
 [[package]]
 name = "audio-graph-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "egui",
  "plugin-host",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "audio-graph-plugin"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "audio-graph-engine",
  "egui",
@@ -330,7 +330,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "clap-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap-sys",
  "host-window",
@@ -348,7 +348,7 @@ checksum = "a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154"
 
 [[package]]
 name = "clap-test-plugin"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap-sys",
  "libc",
@@ -889,7 +889,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "host-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "audio-graph-engine",
  "libc",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "host-window"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "log",
@@ -1702,7 +1702,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugin-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "clap-host",
  "clap-test-plugin",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host-api"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "polling"
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "subhost-adapter"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "log",
  "plugin-host",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "vst3-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libc",
  "log",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "vst3-host-view"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "host-window",
  "libc",
@@ -2850,7 +2850,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "nice-plug-xtask",
