@@ -43,7 +43,7 @@ jobs:
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "::error::${GITHUB_REF_NAME} は main に含まれないコミットを指しています。"
+            echo "::error::${GITHUB_REF_NAME} points at a commit that is not on main."
             exit 1
           fi
 
@@ -64,7 +64,7 @@ jobs:
           query="${query}?head_sha=${GITHUB_SHA}&status=success"
           runs=$(gh api "$query" --jq '.total_count')
           if [ "$runs" -eq 0 ]; then
-            echo "::error::${GITHUB_SHA} で CI が成功していません。検査を通してからタグを打ってください。"
+            echo "::error::No successful CI run for ${GITHUB_SHA}. Tag a commit CI has passed."
             exit 1
           fi
 
@@ -128,7 +128,7 @@ jobs:
           crate="${crate##*[#@]}"
           crate="${crate%%-*}"
           if [ "$tag" != "$crate" ]; then
-            echo "::error::タグ ${GITHUB_REF_NAME} に対し Cargo.toml のバージョンは $crate です。"
+            echo "::error::The tag says ${GITHUB_REF_NAME}, Cargo.toml says $crate."
             exit 1
           fi
 
@@ -209,17 +209,17 @@ jobs:
           shopt -s nullglob
           built=(dist/*.zip)
           if [ ${#built[@]} -eq 0 ]; then
-            echo "::error::どのターゲットもビルドできていません。リリースは作りません。"
+            echo "::error::Not one target built. Making no release."
             exit 1
           fi
-          echo "### ビルドできたアセット" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Assets built" >> "$GITHUB_STEP_SUMMARY"
           for f in "${built[@]}"; do
             echo "- $(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
           if [ "${{ needs.build.result }}" != 'success' ]; then
-            echo "::warning::一部のターゲットがビルドに失敗しました。揃っていないままリリースします。"
+            echo "::warning::Some targets failed to build. Releasing without them."
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "一部のターゲットはビルドに失敗しました。" >> "$GITHUB_STEP_SUMMARY"
+            echo "Some targets failed to build." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # Release notes are not generated; the body is written by hand. A tag
