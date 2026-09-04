@@ -6,67 +6,11 @@
 //! playing. Driven against `clap-test-plugin`, because the path that breaks is
 //! the one taken only when a sub-plugin is already loaded.
 
-use std::path::PathBuf;
+mod harness;
+
+use harness::{LIVE, fixture_as_clap, fx_layout};
 
 use audio_graph_plugin::{Wrapper, WrapperKind};
-use nice_plug::prelude::*;
-
-/// Locates the built CLAP test fixture and copies it under a `.clap` name.
-///
-/// The facade infers the format from the extension and cargo's artefact is
-/// named `.dll`, so it is copied rather than renamed: the original belongs to
-/// cargo and the next build would replace it anyway.
-///
-/// Panics when the fixture is missing rather than skipping, because a skip
-/// would make a green run mean nothing.
-fn fixture_as_clap() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let build_dir = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the test binary is two levels below the build directory");
-    let source = [
-        "clap_test_plugin.dll",
-        "libclap_test_plugin.so",
-        "libclap_test_plugin.dylib",
-    ]
-    .iter()
-    .map(|n| build_dir.join(n))
-    .find(|p| p.is_file())
-    .unwrap_or_else(|| {
-        panic!(
-            "clap-test-plugin is not in {}.\n\
-             Run `cargo build --workspace` before `cargo test --workspace`: \
-             cargo does not build another package's cdylib on its own.",
-            build_dir.display()
-        )
-    });
-
-    // A distinct name per test binary, so two of them cannot copy over each
-    // other's file while the other has it loaded.
-    let target = build_dir.join("state-reload-fixture.clap");
-    std::fs::copy(&source, &target).expect("the fixture can be copied");
-    target
-}
-
-const STEREO: NonZeroU32 = new_nonzero_u32(2);
-
-/// The effect form's layout, as the DAW hands it over.
-fn fx_layout() -> AudioIOLayout {
-    AudioIOLayout {
-        main_input_channels: Some(STEREO),
-        main_output_channels: Some(STEREO),
-        aux_input_ports: &[STEREO],
-        ..AudioIOLayout::const_default()
-    }
-}
-
-const LIVE: BufferConfig = BufferConfig {
-    sample_rate: 48_000.0,
-    min_buffer_size: None,
-    max_buffer_size: 512,
-    process_mode: ProcessMode::Realtime,
-};
 
 /// How many wires the patch is currently carrying.
 fn wires(wrapper: &Wrapper) -> usize {
@@ -92,7 +36,7 @@ fn a_project_loaded_over_a_running_patch_is_read_in() {
     // The user picks a plugin: input, the plugin, output.
     wrapper
         .shared()
-        .load(&fixture_as_clap())
+        .load(&fixture_as_clap("state-reload-fixture"))
         .expect("the fixture loads");
     wrapper.shared().adopt_default_patch();
     wrapper.store_state();

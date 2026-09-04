@@ -6,63 +6,13 @@
 //! through costs nothing. Driven against `clap-test-plugin`, whose latency is
 //! ours to set.
 
-use std::path::PathBuf;
+mod harness;
+
+use harness::{LIVE, fixture_as_clap, fixture_state, fx_layout};
 
 use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeId, NodeKind, Plugin, PluginPorts};
 use audio_graph_plugin::{Shared, Wrapper, WrapperKind};
-use nice_plug::prelude::*;
 use plugin_host::ParamId;
-
-/// Locates the built CLAP test fixture and copies it under a `.clap` name.
-///
-/// The facade infers the format from the extension and cargo's artefact is
-/// named `.dll`, so it is copied rather than renamed: the original belongs to
-/// cargo and the next build would replace it anyway.
-///
-/// Panics when the fixture is missing rather than skipping, because a skip
-/// would make a green run mean nothing.
-fn fixture_as_clap() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let build_dir = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the test binary is two levels below the build directory");
-    let source = [
-        "clap_test_plugin.dll",
-        "libclap_test_plugin.so",
-        "libclap_test_plugin.dylib",
-    ]
-    .iter()
-    .map(|n| build_dir.join(n))
-    .find(|p| p.is_file())
-    .unwrap_or_else(|| {
-        panic!(
-            "clap-test-plugin is not in {}.\n\
-             Run `cargo build --workspace` before `cargo test --workspace`: \
-             cargo does not build another package's cdylib on its own.",
-            build_dir.display()
-        )
-    });
-
-    // A distinct name per test binary, so two of them cannot copy over each
-    // other's file while the other has it loaded.
-    let target = build_dir.join("latency-fixture.clap");
-    std::fs::copy(&source, &target).expect("the fixture can be copied");
-    target
-}
-
-/// The fixture's saved state: gain, offset, mode and latency, as little-endian
-/// doubles in parameter order.
-///
-/// Mirrors the fixture's own format rather than importing it, the way the CLAP
-/// backend's tests mirror its constants: a drift between the two should fail
-/// the test rather than be papered over.
-fn fixture_state(latency: f64) -> [u8; 32] {
-    let mut blob = [0u8; 32];
-    blob[..8].copy_from_slice(&1.0f64.to_le_bytes());
-    blob[24..].copy_from_slice(&latency.to_le_bytes());
-    blob
-}
 
 /// The latency each fixture is asked to report. Any number a plugin might
 /// plausibly claim; nothing else in the wrapper depends on which.
@@ -74,25 +24,6 @@ const PARAM_LATENCY: ParamId = ParamId(3);
 const PARAM_ASK: ParamId = ParamId(5);
 /// The `ask` value that makes the fixture tell its host the latency moved.
 const ASK_LATENCY_CHANGED: f64 = 4.0;
-
-const STEREO: NonZeroU32 = new_nonzero_u32(2);
-
-/// The effect form's layout, as the DAW hands it over.
-fn fx_layout() -> AudioIOLayout {
-    AudioIOLayout {
-        main_input_channels: Some(STEREO),
-        main_output_channels: Some(STEREO),
-        aux_input_ports: &[STEREO],
-        ..AudioIOLayout::const_default()
-    }
-}
-
-const LIVE: BufferConfig = BufferConfig {
-    sample_rate: 48_000.0,
-    min_buffer_size: None,
-    max_buffer_size: 512,
-    process_mode: ProcessMode::Realtime,
-};
 
 /// Two plugin nodes, both loaded with the fixture, and the wires to hang them
 /// on.
@@ -176,7 +107,7 @@ fn the_daw_is_told_what_the_graph_costs() {
     wrapper
         .activate(WrapperKind::Effect, &layout, &LIVE)
         .expect("the first activation");
-    let patch = two_plugins(wrapper.shared(), &fixture_as_clap());
+    let patch = two_plugins(wrapper.shared(), &fixture_as_clap("latency-fixture"));
 
     // In → first → second → out, each plugin holding the signal up by the same
     // amount.
