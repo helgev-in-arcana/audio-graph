@@ -107,6 +107,19 @@ jobs:
         if: runner.os == 'Linux'
         run: xvfb-run -a cargo test --workspace
 
+      # Whether this crate still stands without the editor is not something
+      # the run above can answer: `audio-graph-plugin` pulls it in with
+      # `features = ["ui"]`, and cargo unifies features across everything it
+      # builds at once, so the workspace run only ever sees the half with egui
+      # in it. The CLI and the adapter link the other half, and it has to
+      # compile — tests included, which is the part that went unbuilt.
+      #
+      # Not under Xvfb on Linux and not needing to be: nothing in this crate
+      # opens a window, which is most of what it means for it to be the half
+      # without the editor.
+      - name: Test without the editor
+        run: cargo test -p audio-graph-engine
+
       # What the release actually hands out is a release build, so the check
       # goes that far.
       - name: Build release
