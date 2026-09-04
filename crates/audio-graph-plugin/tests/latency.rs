@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeId, NodeKind, Plugin, PluginPorts};
 use audio_graph_plugin::{Shared, Wrapper, WrapperKind};
 use nice_plug::prelude::*;
+use plugin_host::ParamId;
 
 /// Locates the built CLAP test fixture and copies it under a `.clap` name.
 ///
@@ -66,6 +67,13 @@ fn fixture_state(latency: f64) -> [u8; 32] {
 /// The latency each fixture is asked to report. Any number a plugin might
 /// plausibly claim; nothing else in the wrapper depends on which.
 const LATENCY: u32 = 128;
+
+/// The fixture's own parameter ids, mirrored rather than imported for the same
+/// reason its state layout is: a drift between the two should fail the test.
+const PARAM_LATENCY: ParamId = ParamId(3);
+const PARAM_ASK: ParamId = ParamId(5);
+/// The `ask` value that makes the fixture tell its host the latency moved.
+const ASK_LATENCY_CHANGED: f64 = 4.0;
 
 const STEREO: NonZeroU32 = new_nonzero_u32(2);
 
@@ -203,6 +211,29 @@ fn the_daw_is_told_what_the_graph_costs() {
         wrapper.activate(WrapperKind::Effect, &layout, &LIVE),
         Some(LATENCY),
         "only the plugins the audio goes through may move the track"
+    );
+
+    // A plugin that changes its mind: lookahead switched on after the project
+    // is already open. It announces that itself, and the tick is what goes and
+    // looks — no activation anywhere in this, which is the whole difficulty.
+    wrapper.deactivate();
+    {
+        let mut state = wrapper.shared().main();
+        let deeper = f64::from(LATENCY * 2);
+        state
+            .host
+            .set_sub_param(1, PARAM_LATENCY, deeper)
+            .expect("the fixture takes the new latency");
+        state
+            .host
+            .set_sub_param(1, PARAM_ASK, ASK_LATENCY_CHANGED)
+            .expect("the fixture announces it");
+    }
+    wrapper.tick();
+    assert_eq!(
+        wrapper.shared().latency(),
+        LATENCY * 2,
+        "a sub-plugin that says its latency moved has to be answered by the          tick: read again, recompiled around, and left as the number the DAW          will be told"
     );
 
     wrapper.deactivate();

@@ -32,9 +32,10 @@ pub struct SubHost {
     instances: Vec<Option<MainThread<Loaded>>>,
     slots: SlotTable,
     context: Arc<dyn HostContext>,
-    /// Latency in samples for each instance as of its last activation, cached
-    /// so the DAW can be answered without touching a plugin. Callers that run
-    /// instances in parallel need these to line the paths up.
+    /// Latency in samples for each instance, cached so the DAW can be answered
+    /// without touching a plugin. Filled at activate and brought up to date by
+    /// [`SubHost::reread_latencies`]. Callers that run instances in parallel
+    /// need these to line the paths up.
     latencies: Vec<u32>,
 }
 
@@ -112,6 +113,33 @@ impl SubHost {
         Ok(())
     }
 
+    /// Ask every loaded sub-plugin for its latency again, and say whether any
+    /// of them answered differently.
+    ///
+    /// The cache is filled at activate, which is the first moment a plugin can
+    /// be asked at all. One that changes its mind later — a lookahead limiter
+    /// switched on halfway through a session — says so through the host
+    /// context, and this is what turns that word into numbers.
+    pub fn reread_latencies(&mut self) -> bool {
+        let mut moved = false;
+        for instance in 0..self.instances.len() {
+            let Some(latency) = self
+                .at(instance)
+                .map(|loaded| loaded.plugin.latency_samples())
+            else {
+                continue;
+            };
+            let Some(cached) = self.latencies.get_mut(instance) else {
+                continue;
+            };
+            if *cached != latency {
+                *cached = latency;
+                moved = true;
+            }
+        }
+        moved
+    }
+
     /// Returns the cached latency in samples for all instances, indexed by
     /// instance ID.
     ///
@@ -170,6 +198,23 @@ impl SubHost {
         // `save_state`.
         loaded.plugin.tick();
         Ok(())
+    }
+
+    /// Sets one parameter on the specified sub-plugin, from the main thread.
+    ///
+    /// For a harness that wants a plugin put into a particular state without
+    /// running audio; the graph drives parameters through the slot schedule
+    /// instead, which is where a DAW's automation ends up. Both formats only
+    /// take a value this way while the plugin is inactive — CLAP flushes it,
+    /// and a value for an active plugin has to ride a process block.
+    pub fn set_sub_param(
+        &mut self,
+        instance: usize,
+        id: ParamId,
+        plain: f64,
+    ) -> Result<(), String> {
+        let loaded = self.at_mut(instance).ok_or("no sub-plugin loaded")?;
+        SubPluginMain::set_param(&mut loaded.plugin, id, plain).map_err(|e| e.to_string())
     }
 
     /// Returns the audio bus layout and note support for the sub-plugin at

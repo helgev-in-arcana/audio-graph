@@ -59,6 +59,10 @@ pub struct Wrapper {
     kind: WrapperKind,
     channels: u32,
 
+    /// The latency last reported to the DAW, so a block that has nothing new
+    /// to say does not say it. Audio thread only.
+    reported_latency: u32,
+
     /// The periodic main-thread tick CLAP requires of us (see [`crate::tick`]).
     ///
     /// Started when nice-plug hands over the executor that can reach the main
@@ -88,6 +92,7 @@ impl Default for Wrapper {
             output_scratch: Vec::new(),
             kind: WrapperKind::Effect,
             channels: 2,
+            reported_latency: 0,
             tick_state: TickState::new(),
             ticker: None,
         }
@@ -112,10 +117,20 @@ impl Wrapper {
     /// Queried once, at instance creation, before [`Wrapper::start_ticking`].
     pub fn task_executor(&mut self) -> impl Fn(Task) + Send + 'static {
         let shared = self.shared.clone();
+        let context = self.context.clone();
         let state = self.tick_state.clone();
         move |task| match task {
-            Task::Tick => crate::tick::run(&shared, &state),
+            Task::Tick => crate::tick::run(&shared, &context, &state),
         }
+    }
+
+    /// Run one main-thread tick, the way the host's callback does.
+    ///
+    /// The ticking thread posts these through nice-plug; this is the same turn
+    /// of the same crank, for a caller that has its own reason to take one —
+    /// a harness driving the wrapper without a host under it.
+    pub fn tick(&self) {
+        crate::tick::run(&self.shared, &self.context, &self.tick_state);
     }
 
     /// Begin ticking, using `post` to reach the main thread.
@@ -354,7 +369,8 @@ impl Wrapper {
         if self.shared.refresh_latencies() {
             self.shared.send_fresh_program();
         }
-        Some(self.shared.latency())
+        self.reported_latency = self.shared.latency();
+        Some(self.reported_latency)
     }
 
     pub fn deactivate(&mut self) {
@@ -402,6 +418,18 @@ impl Wrapper {
         // Lock-free in both directions, so this costs nothing on the blocks
         // where nothing has changed — which is nearly all of them.
         self.engine.adopt(self.shared.programs());
+
+        // Read off the engine rather than off the compiler, so the DAW is told
+        // about a program the audio is already coming out of: a sub-plugin that
+        // turns its lookahead on is recompiled around on the main thread, and
+        // this is the block that first runs the result. Saying so is the audio
+        // thread's job because this is the only place the wrapper is handed
+        // something that can reach the host between activations.
+        let latency = self.engine.latency();
+        if latency != self.reported_latency {
+            self.reported_latency = latency;
+            context.set_latency_samples(latency);
+        }
 
         // `try_lock`, never `lock`. The main thread holds this only to start or
         // stop a sub-plugin; missing it means a few blocks pass through
@@ -564,11 +592,6 @@ impl Wrapper {
             ApiStatus::Silent => ProcessStatus::Normal,
             _ => ProcessStatus::KeepAlive,
         }
-    }
-
-    /// Latency the sub-plugin asked to change since the last check.
-    pub fn take_latency_change(&self) -> Option<u32> {
-        self.context.take_latency_change()
     }
 }
 

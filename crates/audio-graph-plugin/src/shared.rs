@@ -539,14 +539,20 @@ impl Shared {
     ///
     /// A plugin only answers for its latency once it has been activated, so
     /// the number a node was drawn with can predate the only moment the plugin
-    /// could have been asked. Only the latency is re-read; the sockets are
+    /// could have been asked — and a plugin is free to change its mind
+    /// afterwards, which is why the plugins are asked again rather than the
+    /// cache being trusted. Only the latency is re-read; the sockets are
     /// [`Shared::discover_ports`]' business, and re-reading those would prune
     /// links against a layout the user has not asked about.
-    pub(crate) fn refresh_latencies(&self) -> bool {
+    pub fn refresh_latencies(&self) -> bool {
         // Read out and copied, so the host and the patch are never locked at
         // once for a question that needs one of them at a time. At most
         // `max_instances` numbers.
-        let latencies: Vec<u32> = self.main().host.latencies().to_vec();
+        let latencies: Vec<u32> = {
+            let mut state = self.main();
+            state.host.reread_latencies();
+            state.host.latencies().to_vec()
+        };
         let mut patch = self.patch();
         let mut moved = false;
         for node in &mut patch.graph.nodes {
