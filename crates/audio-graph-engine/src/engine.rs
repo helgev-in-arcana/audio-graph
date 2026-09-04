@@ -928,7 +928,14 @@ impl Engine {
         self.ledger.stolen()
     }
 
-    /// Returns the latency in samples reported by the compiled program.
+    /// The latency in samples of the program the engine is running.
+    ///
+    /// An audio-thread answer. A program reaches the engine through the
+    /// handoff, and only [`Engine::adopt`] turns that, so a caller that has
+    /// not run a block since the program was published is being told about
+    /// the one before it — and before the first block, about no program at
+    /// all. What the DAW has to be told at activate is the compiler's answer,
+    /// not this one.
     pub fn latency(&self) -> u32 {
         self.program.as_ref().map_or(0, |p| p.latency)
     }

@@ -108,6 +108,12 @@ pub struct Shared {
     /// What the DAW is running at, so the editor can show a delay's floor in
     /// seconds. Bits of an `f32`, the same trick `live` uses.
     sample_rate: AtomicU32,
+    /// What the last graph to compile costs the DAW in samples.
+    ///
+    /// Kept here rather than read off the engine, because the engine only ever
+    /// receives a program on the audio thread and the number is wanted on the
+    /// main one, at the moment the DAW asks what to align the track by.
+    latency: AtomicU32,
     /// What each slot is actually worth after the graph has had its say.
     ///
     /// Written by the audio thread once per block and read by the editor. Two
@@ -174,6 +180,7 @@ impl Shared {
             // Until the DAW says otherwise. A wrong rate here only makes the
             // floor shown in the editor wrong, never the audio.
             sample_rate: AtomicU32::new(48_000f32.to_bits()),
+            latency: AtomicU32::new(0),
             live: array::from_fn(|_| AtomicU32::new(0)),
             params,
             generation: AtomicU64::new(0),
@@ -333,6 +340,16 @@ impl Shared {
         self.sample_rate.store(rate.to_bits(), Ordering::Relaxed);
     }
 
+    /// What to tell the DAW the track has to be pulled forward by.
+    ///
+    /// The whole answer: a plugin's own latency reaches this through the node
+    /// that names it, and the compiler lines the parallel paths up against the
+    /// longest of them. A plugin nothing routes through contributes nothing,
+    /// which is why the plugins are not asked directly.
+    pub fn latency(&self) -> u32 {
+        self.latency.load(Ordering::Relaxed)
+    }
+
     /// Report the slot values the sub-plugin is actually being driven with.
     /// Audio thread; lock-free and allocation-free.
     pub fn report_slots(&self, values: &[f64]) {
@@ -414,6 +431,8 @@ impl Shared {
                 }
             }
         };
+
+        self.latency.store(program.latency, Ordering::Relaxed);
 
         let mut state = self.main();
         // The delay rings are allocated here, on the main thread, and ride over
@@ -506,6 +525,33 @@ impl Shared {
             drop(patch);
         }
         self.publish_graph();
+    }
+
+    /// Bring every plugin node's recorded latency up to date with the plugin
+    /// it names, and say whether any of them moved.
+    ///
+    /// A plugin only answers for its latency once it has been activated, so
+    /// the number a node was drawn with can predate the only moment the plugin
+    /// could have been asked. Only the latency is re-read; the sockets are
+    /// [`Shared::discover_ports`]' business, and re-reading those would prune
+    /// links against a layout the user has not asked about.
+    pub(crate) fn refresh_latencies(&self) -> bool {
+        // Read out and copied, so the host and the patch are never locked at
+        // once for a question that needs one of them at a time. At most
+        // `max_instances` numbers.
+        let latencies: Vec<u32> = self.main().host.latencies().to_vec();
+        let mut patch = self.patch();
+        let mut moved = false;
+        for node in &mut patch.graph.nodes {
+            if let NodeKind::Plugin(Plugin { instance, ports }) = &mut node.kind {
+                let latency = latencies.get(*instance).copied().unwrap_or(0);
+                if ports.latency != latency {
+                    ports.latency = latency;
+                    moved = true;
+                }
+            }
+        }
+        moved
     }
 
     /// Re-read one plugin node's sockets from the plugin itself.
