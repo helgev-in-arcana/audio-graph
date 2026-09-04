@@ -21,6 +21,7 @@ mod delay;
 mod envelope;
 mod gate;
 mod key_param;
+mod key_split;
 mod key_switch;
 mod lfo;
 mod math;
@@ -43,6 +44,7 @@ pub use delay::{DelayRead, DelayWrite};
 pub use envelope::EnvelopeFollower;
 pub use gate::Gate;
 pub use key_param::{KeyParam, KeyParamMode};
+pub use key_split::KeySplit;
 pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
@@ -325,6 +327,7 @@ pub enum NodeKind {
     Gate(Gate),
     NoteGate(NoteGate),
     KeySwitch(KeySwitch),
+    KeySplit(KeySplit),
     KeyParam(KeyParam),
     NoteMute(NoteMute),
     NoteFilter(NoteFilter),
@@ -365,6 +368,7 @@ macro_rules! for_kind {
             NodeKind::Gate($node) => $body,
             NodeKind::NoteGate($node) => $body,
             NodeKind::KeySwitch($node) => $body,
+            NodeKind::KeySplit($node) => $body,
             NodeKind::KeyParam($node) => $body,
             NodeKind::NoteMute($node) => $body,
             NodeKind::NoteFilter($node) => $body,
@@ -644,6 +648,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         KeySwitch::catalogue_defaults(),
         NodeKind::KeySwitch,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        KeySplit::catalogue_defaults(),
+        NodeKind::KeySplit,
     );
     take(
         &mut out,

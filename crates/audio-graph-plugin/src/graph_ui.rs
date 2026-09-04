@@ -1442,6 +1442,26 @@ mod tests {
         assert!(canvas.editor.pan.x < 0.0 && canvas.editor.pan.y < 0.0);
     }
 
+    /// Every list of bands a patch can carry is one the canvas can draw.
+    ///
+    /// A key split holds its bands descending while they are edited, but a
+    /// patch is a file and may name them in any order — bottom-up here, so
+    /// every band but the last is one no key falls in and every control is
+    /// offered a range that reads backwards. A node that panics part-way
+    /// through drawing takes the editor's whole frame with it, and the patch
+    /// that did it is the one the user cannot open to fix.
+    #[test]
+    fn a_key_split_draws_however_its_bands_are_ordered() {
+        let mut canvas = Canvas::new();
+        canvas.graph.add(
+            NodeKind::KeySplit(audio_graph_engine::KeySplit {
+                splits: vec![32, 64, 96],
+            }),
+            [40.0, 40.0],
+        );
+        canvas.frame(Vec::new());
+    }
+
     /// The zoom is clamped, and the clamp is not a place the pan can get stuck:
     /// spinning the wheel at the limit must not keep moving the view.
     #[test]
