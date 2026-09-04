@@ -244,11 +244,23 @@ impl Wrapper {
         self.kind = kind;
         self.channels = layout.main_output_channels.map_or(2, |c| c.get());
 
-        if self.shared.main().host.is_loaded(0) {
-            // A second activate with a different configuration must not reuse
-            // the old processor.
-            self.deactivate();
-        } else {
+        // A processor built for an earlier configuration must not be reused,
+        // and an instance that has never run has none to give back, so this
+        // costs nothing on a first activation.
+        self.deactivate();
+
+        // Whether the DAW has put a project or a preset in front of us since we
+        // last looked. Asking instead whether a sub-plugin is loaded answers a
+        // different question, and gets both halves of this wrong: a patch whose
+        // plugins sit in instances other than the first would be read back in
+        // on every activation, and a preset dropped on a patch that does have
+        // one would never be read at all.
+        if self.shared.state_is_unseen() {
+            // Nothing to start the blob's sub-plugins against yet: the
+            // configuration this activation carries is settled further down,
+            // and starting them here as well would leave a processor that
+            // never gets handed back.
+            self.shared.main().config = None;
             self.restore_state();
             self.load_development_override();
         }

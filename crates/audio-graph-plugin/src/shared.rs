@@ -124,6 +124,12 @@ pub struct Shared {
     /// is driving the slot.
     live: [AtomicU32; SLOT_COUNT],
     params: Arc<WrapperParams>,
+    /// The blob this instance last wrote into the persisted field.
+    ///
+    /// `None` until it has written one. It is what tells the wrapper's own
+    /// bookkeeping apart from a project or a preset the DAW has put there,
+    /// which is the only kind that has to be read back in.
+    last_written: Mutex<Option<String>>,
     /// Bumped whenever something the editor displays has changed shape — a
     /// different sub-plugin, a different set of bindings.
     ///
@@ -183,6 +189,7 @@ impl Shared {
             latency: AtomicU32::new(0),
             live: array::from_fn(|_| AtomicU32::new(0)),
             params,
+            last_written: Mutex::new(None),
             generation: AtomicU64::new(0),
             view: Mutex::new(View::default()),
             posted: Mutex::new(Vec::new()),
@@ -675,8 +682,81 @@ impl Shared {
 
     fn write_state(&self, state: &WrapperState) {
         match serde_json::to_string(state) {
-            Ok(json) => *self.params.state.0.write().unwrap() = json,
+            Ok(json) => {
+                // Two stores rather than one lock held across both:
+                // `state_is_unseen` takes the same pair in the other order,
+                // and the editor stores state from whichever thread its
+                // button was pressed on.
+                *self.params.state.0.write().unwrap() = json.clone();
+                *self.last_written.lock() = Some(json);
+            }
             Err(e) => log::warn!("audio-graph: wrapper state unwritable: {e}"),
         }
+    }
+
+    /// Whether the persisted blob is one this instance did not write.
+    ///
+    /// A DAW hands a project or a preset over by writing that field, which it
+    /// may do before the first activation or in the middle of a session —
+    /// nice-plug answers the second by activating again rather than
+    /// deactivating first, so an activation is where both of them arrive.
+    /// Everything the wrapper stores goes through `write_state`, so a blob
+    /// that is not the one recorded there came from outside and is the user's
+    /// project rather than our own last word on it.
+    pub(crate) fn state_is_unseen(&self) -> bool {
+        let json = self.params.state.0.read().unwrap().clone();
+        self.last_written.lock().as_deref() != Some(json.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SUB_HOST;
+    use plugin_host::{HostContext, RestartReason};
+
+    struct SilentHost;
+
+    impl HostContext for SilentHost {
+        fn host_name(&self) -> &str {
+            "shared tests"
+        }
+        fn request_restart(&self, _reason: RestartReason) {}
+        fn latency_changed(&self, _samples: u32) {}
+        fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
+    }
+
+    fn shared() -> Arc<Shared> {
+        Shared::new(
+            SubHost::new(Arc::new(SilentHost), SUB_HOST),
+            WrapperParams::new(),
+        )
+    }
+
+    /// The wrapper's own last word on the state is not mistaken for the DAW's.
+    ///
+    /// The editor stores state after every change it makes, so an activation
+    /// that read all of those back in would reload every sub-plugin each time
+    /// the DAW so much as changed its block size.
+    #[test]
+    fn only_a_blob_the_wrapper_did_not_write_counts_as_unseen() {
+        let shared = shared();
+        // Nothing written yet, so whatever is in the field belongs to the DAW
+        // — the empty string included, which is what a fresh instance carries
+        // and what has to be answered with the defaults.
+        assert!(shared.state_is_unseen());
+
+        shared.store_state();
+        assert!(
+            !shared.state_is_unseen(),
+            "the wrapper reading its own bookkeeping back in reloads every \
+             sub-plugin for nothing"
+        );
+
+        *shared.params().state.0.write().expect("not poisoned") = String::from("{}");
+        assert!(
+            shared.state_is_unseen(),
+            "a blob written from outside is the user's project and has to be read"
+        );
     }
 }
