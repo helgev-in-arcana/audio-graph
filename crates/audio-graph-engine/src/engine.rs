@@ -1721,6 +1721,15 @@ impl Engine {
                         Follow::Gate => f64::from(u8::from(
                             self.notes.bufs.get(index).is_some_and(|buf| buf.count > 0),
                         )),
+                        // The mask rather than the count next to it: the same
+                        // key on two channels is one key under a hand, and a
+                        // key struck again before it was let go is one key
+                        // too. See [`Follow::HeldKeys`].
+                        Follow::HeldKeys => self
+                            .notes
+                            .bufs
+                            .get(index)
+                            .map_or(0.0, |buf| f64::from(buf.held.count_ones())),
                     };
                     // The latch is not read back — the tables above already
                     // survive a program swap — but keeping the value in it
@@ -1968,8 +1977,8 @@ mod tests {
     use crate::nodes::{
         AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, Gate, KeyParam,
         KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter,
-        NoteFollow, NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn,
-        Switch, linear_to_db,
+        NoteFollow, NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate,
+        SlotIn, Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -4162,6 +4171,90 @@ mod tests {
         keys.note(&off(64));
         keys.run(&mut engine, 32, &mut slots);
         assert_eq!(slots[SINK], 0.0);
+    }
+
+    /// Held Keys counts keys under a hand, not note-ons on a wire: the same
+    /// key on two channels is one key, and one release lifts it. Both fall out
+    /// of reading the mask of what is down rather than a running total — see
+    /// [`Follow::HeldKeys`] for why the mask is the one to read.
+    ///
+    /// Read through a map of 0..8, because a count is not a fraction and a
+    /// parameter lane is normalized on its way out of the engine.
+    #[test]
+    fn held_keys_counts_the_keys_that_are_down() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let count = graph.add(
+            NodeKind::NoteFollow(NoteFollow {
+                what: Follow::HeldKeys,
+            }),
+            [0.0, 0.0],
+        );
+        let map = graph.add(
+            NodeKind::RangeMap(RangeMap {
+                in_lo: 0.0,
+                in_hi: 8.0,
+                out_lo: 0.0,
+                out_hi: 1.0,
+                clamp: true,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, count, 0);
+        graph.connect(count, 0, map, 0);
+        graph.connect(map, 0, out, 0);
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
+        let mut slots = lanes();
+
+        let on = |channel: i16, key: i16| NoteEvent::NoteOn {
+            note_id: None,
+            port: 0,
+            channel,
+            key,
+            velocity: 1.0,
+            sample_offset: 0,
+        };
+        let off = |channel: i16, key: i16| NoteEvent::NoteOff {
+            note_id: None,
+            port: 0,
+            channel,
+            key,
+            velocity: 0.0,
+            sample_offset: 0,
+        };
+        // Eighths, so every reading below is exact in binary.
+        let down = |slots: &[f64]| slots[SINK] * 8.0;
+
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 0.0, "nothing played, nothing down");
+
+        keys.note(&on(0, 60));
+        keys.note(&on(0, 64));
+        keys.note(&on(0, 67));
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 3.0, "a triad is three keys");
+
+        keys.note(&off(0, 64));
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 2.0);
+
+        // The same key again on another channel, which is one hand playing one
+        // key however many streams it arrives on.
+        keys.note(&on(1, 60));
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 2.0, "channel is not part of a key");
+
+        keys.note(&off(0, 60));
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 1.0, "and one release lifts it");
+
+        keys.note(&off(0, 67));
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 0.0);
     }
 
     #[test]

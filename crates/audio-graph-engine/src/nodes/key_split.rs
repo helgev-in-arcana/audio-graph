@@ -266,6 +266,10 @@ mod tests {
     /// Bands come off one at a time down to the last, and the one that is left
     /// covers the keyboard: a split shrunk back to nothing is a node that
     /// passes what it is given, not one stuck two bands wide.
+    ///
+    /// Taking one away is an edit, so this is only there to run when the
+    /// editor is — the crate builds without it for the CLI and the adapter.
+    #[cfg(feature = "ui")]
     #[test]
     fn the_bands_come_off_down_to_the_one_that_stays() {
         let mut node = KeySplit {
