@@ -46,13 +46,14 @@ pub(crate) fn compile_audio(
     plan: &Plan,
     lines: &[Line],
     audio_lanes: &[((NodeId, u8), u16)],
+    latches: &[NodeId],
     notes: &Notes,
 ) -> Result<Audio, CompileError> {
     // Once per stage, rather than once with a sort afterwards: the pool
     // frees a buffer as soon as its last reader is compiled, so the order ops
     // are emitted in has to be the order they will run in. See
     // [`AudioCx::close_stage`].
-    let mut cx = AudioCx::new(graph, lines, order, audio_lanes, notes);
+    let mut cx = AudioCx::new(graph, lines, order, audio_lanes, latches, notes);
     for stage in 0..plan.stages.len() {
         for (index, &id) in order.iter().enumerate() {
             if plan.of[index] != stage {

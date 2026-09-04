@@ -166,8 +166,10 @@ fn math_chain() {
     check("math_chain", &graph);
 }
 
-/// A gate: the parameter half switches the gain, the audio half is a `Mix` of
-/// one. Pinned because the whole node is that arrangement.
+/// A gate with no fade: the parameter half switches the gain, the audio half
+/// is a `Mix` of one. Pinned because the whole node is that arrangement, and
+/// because the cheap shape is the one a fade must not cost anybody who did not
+/// ask for it.
 #[test]
 fn gated_audio() {
     let mut graph = Graph::new();
@@ -178,6 +180,8 @@ fn gated_audio() {
             channels: 2,
             threshold: 0.5,
             invert: false,
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
         }),
         [0.0, 0.0],
     );
@@ -186,6 +190,34 @@ fn gated_audio() {
     graph.connect(control, 0, gate, 1);
     graph.connect(gate, 0, out, 0);
     check("gated_audio", &graph);
+}
+
+/// The same gate with fade times: a `Fade` in place of the `Mix`, and a latch
+/// for the gain it has reached.
+///
+/// Pinned because the two are one node with one control between them, and the
+/// only place the shape of the compiled program forks on a setting rather than
+/// on the wiring.
+#[test]
+fn gated_audio_with_fades() {
+    let mut graph = Graph::new();
+    let src = audio_in(&mut graph, 0, 2);
+    let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+    let gate = graph.add(
+        NodeKind::Gate(Gate {
+            channels: 2,
+            threshold: 0.5,
+            invert: false,
+            fade_in_ms: 5.0,
+            fade_out_ms: 20.0,
+        }),
+        [0.0, 0.0],
+    );
+    let out = audio_out(&mut graph, 0, 2);
+    graph.connect(src, 0, gate, 0);
+    graph.connect(control, 0, gate, 1);
+    graph.connect(gate, 0, out, 0);
+    check("gated_audio_with_fades", &graph);
 }
 
 /// A plugin with a sidechain bus fed by a source of a different width, which is
