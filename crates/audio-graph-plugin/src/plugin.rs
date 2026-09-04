@@ -293,14 +293,26 @@ impl Wrapper {
             output_channels: self.channels,
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
-            offline: false,
+            // A DAW re-activates on every render mode change, so the mode
+            // named here is the one this run is under. A sub-plugin that
+            // trades accuracy for latency to keep up with a sound card is
+            // entitled to know when it no longer has to.
+            offline: config.process_mode == ProcessMode::Offline,
         };
         // Remembered even when nothing is loaded: the editor uses it to
         // activate whatever the user picks next, without waiting for the DAW to
         // call `activate` again.
-        let mut state = self.shared.main();
-        state.config = Some(audio_config);
+        self.shared.main().config = Some(audio_config);
 
+        // The engine holds no program at this point — `deactivate` hands it
+        // back, and a first activation has never had one — so without this the
+        // graph would fall silent for as long as the DAW keeps this
+        // configuration, and a bounce would write that silence to the file.
+        // It is also the only moment the delay rings can be sized for the rate
+        // the DAW has just named.
+        self.shared.send_fresh_program();
+
+        let mut state = self.shared.main();
         if !state.host.any_loaded() {
             // Nothing loaded is a normal state, not a failure: the user has to
             // open the editor and pick something. The wrapper passes audio
