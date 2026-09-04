@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use audio_graph_engine::{
     Graph, NODE_WIDTH, NodeAction, NodeGroup, NodeId, NodeKind, NodeUi, Plugin, PluginPorts,
-    PortType, catalogue,
+    PortType, Remove, catalogue,
 };
 
 use crate::config::SLOT_COUNT;
@@ -663,12 +663,7 @@ impl GraphEditor {
                         // is left.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(port.name.as_ref());
-                            if port.removable
-                                && ui
-                                    .small_button("x")
-                                    .on_hover_text("remove this output")
-                                    .clicked()
-                            {
+                            if remove_button(ui, port.remove, "remove this output") {
                                 dropped_output = Some(i as u8);
                             }
                             let mut cx = node_ui(ctx);
@@ -727,18 +722,12 @@ impl GraphEditor {
                         // answer, rather than one that ignores the button and
                         // runs under it.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if port.removable {
-                                // Outside whatever `input_control` disabled,
-                                // on purpose: a socket with a link in it is
-                                // still one you may want gone, and taking it
-                                // away is exactly what cuts the link.
-                                if ui
-                                    .small_button("x")
-                                    .on_hover_text("remove this input")
-                                    .clicked()
-                                {
-                                    dropped = Some(i as u8);
-                                }
+                            // Outside whatever `input_control` disabled, on
+                            // purpose: a socket with a link in it is still one
+                            // you may want gone, and taking it away is exactly
+                            // what cuts the link.
+                            if remove_button(ui, port.remove, "remove this input") {
+                                dropped = Some(i as u8);
                             }
                             let rest =
                                 egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
@@ -1120,6 +1109,28 @@ impl GraphEditor {
     }
 }
 
+/// The button that takes a socket away, on the row of the socket it takes.
+///
+/// A socket whose group has none to spare keeps the button, greyed. Leaving it
+/// out instead would move every other control on that row by its width, and it
+/// would do so on the click that took the second-to-last socket away — so the
+/// row under the pointer shifts at the moment the pointer is being used on it,
+/// and the next click lands on whatever slid into the gap.
+///
+/// `what` is the tooltip for a button that works; the greyed one says why it
+/// does not, which is the same answer for every group that has one.
+fn remove_button(ui: &mut egui::Ui, remove: Remove, what: &str) -> bool {
+    match remove {
+        Remove::None => false,
+        Remove::Offered => ui.small_button("x").on_hover_text(what).clicked(),
+        Remove::Held => {
+            ui.add_enabled(false, egui::Button::new("x").small())
+                .on_disabled_hover_text("the last of these stays");
+            false
+        }
+    }
+}
+
 /// One of the menu's two lists: a scrolling area of a fixed size.
 ///
 /// Fixed in both directions. Left to fit its content, the height moved with
@@ -1440,6 +1451,32 @@ mod tests {
         // Zooming in about a point below and right of the origin pulls the
         // patch up and left, so the pan goes negative in both.
         assert!(canvas.editor.pan.x < 0.0 && canvas.editor.pan.y < 0.0);
+    }
+
+    /// Every list of bands a patch can carry is one the canvas can draw.
+    ///
+    /// A key split holds its bands descending while they are edited, but a
+    /// patch is a file and may name them in any order — bottom-up here, so
+    /// every band but the last is one no key falls in and every control is
+    /// offered a range that reads backwards. A node that panics part-way
+    /// through drawing takes the editor's whole frame with it, and the patch
+    /// that did it is the one the user cannot open to fix.
+    #[test]
+    fn a_key_split_draws_however_its_bands_are_ordered() {
+        let mut canvas = Canvas::new();
+        canvas.graph.add(
+            NodeKind::KeySplit(audio_graph_engine::KeySplit {
+                splits: vec![32, 64, 96],
+            }),
+            [40.0, 40.0],
+        );
+        // And with one band, which is the other end of the same node: every
+        // row is a held remove button and a control with nothing under it.
+        canvas.graph.add(
+            NodeKind::KeySplit(audio_graph_engine::KeySplit { splits: Vec::new() }),
+            [320.0, 40.0],
+        );
+        canvas.frame(Vec::new());
     }
 
     /// The zoom is clamped, and the clamp is not a place the pan can get stuck:

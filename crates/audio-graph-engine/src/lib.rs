@@ -44,9 +44,9 @@ pub use ir::{
 };
 pub use nodes::{
     AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, FilterMode, Gate,
-    KeyParam, KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter,
-    NoteFollow, NoteGate, NoteIn, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap,
-    Rate, SlotIn, Switch, db_to_linear, linear_to_db,
+    KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind,
+    NoteFilter, NoteFollow, NoteGate, NoteIn, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts,
+    RangeMap, Rate, SlotIn, Switch, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{
@@ -54,4 +54,4 @@ pub use nodes::{
     widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
 };
 pub use notes::{Ended, MAX_LIVE_NOTES};
-pub use port::{Port, PortType};
+pub use port::{Port, PortType, Remove};

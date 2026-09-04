@@ -1967,9 +1967,9 @@ mod tests {
     use crate::ir::MathOp;
     use crate::nodes::{
         AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, Gate, KeyParam,
-        KeyParamMode, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter, NoteFollow,
-        NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn, Switch,
-        linear_to_db,
+        KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math, Mix, NodeKind, NoteFilter,
+        NoteFollow, NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, Rate, SlotIn,
+        Switch, linear_to_db,
     };
     use crate::port::PortType;
 
@@ -2617,6 +2617,76 @@ mod tests {
             seen[1],
             Event::Note(NoteEvent::NoteOn { key: 60, .. })
         ));
+    }
+
+    /// A key split hands each band to its own instrument, and hands the pedal
+    /// to both of them. Dividing the keys is the whole job; an event that has
+    /// no key belongs to no band and so belongs to all of them.
+    #[test]
+    fn a_key_split_divides_the_keys_and_shares_what_has_none() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let split = graph.add(
+            NodeKind::KeySplit(KeySplit { splits: vec![60] }),
+            [0.0, 0.0],
+        );
+        let upper = note_plugin(&mut graph, 0);
+        let lower = note_plugin(&mut graph, 1);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 2,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, split, 0);
+        graph.connect(split, 0, upper, 0);
+        graph.connect(split, 1, lower, 0);
+        graph.connect(upper, 0, mix, 0);
+        graph.connect(lower, 0, mix, 2);
+        graph.connect(mix, 0, out, 0);
+
+        let sustain = Event::Note(NoteEvent::Cc {
+            port: 0,
+            channel: 0,
+            cc: 64,
+            value: 1.0,
+            sample_offset: 3,
+        });
+        // 60 is the split, and it belongs to the band it names — the lower one.
+        let heard = hear(
+            &graph,
+            &[note_on(72, 0), note_on(60, 1), note_on(48, 2), sustain],
+            &[],
+        );
+
+        let keys = |instance: u32| -> Vec<i16> {
+            heard.0[&instance]
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Note(NoteEvent::NoteOn { key, .. }) => Some(*key),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(keys(0), vec![72], "the upper band takes 61 and above");
+        assert_eq!(keys(1), vec![60, 48], "the lower band takes 60 and below");
+        for instance in [0, 1] {
+            assert!(
+                heard.0[&instance]
+                    .iter()
+                    .any(|event| matches!(event, Event::Note(NoteEvent::Cc { cc: 64, .. }))),
+                "the pedal reaches instance {instance}"
+            );
+        }
     }
 
     /// A MIDI filter narrows the stream by channel and by controller number,

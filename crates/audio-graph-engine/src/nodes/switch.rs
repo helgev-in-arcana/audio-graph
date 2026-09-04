@@ -118,7 +118,7 @@ impl Node for Switch {
             // with no threshold, and a switch that had lost it would have
             // nothing to read below its own ladder.
             #[cfg(feature = "ui")]
-            let port = if i > 0 { port.removable() } else { port };
+            let port = if i > 0 { port.removable(true) } else { port };
             out.push(port);
         }
         out

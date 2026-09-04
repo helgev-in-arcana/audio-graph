@@ -94,14 +94,11 @@ impl Node for KeyParam {
         let mut out = vec![Port::new("notes", PortType::Note)];
         for i in 0..self.keys.len() {
             let port = Port::param(format!("value {}", i + 1));
-            // The last value is not offered a remove button: a switch with one
-            // position is a constant, and the node would have nothing to say.
+            // The last value keeps its button greyed rather than losing it: a
+            // switch with one position is a constant, and the node would have
+            // nothing to say.
             #[cfg(feature = "ui")]
-            let port = if self.keys.len() > 1 {
-                port.removable()
-            } else {
-                port
-            };
+            let port = port.removable(self.keys.len() > 1);
             out.push(port);
         }
         out

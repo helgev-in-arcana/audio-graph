@@ -177,7 +177,7 @@ impl Node for Plugin {
             // away again; the audio and note sockets are the plugin's and are
             // not.
             #[cfg(feature = "ui")]
-            let port = port.removable();
+            let port = port.removable(true);
             out.push(port);
         }
         out
@@ -191,11 +191,11 @@ impl Node for Plugin {
             .map(|&bus| {
                 let channels = self.ports.audio_out[usize::from(bus)];
                 let port = Port::new(out_name(bus), PortType::Audio { channels });
-                // The last one stays: a plugin with no way out of it is a node
-                // that cannot be wired to anything, and the socket is how the
-                // others are got back.
+                // The last one stays, its button greyed: a plugin with no way
+                // out of it is a node that cannot be wired to anything, and
+                // the socket is how the others are got back.
                 #[cfg(feature = "ui")]
-                let port = if many { port.removable() } else { port };
+                let port = port.removable(many);
                 let _ = many;
                 port
             })

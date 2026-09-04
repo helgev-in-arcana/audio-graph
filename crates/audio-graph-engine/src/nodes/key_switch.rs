@@ -98,14 +98,10 @@ impl Node for KeySwitch {
         (0..self.keys.len())
             .map(|i| {
                 let port = Port::new(format!("out {}", i + 1), PortType::Note);
-                // The last way is not offered a remove button: a switch with
-                // nowhere to send anything is not a switch.
+                // The last way keeps its button greyed rather than losing it:
+                // a switch with nowhere to send anything is not a switch.
                 #[cfg(feature = "ui")]
-                let port = if self.keys.len() > 1 {
-                    port.removable()
-                } else {
-                    port
-                };
+                let port = port.removable(self.keys.len() > 1);
                 port
             })
             .collect()
