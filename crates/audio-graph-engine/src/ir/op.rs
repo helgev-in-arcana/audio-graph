@@ -276,16 +276,36 @@ pub enum Follow {
     Gate,
     /// Key number of the most recent note-on, `0..=1` across the MIDI range.
     KeyTrack,
+    /// How many keys are down, `0..=128`, counted off the mask of held keys
+    /// rather than off the running note count beside it.
+    ///
+    /// The mask is the exact answer under a gate: a gate holds note-ons back
+    /// and lets note-offs through, so a stream can carry the release of a note
+    /// whose arrival it never saw. Clearing a bit that is already clear costs
+    /// nothing, where a decrement would take the count somewhere the keyboard
+    /// never was.
+    ///
+    /// A count, not a fraction, and the only reading here that is. Two keys
+    /// are two, and what that is worth is the business of a `Param Map` or of
+    /// the thresholds on a `Param Select` — both of which read the number as
+    /// it stands.
+    HeldKeys,
 }
 
 impl Follow {
-    pub const ALL: [Follow; 3] = [Follow::Velocity, Follow::Gate, Follow::KeyTrack];
+    pub const ALL: [Follow; 4] = [
+        Follow::Velocity,
+        Follow::Gate,
+        Follow::KeyTrack,
+        Follow::HeldKeys,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Follow::Velocity => "Velocity",
             Follow::Gate => "Gate",
             Follow::KeyTrack => "Key Track",
+            Follow::HeldKeys => "Held Keys",
         }
     }
 }

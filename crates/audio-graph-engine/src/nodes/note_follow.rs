@@ -8,14 +8,22 @@ use crate::nodes::Node;
 use crate::nodes::widgets::{NodeUi, combo};
 use crate::port::{Port, PortType};
 
-/// Follows the notes on a stream: how hard, whether any are down, or which key.
+/// Follows the notes on a stream: how hard, whether any are down, which key,
+/// or how many keys.
 ///
-/// The three readings that still mean something when polyphony is flattened.
-/// The per-note controllers — pressure, tuning, brightness and the rest —
+/// The readings that still mean something when polyphony is flattened. The
+/// per-note controllers — pressure, tuning, brightness and the rest —
 /// deliberately have no place here: reducing them to "the newest note wins" is
 /// not musical, giving one number for a chord with nothing on the canvas to
 /// say which note it came from. They wait for a per-voice engine to be given
-/// to; these three are monophonic by nature and keep working without one.
+/// to; these are monophonic by nature and keep working without one.
+///
+/// Three of them read `0..=1` and `Held Keys` reads a count, which is the one
+/// place this node's output changes units with its setting. A count is what
+/// the reading is: two keys are two, and rescaling them here would be a guess
+/// at what full means, made in the node that has the least idea — a `Param
+/// Map` downstream is told, and a `Param Select`'s thresholds want the number
+/// as it stands.
 ///
 /// The stream is an input rather than an assumption, so a filter or a gate
 /// upstream changes what this follows.
@@ -47,7 +55,7 @@ impl Node for NoteFollow {
                 out,
                 value: match self.what {
                     Follow::KeyTrack => 0.5,
-                    Follow::Velocity | Follow::Gate => 0.0,
+                    Follow::Velocity | Follow::Gate | Follow::HeldKeys => 0.0,
                 },
             });
             cx.bind_output(0, out);
