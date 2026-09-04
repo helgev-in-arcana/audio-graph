@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use audio_graph_engine::{
     Graph, NODE_WIDTH, NodeAction, NodeGroup, NodeId, NodeKind, NodeUi, Plugin, PluginPorts,
-    PortType, catalogue,
+    PortType, Remove, catalogue,
 };
 
 use crate::config::SLOT_COUNT;
@@ -663,12 +663,7 @@ impl GraphEditor {
                         // is left.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(port.name.as_ref());
-                            if port.removable
-                                && ui
-                                    .small_button("x")
-                                    .on_hover_text("remove this output")
-                                    .clicked()
-                            {
+                            if remove_button(ui, port.remove, "remove this output") {
                                 dropped_output = Some(i as u8);
                             }
                             let mut cx = node_ui(ctx);
@@ -727,18 +722,12 @@ impl GraphEditor {
                         // answer, rather than one that ignores the button and
                         // runs under it.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if port.removable {
-                                // Outside whatever `input_control` disabled,
-                                // on purpose: a socket with a link in it is
-                                // still one you may want gone, and taking it
-                                // away is exactly what cuts the link.
-                                if ui
-                                    .small_button("x")
-                                    .on_hover_text("remove this input")
-                                    .clicked()
-                                {
-                                    dropped = Some(i as u8);
-                                }
+                            // Outside whatever `input_control` disabled, on
+                            // purpose: a socket with a link in it is still one
+                            // you may want gone, and taking it away is exactly
+                            // what cuts the link.
+                            if remove_button(ui, port.remove, "remove this input") {
+                                dropped = Some(i as u8);
                             }
                             let rest =
                                 egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
@@ -1120,6 +1109,28 @@ impl GraphEditor {
     }
 }
 
+/// The button that takes a socket away, on the row of the socket it takes.
+///
+/// A socket whose group has none to spare keeps the button, greyed. Leaving it
+/// out instead would move every other control on that row by its width, and it
+/// would do so on the click that took the second-to-last socket away — so the
+/// row under the pointer shifts at the moment the pointer is being used on it,
+/// and the next click lands on whatever slid into the gap.
+///
+/// `what` is the tooltip for a button that works; the greyed one says why it
+/// does not, which is the same answer for every group that has one.
+fn remove_button(ui: &mut egui::Ui, remove: Remove, what: &str) -> bool {
+    match remove {
+        Remove::None => false,
+        Remove::Offered => ui.small_button("x").on_hover_text(what).clicked(),
+        Remove::Held => {
+            ui.add_enabled(false, egui::Button::new("x").small())
+                .on_disabled_hover_text("the last of these stays");
+            false
+        }
+    }
+}
+
 /// One of the menu's two lists: a scrolling area of a fixed size.
 ///
 /// Fixed in both directions. Left to fit its content, the height moved with
@@ -1458,6 +1469,12 @@ mod tests {
                 splits: vec![32, 64, 96],
             }),
             [40.0, 40.0],
+        );
+        // And with one band, which is the other end of the same node: every
+        // row is a held remove button and a control with nothing under it.
+        canvas.graph.add(
+            NodeKind::KeySplit(audio_graph_engine::KeySplit { splits: Vec::new() }),
+            [320.0, 40.0],
         );
         canvas.frame(Vec::new());
     }

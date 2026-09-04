@@ -28,6 +28,13 @@ const TOP_KEY: u8 = 127;
 /// leaves two. The first output has no key of its own for that reason: 127 is
 /// not a setting, it is where the keyboard ends.
 ///
+/// One band is allowed, and is the whole keyboard on one socket. The count
+/// falls out of the splits with no floor under it — `n` splits are `n + 1`
+/// bands at every `n`, including none — and a node held at two bands would be
+/// a rule to state and a case to check for the sake of forbidding a node that
+/// costs nothing: with nothing to drop, the socket carries the buffer that
+/// came in rather than a copy of it.
+///
 /// Only keys are divided. An event with no key of its own — a control change,
 /// a pitch bend — carries the whole channel and belongs to no band, so it goes
 /// out of every output. A player leaning on the sustain pedal means it for
@@ -83,14 +90,10 @@ impl Node for KeySplit {
         (0..=self.splits.len())
             .map(|i| {
                 let port = Port::new(format!("out {}", i + 1), PortType::Note);
-                // Two bands is the least a split can be: one band is the
-                // keyboard, and there is already a way to draw a wire.
+                // Held rather than dropped on the sole band, which has no
+                // split under it to take away.
                 #[cfg(feature = "ui")]
-                let port = if self.splits.len() > 1 {
-                    port.removable()
-                } else {
-                    port
-                };
+                let port = port.removable(!self.splits.is_empty());
                 port
             })
             .collect()
@@ -195,11 +198,13 @@ impl Node for KeySplit {
 
     /// Taking a band away merges it into the one above it — or, for the first
     /// band, into the one below. Either way one split goes, and the socket
-    /// that keeps the merged band keeps whatever was wired to it.
+    /// that keeps the merged band keeps whatever was wired to it. The last
+    /// band merges into nothing and stays, since there is no split left to
+    /// remove.
     #[cfg(feature = "ui")]
     fn remove_output(&mut self, port: u8) -> u8 {
         let index = usize::from(port).saturating_sub(1);
-        if self.splits.len() <= 1 || index >= self.splits.len() {
+        if index >= self.splits.len() {
             return 0;
         }
         self.splits.remove(index);
@@ -253,6 +258,24 @@ mod tests {
     #[test]
     fn a_single_band_passes_the_whole_keyboard() {
         let node = KeySplit { splits: Vec::new() };
+        assert_eq!(node.band(0), Some((0, 127)));
+        assert_eq!(node.note_mute(0), 0);
+        assert_eq!(node.output_ports().len(), 1);
+    }
+
+    /// Bands come off one at a time down to the last, and the one that is left
+    /// covers the keyboard: a split shrunk back to nothing is a node that
+    /// passes what it is given, not one stuck two bands wide.
+    #[test]
+    fn the_bands_come_off_down_to_the_one_that_stays() {
+        let mut node = KeySplit {
+            splits: vec![64, 32],
+        };
+        assert_eq!(node.remove_output(2), 1, "the bottom band merges upwards");
+        assert_eq!(node.splits, vec![64]);
+        assert_eq!(node.remove_output(0), 1, "and the top one downwards");
+        assert!(node.splits.is_empty());
+        assert_eq!(node.remove_output(0), 0, "the last band stays");
         assert_eq!(node.note_mute(0), 0);
     }
 

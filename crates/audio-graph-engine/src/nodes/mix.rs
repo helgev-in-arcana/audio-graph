@@ -73,15 +73,11 @@ impl Node for Mix {
                         channels: self.channels,
                     },
                 );
-                // The signal socket carries the pair's remove button. The last
-                // input is not offered one: a mix of none is not a mix, and a
-                // mix of one is a gain, which is a thing people want.
+                // The signal socket carries the pair's remove button, greyed on
+                // the last input: a mix of none is not a mix, and a mix of one
+                // is a gain, which is a thing people want.
                 #[cfg(feature = "ui")]
-                let signal = if self.inputs > 1 {
-                    signal.removable()
-                } else {
-                    signal
-                };
+                let signal = signal.removable(self.inputs > 1);
                 [signal, Port::param(format!("gain {}", i + 1))]
             })
             .collect()

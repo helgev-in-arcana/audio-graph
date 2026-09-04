@@ -54,4 +54,4 @@ pub use nodes::{
     widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
 };
 pub use notes::{Ended, MAX_LIVE_NOTES};
-pub use port::{Port, PortType};
+pub use port::{Port, PortType, Remove};

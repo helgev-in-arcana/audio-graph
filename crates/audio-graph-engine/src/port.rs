@@ -34,6 +34,24 @@ impl PortType {
     }
 }
 
+/// What the button that takes a socket away is doing on that socket's row.
+///
+/// Three states rather than two, because a group at its floor still has rows:
+/// the button stays on them, greyed. It is drawn there rather than left out
+/// because a row is laid out from the socket inwards, so a button that comes
+/// and goes takes its width from everything beside it — and it would come and
+/// go exactly while the user is adding and removing sockets, which is when
+/// they are clicking along those rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remove {
+    /// No button: this socket is not one of a group the user grows.
+    None,
+    /// A button that works.
+    Offered,
+    /// A button that does not, because the group has none to spare.
+    Held,
+}
+
 /// One socket on a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Port {
@@ -43,12 +61,11 @@ pub struct Port {
     ///
     /// Used by the UI to visually distinguish auxiliary inputs from main signal inputs.
     pub aux: bool,
-    /// Indicates whether this socket represents a dynamically removable input group
-    /// (e.g. mix bus inputs or plugin parameter ports).
-    ///
-    /// Used by the UI to render removal controls for dynamic port sets. For the actual
-    /// logic determining how many sockets are removed, see [`NodeKind::remove_input`][crate::NodeKind::remove_input].
-    pub removable: bool,
+    /// What the button that takes this socket away is doing on its row — a
+    /// mix's inputs and a plugin's parameter sockets are the groups that have
+    /// one. For how many sockets actually go, see
+    /// [`NodeKind::remove_input`][crate::NodeKind::remove_input].
+    pub remove: Remove,
 }
 
 impl Port {
@@ -57,7 +74,7 @@ impl Port {
             name: name.into(),
             ty,
             aux: false,
-            removable: false,
+            remove: Remove::None,
         }
     }
 
@@ -69,11 +86,18 @@ impl Port {
         Port { aux: true, ..self }
     }
 
-    /// Mark this port as the first socket of a group the user may remove.
+    /// Mark this port as the first socket of a group the user grows and
+    /// shrinks. `offered` says whether the button may be clicked now — a
+    /// group down to what it has to keep holds its button rather than
+    /// dropping it, see [`Remove::Held`].
     #[cfg(feature = "ui")]
-    pub(crate) fn removable(self) -> Port {
+    pub(crate) fn removable(self, offered: bool) -> Port {
         Port {
-            removable: true,
+            remove: if offered {
+                Remove::Offered
+            } else {
+                Remove::Held
+            },
             ..self
         }
     }

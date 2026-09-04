@@ -737,3 +737,81 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
     );
     out
 }
+
+/// The rule every growable group follows, checked on all of them at once.
+///
+/// It is one rule about the canvas rather than one about any node, and the
+/// nodes are where it is actually spelled — so the place to state it is where
+/// the set of nodes is, and a node added without it fails here rather than in
+/// somebody's hands.
+#[cfg(all(test, feature = "ui"))]
+mod tests {
+    use super::*;
+    use crate::port::Remove;
+
+    /// A group at its floor keeps its remove button, greyed. Dropping the
+    /// button instead moves every other control on that row by its width, and
+    /// it does so on the click that took the second-to-last socket away — the
+    /// row shifts under the pointer at the one moment the pointer is being
+    /// used on it.
+    #[test]
+    fn a_group_at_its_floor_keeps_the_button_that_cannot_be_pressed() {
+        let mix = Mix {
+            channels: 2,
+            inputs: 1,
+            gains: vec![0.0],
+        };
+        assert_eq!(mix.input_ports()[0].remove, Remove::Held);
+
+        let switch = KeySwitch {
+            mode: KeySwitchMode::Select,
+            keys: vec![24],
+            mute_keys: true,
+        };
+        assert_eq!(switch.output_ports()[0].remove, Remove::Held);
+
+        let param = KeyParam {
+            mode: KeyParamMode::Select,
+            keys: vec![24],
+            values: vec![0.0],
+            mute_keys: true,
+        };
+        // Socket 0 is the notes input, which is not one of the group.
+        assert_eq!(param.input_ports()[0].remove, Remove::None);
+        assert_eq!(param.input_ports()[1].remove, Remove::Held);
+
+        let split = KeySplit { splits: Vec::new() };
+        assert_eq!(split.output_ports()[0].remove, Remove::Held);
+
+        let plugin = Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                audio_out: vec![2],
+                audio_out_shown: Vec::new(),
+                ..PluginPorts::default()
+            },
+        };
+        assert_eq!(plugin.output_ports()[0].remove, Remove::Held);
+    }
+
+    /// And offers it as soon as there is one to spare, on every socket of the
+    /// group rather than on the ones past the first.
+    #[test]
+    fn a_group_with_one_to_spare_offers_the_button_on_every_socket() {
+        let mix = Mix {
+            channels: 2,
+            inputs: 2,
+            gains: vec![0.0, 0.0],
+        };
+        let ports = mix.input_ports();
+        // A mix input is a signal socket and the gain beside it; the button is
+        // on the signal, which is the even one of each pair.
+        assert_eq!(ports[0].remove, Remove::Offered);
+        assert_eq!(ports[2].remove, Remove::Offered);
+
+        let split = KeySplit { splits: vec![60] };
+        let ports = split.output_ports();
+        assert_eq!(ports[0].remove, Remove::Offered);
+        assert_eq!(ports[1].remove, Remove::Offered);
+    }
+}
