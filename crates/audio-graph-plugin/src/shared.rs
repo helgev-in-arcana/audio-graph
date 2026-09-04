@@ -355,13 +355,43 @@ impl Shared {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Compile the current graph and hand it to the audio thread.
+    /// Compile the current graph, hand it to the audio thread, and re-activate
+    /// the sub-plugins if their buses moved with it.
     ///
     /// Called after every edit. A graph that will not compile leaves the last
     /// working program running and records why, because the alternative —
     /// silence, or the DAW's raw automation reappearing — would make the
     /// editor's own error message the second thing the user noticed.
     pub fn publish_graph(&self) {
+        if self.send_program()
+            && let Err(e) = self.rebind()
+        {
+            log::warn!("audio-graph: re-activating for new buses: {e}");
+        }
+    }
+
+    /// Compile the current graph and hand it to the audio thread, with every
+    /// delay line's ring allocated afresh.
+    ///
+    /// For an activation, which is the one moment `sized_rings` cannot be
+    /// trusted: it records what the audio thread was last handed, and a
+    /// program waiting in the handoff when the DAW deactivates us is dropped
+    /// unread. A line the cache calls unchanged would then arrive with no ring
+    /// at all, and a delay with no buffer to read is a delay that repeats
+    /// nothing.
+    pub(crate) fn send_fresh_program(&self) {
+        self.main().sized_rings.clear();
+        self.send_program();
+    }
+
+    /// Compile the current graph and hand it to the audio thread.
+    ///
+    /// Returns whether the sub-plugins' buses or parameter targets moved with
+    /// it. Acting on that is [`Shared::rebind`]'s job, and a caller that is
+    /// about to activate them itself has nothing to do about it. `false` also
+    /// when the graph would not compile: nothing was sent, so nothing has to
+    /// be activated against it.
+    fn send_program(&self) -> bool {
         // Copied, then compiled with nothing held. The editor draws under this
         // same lock on its own thread, so holding it across a compile would
         // cost it a frame every time the user drags a control — which is
@@ -380,7 +410,7 @@ impl Shared {
                 }
                 Err(e) => {
                     patch.compile_error = Some(e.to_string());
-                    return;
+                    return false;
                 }
             }
         };
@@ -400,10 +430,7 @@ impl Shared {
         state.instance_io = program.instances.clone();
         state.graph_params = program.param_targets.clone();
         self.programs.send(Box::new(program));
-        drop(state);
-        if changed && let Err(e) = self.rebind() {
-            log::warn!("audio-graph: re-activating for new buses: {e}");
-        }
+        changed
     }
 
     /// Free anything the audio thread has handed back. Main thread, called from
