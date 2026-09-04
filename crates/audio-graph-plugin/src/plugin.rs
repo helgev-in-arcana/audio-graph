@@ -312,34 +312,37 @@ impl Wrapper {
         // the DAW has just named.
         self.shared.send_fresh_program();
 
-        let mut state = self.shared.main();
-        if !state.host.any_loaded() {
+        {
+            let mut state = self.shared.main();
             // Nothing loaded is a normal state, not a failure: the user has to
-            // open the editor and pick something. The wrapper passes audio
-            // through until then.
-            return Some(0);
+            // open the editor and pick something, and the graph draws a
+            // through-connection until they do.
+            if state.host.any_loaded() {
+                let io = state.instance_io.clone();
+                let graph_params = state.graph_params.clone();
+                match state.host.activate(audio_config, &io, &graph_params) {
+                    Ok(processor) => {
+                        drop(state);
+                        self.shared.audio().processor = Some(processor);
+                    }
+                    // Still a successful activation of *the wrapper*: the rest
+                    // of the graph runs, and a plugin node with no plugin
+                    // behind it produces silence. Refusing to load would lose
+                    // the user's whole patch over one plugin.
+                    Err(e) => log::warn!("audio-graph: sub-plugin failed to activate: {e}"),
+                }
+            }
         }
 
-        let io = state.instance_io.clone();
-        let graph_params = state.graph_params.clone();
-        match state.host.activate(audio_config, &io, &graph_params) {
-            Ok(processor) => {
-                // What to report depends on how the audio is routed. A graph
-                // knows its own longest path; the direct path is one plugin, so
-                // its latency is the plugin's.
-                let latency = self.engine.latency().max(state.host.sub_latency(0));
-                drop(state);
-                self.shared.audio().processor = Some(processor);
-                Some(latency)
-            }
-            Err(e) => {
-                log::warn!("audio-graph: sub-plugin failed to activate: {e}");
-                // Still a successful activation of *the wrapper*: it will pass
-                // audio through. Refusing to load would lose the user's whole
-                // patch over one plugin.
-                Some(0)
-            }
+        // Activating a plugin is what makes it answerable about its latency, so
+        // a node can be carrying a number from before its plugin had one — or
+        // from a project whose plugin is no longer installed, where the honest
+        // answer is none at all. The DAW is told what the graph costs, and that
+        // can only be right if the nodes in it are.
+        if self.shared.refresh_latencies() {
+            self.shared.send_fresh_program();
         }
+        Some(self.shared.latency())
     }
 
     pub fn deactivate(&mut self) {
