@@ -79,7 +79,7 @@ impl KeySplit {
 
 impl Node for KeySplit {
     fn title(&self) -> String {
-        "Key Range MIDI Route".into()
+        "MIDI Split".into()
     }
 
     fn input_ports(&self) -> Vec<Port> {
@@ -216,7 +216,7 @@ impl Node for KeySplit {
 impl KeySplit {
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, KeySplit)> {
         vec![(
-            "Key Range MIDI Route",
+            "MIDI Split",
             KeySplit {
                 // Two bands parting at middle C, which is where a left hand and
                 // a right hand part on a keyboard that is not being split by a
