@@ -31,7 +31,7 @@ use clap_sys::ext::audio_ports_activation::{
     CLAP_EXT_AUDIO_PORTS_ACTIVATION, clap_plugin_audio_ports_activation,
 };
 use clap_sys::ext::gui::CLAP_EXT_GUI;
-use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_plugin_latency};
+use clap_sys::ext::latency::{CLAP_EXT_LATENCY, clap_host_latency, clap_plugin_latency};
 use clap_sys::ext::note_ports::clap_host_note_ports;
 use clap_sys::ext::note_ports::{
     CLAP_EXT_NOTE_PORTS, CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI, clap_note_port_info,
@@ -103,6 +103,10 @@ pub mod ask {
     pub const RESTART: f64 = 1.0;
     pub const AUDIO_PORTS_RESCAN: f64 = 2.0;
     pub const NOTE_PORTS_RESCAN: f64 = 3.0;
+    /// Say that the number [`PARAM_LATENCY`][super::PARAM_LATENCY] reports has
+    /// moved. Set that one first, or the host is being told to re-read a value
+    /// that has not changed and will rightly do nothing with it.
+    pub const LATENCY_CHANGED: f64 = 4.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -170,7 +174,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, 3.0).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, 4.0).round(),
             _ => {}
         }
     }
@@ -964,6 +968,15 @@ impl Instance {
                     && let Some(rescan) = unsafe { (*ext).rescan }
                 {
                     unsafe { rescan(self.host, 0) };
+                }
+            }
+            ask::LATENCY_CHANGED => {
+                let ext = unsafe { get(self.host, CLAP_EXT_LATENCY.as_ptr()) }
+                    .cast::<clap_host_latency>();
+                if !ext.is_null()
+                    && let Some(changed) = unsafe { (*ext).changed }
+                {
+                    unsafe { changed(self.host) };
                 }
             }
             _ => {}

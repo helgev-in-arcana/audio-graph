@@ -41,6 +41,9 @@ const PARAM_FD_CALLS: ParamId = ParamId(7);
 const ASK_RESTART: f64 = 1.0;
 const ASK_AUDIO_PORTS_RESCAN: f64 = 2.0;
 const ASK_NOTE_PORTS_RESCAN: f64 = 3.0;
+const ASK_LATENCY_CHANGED: f64 = 4.0;
+/// What the fixture is told to claim before it says its latency moved.
+const NEW_LATENCY: u32 = 128;
 
 #[derive(Default)]
 struct TestHost;
@@ -56,6 +59,7 @@ impl HostContext for TestHost {
 #[derive(Default)]
 struct RecordingHost {
     reasons: std::sync::Mutex<Vec<RestartReason>>,
+    latencies: std::sync::Mutex<Vec<u32>>,
 }
 
 impl HostContext for RecordingHost {
@@ -64,6 +68,9 @@ impl HostContext for RecordingHost {
     }
     fn request_restart(&self, reason: RestartReason) {
         self.reasons.lock().expect("not poisoned").push(reason);
+    }
+    fn latency_changed(&self, samples: u32) {
+        self.latencies.lock().expect("not poisoned").push(samples);
     }
 }
 
@@ -83,6 +90,7 @@ fn the_host_forwards_what_the_plugin_asks_for() {
         (ASK_RESTART, RestartReason::IoConfig),
         (ASK_AUDIO_PORTS_RESCAN, RestartReason::IoConfig),
         (ASK_NOTE_PORTS_RESCAN, RestartReason::IoConfig),
+        (ASK_LATENCY_CHANGED, RestartReason::Latency),
     ] {
         let host = Arc::new(RecordingHost::default());
         let mut plugin = ClapPlugin::create(
@@ -104,6 +112,53 @@ fn the_host_forwards_what_the_plugin_asks_for() {
         let seen = host.reasons.lock().unwrap().clone();
         assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
     }
+}
+
+/// A plugin that changes its latency mid-session is asked again, and the new
+/// number reaches the host.
+///
+/// Saying "it moved" is only half of it: the number itself is read back on the
+/// main-thread tick, and a host that records the request without ever
+/// re-reading leaves whatever it learned at activate in place — which is
+/// exactly the stale figure the plugin was trying to correct.
+#[test]
+fn a_latency_that_moves_is_read_back() {
+    let module = Module::open(fixture_path()).expect("the fixture opens");
+    let host = Arc::new(RecordingHost::default());
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::clone(&host) as Arc<dyn HostContext>,
+    )
+    .expect("instantiates");
+
+    assert_eq!(SubPluginMain::latency_samples(&plugin), 0);
+
+    // The plugin decides it needs lookahead, and says so.
+    SubPluginMain::set_param(&mut plugin, PARAM_LATENCY, f64::from(NEW_LATENCY))
+        .expect("the latency lands");
+    SubPluginMain::set_param(&mut plugin, PARAM_ASK, ASK_LATENCY_CHANGED).expect("the ask lands");
+    assert!(
+        host.latencies.lock().unwrap().is_empty(),
+        "the number is read on the tick, not from inside the plugin's own call"
+    );
+
+    plugin.tick();
+    assert_eq!(
+        SubPluginMain::latency_samples(&plugin),
+        NEW_LATENCY,
+        "the host went on answering for a latency the plugin no longer has"
+    );
+    assert_eq!(
+        *host.latencies.lock().unwrap(),
+        vec![NEW_LATENCY],
+        "whoever is hosting this host has to be told once, and once only"
+    );
+
+    // Nothing new to say on the next turn: a number that has not moved must not
+    // be announced again, or every tick restarts the DAW's processing.
+    plugin.tick();
+    assert_eq!(*host.latencies.lock().unwrap(), vec![NEW_LATENCY]);
 }
 
 /// The host has to actually poll the descriptor a plugin registers.

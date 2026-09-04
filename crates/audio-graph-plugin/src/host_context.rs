@@ -1,6 +1,6 @@
 //! Host context implementation provided by the wrapper to hosted sub-plugins.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use plugin_host::{HostContext, ParamId, RestartReason};
 
@@ -11,7 +11,6 @@ use plugin_host::{HostContext, ParamId, RestartReason};
 /// upward at points the DAW allows (activate, or the next process block).
 #[derive(Default)]
 pub struct WrapperHostContext {
-    latency: AtomicU32,
     /// Set when the sub-plugin asked for anything that needs the DAW's
     /// attention, so the wrapper can check cheaply once per block.
     restart_pending: AtomicBool,
@@ -23,15 +22,14 @@ impl WrapperHostContext {
         WrapperHostContext::default()
     }
 
-    pub fn latency(&self) -> u32 {
-        self.latency.load(Ordering::Relaxed)
-    }
-
-    /// Take the pending latency change, if any.
-    pub fn take_latency_change(&self) -> Option<u32> {
-        self.latency_changed
-            .swap(false, Ordering::AcqRel)
-            .then(|| self.latency.load(Ordering::Acquire))
+    /// Whether some sub-plugin has said its latency moved since the last ask.
+    ///
+    /// A flag rather than the number, because every instance the wrapper hosts
+    /// reports through this one context: the samples one of them named say
+    /// nothing about which one named them, and the answer the DAW wants is the
+    /// graph's anyway. What this is for is knowing when to go and look.
+    pub fn take_latency_change(&self) -> bool {
+        self.latency_changed.swap(false, Ordering::AcqRel)
     }
 
     pub fn take_restart_request(&self) -> bool {
@@ -52,8 +50,7 @@ impl HostContext for WrapperHostContext {
         self.restart_pending.store(true, Ordering::Release);
     }
 
-    fn latency_changed(&self, samples: u32) {
-        self.latency.store(samples, Ordering::Release);
+    fn latency_changed(&self, _samples: u32) {
         self.latency_changed.store(true, Ordering::Release);
     }
 
@@ -75,14 +72,13 @@ mod tests {
     #[test]
     fn latency_changes_are_taken_once() {
         let ctx = WrapperHostContext::new();
-        assert_eq!(ctx.take_latency_change(), None);
+        assert!(!ctx.take_latency_change());
 
         ctx.latency_changed(256);
-        assert_eq!(ctx.take_latency_change(), Some(256));
-        // Taken means taken: reporting the same change twice would make the
-        // DAW restart processing for no reason.
-        assert_eq!(ctx.take_latency_change(), None);
-        assert_eq!(ctx.latency(), 256);
+        assert!(ctx.take_latency_change());
+        // Taken means taken: recompiling the graph and telling the DAW again
+        // for a change already acted on would restart processing for nothing.
+        assert!(!ctx.take_latency_change());
     }
 
     #[test]

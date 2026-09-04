@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::host_context::WrapperHostContext;
 use crate::shared::Shared;
 
 /// The period while at least one sub-plugin is loaded, in milliseconds.
@@ -72,7 +73,7 @@ impl TickState {
 /// Skips rather than waits if the state is already borrowed further up the
 /// stack: this runs from the host's callback, and the callback can arrive
 /// while a command that is loading a plugin is dispatching messages.
-pub fn run(shared: &Arc<Shared>, state: &TickState) {
+pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &TickState) {
     state.pending.store(false, Ordering::Release);
 
     // Before the thread check, because it does not need a thread: freeing a
@@ -115,6 +116,15 @@ pub fn run(shared: &Arc<Shared>, state: &TickState) {
         main.host.tick_editors();
         main.host.any_loaded()
     };
+
+    // After the editors, because a plugin says its latency has moved from its
+    // own main-thread callback and that is what turns one. Recompiling is what
+    // makes the new number the graph's; `Wrapper::process` is what tells the
+    // DAW, being the only place the wrapper is handed something that can.
+    if context.take_latency_change() && shared.refresh_latencies() {
+        shared.publish_graph();
+    }
+
     // Last, so the snapshot the next frame draws includes everything this tick
     // did.
     shared.publish_view();
