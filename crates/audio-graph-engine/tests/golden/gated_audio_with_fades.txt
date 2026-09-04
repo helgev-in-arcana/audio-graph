@@ -1,0 +1,83 @@
+Program {
+    ops: [
+        Slot {
+            out: 0,
+            slot: 0,
+        },
+        Select {
+            out: 1,
+            control: 0,
+            threshold: 0.5,
+            low: Value(
+                -100.0,
+            ),
+            high: Value(
+                0.0,
+            ),
+        },
+    ],
+    registers: 2,
+    outputs: [
+        (
+            96,
+            1,
+        ),
+    ],
+    audio_ring_len: [],
+    audio_rings: [],
+    audio_ring_seconds: [],
+    audio_delay_nodes: [],
+    delay_nodes: [],
+    audio_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+        Fade {
+            out: 0,
+            a: 0,
+            state: 0,
+            lane: Some(
+                96,
+            ),
+            gain: 1.0,
+            rise: 0.005,
+            fall: 0.02,
+        },
+        Output {
+            a: 0,
+            bus: 0,
+        },
+    ],
+    note_ops: [],
+    note_bufs: 0,
+    param_targets: [],
+    audio_lane_base: 96,
+    instances: [],
+    buffers: [
+        2,
+    ],
+    stages: [
+        Stage {
+            params: Span {
+                start: 0,
+                end: 2,
+            },
+            notes: Span {
+                start: 0,
+                end: 0,
+            },
+            audio: Span {
+                start: 0,
+                end: 3,
+            },
+            note_bufs: 0,
+            chunking: WholeBlock,
+        },
+    ],
+    latency: 0,
+    latch_nodes: [
+        2,
+    ],
+    lfo_nodes: [],
+}

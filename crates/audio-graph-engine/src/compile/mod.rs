@@ -144,7 +144,15 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
     notes::resolve_lanes(&mut notes, plan.stages.len(), &param.audio_lanes);
 
     let mut param = param;
-    let audio = audio::compile_audio(graph, &order, &plan, &lines, &param.audio_lanes, &notes)?;
+    let audio = audio::compile_audio(
+        graph,
+        &order,
+        &plan,
+        &lines,
+        &param.audio_lanes,
+        &param.latch_nodes,
+        &notes,
+    )?;
 
     // And now the other direction: the parameter ops that read audio learn
     // which buffer they read.

@@ -270,7 +270,7 @@ impl<'a> ParamCx<'a> {
     pub(crate) fn latch(&mut self) -> Result<u16, CompileError> {
         if self.latch_nodes.len() >= MAX_LATCHES {
             return Err(CompileError::TooLarge {
-                what: "key switches",
+                what: "nodes that keep a value of their own",
                 limit: MAX_LATCHES,
             });
         }
@@ -489,6 +489,8 @@ pub(crate) struct AudioCx<'a> {
     /// node at its far end is one of these.
     order: &'a [NodeId],
     lanes: &'a [((NodeId, u8), u16)],
+    /// Latch index → the node that took it out, as the param pass left it.
+    latches: &'a [NodeId],
     id: NodeId,
 
     /// Where each audio input's signal came from, in port order. `None` for an
@@ -528,6 +530,7 @@ impl<'a> AudioCx<'a> {
         lines: &'a [Line],
         order: &'a [NodeId],
         lanes: &'a [((NodeId, u8), u16)],
+        latches: &'a [NodeId],
         notes: &'a Notes,
     ) -> AudioCx<'a> {
         AudioCx {
@@ -535,6 +538,7 @@ impl<'a> AudioCx<'a> {
             lines,
             order,
             lanes,
+            latches,
             id: NodeId::MAX,
             sources: Vec::new(),
             source_widths: Vec::new(),
@@ -723,6 +727,20 @@ impl<'a> AudioCx<'a> {
 
     pub(crate) fn out_width(&self) -> u16 {
         self.out_width
+    }
+
+    /// The latch the param half took out for this node, if it took one.
+    ///
+    /// The same arrangement as [`AudioCx::lane`]: the param pass runs first
+    /// and hands over what it booked, so a node whose two halves share a piece
+    /// of state — an audio ramp that has to survive a swap is one — can name
+    /// it from either side. A node takes out at most one, because the table
+    /// that carries latches across a swap is keyed by node.
+    pub(crate) fn latch_of(&self) -> Option<u16> {
+        self.latches
+            .iter()
+            .position(|&node| node == self.id)
+            .map(|state| state as u16)
     }
 
     /// The lane the param half booked for one of this node's sockets, if it

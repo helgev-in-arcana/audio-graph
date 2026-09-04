@@ -1341,6 +1341,84 @@ impl Engine {
                         }
                     }
                 }
+                AudioOp::Fade {
+                    out,
+                    a,
+                    state,
+                    lane,
+                    gain,
+                    rise,
+                    fall,
+                } => {
+                    let width = program.buffers[*out as usize] as usize;
+                    let quantum = (ctx.quantum as usize).max(1);
+                    let rate = ctx.sample_rate.max(1.0);
+                    // Where the last block left the ramp. NaN until it has
+                    // ever run, which the first target resolves.
+                    let mut from = self
+                        .latches
+                        .get(*state as usize)
+                        .copied()
+                        .unwrap_or(f64::NAN);
+                    // One segment per sub-block the chunk covers, so a chunk
+                    // that spans the whole block still follows the lane.
+                    let mut target = *gain;
+                    let mut done = 0usize;
+                    while done < frames {
+                        let at = start + done;
+                        let seg = (quantum - at % quantum).min(frames - done);
+                        // A row the lane grid does not reach holds the target
+                        // where it was. Opening a gate because a block ran off
+                        // the end of the schedule is not a defensible answer.
+                        if let Some(value) = lane.and_then(|lane| ctx.lane(at / quantum, lane)) {
+                            target = db_to_linear(value);
+                        }
+                        if from.is_nan() {
+                            from = target;
+                        }
+                        let seconds = if target > from { *rise } else { *fall };
+                        // Per sample, of the whole 0..1 travel. A fade of no
+                        // time is a step, and arrives within the first sample.
+                        let step = if seconds > 0.0 {
+                            1.0 / (seconds * rate)
+                        } else {
+                            f64::INFINITY
+                        };
+                        let delta = target - from;
+                        // Where the ramp stops and the constant tail begins.
+                        let ramp = if step.is_finite() {
+                            ((delta.abs() / step).ceil() as usize).min(seg)
+                        } else {
+                            0
+                        };
+                        // Off the segment's own start rather than accumulated
+                        // per sample, so both channels travel identically and
+                        // the value carried out is the one they reached.
+                        let ramped = |i: usize| {
+                            let moved = from + delta.signum() * step * (i + 1) as f64;
+                            if delta > 0.0 {
+                                moved.min(target)
+                            } else {
+                                moved.max(target)
+                            }
+                        };
+                        for ch in 0..width.min(MAX_CHANNELS) {
+                            let src = self.at(*a, ch, win) + done;
+                            let dst = self.at(*out, ch, win) + done;
+                            for i in 0..ramp {
+                                self.pool[dst + i] = self.pool[src + i] * ramped(i) as f32;
+                            }
+                            for i in ramp..seg {
+                                self.pool[dst + i] = self.pool[src + i] * target as f32;
+                            }
+                        }
+                        from = if ramp < seg { target } else { ramped(ramp - 1) };
+                        done += seg;
+                    }
+                    if let Some(latch) = self.latches.get_mut(*state as usize) {
+                        *latch = from;
+                    }
+                }
                 AudioOp::Compensate { buf, slot, samples } => {
                     let width = program.buffers[*buf as usize] as usize;
                     self.compensate(*buf, *slot as usize, *samples as usize, width, win);
@@ -5123,9 +5201,9 @@ mod tests {
         );
     }
 
-    /// A gate is a `Mix` of one whose gain the parameter half switches, and
-    /// this is the whole round trip: the control lands in a lane, the lane
-    /// becomes a gain, the gain is unity or silence.
+    /// A gate with its fades off is a `Mix` of one whose gain the parameter
+    /// half switches, and this is the whole round trip: the control lands in a
+    /// lane, the lane becomes a gain, the gain is unity or silence.
     #[test]
     fn a_gate_passes_or_silences_by_its_control() {
         let mut graph = Graph::new();
@@ -5137,6 +5215,8 @@ mod tests {
                 channels: 2,
                 threshold: 0.5,
                 invert: false,
+                fade_in_ms: 0.0,
+                fade_out_ms: 0.0,
             }),
             [0.0, 0.0],
         );
@@ -5177,6 +5257,137 @@ mod tests {
         assert!(
             render(0.0).iter().all(|&v| v.abs() < 1e-6),
             "a shut gate is silence"
+        );
+    }
+
+    /// A patch with a gate in it, its fades in milliseconds. Renders one DAW
+    /// block of 64 over four sub-blocks of 16, and hands back both channels.
+    fn fading_gate(fade_ms: f64) -> (Graph, Engine) {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let control = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        let gate = graph.add(
+            NodeKind::Gate(Gate {
+                channels: 2,
+                threshold: 0.5,
+                invert: false,
+                fade_in_ms: fade_ms,
+                fade_out_ms: fade_ms,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, gate, 0);
+        graph.connect(control, 0, gate, 1);
+        graph.connect(gate, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+        (graph, engine)
+    }
+
+    /// One block of [`fading_gate`], the control taking one value per
+    /// sub-block. The input is unity, so what comes back is the gain itself.
+    fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut rows = vec![0.0; width * control.len()];
+        for (index, &value) in control.iter().enumerate() {
+            let row = &mut rows[index * width..(index + 1) * width];
+            row[0] = value;
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: 16,
+                    offset: index as u32 * 16,
+                    row: index as u32,
+                    block: 64,
+                },
+                row,
+            );
+        }
+        let mut daw_out = vec![0.0f32; 2 * 64];
+        engine.run_audio(
+            &AudioContext {
+                frames: 64,
+                quantum: 16,
+                sample_rate: RATE,
+                lanes: &rows,
+                lanes_per_row: width,
+            },
+            &vec![1.0f32; 2 * 64],
+            &mut daw_out,
+            &mut Adders,
+        );
+        daw_out
+    }
+
+    /// The gain slides instead of stepping, and starts sliding at the
+    /// sub-block the control moved in.
+    ///
+    /// Two claims, because they are one behaviour: a ramp that waited for the
+    /// chunk boundary would be smooth and late, and a gate that opened on time
+    /// by stepping would be on time and audible. The plugins are called once
+    /// for the block here — how often that happens is a cost decision, and the
+    /// resolution of what the graph was told is not the same question.
+    #[test]
+    fn a_gate_opens_over_its_fade_time_from_the_sub_block_it_was_told() {
+        // A millisecond is 48 samples, which is longer than what is left of
+        // the block: the fade is caught in flight rather than at its end.
+        let (_graph, mut engine) = fading_gate(1.0);
+        let step = 1.0 / 48.0;
+
+        assert!(
+            gated_block(&mut engine, [0.0; 4]).iter().all(|&v| v == 0.0),
+            "a gate that has never opened is silence, and the first block does              not fade into it"
+        );
+
+        let heard = gated_block(&mut engine, [0.0, 0.0, 1.0, 1.0]);
+        assert!(
+            heard[..32].iter().all(|&v| v == 0.0),
+            "shut for the two sub-blocks the control was low: {:?}",
+            &heard[..34]
+        );
+        for i in 0..32 {
+            let want = (step * (i + 1) as f64) as f32;
+            assert!(
+                (heard[32 + i] - want).abs() < 1e-5,
+                "sample {} of the fade is {} rather than {want}",
+                i,
+                heard[32 + i]
+            );
+        }
+        assert_eq!(
+            heard[..64],
+            heard[64..],
+            "both channels travel together, or the ramp would move the image"
+        );
+    }
+
+    /// A fade in flight is not restarted, nor finished early, by a recompile.
+    ///
+    /// A recompile happens on every drag of every control, and one landing
+    /// mid-fade must not step the gain that the fade exists to stop stepping.
+    #[test]
+    fn a_fade_in_flight_survives_a_recompile() {
+        let (graph, mut engine) = fading_gate(1.0);
+        let step = 1.0 / 48.0;
+        gated_block(&mut engine, [0.0; 4]);
+        gated_block(&mut engine, [0.0, 0.0, 1.0, 1.0]);
+
+        load(&mut engine, &graph);
+
+        let heard = gated_block(&mut engine, [1.0; 4]);
+        assert!(
+            (heard[0] - (step * 33.0) as f32).abs() < 1e-5,
+            "the ramp carries on from where the swap caught it, at {}",
+            heard[0]
+        );
+        assert!(
+            heard[15..64].iter().all(|&v| (v - 1.0).abs() < 1e-5),
+            "and arrives on the sample it would have arrived on: {:?}",
+            &heard[12..20]
         );
     }
 

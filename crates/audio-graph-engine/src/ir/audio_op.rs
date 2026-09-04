@@ -159,6 +159,37 @@ pub enum AudioOp {
     /// accumulate rather than a copy, and with one input it makes a gain a
     /// scaling in place that costs no buffer at all.
     Mix { out: Buf, inputs: Vec<MixIn> },
+    /// Scale a buffer by a gain that slides towards its target instead of
+    /// stepping to it.
+    ///
+    /// What a [`AudioOp::Mix`] of one cannot do: a mix holds its gain for the
+    /// whole chunk, so a gate switching a loud signal steps the waveform at a
+    /// chunk boundary and clicks. Here the gain moves sample by sample, and
+    /// the target is re-read every sub-block — how often a chunk calls the
+    /// plugins is a cost decision, and the resolution of what the graph says
+    /// is not the same question.
+    ///
+    /// `out` may be `a`, which makes it a scaling in place that costs no
+    /// buffer. Nothing about the ramp is fixed at compile time except its
+    /// slope: where a fade starts is wherever the last one left off, and it
+    /// may reverse mid-travel, so `state` names the latch the gain lives in
+    /// between blocks. A latch is NaN until it has run, and the first block
+    /// takes its target as it stands — a patch loaded with the gate open must
+    /// not fade in.
+    Fade {
+        out: Buf,
+        a: Buf,
+        state: u16,
+        /// The lane carrying the target gain in decibels. Without one, `gain`
+        /// is the whole story.
+        lane: Option<u16>,
+        gain: f64,
+        /// Seconds to travel the whole range, rising and falling. The slope is
+        /// what is constant, so a gain a third of the way up falls back in a
+        /// third of `fall`.
+        rise: f64,
+        fall: f64,
+    },
     /// Delay a buffer by a fixed number of samples.
     ///
     /// Inserted by the compiler to line up parallel paths, never placed by the
