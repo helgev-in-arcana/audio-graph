@@ -91,6 +91,17 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
         offline: true,
     });
 
+    // One publish before anything is measured, because the first one is not an
+    // edit: it is where the wrapper first learns which buses and parameters the
+    // graph wants, and binding those is a suspend and a resume — a heavy
+    // operation, and heavy operations are allowed to block. Every publish after
+    // it asks for the same bindings and takes no lock at all, which is the
+    // property under test. Measuring the first one too would make this a test of
+    // how the two threads happened to interleave once.
+    lfo_into(&shared, 0.5);
+    shared.publish_graph();
+    shared.reclaim();
+
     let stop = Arc::new(AtomicBool::new(false));
     let edits = Arc::new(AtomicUsize::new(0));
 
