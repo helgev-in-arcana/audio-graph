@@ -440,6 +440,31 @@ impl Wrapper {
             Some(state) => state,
             None => return pass_through(buffer, self.kind),
         };
+        // Throwing the graph's state away happens here rather than in
+        // `reset`, which belongs to the DAW: this is the only place the
+        // wrapper holds the engine, the sub-plugins and a way to tell the DAW
+        // that the notes it asked for are over, all at once.
+        //
+        // Before the block runs rather than after, because a reset asked for
+        // while a key is down is asked for *now*; a note arriving in this same
+        // block is later than the request and is heard.
+        let wanted = self.shared.take_reset();
+        let notes_off = all_notes_off(&self.events);
+        if wanted || notes_off {
+            self.ended_notes.clear();
+            if wanted {
+                self.engine.reset_everything(&mut self.ended_notes);
+            } else {
+                // See `all_notes_off`: what arrives on the wire takes the
+                // notes and leaves the patch alone.
+                self.engine.reset_notes(&mut self.ended_notes);
+            }
+            report_ended(&self.ended_notes, context);
+            if let Some(processor) = state.processor.as_mut() {
+                processor.reset();
+            }
+        }
+
         // Nothing loaded is not the same as nothing to do: a patch can be a
         // delay line and a mix with no sub-plugin anywhere in it, and passing
         // the input through would be exactly the invisible route the graph
@@ -616,7 +641,16 @@ fn settle_notes<P: Plugin>(
 ) {
     ended.clear();
     engine.end_block(from_plugins.events(), ended);
-    for note in ended.iter() {
+    report_ended(ended, context);
+}
+
+/// Tell the DAW the graph is done with each of these notes.
+///
+/// A host allocates a voice per note it sends and frees it on being told the
+/// note is over, so a note the graph drops without a word is a voice the DAW
+/// keeps for the rest of the session.
+fn report_ended<P: Plugin>(ended: &[Ended], context: &mut impl ProcessContext<P>) {
+    for note in ended {
         context.send_event(NoteEvent::VoiceTerminated {
             timing: 0,
             voice_id: note.daw_id,
@@ -624,6 +658,23 @@ fn settle_notes<P: Plugin>(
             note: note.key.clamp(0, 127) as u8,
         });
     }
+}
+
+/// Whether the block carries a channel-mode message that says to stop playing.
+///
+/// CC 123 is All Notes Off and CC 120 is All Sound Off. Both are answered the
+/// same way and neither touches the patch: a DAW is free to send one on every
+/// transport stop, so taking the key switch latches or the delay lines with it
+/// would undo the user's settings a few times an hour. The editor's Reset is
+/// the way to ask for that, and it is asked for once.
+///
+/// The message is not swallowed. A `CC In` node reading 123 is a strange patch
+/// but it is the user's, and removing an event the DAW sent is not this
+/// function's to do.
+fn all_notes_off(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Note(ApiNote::Cc { cc: 120 | 123, .. })))
 }
 
 /// Fill the sub-block schedule with host automation and graph evaluation outputs.

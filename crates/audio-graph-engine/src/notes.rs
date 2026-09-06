@@ -139,12 +139,48 @@ impl NoteLedger {
 
     /// Forget everything. For a transport jump, where the notes that were
     /// sounding are not coming back.
+    ///
+    /// The DAW is told nothing. It is the one that jumped, and a host that
+    /// moves the playhead has already let go of the voices it had asked for.
+    /// Where the graph is what decided to stop — a panic from the editor, an
+    /// All Notes Off on the wire — use [`end_all`][NoteLedger::end_all]
+    /// instead: nothing has happened there that the DAW knows about, so
+    /// dropping the entries silently would leave it holding voices for notes
+    /// that will never be spoken of again.
     pub fn clear(&mut self) {
         self.entries.iter_mut().for_each(|e| *e = Entry::EMPTY);
         self.free.clear();
         self.free.extend((0..MAX_LIVE_NOTES as Idx).rev());
         self.head.iter_mut().for_each(|h| *h = None);
         self.next_serial = 0;
+    }
+
+    /// Report every note still alive as ended, then forget them all.
+    ///
+    /// A note already reported is not reported twice: the DAW may have been
+    /// told about it in an earlier block, by a sub-plugin that finished with
+    /// it while the key was still down.
+    ///
+    /// `out` is appended to and is not cleared, so a caller can settle a block
+    /// and end what is left over into the same list. Anything past its
+    /// capacity is dropped rather than grown, because this runs on the audio
+    /// thread; the list is sized for [`MAX_LIVE_NOTES`], so that is a note the
+    /// ledger could not have been holding.
+    pub fn end_all(&mut self, out: &mut Vec<Ended>) {
+        for entry in &self.entries {
+            if !entry.live || entry.reported {
+                continue;
+            }
+            if out.len() < out.capacity() {
+                out.push(Ended {
+                    port: entry.port,
+                    channel: entry.channel,
+                    key: entry.key,
+                    daw_id: entry.daw_id,
+                });
+            }
+        }
+        self.clear();
     }
 
     /// How many notes have been forced out of the pool to make room.

@@ -59,6 +59,8 @@ enum Command {
     /// (recompilation and serialization) is deferred to run once per frame.
     GraphEdited,
     SetQuantum(u32),
+    /// Throw away everything the running graph remembers.
+    Reset,
 }
 
 /// Status message from the last executed command.
@@ -440,7 +442,8 @@ impl WrapperEditor {
                     if ui
                         .button("Rescan")
                         .on_hover_text(
-                            "open every module again, rather than trusting what was                              found last time",
+                            "open every module again, rather than trusting what \
+                             was found last time",
                         )
                         .clicked()
                     {
@@ -514,6 +517,21 @@ impl WrapperEditor {
         {
             self.folders_open = !self.folders_open;
         }
+
+        ui.separator();
+        if ui
+            .button("Reset")
+            .on_hover_text(
+                "forget everything the running graph is holding: the notes it \
+                 thinks are down, the sub-plugins' own state, latched key \
+                 switches, LFO phases and whatever is still in the delay \
+                 lines. For a patch rewired while it was playing, where a \
+                 note-off went somewhere the note-on never did.",
+            )
+            .clicked()
+        {
+            self.commands.push(Command::Reset);
+        }
     }
 
     /// Hand everything the user clicked to the main thread.
@@ -546,6 +564,13 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                     Some(e) => status.set(format!("graph not applied: {e}")),
                     None => status.set("graph applied"),
                 }
+            }
+            Command::Reset => {
+                // Not carried out here: the state belongs to the engine, which
+                // only the audio thread may touch. This leaves a note for the
+                // next block to collect.
+                shared.request_reset();
+                status.set("state reset");
             }
             Command::SetQuantum(quantum) => {
                 shared.set_quantum(quantum);

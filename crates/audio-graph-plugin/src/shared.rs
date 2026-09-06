@@ -150,6 +150,17 @@ pub struct Shared {
     /// Whether the editor's window is open, which is what decides how often
     /// the tick has anything to do.
     editor_open: AtomicBool,
+    /// Whether the user has asked for the graph's state to be thrown away.
+    ///
+    /// An atomic rather than a [`Task`], because the state to throw away is
+    /// the engine's and the engine is only ever reachable from the audio
+    /// thread — a main-thread task could not do the work if it were handed it.
+    /// So the request waits here and the next block collects it.
+    ///
+    /// A flag and not a count: two clicks before a block runs are one reset,
+    /// which is what a user pressing it twice because nothing seemed to happen
+    /// means by it.
+    reset_wanted: AtomicBool,
 }
 
 /// One piece of main-thread work handed over by the editor.
@@ -194,6 +205,7 @@ impl Shared {
             view: Mutex::new(View::default()),
             posted: Mutex::new(Vec::new()),
             editor_open: AtomicBool::new(false),
+            reset_wanted: AtomicBool::new(false),
         })
     }
 
@@ -337,6 +349,23 @@ impl Shared {
 
     pub fn set_quantum(&self, quantum: u32) {
         self.quantum.store(quantum, Ordering::Relaxed);
+    }
+
+    /// Ask for the graph's state to be thrown away on the next block.
+    ///
+    /// Any thread: this is one store, and the editor may call it from inside a
+    /// draw callback for the same reason it may read `quantum` there.
+    pub fn request_reset(&self) {
+        self.reset_wanted.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a reset was asked for, taking the request if so.
+    ///
+    /// Audio thread. The caller has to be able to carry it out then and there:
+    /// a request taken and not honoured is one the user has no way of
+    /// repeating short of clicking again.
+    pub fn take_reset(&self) -> bool {
+        self.reset_wanted.swap(false, Ordering::Relaxed)
     }
 
     pub fn sample_rate(&self) -> f32 {

@@ -810,22 +810,98 @@ impl Engine {
         self.program.take()
     }
 
-    /// Clears held notes and resets internal phase/delay head counters on host transport jump.
+    /// The playhead moved: forget what was sounding and what was in flight.
     ///
-    /// This intentionally does NOT clear key switch latches, because latches should survive
-    /// transport jumps (e.g. seeking in the DAW timeline).
+    /// Called by the DAW, on the audio thread. Key switch latches survive it,
+    /// and that is the whole difference between this and
+    /// [`reset_everything`][Engine::reset_everything]: a latch is a setting
+    /// the user made with a key rather than a sound in progress, and seeking
+    /// in a timeline is not a way of asking to undo it.
+    ///
+    /// The DAW is told nothing about the notes dropped here, because it is the
+    /// one that jumped. See [`NoteLedger::clear`].
     pub fn reset(&mut self) {
         self.ledger.clear();
+        self.forget_notes();
+        self.forget_params();
+        self.forget_audio();
+    }
+
+    /// Forget everything the graph remembers, and report the notes still alive
+    /// into `ended`.
+    ///
+    /// What the editor's Reset asks for. Unlike a transport jump this takes
+    /// the latches too: it exists for a patch whose stateful nodes have been
+    /// left holding something that no longer matches what is on the canvas —
+    /// a `Held Keys` counting a note-off that arrived while the wire was
+    /// somewhere else — and a latch is exactly as able to be stranded that way
+    /// as anything else here.
+    ///
+    /// Nothing on the wire caused this, so the DAW has no reason to think the
+    /// notes it asked for are over. It is told, through `ended`.
+    pub fn reset_everything(&mut self, ended: &mut Vec<Ended>) {
+        self.ledger.end_all(ended);
+        self.forget_notes();
+        self.forget_params();
+        // A latch nothing has set reads as NaN, which is what a fresh program
+        // leaves behind; see `adopt`.
+        self.latches.iter_mut().for_each(|v| *v = f64::NAN);
+        self.forget_audio();
+    }
+
+    /// Forget what is being played, and nothing else.
+    ///
+    /// What an All Notes Off on the wire asks for, and no more than that: a
+    /// DAW is free to send one on every stop, so taking the latches or the
+    /// delay lines with it would undo the user's patch a few times an hour.
+    pub fn reset_notes(&mut self, ended: &mut Vec<Ended>) {
+        self.ledger.end_all(ended);
+        self.forget_notes();
+    }
+
+    /// The note half of a reset: who is playing, and what has been said about
+    /// it. The ledger is the caller's to settle, because how the DAW hears
+    /// about it is the one thing the three entry points disagree on.
+    fn forget_notes(&mut self) {
         self.translated.clear();
-        self.notes.bufs.iter_mut().for_each(NoteBuf::silence);
+        for buf in &mut self.notes.bufs {
+            buf.silence();
+            buf.events.clear();
+        }
+        self.note_rows = 0;
+        // NaN is "nothing sent yet", so every controller-generating op sends
+        // its value again rather than holding back a number that matches what
+        // a sub-plugin no longer has.
+        self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
+    }
+
+    /// The parameter half: what a modulator has been carrying between blocks.
+    /// Latches are not in it — see the two callers that differ over them.
+    fn forget_params(&mut self) {
         self.phases.iter_mut().for_each(|p| *p = 0.0);
+        self.holds.iter_mut().for_each(|h| *h = 0.0);
         self.rings.iter_mut().for_each(|r| r.fill(0.0));
         self.ring_heads.iter_mut().for_each(|h| *h = 0);
+    }
+
+    /// The audio half: every sample still on its way somewhere.
+    ///
+    /// The delay rings are emptied rather than only rewound. Moving a head
+    /// back to zero without clearing what it points at leaves the old contents
+    /// exactly where a read a fraction of a ring behind it will find them, so
+    /// a reset would be heard as the tail carrying on.
+    fn forget_audio(&mut self) {
         self.pool.fill(0.0);
         self.compensators.fill(0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
-        // Audio delay rings are sized and allocated by the main thread via Program::size_rings.
+        // Emptied where they stand. An audio delay's ring is sized and
+        // allocated on the main thread and rides in on the program, so there
+        // is nothing to hand back and nothing to resize.
+        self.audio_rings.iter_mut().for_each(|r| r.fill(0.0));
         self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
+        // No previous position, so the first chunk after this jumps to where
+        // its tap says rather than sweeping from where the old one left off.
+        self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
     }
 
     /// Allocates and sizes audio buffers for worst-case limits. Called from the main thread on activation.
@@ -2065,6 +2141,7 @@ mod tests {
         NoteFollow, NoteGate, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate,
         SlotIn, Switch, linear_to_db,
     };
+    use crate::notes::MAX_LIVE_NOTES;
     use crate::port::PortType;
 
     const SLOTS: usize = 32;
@@ -4340,6 +4417,196 @@ mod tests {
         keys.note(&off(0, 67));
         keys.run(&mut engine, 32, &mut slots);
         assert_eq!(down(&slots), 0.0);
+    }
+
+    /// A reset leaves the graph believing nothing is being played.
+    ///
+    /// The whole point of the button: a patch rewired while a chord was down
+    /// keeps counting keys whose note-offs went somewhere the note-ons never
+    /// did, and nothing short of this convinces it otherwise.
+    #[test]
+    fn a_reset_takes_the_notes_the_graph_thought_were_down() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let count = graph.add(
+            NodeKind::NoteFollow(NoteFollow {
+                what: Follow::HeldKeys,
+            }),
+            [0.0, 0.0],
+        );
+        let map = graph.add(
+            NodeKind::RangeMap(RangeMap {
+                in_lo: 0.0,
+                in_hi: 8.0,
+                out_lo: 0.0,
+                out_hi: 1.0,
+                clamp: true,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, count, 0);
+        graph.connect(count, 0, map, 0);
+        graph.connect(map, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
+        let mut slots = lanes();
+        let down = |slots: &[f64]| slots[SINK] * 8.0;
+
+        for key in [60, 64, 67] {
+            keys.note(&NoteEvent::NoteOn {
+                note_id: None,
+                port: 0,
+                channel: 0,
+                key,
+                velocity: 1.0,
+                sample_offset: 0,
+            });
+        }
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 3.0, "a triad is three keys");
+
+        // Sized the way the wrapper sizes it, because `end_all` fills rather
+        // than grows: the audio thread may not allocate.
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        engine.reset_everything(&mut ended);
+
+        let mut sounding: Vec<i16> = ended.iter().map(|note| note.key).collect();
+        sounding.sort_unstable();
+        assert_eq!(
+            sounding,
+            [60, 64, 67],
+            "the DAW is told about every note it is still holding a voice for"
+        );
+
+        keys.run(&mut engine, 32, &mut slots);
+        assert_eq!(down(&slots), 0.0, "and nothing is down afterwards");
+    }
+
+    /// A latch is a setting, so only the button takes it.
+    ///
+    /// A DAW seeks constantly and sends All Notes Off freely; a key switch
+    /// thrown by hand surviving both is what makes it usable at all. The
+    /// editor's Reset is the one thing the user asked for by name, so it is
+    /// the one thing that moves it.
+    #[test]
+    fn only_an_explicit_reset_throws_a_latched_key_switch_back() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let switch = graph.add(
+            NodeKind::KeySwitch(KeySwitch {
+                keys: vec![24, 25],
+                mode: KeySwitchMode::Toggle,
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let synth = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    audio_out: vec![2],
+                    audio_out_shown: Vec::new(),
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, switch, 0);
+        graph.connect(switch, 1, synth, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let lane = compile(&graph, SLOTS)
+            .unwrap()
+            .note_ops
+            .iter()
+            .find_map(|op| match op {
+                crate::ir::NoteOp::Filter { gate, .. } => *gate,
+                _ => None,
+            })
+            .expect("output b got a gate lane") as usize;
+
+        let mut engine = Engine::new();
+        engine.prepare(8, &[]);
+        load(&mut engine, &graph);
+        let mut keys = Keyboard::default();
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut lanes = vec![0.0; width];
+
+        keys.note(&NoteEvent::NoteOn {
+            note_id: Some(1),
+            port: 0,
+            channel: 0,
+            key: 24,
+            velocity: 1.0,
+            sample_offset: 0,
+        });
+        keys.run(&mut engine, 8, &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "thrown");
+
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        engine.reset();
+        keys.run(&mut engine, 8, &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "a transport jump must not move it");
+
+        engine.reset_notes(&mut ended);
+        keys.run(&mut engine, 8, &mut lanes);
+        assert_eq!(lanes[lane], 1.0, "nor an All Notes Off on the wire");
+
+        engine.reset_everything(&mut ended);
+        keys.run(&mut engine, 8, &mut lanes);
+        assert_eq!(lanes[lane], 0.0, "the button does");
+    }
+
+    /// A reset empties a delay line rather than only rewinding it.
+    ///
+    /// Silence written into the line from the moment of the reset sweeps the
+    /// ring at the rate the reads consume it, so most of the old contents are
+    /// gone before anything looks at them. The part in front of the write head
+    /// is not: for the first delay time after the head goes back to the start,
+    /// every read points behind it, into a stretch the sweep has not reached.
+    /// That is the tail carrying on through a reset asked for to stop it.
+    #[test]
+    fn a_reset_empties_an_audio_delay_line() {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let (write, read) = audio_delay(&mut graph, 64.0);
+        graph.connect(input, 0, write, 0);
+        graph.connect(read, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(128, &[2]);
+        load(&mut engine, &graph);
+
+        // Long enough for the write head to have been all the way round: a
+        // line whose far end is still the silence it was allocated with would
+        // pass this whether or not the reset emptied anything.
+        let loud = vec![1.0f32; 2 * 128];
+        let quiet = vec![0.0f32; 2 * 128];
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        for _ in 0..(2 * (RATE * 0.05) as usize / 128) {
+            engine.run_audio(&audio_ctx(128), &loud, &mut daw_out, &mut Adders);
+        }
+        assert!(daw_out[0] > 0.5, "the line is full before the reset");
+
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        engine.reset_everything(&mut ended);
+
+        engine.run_audio(&audio_ctx(128), &quiet, &mut daw_out, &mut Adders);
+        let peak = daw_out.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(peak < 1e-6, "the line came back with {peak} still in it");
     }
 
     #[test]
