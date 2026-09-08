@@ -15,7 +15,8 @@ the only crate in the workspace that knows AudioGraph is a product.
 - Connecting `audio-graph-settings` to the host scanner and catalogue, and
   choosing the browser's display categories from the scanned class metadata.
 - Owning the state split between the main thread and the audio thread, and
-  publishing each newly compiled program across it.
+  handing each compiled program to the engine's `ProgramPublisher` for
+  preparation and publication.
 - The wrapper's saved document, with the adapter's and the engine's states
   nested inside it.
 - The main-thread tick that keeps sub-plugins alive whether or not any window is
@@ -38,9 +39,10 @@ the only crate in the workspace that knows AudioGraph is a product.
   processors sit behind a mutex the audio thread only ever *tries*, and the
   compiled program crosses through a lock-free handoff — which is the path every
   graph edit takes, so it is the one that had to be free.
-- **Allocation happens on the main thread and rides over inside the program.**
-  Delay rings are sized here, and an unchanged line is handed nothing rather
-  than a fresh copy of what it already has.
+- **Allocation happens on the main thread and rides over inside a prepared
+  program.** The engine's publisher sizes delay rings on this thread, and an unchanged line
+  is handed nothing rather than a fresh copy of what it already has. Pending
+  replacements transfer matching rings before they are published.
 - **Nothing that opens or resizes a window happens inside `ui()`.** Every such
   button pushes a command and returns; the commands run on the next turn of the
   DAW's message loop, once the frame is over.

@@ -46,12 +46,12 @@ A caller owns a graph, a chain, a rack: it decides *when* each sub-plugin runs
 and *what* it hears. It has no idea what is at the other end of one, and never
 learns whether a VST3 or a CLAP answered.
 
-**Everything crossing that trait is a flat slice or a `Copy` value.** No
-pointers, no borrows into caller-owned structures. This is what keeps the
-boundary workable if a sub-plugin is ever moved into a separate process, where
-neither could cross. It is also why a note stream crosses as a *name* plus a key
-mask rather than as an event buffer: the caller routes notes without knowing
-what a note is, and this crate turns the name into events.
+Audio and note events cross as flat slices, with a `Copy` value describing the
+audio chunk. `ScheduleView` provides read-only access to the parameter rows for
+one processing call. A bound processor never stores it, so the graph can update
+the next parameter stage as soon as the call returns. The caller decides which
+notes each instance receives; the adapter maps its schedule lanes to plugin
+parameters.
 
 ### The instance table is sparse, and stays sparse
 

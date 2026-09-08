@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::schedule::SlotSchedule;
+use crate::schedule::ScheduleView;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
     ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
@@ -50,7 +50,7 @@ pub struct SubHostConfig {
     pub max_instances: usize,
     /// Number of parameter slots published to the host DAW.
     pub slot_count: usize,
-    /// Number of values carried per sub-block in the [`SlotSchedule`]: the
+    /// Number of values carried per sub-block in the [`SlotSchedule`][crate::SlotSchedule]: the
     /// slots plus whatever else the caller packs alongside them.
     pub lanes: usize,
 }
@@ -651,7 +651,7 @@ impl SubHostProcessor {
     pub fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,
-        slots: &SlotSchedule,
+        slots: ScheduleView<'_>,
         events: &[Event],
         chunk: Range<u32>,
         context: &TimeContext,
@@ -754,7 +754,7 @@ impl SubHostProcessors {
         }
     }
 
-    /// Binds block-level context (slot schedule, transport context) to produce
+    /// Binds block-level context (transport context) to produce
     /// a [`BoundInstances`] processor for the duration of a block.
     ///
     /// The DAW's note stream is not among it: the graph decides what each
@@ -767,23 +767,20 @@ impl SubHostProcessors {
     /// is attached here and the borrow lasts exactly that long.
     pub fn bind<'a>(
         &'a mut self,
-        slots: &'a SlotSchedule,
         context: &'a TimeContext,
         out_events: &'a mut EventSink,
     ) -> BoundInstances<'a> {
         BoundInstances {
             processors: self,
-            slots,
             context,
             out_events,
         }
     }
 }
 
-/// Audio-thread sub-plugin processors bound to a block's schedule and event context.
+/// Audio-thread sub-plugin processors bound to a block's transport and event context.
 pub struct BoundInstances<'a> {
     processors: &'a mut SubHostProcessors,
-    slots: &'a SlotSchedule,
     context: &'a TimeContext,
     out_events: &'a mut EventSink,
 }
@@ -796,6 +793,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         input: &[f32],
         output: &mut [f32],
         chunk: crate::instances::AudioChunk,
+        schedule: ScheduleView<'_>,
     ) {
         let Some(processor) = self
             .processors
@@ -828,7 +826,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         .with_aux_outputs(chunk.aux_outputs);
         processor.process(
             &mut buffers,
-            self.slots,
+            schedule,
             notes,
             chunk.offset..chunk.offset + chunk.frames,
             self.context,
@@ -863,6 +861,7 @@ fn push(scratch: &mut Vec<Event>, event: Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SlotSchedule;
     use plugin_host::{BufferLayout, NoteEvent, ParamFlags};
 
     /// A processor that records what it was handed.
@@ -918,7 +917,7 @@ mod tests {
         let mut sink = EventSink::new();
         p.process(
             &mut buffers,
-            schedule,
+            schedule.view(),
             events,
             0..schedule.frames(),
             &TimeContext::default(),
@@ -1031,7 +1030,7 @@ mod tests {
                 AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
             p.process(
                 &mut buffers,
-                &schedule,
+                schedule.view(),
                 &[note],
                 chunk,
                 &TimeContext::default(),
@@ -1072,7 +1071,7 @@ mod tests {
         let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
         p.process(
             &mut buffers,
-            &schedule,
+            schedule.view(),
             &[],
             64..96,
             &TimeContext::default(),
@@ -1230,7 +1229,10 @@ mod tests {
         let schedule = SlotSchedule::new(LANES, 4, 32);
         let mut sink = EventSink::new();
         let context = TimeContext::default();
-        let mut running = processors.bind(&schedule, &context, &mut sink);
+        let mut schedule = schedule;
+        schedule.begin(4);
+        let view = schedule.view();
+        let mut running = processors.bind(&context, &mut sink);
 
         let chunk = AudioChunk {
             input_channels: 2,
@@ -1242,8 +1244,8 @@ mod tests {
         };
         let input = [0.0f32; 8];
         let mut output = [0.0f32; 8];
-        running.process(0, &[note], &input, &mut output, chunk);
-        running.process(1, &[], &input, &mut output, chunk);
+        running.process(0, &[note], &input, &mut output, chunk, view);
+        running.process(1, &[], &input, &mut output, chunk, view);
 
         assert_eq!(wired_saw.lock().unwrap().len(), 1);
         assert!(

@@ -25,9 +25,10 @@
 //!   ever *tries*, and which the main thread takes solely to start or stop a
 //!   sub-plugin. Swapping a plugin mid-playback glitches, which is the honest
 //!   cost of doing it at all, and nothing else contends.
-//! - The compiled [`Program`] — published through a [`Handoff`], which the audio
-//!   thread reads without any lock whatsoever. This is the path every graph edit
-//!   takes, so it is the one that had to be free.
+//! - The compiled [`Program`][audio_graph_engine::Program] — prepared and published through a
+//!   [`ProgramPublisher`], which the audio thread reads without any lock
+//!   whatsoever. This is the path every graph edit takes, so it is the one that
+//!   had to be free.
 
 use std::array;
 use std::cell::{RefCell, RefMut};
@@ -37,8 +38,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::config::SLOT_COUNT;
 use crate::state::WrapperState;
-use audio_graph_engine::{Graph, Handoff, Program, compile};
-use audio_graph_engine::{NodeId, NodeKind, Plugin, PluginPorts};
+use audio_graph_engine::NodeId;
+use audio_graph_engine::{Graph, ProgramPublisher, compile};
+use audio_graph_engine::{NodeKind, Plugin, PluginPorts};
 use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
 use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
@@ -62,12 +64,6 @@ pub struct MainState {
     /// activate, like the slot bindings, so a new socket only reaches audio
     /// after a restart.
     pub graph_params: Vec<ParamTarget>,
-    /// Tracked delay ring buffer allocations (node ID and size in samples) sent to the audio thread.
-    ///
-    /// Only so the next publish can tell whether anything changed. A recompile
-    /// happens on every drag of every control, and allocating 700 kB each time
-    /// to replace a ring with an identical one would be silly.
-    pub sized_rings: Vec<(NodeId, usize)>,
 }
 
 /// The graph being edited, reachable from whichever thread the editor is on.
@@ -99,7 +95,7 @@ pub struct Shared {
     main: MainThread<RefCell<MainState>>,
     patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
-    programs: Handoff<Program>,
+    programs: ProgramPublisher,
     /// Sub-block modulation quantum in samples.
     ///
     /// Stored as a standalone atomic rather than in `MainState` because the audio
@@ -185,14 +181,13 @@ impl Shared {
                 config: None,
                 instance_io: Vec::new(),
                 graph_params: Vec::new(),
-                sized_rings: Vec::new(),
             })),
             patch: Mutex::new(Patch {
                 graph: Graph::default_patch(),
                 compile_error: None,
             }),
             audio: Mutex::new(AudioState { processor: None }),
-            programs: Handoff::new(),
+            programs: ProgramPublisher::default(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
             // Until the DAW says otherwise. A wrong rate here only makes the
             // floor shown in the editor wrong, never the audio.
@@ -335,7 +330,7 @@ impl Shared {
         self.audio.lock()
     }
 
-    pub fn programs(&self) -> &Handoff<Program> {
+    pub fn programs(&self) -> &ProgramPublisher {
         &self.programs
     }
 
@@ -426,14 +421,13 @@ impl Shared {
     /// Compile the current graph and hand it to the audio thread, with every
     /// delay line's ring allocated afresh.
     ///
-    /// For an activation, which is the one moment `sized_rings` cannot be
-    /// trusted: it records what the audio thread was last handed, and a
+    /// For an activation, the publisher's history cannot be trusted: a
     /// program waiting in the handoff when the DAW deactivates us is dropped
-    /// unread. A line the cache calls unchanged would then arrive with no ring
-    /// at all, and a delay with no buffer to read is a delay that repeats
+    /// unread. A line the history calls unchanged would then arrive with no
+    /// ring at all, and a delay with no buffer to read is a delay that repeats
     /// nothing.
     pub(crate) fn send_fresh_program(&self) {
-        self.main().sized_rings.clear();
+        self.programs.reset();
         self.send_program();
     }
 
@@ -454,7 +448,7 @@ impl Shared {
 
         // One guard for the answer, so that the error and the graph it is about
         // cannot be separated by an edit landing in between.
-        let mut program = {
+        let program = {
             let mut patch = self.patch();
             match compiled {
                 Ok(program) => {
@@ -468,23 +462,21 @@ impl Shared {
             }
         };
 
-        self.latency.store(program.latency, Ordering::Relaxed);
+        self.latency.store(program.latency(), Ordering::Relaxed);
 
         let mut state = self.main();
-        // The delay rings are allocated here, on the main thread, and ride over
-        // inside the program, because the audio thread may not allocate.
-        // `sized_rings` remembers what was sent last time so an unchanged line
-        // is handed nothing rather than a fresh copy of what it already has.
-        state.sized_rings = program.size_rings(f64::from(self.sample_rate()), &state.sized_rings);
-        // A graph edit can change which buses a sub-plugin needs — wiring a
-        // sidechain is exactly that — and a bus cannot be switched on while the
+        // The publisher allocates delay rings here, on the main thread, and
+        // carries them inside the prepared program because the audio thread may
+        // not allocate. A graph edit can change which buses a sub-plugin needs:
+        // wiring a sidechain does that, and a bus cannot be switched on while the
         // plugin is active. Whether the change has to be acted on is
         // `rebind`'s decision; recording it is this one's.
-        let changed =
-            state.instance_io != program.instances || state.graph_params != program.param_targets;
-        state.instance_io = program.instances.clone();
-        state.graph_params = program.param_targets.clone();
-        self.programs.send(Box::new(program));
+        let changed = state.instance_io != program.instances()
+            || state.graph_params != program.param_targets();
+        state.instance_io = program.instances().to_vec();
+        state.graph_params = program.param_targets().to_vec();
+        self.programs
+            .publish(program, f64::from(self.sample_rate()));
         changed
     }
 

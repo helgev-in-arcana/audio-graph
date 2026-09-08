@@ -12,16 +12,11 @@
 
 mod harness;
 
-use harness::{BOUNCE, LIVE, fixture_as_clap, fx_layout};
+use harness::{BOUNCE, Block, Daw, LIVE, fixture_as_clap, fx_layout};
 
-use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Graph, Mix, NodeKind, PortType, Program};
+use audio_graph_engine::{AudioIn, AudioOut, DelayRead, Graph, Mix, NodeKind, PortType};
 use audio_graph_plugin::{Shared, Wrapper, WrapperKind};
 use nice_plug::prelude::ProcessMode;
-
-/// The audio thread's side of the handoff, which is one `Engine::adopt`.
-fn adopt(wrapper: &Wrapper, held: &mut Option<Box<Program>>) -> bool {
-    wrapper.shared().programs().take(held)
-}
 
 /// Draw a quarter-second feedback delay around the sub-plugin.
 ///
@@ -102,30 +97,28 @@ fn every_activation_leaves_the_audio_thread_a_program() {
     wrapper.shared().adopt_default_patch();
     feedback_delay(wrapper.shared());
 
-    // The audio thread picks that up and the track is heard. From here on the
-    // only thing that may send a program is an activation.
-    let mut held: Option<Box<Program>> = None;
-    assert!(
-        adopt(&wrapper, &mut held),
-        "the edit reaches the audio thread"
-    );
-
+    // Each activation is observed through a short impulse followed by silence:
+    // the delayed echo proves that the prepared graph is running after the
+    // activation, rather than only that the direct path is audible.
     for (what, config) in [("the bounce", BOUNCE), ("the return to the desk", LIVE)] {
         wrapper.deactivate();
         wrapper
             .activate(WrapperKind::Effect, &layout, &config)
             .unwrap_or_else(|| panic!("{what} activates"));
-        assert!(
-            adopt(&wrapper, &mut held),
-            "{what} left the audio thread with no program: silence until an edit compiles one"
-        );
-        let program = held.as_ref().expect("adopting leaves a program held");
-        for line in 0..program.audio_delay_nodes.len() {
-            assert!(
-                program.audio_rings.get(line).is_some_and(|r| !r.is_empty()),
-                "{what} handed over delay line {line} with no ring: it repeats nothing"
-            );
+        let mut daw = Daw::playing();
+        let mut impulse = Block::silent(128);
+        impulse.fill(1.0);
+        impulse.process(&mut wrapper, &mut daw);
+        let mut heard = false;
+        for _ in 0..100 {
+            let mut block = Block::silent(128);
+            block.process(&mut wrapper, &mut daw);
+            heard |= block.peak() > 0.1;
         }
+        assert!(
+            heard,
+            "{what} left the audio thread with no running program"
+        );
         assert_eq!(
             wrapper
                 .shared()

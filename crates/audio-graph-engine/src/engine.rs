@@ -25,11 +25,11 @@ use crate::ir::{
     AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
     MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
     MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
-    NoteOp, Op, Operand, Program, RateSpec, Stage, Waveform,
+    NoteOp, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
-use subhost_adapter::{AudioChunk, AudioInstances, MIN_QUANTUM};
+use subhost_adapter::{AudioChunk, AudioInstances, MIN_QUANTUM, ScheduleView, SlotSchedule};
 
 /// Maximum number of `DelayRead` taps supported in a single program.
 ///
@@ -447,7 +447,7 @@ impl NoteState {
 }
 
 pub struct Engine {
-    program: Option<Box<Program>>,
+    program: Option<Box<PreparedProgram>>,
     registers: Vec<f64>,
     /// LFO phase, 0..1, per state index of the current program.
     phases: Vec<f64>,
@@ -703,7 +703,11 @@ impl Engine {
     /// Picks up a newly compiled program if one is waiting in the handoff channel.
     ///
     /// Returns `true` if a new program was adopted. Realtime-safe: does not allocate or lock.
-    pub fn adopt(&mut self, handoff: &Handoff<Program>) -> bool {
+    pub fn adopt(&mut self, publisher: &crate::ProgramPublisher) -> bool {
+        self.adopt_handoff(publisher.handoff())
+    }
+
+    pub(crate) fn adopt_handoff(&mut self, handoff: &Handoff<PreparedProgram>) -> bool {
         // Remember which node each running phase belongs to *before* the swap;
         // afterwards the old program is gone.
         let live = self.phase_nodes.len().min(self.phases.len());
@@ -777,7 +781,11 @@ impl Engine {
             0.0,
         );
         // When ring lengths change, new buffers provided by the main thread are swapped in.
-        let next = self.program.as_mut().expect("take reported a swap");
+        let next = self
+            .program
+            .as_mut()
+            .expect("take reported a swap")
+            .program_mut();
         for line in 0..next.audio_delay_nodes.len().min(MAX_AUDIO_DELAY_LINES) {
             let len = next.audio_ring_len.get(line).copied().unwrap_or(0);
             if next.audio_rings.get(line).is_some_and(|r| !r.is_empty()) {
@@ -806,7 +814,7 @@ impl Engine {
     /// Give back whatever program is loaded, so the main thread can free it.
     ///
     /// Called when the plugin is torn down, from the main thread.
-    pub fn release(&mut self) -> Option<Box<Program>> {
+    pub fn release(&mut self) -> Option<Box<PreparedProgram>> {
         self.program.take()
     }
 
@@ -1076,6 +1084,72 @@ impl Engine {
         }
     }
 
+    /// Evaluates one complete host block, including schedule setup, note
+    /// ingestion, parameter stages, and audio stages in dependency order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_block(
+        &mut self,
+        schedule: &mut SlotSchedule,
+        daw_slots: &[f64],
+        events: &[Event],
+        frames: u32,
+        quantum: u32,
+        sample_rate: f64,
+        tempo_bpm: f64,
+        daw_in: &[f32],
+        daw_out: &mut [f32],
+        nodes: &mut dyn AudioInstances,
+    ) -> bool {
+        if schedule.quantum() != quantum {
+            schedule.set_quantum(quantum);
+        }
+        let blocks = schedule.begin(frames);
+        if !self.has_program() {
+            daw_out.fill(0.0);
+            schedule.fill(daw_slots);
+            return false;
+        }
+        for index in 0..blocks {
+            let values = schedule.block_mut(index);
+            let slots = daw_slots.len().min(values.len());
+            values[..slots].copy_from_slice(&daw_slots[..slots]);
+            values[slots..].fill(0.0);
+        }
+        self.begin_block(events);
+        self.clear_output(daw_out);
+        for stage in 0..self.stages() {
+            for index in 0..blocks {
+                self.run_stage(
+                    stage,
+                    &BlockContext {
+                        sample_rate,
+                        tempo_bpm,
+                        frames: schedule.frames_of(index),
+                        offset: schedule.offset(index),
+                        block: frames,
+                        row: index as u32,
+                    },
+                    schedule.block_mut(index),
+                );
+            }
+            let view = schedule.view();
+            self.run_audio_stage(
+                stage,
+                &AudioContext {
+                    frames,
+                    quantum: view.quantum(),
+                    sample_rate,
+                    lanes: view.rows(),
+                    lanes_per_row: view.lanes(),
+                },
+                daw_in,
+                daw_out,
+                nodes,
+            );
+        }
+        true
+    }
+
     /// The block is the program's to fill: a channel no `Output` op reaches is
     /// silence, not whatever the caller's buffer already held. Called once
     /// before the stages, because each of them writes only its own part.
@@ -1179,6 +1253,13 @@ impl Engine {
         row: usize,
     ) {
         let block = ctx.frames as usize;
+        let schedule = ScheduleView::from_parts(
+            ctx.lanes,
+            ctx.lanes_per_row,
+            ctx.frames.div_ceil(ctx.quantum.max(1)) as usize,
+            ctx.quantum,
+            ctx.frames,
+        );
         let mut tap = 0usize;
         // Which rows of the note buffers this chunk covers. The buffers were
         // filled by the parameter half and hold the whole block; a chunk is a
@@ -1384,6 +1465,7 @@ impl Engine {
                             frames: frames as u32,
                             offset: start as u32,
                         },
+                        schedule,
                     );
                     if short {
                         for ch in 0..out_width as usize {
@@ -2209,8 +2291,8 @@ mod tests {
         // What the wrapper's `publish_graph` does, and for the same reason: the
         // rings are allocated on this side and ride over with the program.
         program.size_rings(RATE, &[]);
-        handoff.send(Box::new(program));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(PreparedProgram { program }));
+        assert!(engine.adopt_handoff(&handoff));
     }
 
     #[test]
@@ -2602,6 +2684,7 @@ mod tests {
             _input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
+            _schedule: ScheduleView<'_>,
         ) {
             self.0.entry(instance).or_default().extend_from_slice(notes);
             for ch in 0..chunk.output_channels {
@@ -3340,6 +3423,97 @@ mod tests {
         assert_eq!(heard.0[&0].len(), 2, "each note once: {:?}", heard.0[&0]);
     }
 
+    /// Later parameter stages do not duplicate note input or orphan notes already delivered to an instrument.
+    #[test]
+    fn notes_are_ingested_once_across_parameter_and_audio_stages() {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let synth = note_plugin(&mut graph, 0);
+        let out = graph.add(
+            NodeKind::AudioOut(AudioOut {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, synth, 0);
+
+        let follower = graph.add(
+            NodeKind::EnvelopeFollower(EnvelopeFollower {
+                detect: Detect::Peak,
+                attack: 0.0,
+                release: 0.0,
+            }),
+            [0.0, 0.0],
+        );
+        let sink = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 1,
+                ports: PluginPorts {
+                    params: vec![ParamPort {
+                        id: 0,
+                        name: "level".into(),
+                    }],
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(synth, 0, follower, 0);
+        graph.connect(follower, 0, sink, 0);
+        graph.connect(synth, 0, out, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        load(&mut engine, &graph);
+        assert!(
+            engine.stages() > 1,
+            "the follower waits for audio from the instrument"
+        );
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, 64, 32);
+        let mut heard = Heard::default();
+        let mut daw_out = [0.0; 2 * 64];
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[note_on(60, 0), note_on(61, 37)],
+            64,
+            32,
+            RATE,
+            120.0,
+            &[0.0; 2 * 64],
+            &mut daw_out,
+            &mut heard,
+        );
+        assert_eq!(schedule.blocks(), 2);
+        assert_eq!(heard.0[&0].len(), 2, "each note once: {:?}", heard.0[&0]);
+        let mut ended = Vec::with_capacity(8);
+        engine.end_block(&[], &mut ended);
+        assert!(
+            ended.is_empty(),
+            "both notes belong to the instrument and remain live"
+        );
+
+        heard.0.clear();
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            64,
+            32,
+            RATE,
+            120.0,
+            &[0.0; 2 * 64],
+            &mut daw_out,
+            &mut heard,
+        );
+        assert!(
+            heard.0[&0].is_empty(),
+            "the next block does not replay either note"
+        );
+    }
+
     /// The last sub-block of a block is still readable at the start of the
     /// next one, and is not played twice.
     ///
@@ -3582,6 +3756,7 @@ mod tests {
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
+            _schedule: ScheduleView<'_>,
         ) {
             for ch in 0..chunk.output_channels {
                 let range = chunk.channel(ch);
@@ -4641,6 +4816,29 @@ mod tests {
         assert!(!engine.has_program());
     }
 
+    /// The standard block entry point clears output even before a program is adopted.
+    #[test]
+    fn run_block_silences_an_empty_engine() {
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        let mut schedule = SlotSchedule::new(1, 64, 32);
+        let mut output = vec![3.0f32; 16];
+        let mut nodes = subhost_adapter::NoInstances;
+        assert!(!engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            8,
+            32,
+            RATE,
+            120.0,
+            &[0.0; 16],
+            &mut output,
+            &mut nodes,
+        ));
+        assert!(output.iter().all(|&sample| sample == 0.0));
+    }
+
     /// A parameter read off audio, which only a program cut into stages can
     /// express.
     ///
@@ -4683,36 +4881,21 @@ mod tests {
                 }
             }
             let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
-            let mut lanes = vec![0.0; width * 2];
-
-            engine.begin_block(&[]);
-            for stage in 0..engine.stages() {
-                for row in 0..2usize {
-                    let context = BlockContext {
-                        sample_rate: RATE,
-                        tempo_bpm: 120.0,
-                        frames: QUANTUM,
-                        offset: row as u32 * QUANTUM,
-                        row: row as u32,
-                        block: BLOCK,
-                    };
-                    engine.run_stage(stage, &context, &mut lanes[row * width..(row + 1) * width]);
-                }
-                engine.run_audio_stage(
-                    stage,
-                    &AudioContext {
-                        frames: BLOCK,
-                        quantum: QUANTUM,
-                        sample_rate: RATE,
-                        lanes: &lanes,
-                        lanes_per_row: width,
-                    },
-                    &daw_in,
-                    &mut daw_out,
-                    &mut Adders,
-                );
-            }
-            [lanes[SINK], lanes[width + SINK]]
+            let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM);
+            let mut nodes = Adders;
+            engine.run_block(
+                &mut schedule,
+                &[],
+                &[],
+                BLOCK,
+                QUANTUM,
+                RATE,
+                120.0,
+                &daw_in,
+                &mut daw_out,
+                &mut nodes,
+            );
+            [schedule.block(0)[SINK], schedule.block(1)[SINK]]
         };
 
         let steady = level(Detect::Peak, 0.0, false);
@@ -4823,28 +5006,23 @@ mod tests {
                     lanes: &[],
                     lanes_per_row: width,
                 };
-                engine.begin_block(&[]);
                 if staged {
-                    for stage in 0..engine.stages() {
-                        for row in 0..2usize {
-                            engine.run_stage(
-                                stage,
-                                &context(row),
-                                &mut lanes[row * width..(row + 1) * width],
-                            );
-                        }
-                        engine.run_audio_stage(
-                            stage,
-                            &AudioContext {
-                                lanes: &lanes,
-                                ..audio
-                            },
-                            &daw_in,
-                            &mut daw_out,
-                            &mut Adders,
-                        );
-                    }
+                    let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM);
+                    engine.run_block(
+                        &mut schedule,
+                        &[],
+                        &[],
+                        BLOCK,
+                        QUANTUM,
+                        RATE,
+                        120.0,
+                        &daw_in,
+                        &mut daw_out,
+                        &mut Adders,
+                    );
+                    lanes.copy_from_slice(schedule.rows());
                 } else {
+                    engine.begin_block(&[]);
                     for row in 0..2usize {
                         engine.run(&context(row), &mut lanes[row * width..(row + 1) * width]);
                     }
@@ -5189,6 +5367,7 @@ mod tests {
                 input: &[f32],
                 output: &mut [f32],
                 chunk: AudioChunk,
+                _schedule: ScheduleView<'_>,
             ) {
                 self.heard.resize(chunk.input_channels as usize, Vec::new());
                 for ch in 0..chunk.input_channels {
@@ -5275,6 +5454,7 @@ mod tests {
                 _input: &[f32],
                 output: &mut [f32],
                 chunk: AudioChunk,
+                _schedule: ScheduleView<'_>,
             ) {
                 self.0 += 1;
                 for ch in 0..chunk.output_channels {
@@ -5752,8 +5932,8 @@ mod tests {
         let mut engine = Engine::new();
         engine.prepare(128, &[2]);
         let handoff = Handoff::new();
-        handoff.send(Box::new(program));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(PreparedProgram { program }));
+        assert!(engine.adopt_handoff(&handoff));
 
         let daw_in = impulse(128, 8);
         let mut daw_out = vec![0.0f32; 2 * 128];
@@ -5774,8 +5954,8 @@ mod tests {
             "a changed line gets a new ring"
         );
         let handoff = Handoff::new();
-        handoff.send(Box::new(wider));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(PreparedProgram { program: wider }));
+        assert!(engine.adopt_handoff(&handoff));
 
         let mut daw_out = vec![0.0f32; 2 * 128];
         engine.run_audio(

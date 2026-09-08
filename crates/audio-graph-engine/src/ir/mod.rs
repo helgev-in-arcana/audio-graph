@@ -119,88 +119,212 @@ pub const MAX_BUFFER_CHANNELS: usize = MAX_CHANNELS * (1 + MAX_AUX_BUSES);
 pub use plugin_host::MAX_AUX_BUSES;
 
 /// A compiled execution program representing an audio and control graph.
+///
+/// The instruction storage is owned by the compiler. External callers receive
+/// metadata through read-only accessors and must publish through
+/// [`ProgramPublisher`].
+///
+/// ```compile_fail
+/// let mut program = audio_graph_engine::Program::empty();
+/// program.ops.clear();
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     /// Topologically ordered scalar operations. Every `Op` reads only registers already written.
-    pub ops: Vec<Op>,
-    pub registers: usize,
+    pub(crate) ops: Vec<Op>,
+    pub(crate) registers: usize,
     /// Which lane each output drives, and where its value ends up. Sorted by
     /// lane, and at most one entry per lane.
     ///
     /// Lanes below `slot_count` are the DAW's own automation and the graph never
     /// writes them; what lands here is a parameter lane or an audio lane.
-    pub outputs: Vec<(u16, Reg)>,
+    pub(crate) outputs: Vec<(u16, Reg)>,
     /// Audio line index → how many samples per channel its ring holds.
     ///
     /// From the node's `max_time` and the sample rate, so a line costs what it
     /// was asked for. The compiler cannot fill it in — it does not know the
     /// sample rate — so the main thread does, in `size_rings`.
-    pub audio_ring_len: Vec<usize>,
+    pub(crate) audio_ring_len: Vec<usize>,
     /// Rings for the lines whose length has changed, allocated on the main
     /// thread and handed over with the program.
     ///
     /// Empty — the usual case — means "keep the ones you have". A recompile
     /// happens on every drag of every control, and reallocating 700 kB each time
     /// to hand back something the same size would be silly.
-    pub audio_rings: Vec<Vec<f32>>,
+    pub(crate) audio_rings: Vec<Vec<f32>>,
     /// Maximum delay duration in seconds per audio delay line.
-    pub audio_ring_seconds: Vec<f64>,
+    pub(crate) audio_ring_seconds: Vec<f64>,
     /// Audio line index → the `DelayWrite` node it belongs to.
     ///
     /// Separate from `delay_nodes`: audio lines are numbered among themselves,
     /// because their rings are a scarcer resource than a param line's. Carried
     /// across a swap so the ring contents survive.
-    pub audio_delay_nodes: Vec<NodeId>,
+    pub(crate) audio_delay_nodes: Vec<NodeId>,
     /// Line index → the `DelayWrite` node it belongs to.
     ///
     /// Carried across a swap for the same reason as `lfo_nodes`: a feedback loop
     /// that emptied itself every time the user nudged an unrelated control would
     /// not be usable.
-    pub delay_nodes: Vec<NodeId>,
+    pub(crate) delay_nodes: Vec<NodeId>,
     /// Audio processing operations in topological execution order.
-    pub audio_ops: Vec<AudioOp>,
+    pub(crate) audio_ops: Vec<AudioOp>,
     /// The note half, run once per sub-block ahead of the audio ops.
-    pub note_ops: Vec<NoteOp>,
+    pub(crate) note_ops: Vec<NoteOp>,
     /// How many note buffers this program uses.
-    pub note_bufs: u16,
+    pub(crate) note_bufs: u16,
     /// Which sub-plugin parameter each graph-driven lane drives.
     ///
     /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
     /// evaluator writes it exactly the way it writes a slot and needs to know
     /// nothing about parameters. Sorted by instance, then by parameter.
-    pub param_targets: Vec<ParamTarget>,
+    pub(crate) param_targets: Vec<ParamTarget>,
     /// The first lane number that carries something the *audio* half reads:
     /// `slot_count + MAX_GRAPH_PARAMS`.
     ///
     /// The evaluator needs it to know which of its outputs are 0..1 parameters
     /// and which are not. A gain is decibels and a delay time is seconds;
     /// clamping either of those to 0..1 turns a -100 dB mute into unity gain.
-    pub audio_lane_base: u16,
+    pub(crate) audio_lane_base: u16,
     /// How each plugin instance has to be activated.
     ///
     /// Derived from the graph, not from the plugin: whether a sidechain bus is
     /// switched on depends on whether anything is wired to it. Sorted by
     /// instance.
-    pub instances: Vec<InstanceIo>,
+    pub(crate) instances: Vec<InstanceIo>,
     /// Channel width of each buffer in the audio pool.
-    pub buffers: Vec<u16>,
+    pub(crate) buffers: Vec<u16>,
     /// How the three op lists are cut into runs that execute together, in
     /// the order they run. See [`Stage`].
-    pub stages: Vec<Stage>,
+    pub(crate) stages: Vec<Stage>,
     /// What the wrapper should report to the DAW as its own latency: the longest
     /// path from an input to an output, after compensation.
-    pub latency: u32,
+    pub(crate) latency: u32,
     /// Latch index → the node it belongs to.
     ///
     /// Carried across a swap: a key switch that forgot which way it was thrown
     /// every time the user nudged an unrelated control would be unusable.
-    pub latch_nodes: Vec<NodeId>,
+    pub(crate) latch_nodes: Vec<NodeId>,
     /// State index → the LFO node it belongs to.
     ///
     /// Carried across a swap so that recompiling — which happens on every drag
     /// of every knob — does not restart the oscillators. Without it, editing an
     /// unrelated node would put a click in the middle of a slow LFO sweep.
-    pub lfo_nodes: Vec<NodeId>,
+    pub(crate) lfo_nodes: Vec<NodeId>,
+}
+
+/// A compiled program prepared for its publisher's receiving engine and sample
+/// rate. Unchanged delay rings remain in the engine instead of being duplicated.
+///
+/// Construction belongs to [`ProgramPublisher`], which keeps the preparation
+/// history and pending resources together.
+///
+/// ```compile_fail
+/// use audio_graph_engine::{PreparedProgram, Program};
+/// let prepared = PreparedProgram { program: Program::empty() };
+/// ```
+#[derive(Debug, PartialEq)]
+pub struct PreparedProgram {
+    pub(crate) program: Program,
+}
+
+impl std::ops::Deref for PreparedProgram {
+    type Target = Program;
+
+    fn deref(&self) -> &Self::Target {
+        &self.program
+    }
+}
+
+impl PreparedProgram {
+    pub(crate) fn prepare(
+        mut program: Program,
+        sample_rate: f64,
+        previous: &[(NodeId, usize)],
+    ) -> (Self, Vec<(NodeId, usize)>) {
+        let sizes = program.size_rings(sample_rate, previous);
+        (Self { program }, sizes)
+    }
+
+    pub(crate) fn program_mut(&mut self) -> &mut Program {
+        &mut self.program
+    }
+
+    pub(crate) fn carry_pending_rings(&mut self, pending: &mut Self) {
+        for line in 0..self.program.audio_delay_nodes.len() {
+            let node = self.program.audio_delay_nodes[line];
+            let len = self.program.audio_ring_len[line];
+            let Some(old_line) = pending
+                .program
+                .audio_delay_nodes
+                .iter()
+                .zip(&pending.program.audio_ring_len)
+                .position(|(&old_node, &old_len)| old_node == node && old_len == len)
+            else {
+                continue;
+            };
+            if self.program.audio_rings[line].is_empty()
+                && !pending.program.audio_rings[old_line].is_empty()
+            {
+                std::mem::swap(
+                    &mut self.program.audio_rings[line],
+                    &mut pending.program.audio_rings[old_line],
+                );
+            }
+        }
+    }
+}
+
+/// Main-thread owner of ring sizing history and the prepared handoff.
+///
+/// One publisher serves one receiving [`Engine`][crate::Engine]. Publishing and
+/// reclamation run off the audio thread; adoption takes no lock. Call
+/// [`reset`][Self::reset] before publishing for a new activation so its rings
+/// do not depend on a program from the previous activation.
+///
+/// The engine accepts this preparation boundary instead of an unprepared queue.
+///
+/// ```compile_fail
+/// use audio_graph_engine::{Engine, Handoff, Program};
+/// let handoff = Handoff::new();
+/// handoff.send(Box::new(Program::empty()));
+/// Engine::new().adopt(&handoff);
+/// ```
+pub struct ProgramPublisher {
+    previous: std::sync::Mutex<Vec<(NodeId, usize)>>,
+    handoff: crate::Handoff<PreparedProgram>,
+}
+
+impl Default for ProgramPublisher {
+    fn default() -> Self {
+        Self {
+            previous: std::sync::Mutex::new(Vec::new()),
+            handoff: crate::Handoff::new(),
+        }
+    }
+}
+
+impl ProgramPublisher {
+    /// Forces the next publication to supply every delay ring for a new activation.
+    pub fn reset(&self) {
+        self.previous.lock().unwrap().clear();
+    }
+
+    pub(crate) fn handoff(&self) -> &crate::Handoff<PreparedProgram> {
+        &self.handoff
+    }
+
+    pub fn reclaim(&self) {
+        self.handoff.reclaim();
+    }
+
+    pub fn publish(&self, program: Program, sample_rate: f64) {
+        let mut previous = self.previous.lock().unwrap();
+        let (prepared, sizes) = PreparedProgram::prepare(program, sample_rate, &previous);
+        *previous = sizes;
+        self.handoff.send_with(Box::new(prepared), |next, pending| {
+            next.carry_pending_rings(pending);
+        });
+    }
 }
 
 impl Program {
@@ -243,7 +367,7 @@ impl Program {
     /// a fresh 700 kB to replace something identical.
     ///
     /// Returns what it decided, for the next call to compare against.
-    pub fn size_rings(
+    pub(crate) fn size_rings(
         &mut self,
         sample_rate: f64,
         previous: &[(NodeId, usize)],
@@ -284,5 +408,42 @@ impl Program {
     /// Returns true if running this program produces no observable outputs or audio operations.
     pub fn is_empty(&self) -> bool {
         self.outputs.is_empty() && self.audio_ops.is_empty()
+    }
+
+    pub fn instances(&self) -> &[InstanceIo] {
+        &self.instances
+    }
+
+    pub fn param_targets(&self) -> &[ParamTarget] {
+        &self.param_targets
+    }
+
+    pub fn latency(&self) -> u32 {
+        self.latency
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pending replacements preserve rings by node identity, even when compile order changes.
+    #[test]
+    fn pending_ring_transfer_follows_nodes_not_line_numbers() {
+        let mut old = Program::empty();
+        old.audio_delay_nodes = vec![11, 22];
+        old.audio_ring_len = vec![4, 8];
+        old.audio_rings = vec![vec![1.0; 8], Vec::new()];
+        let mut next = Program::empty();
+        next.audio_delay_nodes = vec![22, 11];
+        next.audio_ring_len = vec![8, 4];
+        next.audio_rings = vec![Vec::new(), Vec::new()];
+
+        let mut next = PreparedProgram { program: next };
+        let mut old = PreparedProgram { program: old };
+        next.carry_pending_rings(&mut old);
+
+        assert_eq!(next.program.audio_rings[1], vec![1.0; 8]);
+        assert!(next.program.audio_rings[0].is_empty());
     }
 }
