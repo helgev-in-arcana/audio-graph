@@ -92,7 +92,7 @@ mod tests {
         Mix, NodeKind, NoteGate, NoteMute, Plugin, PluginPorts, SlotIn,
     };
     use crate::port::PortType;
-    use subhost_adapter::{AudioChunk, AudioInstances};
+    use subhost_adapter::{AudioChunk, AudioInstances, ScheduleView};
 
     const SLOTS: usize = 32;
 
@@ -1297,8 +1297,10 @@ mod tests {
         let mut engine = crate::Engine::new();
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
-        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(
+            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+        ));
+        assert!(engine.adopt_handoff(&handoff));
 
         // Both stereo inputs read DAW bus 0, so the sidechain sees the same
         // two channels: 1.0 and 2.0, which have to arrive as their mean, 1.5.
@@ -1325,8 +1327,10 @@ mod tests {
         let mut engine = crate::Engine::new();
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
-        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(
+            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+        ));
+        assert!(engine.adopt_handoff(&handoff));
 
         // 1.0 left and 2.0 right average to 1.5 in the plugin's mono bus, and
         // both output channels have to carry it.
@@ -1361,8 +1365,10 @@ mod tests {
         let mut engine = crate::Engine::new();
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
-        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(
+            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+        ));
+        assert!(engine.adopt_handoff(&handoff));
 
         let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
         let mut daw_out = [0.0f32; 8];
@@ -1410,8 +1416,10 @@ mod tests {
         let mut engine = crate::Engine::new();
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
-        handoff.send(Box::new(compile(&graph, SLOTS).unwrap()));
-        assert!(engine.adopt(&handoff));
+        handoff.send(Box::new(
+            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+        ));
+        assert!(engine.adopt_handoff(&handoff));
 
         let daw_in = [1.0f32, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
         let mut daw_out = [0.0f32; 8];
@@ -1472,6 +1480,7 @@ mod tests {
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
+            _schedule: ScheduleView<'_>,
         ) {
             for ch in 0..chunk.output_channels {
                 let range = chunk.channel(ch);
@@ -1499,6 +1508,7 @@ mod tests {
             input: &[f32],
             output: &mut [f32],
             chunk: AudioChunk,
+            _schedule: ScheduleView<'_>,
         ) {
             self.channels = chunk.input_channels;
             self.first_of_each = (0..chunk.input_channels)

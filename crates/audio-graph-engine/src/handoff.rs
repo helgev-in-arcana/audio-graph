@@ -48,11 +48,25 @@ impl<T> Handoff<T> {
     pub fn send(&self, value: Box<T>) {
         let previous = self.incoming.swap(Box::into_raw(value), Ordering::AcqRel);
         if !previous.is_null() {
-            // SAFETY: only `send` stores non-null here, and only the audio
-            // thread's `take` removes one — either way the pointer we got back
-            // came from `Box::into_raw` and nobody else holds it.
+            // SAFETY: every non-null pointer comes from `Box::into_raw`, and
+            // the atomic swap makes this producer its only owner.
             drop(unsafe { Box::from_raw(previous) });
         }
+        self.reclaim();
+    }
+
+    /// Publish a value while allowing the producer to transfer resources from
+    /// a pending value that has not reached the audio thread yet.
+    pub(crate) fn send_with(&self, value: Box<T>, transfer: impl FnOnce(&mut T, &mut T)) {
+        let mut value = value;
+        let previous = self.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !previous.is_null() {
+            // SAFETY: the pointer was produced by `send`/`send_with`, and the
+            // swap makes this producer the only owner of it.
+            let mut pending = unsafe { Box::from_raw(previous) };
+            transfer(&mut value, &mut pending);
+        }
+        self.incoming.store(Box::into_raw(value), Ordering::Release);
         self.reclaim();
     }
 
@@ -92,13 +106,13 @@ impl<T> Handoff<T> {
 
         let new = self.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
         if new.is_null() {
-            // Cannot happen with one producer, but the alternative to checking
-            // is dereferencing null in an audio callback.
+            // The producer can withdraw the pending value while transferring
+            // its resources into a replacement.
             return false;
         }
 
-        // SAFETY: came from `Box::into_raw` in `send`, and the swap above means
-        // no one else can observe it.
+        // SAFETY: every non-null pointer comes from `Box::into_raw`, and the
+        // swap above makes this consumer its only owner.
         let previous = held.replace(unsafe { Box::from_raw(new) });
         if let (Some(slot), Some(old)) = (slot, previous) {
             slot.store(Box::into_raw(old), Ordering::Release);

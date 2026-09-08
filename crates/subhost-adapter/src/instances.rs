@@ -17,6 +17,8 @@
 
 use plugin_host::{AuxBuses, Event};
 
+use crate::ScheduleView;
+
 /// Buffer layout and timing geometry for an audio processing chunk.
 ///
 /// Channels are stored contiguously in planar format packed by `frames` —
@@ -82,6 +84,7 @@ pub trait AudioInstances {
         input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
+        schedule: ScheduleView<'_>,
     );
 }
 
@@ -97,6 +100,7 @@ impl AudioInstances for NoInstances {
         _input: &[f32],
         output: &mut [f32],
         chunk: AudioChunk,
+        _schedule: ScheduleView<'_>,
     ) {
         for ch in 0..chunk.output_channels {
             output[chunk.channel(ch)].fill(0.0);

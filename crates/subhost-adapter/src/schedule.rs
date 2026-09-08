@@ -49,6 +49,67 @@ pub struct SlotSchedule {
     frames: u32,
 }
 
+/// Read-only view of the rows prepared for one audio block.
+///
+/// The view borrows only for the duration of the audio call. The caller drops
+/// it before the next parameter stage updates the schedule rows.
+#[derive(Clone, Copy)]
+pub struct ScheduleView<'a> {
+    values: &'a [f64],
+    lanes: usize,
+    blocks: usize,
+    quantum: u32,
+    frames: u32,
+}
+
+impl ScheduleView<'_> {
+    pub fn lanes(&self) -> usize {
+        self.lanes
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    pub fn quantum(&self) -> u32 {
+        self.quantum
+    }
+
+    pub fn frames(&self) -> u32 {
+        self.frames
+    }
+
+    pub fn offset(&self, index: usize) -> u32 {
+        (index as u32 * self.quantum).min(self.frames.saturating_sub(1))
+    }
+
+    pub fn block(&self, index: usize) -> &[f64] {
+        &self.values[index * self.lanes..(index + 1) * self.lanes]
+    }
+
+    pub fn rows(&self) -> &[f64] {
+        self.values
+    }
+}
+
+impl<'a> ScheduleView<'a> {
+    pub fn from_parts(
+        values: &'a [f64],
+        lanes: usize,
+        blocks: usize,
+        quantum: u32,
+        frames: u32,
+    ) -> Self {
+        Self {
+            values,
+            lanes,
+            blocks,
+            quantum,
+            frames,
+        }
+    }
+}
+
 impl SlotSchedule {
     /// Creates a new schedule buffer preallocated for the worst case: a full
     /// `max_block` cut into [`MIN_QUANTUM`] pieces.
@@ -124,6 +185,16 @@ impl SlotSchedule {
     /// picks a row per chunk.
     pub fn rows(&self) -> &[f64] {
         &self.values[..self.blocks * self.lanes]
+    }
+
+    pub fn view(&self) -> ScheduleView<'_> {
+        ScheduleView {
+            values: self.rows(),
+            lanes: self.lanes,
+            blocks: self.blocks,
+            quantum: self.quantum,
+            frames: self.frames,
+        }
     }
 
     pub fn block(&self, index: usize) -> &[f64] {

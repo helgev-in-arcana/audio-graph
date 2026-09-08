@@ -11,7 +11,7 @@
 //!
 //! Plugin nodes interact through
 //! [`AudioInstances`][subhost_adapter::AudioInstances], passing instance IDs,
-//! note stream *names*, and flat audio slices. Which way that dependency points
+//! note events, schedule views, and flat audio slices. Which way that dependency points
 //! matters: `subhost-adapter` is the general crate and this one is AudioGraph's,
 //! so this one does the depending.
 //!
@@ -20,9 +20,9 @@
 //! - [`Graph`]: the edit side. Freely mutable, serialisable, allowed to be
 //!   nonsense in the middle of an edit.
 //! - [`compile`]: turns a graph into a [`Program`] — flat, ordered, checked.
-//! - [`Handoff`]: carries the program down to the audio thread and the old one
-//!   back up, without a lock in either direction.
-//! - [`Engine`]: runs it, allocating nothing and freeing nothing.
+//! - [`ProgramPublisher`]: prepares rings and carries only a prepared program
+//!   down to the audio thread, while reclaiming superseded values off-thread.
+//! - [`Engine`]: adopts and runs it, allocating nothing and freeing nothing.
 
 mod compile;
 mod engine;
@@ -40,7 +40,8 @@ pub use handoff::Handoff;
 pub use ir::{
     AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS,
     MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_GRAPH_PARAMS,
-    MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, Program, RateSpec, Reg, Waveform,
+    MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, PreparedProgram, Program,
+    ProgramPublisher, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
     AudioIn, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower, FilterMode, Gate,

@@ -33,8 +33,10 @@ VST3とCLAPを共通化します。
 - [audio-graph-engine](../crates/audio-graph-engine/README.md)
 - [audio-graph-plugin](../crates/audio-graph-plugin/README.md)
 
-`audio-graph-engine` がプラグインバックエンド処理を担当します。
-`audio-graph-plugin` がプラグインフロントエンド・ `nice-plug` を使ったプラグイン梱包を担当します。
+`audio-graph-engine` がグラフのコンパイル、実行準備、評価順序を担当します。
+コンパイル結果の `Program` は外部から書き換えられず、`ProgramPublisher` が遅延リングを準備して `PreparedProgram` を公開します。`Engine::run_block` がスケジュール初期化とノート入力、パラメーターと音声のステージ実行をまとめて所有します。
+
+`audio-graph-plugin` がエディターと `nice-plug` を使ったプラグイン梱包を担当します。実行時にはDAWの音声・イベント・transportを変換し、ホストされたプラグインの処理器をエンジンへ接続します。
 
 ### 開発用CLIツール
 

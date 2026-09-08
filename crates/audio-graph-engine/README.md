@@ -12,16 +12,17 @@ and writes numbers, and the outer layers decide what those numbers mean.
 - The edit graph: nodes, links, positions, and the patch as it is saved.
 - Compiling that graph into a flat `Program` — pruning, ordering, register and
   buffer allocation, latency compensation, note routing.
-- Running a `Program` on the audio thread, and holding the state that has to
-  survive a recompile.
+- Preparing a compiled `Program` for the active sample rate, then running the
+  resulting `PreparedProgram` on the audio thread while holding state that has
+  to survive a recompile.
 - The node set itself, one file per node, including each node's own editor
   controls behind the `ui` feature.
 
 ## Not this crate's job
 
 - **What a plugin is.** A plugin node reaches its sub-plugin only through
-  `subhost_adapter::AudioInstances`: an instance number, a note stream's name,
-  and two flat slices. It never learns whether a VST3 or a CLAP answered.
+  `subhost_adapter::AudioInstances`: an instance number, note events, a schedule
+  view, and flat audio slices. It never learns whether a VST3 or a CLAP answered.
 - **What a slot is bound to.** A node reads a slot and a node writes a slot;
   the binding lives outside the graph.
 - **Deciding the numbers.** How many slots exist, how many instances a patch may
@@ -39,13 +40,14 @@ The crate is split along the one line that matters, the thread boundary:
 | `graph`    | main   | The edit side. Freely mutable, serialisable, allowed to be nonsense in the middle of an edit. |
 | `compile`  | main   | Turns a `Graph` into a `Program` — flat, ordered, checked.            |
 | `handoff`  | both   | Carries the program down to the audio thread and the old one back up, without a lock in either direction. |
-| `engine`   | audio  | Runs a `Program`, allocating nothing and freeing nothing.             |
+| `ir`       | main   | Owns compiled and prepared programs and their publisher.             |
+| `engine`   | audio  | Runs a `PreparedProgram`, allocating nothing and freeing nothing.     |
 
 ## Invariants
 
 ### The thread boundary is a module boundary
 
-What reaches the audio side is a `Program` and nothing else. `engine.rs` must
+What reaches the audio side is a `PreparedProgram` and nothing else. `engine.rs` must
 not mention `graph` or a node kind outside of its own tests.
 
 **A `use crate::graph::…` appearing above the `#[cfg(test)]` line in `engine.rs`
@@ -59,6 +61,16 @@ compiler's ceilings. Adopting a new program is a pointer swap and a short loop,
 never a resize. No allocation, no locking, and no `Drop` of anything the main
 thread handed over.
 
+`ProgramPublisher` owns the only handoff used by the product. It prepares rings
+on the non-realtime side and transfers matching rings from an unadopted
+superseded value before publishing a replacement. The audio side only adopts a
+`PreparedProgram`; it cannot construct one or mutate its IR.
+
+`Engine::run_block` is the standard block entry point. It initializes the lane
+schedule, ingests notes once, evaluates parameter and audio stages in order, and
+passes a short-lived `ScheduleView` to each sub-plugin call. The caller only
+adapts host buffers and binds the sub-plugin processors.
+
 ### Some state has to survive a program swap
 
 Recompiling happens on every drag of every control. State that represents where
@@ -70,6 +82,6 @@ exactly the thing an LFO is for.
 ### The dependency on `subhost-adapter` points this way on purpose
 
 A plugin node has something behind it, but this crate only ever sees it through
-`subhost_adapter::AudioInstances`: an instance number, a note stream's *name*,
-and two flat slices. `subhost-adapter` is the general crate and this one is
+`subhost_adapter::AudioInstances`: an instance number, note events, a schedule
+view, and flat audio slices. `subhost-adapter` is the general crate and this one is
 AudioGraph's, so this one does the depending — never the reverse.
