@@ -121,6 +121,7 @@ name = "audio-graph-plugin"
 version = "0.1.5"
 dependencies = [
  "audio-graph-engine",
+ "audio-graph-settings",
  "egui",
  "log",
  "nice-log",
@@ -132,6 +133,16 @@ dependencies = [
  "serde",
  "serde_json",
  "subhost-adapter",
+]
+
+[[package]]
+name = "audio-graph-settings"
+version = "0.1.5"
+dependencies = [
+ "log",
+ "plugin-host",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -892,6 +903,7 @@ name = "host-cli"
 version = "0.1.5"
 dependencies = [
  "audio-graph-engine",
+ "audio-graph-settings",
  "libc",
  "plugin-host",
  "serde_json",

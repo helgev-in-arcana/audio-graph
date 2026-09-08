@@ -1,5 +1,9 @@
 # plugin-host
 
+`plugin-host` is the format-neutral hosting and scanning facade. It receives
+scan directories and catalogue paths from its caller; AudioGraph's persistent
+folders, pins, and `config.json` live in `audio-graph-settings`.
+
 One facade over both plugin backends. A caller says "load this path", "give me
 its parameters", "open its editor" and never learns which format answered.
 
@@ -11,8 +15,9 @@ its parameters", "open its editor" and never learns which format answered.
   module lifetime and the order things must be torn down in.
 - **`Format`** — the closed set of formats, and the stable tags a saved project
   holds.
-- **`scan` / `catalogue` / `config`** — finding installed modules, remembering
-  what is inside them between runs, and the user's list of folders to look in.
+- **`scan` / `catalogue`** — finding installed modules and remembering what is
+  inside them between runs. Product settings are owned by
+  `audio-graph-settings`.
 - **`MainThread`** — the thread-affinity container. It lives here because the
   rule it encodes (a controller call is pinned to the thread that created the
   instance) is a *format's* rule.
@@ -41,13 +46,8 @@ If it only makes sense because a DAW is above us, it belongs in
 - **A saved reference is `(format, plugin_id, path_hint)`, and the id is the
   authority.** Plugin folders differ between machines; a missing path triggers a
   search rather than a failure.
-- **The catalogue is derived data.** Deleting `plugins.json` costs a rescan and
-  nothing else, which is why it is kept beside the settings rather than inside
-  them — a corrupt cache must not take the user's folder list with it.
-- **The config file is the whole answer, not an addition to the conventions.**
-  The OS-conventional folders are seeded into it on first run and are the user's
-  to remove from then on. Re-seeding keys off the file being absent, never off
-  the list being short, so "scan nothing" stays a thing a user can ask for.
+- **The catalogue is derived data.** Deleting the caller-selected cache file
+  costs a rescan. The caller owns its settings independently of that file.
 - **Enumerating a module means loading third-party code.** `installed_modules`
   returns paths only; anything that opens a module says so and expects to be
   called off the UI thread.

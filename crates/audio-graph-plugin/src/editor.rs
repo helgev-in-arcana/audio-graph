@@ -37,7 +37,7 @@ use nice_plug::editor::ResizeHint;
 use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
 
-use crate::graph_ui::{GraphContext, GraphEditor};
+use crate::graph_ui::{GraphContext, GraphEditor, PluginKind};
 use crate::shared::Shared;
 use crate::view::View;
 
@@ -174,7 +174,9 @@ impl WrapperEditor {
     /// cache, and anything the cache does not know yet is `Unknown` until the
     /// background scan started here says otherwise.
     fn rescan(&mut self) {
-        self.fill_entries(&plugin_host::catalogue::cached());
+        let known = audio_graph_settings::catalogue_path()
+            .map_or_else(Vec::new, |p| plugin_host::catalogue::cached(&p));
+        self.fill_entries(&known);
         self.scanned = true;
         self.start_scan();
     }
@@ -182,16 +184,24 @@ impl WrapperEditor {
     /// Rebuild the menu's entries from the modules on disk and what `known`
     /// says about them.
     fn fill_entries(&mut self, known: &[plugin_host::catalogue::Module]) {
-        let pinned = plugin_host::config::pinned();
+        let pinned = audio_graph_settings::pinned();
         self.entries.clear();
-        for (format, path) in plugin_host::installed_modules() {
+        for (format, path) in plugin_host::installed_modules(&audio_graph_settings::directories()) {
             let name = path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
             let kind = known
                 .iter()
                 .find(|m| m.path == path)
-                .map_or(plugin_host::catalogue::Kind::Unknown, |m| m.kind());
+                .map_or(PluginKind::Unknown, |m| {
+                    if m.error.is_some() || m.classes.is_empty() {
+                        PluginKind::Unknown
+                    } else if m.classes.iter().any(|class| class.is_instrument) {
+                        PluginKind::Instrument
+                    } else {
+                        PluginKind::Effect
+                    }
+                });
             let pinned = pinned.contains(&path);
             self.entries.push(crate::graph_ui::PluginEntry {
                 name,
@@ -231,7 +241,9 @@ impl WrapperEditor {
             .spawn(move || {
                 // Initialize COM/threading prerequisites for loading plugins on this thread.
                 plugin_host::init_thread();
-                let _ = tx.send(plugin_host::catalogue::refresh());
+                let dirs = audio_graph_settings::directories();
+                let cache = audio_graph_settings::catalogue_path();
+                let _ = tx.send(plugin_host::catalogue::refresh(&dirs, cache.as_deref()));
             }) {
             Ok(_) => self.scan = Some(rx),
             Err(e) => self.status.set(format!("scan not started: {e}")),
@@ -253,7 +265,7 @@ impl WrapperEditor {
                 let unknown = self
                     .entries
                     .iter()
-                    .filter(|e| e.kind == plugin_host::catalogue::Kind::Unknown)
+                    .filter(|e| e.kind == PluginKind::Unknown)
                     .count();
                 self.status.set(if unknown == 0 {
                     format!("scanned {} modules", self.entries.len())
@@ -312,7 +324,7 @@ impl WrapperEditor {
                 // dispatches no message, so it is safe inline for the same
                 // reason the folders window is.
                 crate::graph_ui::GraphAction::PinPlugin { path, pinned } => {
-                    if let Err(e) = plugin_host::config::set_pinned(&path, pinned) {
+                    if let Err(e) = audio_graph_settings::set_pinned(&path, pinned) {
                         log::warn!("audio-graph: the pinned plugins could not be saved: {e}");
                     }
                     for entry in &mut self.entries {
@@ -362,7 +374,7 @@ impl WrapperEditor {
                 // Add button pushed off the bottom is an Add button that does
                 // not exist.
                 let mut remove = None;
-                let directories = plugin_host::config::directories();
+                let directories = audio_graph_settings::directories();
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
@@ -397,7 +409,7 @@ impl WrapperEditor {
                     });
 
                 if let Some(dir) = remove {
-                    match plugin_host::config::remove_directory(&dir) {
+                    match audio_graph_settings::remove_directory(&dir) {
                         Ok(()) => {
                             self.status.set(format!("removed {}", dir.display()));
                             self.scanned = false;
@@ -425,7 +437,7 @@ impl WrapperEditor {
                             self.status
                                 .set(format!("{} is not a folder", dir.display()));
                         } else {
-                            match plugin_host::config::add_directory(dir.clone()) {
+                            match audio_graph_settings::add_directory(dir.clone()) {
                                 Ok(()) => {
                                     self.status.set(format!("added {}", dir.display()));
                                     self.folder_input.clear();
@@ -447,7 +459,9 @@ impl WrapperEditor {
                         )
                         .clicked()
                     {
-                        if let Err(e) = plugin_host::catalogue::forget() {
+                        if let Some(cache) = audio_graph_settings::catalogue_path()
+                            && let Err(e) = plugin_host::catalogue::forget(&cache)
+                        {
                             self.status.set(format!("cache not cleared: {e}"));
                         }
                         self.scanned = false;
@@ -468,7 +482,7 @@ impl WrapperEditor {
                         )
                         .clicked()
                     {
-                        match plugin_host::config::restore_defaults() {
+                        match audio_graph_settings::restore_defaults() {
                             Ok(()) => {
                                 self.status.set("the usual folders are on the list");
                                 self.scanned = false;
@@ -482,7 +496,7 @@ impl WrapperEditor {
                 // The settings are shared by every instance in this process and
                 // outlive all of them, which is surprising enough to say out
                 // loud, and the path is what a user needs to back it up.
-                if let Some(path) = plugin_host::config::config_path() {
+                if let Some(path) = audio_graph_settings::config_path() {
                     ui.add_space(4.0);
                     ui.weak(format!(
                         "Shared by every Audio Graph instance. Saved in {}",

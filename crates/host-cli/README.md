@@ -15,6 +15,8 @@ and restores — is exercised from here without a DAW in the loop.
 - The standing regression sweep over every plugin installed on the machine.
 - Building patches directly, so graph behaviour can be checked against a
   hand-rendered equivalent.
+- Sharing AudioGraph's persisted folder list through `audio-graph-settings`,
+  and passing the chosen paths to the generic host's scanner.
 
 ## Not this crate's job
 

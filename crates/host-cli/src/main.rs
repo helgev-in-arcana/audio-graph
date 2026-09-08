@@ -185,7 +185,7 @@ fn cmd_dirs() -> Result<(), String> {
     // One line per folder, not one per folder and format. Every folder is
     // searched for every format now, so printing the pairs would say the same
     // thing twice and imply a distinction that no longer exists.
-    let dirs = plugin_host::config::directories();
+    let dirs = audio_graph_settings::directories();
     if dirs.is_empty() {
         println!("(no folders; nothing will be scanned)");
     }
@@ -195,15 +195,14 @@ fn cmd_dirs() -> Result<(), String> {
         let note = if d.is_dir() { "" } else { "  (missing)" };
         println!("{}{note}", d.display());
     }
-    match plugin_host::config::config_path() {
+    match audio_graph_settings::config_path() {
         Some(path) => println!("\nconfig {}", path.display()),
         None => println!("\nconfig (nowhere to keep one on this platform)"),
     }
     Ok(())
 }
 
-/// Resolve the paths to scan: explicit arguments, or the OS-conventional
-/// directories when none are given.
+/// Explicit paths override the product's persisted scan directory list.
 fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
     // Flags are not paths.
     let args: Vec<String> = args
@@ -212,8 +211,7 @@ fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
         .cloned()
         .collect();
     if args.is_empty() {
-        // Both formats, in the conventional places.
-        return plugin_host::installed_modules()
+        return plugin_host::installed_modules(&audio_graph_settings::directories())
             .into_iter()
             .map(|(_, path)| path)
             .collect();

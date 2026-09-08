@@ -6,6 +6,7 @@ license.workspace = true
 readme = "README.md"
 
 [dependencies]
+audio-graph-settings = { path = "../audio-graph-settings" }
 plugin-host.workspace = true
 audio-graph-engine.workspace = true
 subhost-adapter.workspace = true

@@ -100,7 +100,11 @@ fn the_facade_loads_a_clap_by_path_alone() {
     let reference = plugin.reference();
     assert_eq!(reference.format, Format::Clap);
     assert_eq!(
-        resolve_reference(&reference).as_deref(),
+        resolve_reference(
+            &reference,
+            &[(Format::Clap, path.parent().unwrap().to_path_buf())]
+        )
+        .as_deref(),
         Some(path.as_path())
     );
 
@@ -115,17 +119,22 @@ fn the_facade_loads_an_installed_vst3() {
     // First module that yields a class. Some installed plugins are wrappers
     // around a scanner and export nothing loadable, so this is a search rather
     // than a first-hit assertion.
-    let found = plugin_host::installed_modules()
-        .into_iter()
-        .filter(|(format, _)| *format == Format::Vst3)
-        // Known to corrupt its own heap on teardown, and excluded from
-        // `vst3-host`'s tests for the same reason.
-        .filter(|(_, path)| !path.ends_with("OTT.vst3"))
-        .take(8)
-        .find_map(|(_, path)| {
-            let classes = scan_module(&path).ok()?;
-            classes.into_iter().next()
-        });
+    let found = plugin_host::installed_modules(
+        &plugin_host::default_plugin_directories()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .filter(|(format, _)| *format == Format::Vst3)
+    // Known to corrupt its own heap on teardown, and excluded from
+    // `vst3-host`'s tests for the same reason.
+    .filter(|(_, path)| !path.ends_with("OTT.vst3"))
+    .take(8)
+    .find_map(|(_, path)| {
+        let classes = scan_module(&path).ok()?;
+        classes.into_iter().next()
+    });
 
     let Some(class) = found else {
         eprintln!("no VST3 plugins installed; skipping");

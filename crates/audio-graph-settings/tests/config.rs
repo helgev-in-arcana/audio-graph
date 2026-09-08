@@ -12,11 +12,13 @@
 
 use std::path::PathBuf;
 
-use plugin_host::config;
+use audio_graph_settings as config;
 
+/// Product preferences survive storage, reload, and scanning without changing their meaning.
 #[test]
 fn folders_are_seeded_saved_reread_and_scanned() {
-    let dir = std::env::temp_dir().join("audio-graph-config-test");
+    let dir =
+        std::env::temp_dir().join(format!("audio-graph-settings-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temp directory can be made");
     let file = dir.join("config.json");
@@ -38,6 +40,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         }
         dirs
     };
+    assert_eq!(config::catalogue_path(), Some(dir.join("plugins.json")));
     let seeded = config::directories();
     assert_eq!(seeded, expected, "a first run starts from the conventions");
     assert!(
@@ -47,7 +50,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
 
     // Every one of them is a scanned directory, for every format: past the
     // settings, a folder is a folder.
-    let scanned = plugin_host::plugin_directories();
+    let scanned = plugin_host::plugin_directories(&config::directories());
     for d in seeded.iter().filter(|d| d.is_dir()) {
         for format in plugin_host::FORMATS {
             assert!(
@@ -67,7 +70,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
             "a conventional folder can be removed"
         );
         assert!(
-            !plugin_host::plugin_directories()
+            !plugin_host::plugin_directories(&config::directories())
                 .iter()
                 .any(|(_, d)| *d == first),
             "and removing it stops it being scanned"
@@ -89,7 +92,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         config::directories().is_empty(),
         "an emptied list stays empty"
     );
-    assert!(plugin_host::plugin_directories().is_empty());
+    assert!(plugin_host::plugin_directories(&config::directories()).is_empty());
 
     // Restore defaults appends conventional directories.
     config::restore_defaults().expect("saving works");
