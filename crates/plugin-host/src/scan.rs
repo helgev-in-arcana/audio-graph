@@ -75,7 +75,7 @@ pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
 
 /// Every directory a scan should look in, as the user's settings have it.
 ///
-/// [`crate::config`] is the whole answer, not an addition to
+/// The supplied directory list is the whole answer, not an addition to
 /// [`default_plugin_directories`]: the conventional folders are written into
 /// the settings the first time they are read, and are the user's to keep or
 /// remove from then on.
@@ -86,9 +86,9 @@ pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
 /// Directories that do not exist are dropped: a folder can be on a drive that
 /// is not plugged in today, and a scan should be quiet about that rather than
 /// fail.
-pub fn plugin_directories() -> Vec<(Format, PathBuf)> {
+pub fn plugin_directories(directories: &[PathBuf]) -> Vec<(Format, PathBuf)> {
     let mut out = Vec::new();
-    for dir in crate::config::directories() {
+    for dir in directories {
         if !dir.is_dir() {
             continue;
         }
@@ -115,9 +115,9 @@ pub fn find_modules(format: Format, dir: &Path) -> Vec<PathBuf> {
 ///
 /// Paths only: enumerating the classes inside means loading third-party code,
 /// which is a decision the caller should make deliberately.
-pub fn installed_modules() -> Vec<(Format, PathBuf)> {
+pub fn installed_modules(directories: &[PathBuf]) -> Vec<(Format, PathBuf)> {
     let mut out = Vec::new();
-    for (format, dir) in plugin_directories() {
+    for (format, dir) in plugin_directories(directories) {
         for path in find_modules(format, &dir) {
             out.push((format, path));
         }
@@ -184,7 +184,10 @@ pub fn scan_module_as(format: Format, path: &Path) -> Result<Vec<ClassInfo>> {
 /// between machines still opens. Each candidate module has to be loaded to be
 /// asked, which is why `path_hint` is tried first and the directory search is
 /// the fallback.
-pub fn resolve_reference(reference: &PluginRef) -> Option<PathBuf> {
+pub fn resolve_reference(
+    reference: &PluginRef,
+    search_directories: &[(Format, PathBuf)],
+) -> Option<PathBuf> {
     if reference.path_hint.exists()
         && scan_module_as(reference.format, &reference.path_hint)
             .is_ok_and(|classes| classes.iter().any(|c| c.id == reference.id))
@@ -192,12 +195,12 @@ pub fn resolve_reference(reference: &PluginRef) -> Option<PathBuf> {
         return Some(reference.path_hint.clone());
     }
 
-    for (format, dir) in default_plugin_directories() {
-        if format != reference.format {
+    for (format, dir) in search_directories {
+        if *format != reference.format {
             continue;
         }
-        for candidate in find_modules(format, &dir) {
-            let Ok(classes) = scan_module_as(format, &candidate) else {
+        for candidate in find_modules(*format, dir) {
+            let Ok(classes) = scan_module_as(*format, &candidate) else {
                 continue;
             };
             if classes.iter().any(|c| c.id == reference.id) {

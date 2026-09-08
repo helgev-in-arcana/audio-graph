@@ -9,6 +9,7 @@ readme = "README.md"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
+audio-graph-settings = { path = "../audio-graph-settings" }
 plugin-host.workspace = true
 subhost-adapter.workspace = true
 audio-graph-engine = { workspace = true, features = ["ui"] }

@@ -34,7 +34,6 @@
 //! instance — is a format's rule, not a nesting one.
 
 pub mod catalogue;
-pub mod config;
 mod format;
 mod main_thread;
 mod plugin;

@@ -72,7 +72,14 @@ pub struct PluginEntry {
     pub pinned: bool,
     /// Effect or instrument, as the scan cache has it — `Unknown` until this
     /// module has been opened once.
-    pub kind: plugin_host::catalogue::Kind,
+    pub kind: PluginKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginKind {
+    Effect,
+    Instrument,
+    Unknown,
 }
 
 /// The add-node menu's width, and the height each of its two lists gets.
@@ -107,16 +114,15 @@ impl PluginTab {
     /// `Unknown` — never opened, or it could not be opened — shows under both.
     /// The alternative is a plugin the user can see in no tab at all, which is
     /// worse than one shown under the wrong heading.
-    fn shows(self, kind: plugin_host::catalogue::Kind) -> bool {
-        use plugin_host::catalogue::Kind;
+    fn shows(self, kind: PluginKind) -> bool {
         if !PLUGIN_TABS {
             return true;
         }
         matches!(
             (self, kind),
-            (_, Kind::Unknown)
-                | (PluginTab::Effect, Kind::Effect)
-                | (PluginTab::Instrument, Kind::Instrument)
+            (_, PluginKind::Unknown)
+                | (PluginTab::Effect, PluginKind::Effect)
+                | (PluginTab::Instrument, PluginKind::Instrument)
         )
     }
 }
