@@ -9,7 +9,7 @@
 //! Doing that for every plugin on the machine just to draw a menu takes
 //! seconds, and some modules crash while at least one is known to hang — which
 //! is why [`crate::scan::installed_modules`] deliberately does not. So it is
-//! done once, written down as `plugins.json`, and read back. This is what every
+//! done once, persisted at the caller's chosen path, and read back. This is what every
 //! DAW's plugin database is, and for the same reason.
 //!
 //! # Cache Invalidation
@@ -30,10 +30,9 @@
 //!
 //! # Storage
 //!
-//! The cache is stored adjacent to the configuration file as `plugins.json`,
-//! but it is not settings: nothing here is the user's, and deleting the file
-//! costs a rescan and nothing else. It is kept separate so that a corrupt cache
-//! can never take the user's plugin folders down with it.
+//! The caller supplies the cache path, independently of its settings storage.
+//! Cached metadata is derived data: deleting the file costs a rescan and loses
+//! no user preferences. A caller without a writable cache can scan in memory.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,17 +47,6 @@ use crate::format::Format;
 /// the browser asks. A module exporting both — rare, but a synth shipped with
 /// its own effect does it — counts as an instrument: that is the part the user
 /// went looking for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Effect,
-    Instrument,
-    /// Not yet scanned, or it could not be opened. Shown under both headings
-    /// rather than hidden: a plugin the scanner choked on is still one the
-    /// user may want to try loading.
-    Unknown,
-}
-
 /// One class a module exports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {
@@ -92,17 +80,6 @@ impl Module {
         self.path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-    }
-
-    pub fn kind(&self) -> Kind {
-        if self.error.is_some() || self.classes.is_empty() {
-            return Kind::Unknown;
-        }
-        if self.classes.iter().any(|c| c.is_instrument) {
-            Kind::Instrument
-        } else {
-            Kind::Effect
-        }
     }
 }
 
@@ -172,30 +149,20 @@ struct Cache {
     modules: Vec<Module>,
 }
 
-/// Where the cache lives: beside the settings file, whatever the settings file
-/// turned out to be — which is what keeps a test's cache in the test's own
-/// directory.
-pub fn cache_path() -> Option<PathBuf> {
-    Some(crate::config::config_path()?.with_file_name("plugins.json"))
-}
-
 /// Reads the cached module list from disk without performing a scan.
 ///
 /// The answer to "what do we already know", and what a browser draws before
 /// its rescan has finished. A missing or unreadable file gives an empty list:
 /// the cache is derived data, and losing it costs a rescan.
-pub fn cached() -> Vec<Module> {
-    let Some(path) = cache_path() else {
-        return Vec::new();
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
+pub fn cached(path: &Path) -> Vec<Module> {
+    let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
     };
     match serde_json::from_slice::<Cache>(&bytes) {
         Ok(cache) => cache.modules,
         Err(e) => {
             log::warn!(
-                "audio-graph: {} is not a readable cache: {e}",
+                "plugin-host: {} is not a readable cache: {e}",
                 path.display()
             );
             Vec::new()
@@ -212,11 +179,11 @@ pub fn cached() -> Vec<Module> {
 ///
 /// **This loads third-party code.** Call it off the UI thread, on a thread
 /// that has had [`crate::init_thread`] called on it.
-pub fn refresh() -> Vec<Module> {
-    let known = cached();
+pub fn refresh(directories: &[PathBuf], cache_path: Option<&Path>) -> Vec<Module> {
+    let known = cache_path.map_or_else(Vec::new, cached);
     let mut out = Vec::new();
 
-    for (format, path) in crate::scan::installed_modules() {
+    for (format, path) in crate::scan::installed_modules(directories) {
         let stamp = stamp_of(&path);
         // Unchanged since we looked: keep what we know, including the fact that
         // it could not be opened.
@@ -233,8 +200,10 @@ pub fn refresh() -> Vec<Module> {
     // Sorted so the file is stable between runs and a diff of it means
     // something; a module that vanished is simply not here.
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    if let Err(e) = store(&out) {
-        log::warn!("audio-graph: the plugin cache could not be saved: {e}");
+    if let Some(cache_path) = cache_path
+        && let Err(e) = store(cache_path, &out)
+    {
+        log::warn!("plugin-host: the plugin cache could not be saved: {e}");
     }
     out
 }
@@ -258,7 +227,7 @@ fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
             error: None,
         },
         Err(e) => {
-            log::warn!("audio-graph: {} could not be scanned: {e}", path.display());
+            log::warn!("plugin-host: {} could not be scanned: {e}", path.display());
             Module {
                 path: path.to_path_buf(),
                 format,
@@ -273,8 +242,7 @@ fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
 /// Writes the module cache to disk the same way the settings are written:
 /// beside the target and renamed over it, so a crash halfway through leaves
 /// the previous cache rather than half of the new one.
-fn store(modules: &[Module]) -> Result<(), String> {
-    let path = cache_path().ok_or_else(|| "no config directory on this platform".to_string())?;
+fn store(path: &Path, modules: &[Module]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
@@ -286,7 +254,7 @@ fn store(modules: &[Module]) -> Result<(), String> {
 
     let temp = path.with_extension("json.new");
     std::fs::write(&temp, &json).map_err(|e| format!("writing {}: {e}", temp.display()))?;
-    std::fs::rename(&temp, &path).map_err(|e| {
+    std::fs::rename(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         format!("replacing {}: {e}", path.display())
     })
@@ -296,11 +264,8 @@ fn store(modules: &[Module]) -> Result<(), String> {
 ///
 /// What "rescan" means when the user has replaced a plugin in a way the stamp
 /// cannot see, or when a scan went wrong and they want it done over.
-pub fn forget() -> Result<(), String> {
-    let Some(path) = cache_path() else {
-        return Ok(());
-    };
-    match std::fs::remove_file(&path) {
+pub fn forget(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("removing {}: {e}", path.display())),

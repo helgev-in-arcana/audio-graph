@@ -306,18 +306,24 @@ impl SubHost {
     /// Projects move between machines, and a plugin folder that differs by
     /// one directory should not cost the user their patch: the class id is the
     /// authority and the recorded path is only a hint.
-    pub fn resolve_reference(reference: &SubPluginRef) -> Option<PathBuf> {
+    pub fn resolve_reference(
+        reference: &SubPluginRef,
+        search_directories: &[(Format, PathBuf)],
+    ) -> Option<PathBuf> {
         // An unrecognised format tag is "not found" rather than an error,
         // which is what the caller already handles: a reference saved before
         // CLAP existed has no format tag worth trusting, and one saved by a
         // newer build might name a format this build does not have.
         let format = Format::from_tag(&reference.format)?;
-        plugin_host::resolve_reference(&plugin_host::PluginRef {
-            format,
-            id: reference.plugin_id.clone(),
-            path_hint: PathBuf::from(&reference.path_hint),
-            display_name: reference.display_name.clone(),
-        })
+        plugin_host::resolve_reference(
+            &plugin_host::PluginRef {
+                format,
+                id: reference.plugin_id.clone(),
+                path_hint: PathBuf::from(&reference.path_hint),
+                display_name: reference.display_name.clone(),
+            },
+            search_directories,
+        )
     }
 
     pub fn class(&self, instance: usize) -> Option<&ClassInfo> {
@@ -568,7 +574,8 @@ impl SubHost {
 
         for entry in &state.instances {
             let reference = &entry.reference;
-            let Some(path) = Self::resolve_reference(reference) else {
+            let defaults = plugin_host::default_plugin_directories();
+            let Some(path) = Self::resolve_reference(reference, &defaults) else {
                 problems.push(format!(
                     "{} could not be found; its slot bindings are kept and will \
                      resolve if it is reinstalled",

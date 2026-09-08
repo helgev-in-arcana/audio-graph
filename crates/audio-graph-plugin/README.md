@@ -12,6 +12,8 @@ the only crate in the workspace that knows AudioGraph is a product.
   patch may hold, how many lanes a sub-block carries. They are handed to
   `subhost-adapter` as configuration, which never names one itself.
 - The editor: the node canvas, the slot table, the plugin browser.
+- Connecting `audio-graph-settings` to the host scanner and catalogue, and
+  choosing the browser's display categories from the scanned class metadata.
 - Owning the state split between the main thread and the audio thread, and
   handing each compiled program to the engine's `ProgramPublisher` for
   preparation and publication.

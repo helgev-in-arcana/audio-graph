@@ -88,10 +88,15 @@ fn candidate_paths() -> Vec<std::path::PathBuf> {
         return vec![std::path::PathBuf::from(explicit)];
     }
     // Both formats, exactly as the editor's own rescan sees them.
-    plugin_host::installed_modules()
-        .into_iter()
-        .map(|(_, path)| path)
-        .collect()
+    plugin_host::installed_modules(
+        &plugin_host::default_plugin_directories()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(|(_, path)| path)
+    .collect()
 }
 
 #[test]
@@ -115,7 +120,13 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     });
 
     // "Rescan" — the list the editor draws.
-    let installed = plugin_host::installed_modules().len();
+    let installed = plugin_host::installed_modules(
+        &plugin_host::default_plugin_directories()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect::<Vec<_>>(),
+    )
+    .len();
     assert!(installed > 0, "the plugin list would be empty");
 
     // Clicking an entry in that list.

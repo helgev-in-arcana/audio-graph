@@ -30,6 +30,7 @@ VST3とCLAPを共通化します。
 
 ### audio-graph実装
 
+- [audio-graph-settings](../crates/audio-graph-settings/README.md)
 - [audio-graph-engine](../crates/audio-graph-engine/README.md)
 - [audio-graph-plugin](../crates/audio-graph-plugin/README.md)
 
@@ -37,6 +38,8 @@ VST3とCLAPを共通化します。
 コンパイル結果の `Program` は外部から書き換えられず、`ProgramPublisher` が遅延リングを準備して `PreparedProgram` を公開します。`Engine::run_block` がスケジュール初期化とノート入力、パラメーターと音声のステージ実行をまとめて所有します。
 
 `audio-graph-plugin` がエディターと `nice-plug` を使ったプラグイン梱包を担当します。実行時にはDAWの音声・イベント・transportを変換し、ホストされたプラグインの処理器をエンジンへ接続します。
+
+AudioGraph固有の設定ファイル、探索フォルダー、ピン留め、カタログの保存先は `audio-graph-settings` が所有し、製品とCLIで共有します。`plugin-host` は呼び出し側から渡された探索対象とカタログ保存先を扱います。ブラウザー上の表示分類は `audio-graph-plugin` が決定します。
 
 ### 開発用CLIツール
 

@@ -1,4 +1,4 @@
-//! Configuration and directory management for plugin scanning.
+//! AudioGraph product settings and plugin discovery preferences.
 //!
 //! Nothing in either format lets a plugin discover where the DAW looks:
 //! neither VST3 nor CLAP has a way to ask. So the list is the user's, and this
@@ -143,6 +143,11 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_directory()?.join("config.json"))
 }
 
+/// The catalogue is derived data and has a separate file from user settings.
+pub fn catalogue_path() -> Option<PathBuf> {
+    Some(config_path()?.with_file_name("plugins.json"))
+}
+
 fn stamp_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
@@ -153,7 +158,7 @@ fn stamp_of(path: &Path) -> Option<SystemTime> {
 /// past this point a folder is a folder — see [`Config::directories`].
 fn conventional() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    for (_, dir) in crate::scan::default_plugin_directories() {
+    for (_, dir) in plugin_host::default_plugin_directories() {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
