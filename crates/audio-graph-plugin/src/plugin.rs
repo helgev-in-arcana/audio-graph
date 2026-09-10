@@ -326,58 +326,15 @@ impl Wrapper {
             // entitled to know when it no longer has to.
             offline: config.process_mode == ProcessMode::Offline,
         };
-        // Remembered even when nothing is loaded: the editor uses it to
-        // activate whatever the user picks next, without waiting for the DAW to
-        // call `activate` again.
-        self.shared.main().config = Some(audio_config);
-
-        // The engine holds no program at this point — `deactivate` hands it
-        // back, and a first activation has never had one — so without this the
-        // graph would fall silent for as long as the DAW keeps this
-        // configuration, and a bounce would write that silence to the file.
-        // It is also the only moment the delay rings can be sized for the rate
-        // the DAW has just named.
-        self.shared.send_fresh_program();
-
-        {
-            let mut state = self.shared.main();
-            // Nothing loaded is a normal state, not a failure: the user has to
-            // open the editor and pick something, and the graph draws a
-            // through-connection until they do.
-            if state.host.any_loaded() {
-                let io = state.instance_io.clone();
-                let graph_params = state.graph_params.clone();
-                match state.host.activate(audio_config, &io, &graph_params) {
-                    Ok(processor) => {
-                        drop(state);
-                        self.shared.audio().processor = Some(processor);
-                    }
-                    // Still a successful activation of *the wrapper*: the rest
-                    // of the graph runs, and a plugin node with no plugin
-                    // behind it produces silence. Refusing to load would lose
-                    // the user's whole patch over one plugin.
-                    Err(e) => log::warn!("audio-graph: sub-plugin failed to activate: {e}"),
-                }
-            }
-        }
-
-        // Activating a plugin is what makes it answerable about its latency, so
-        // a node can be carrying a number from before its plugin had one — or
-        // from a project whose plugin is no longer installed, where the honest
-        // answer is none at all. The DAW is told what the graph costs, and that
-        // can only be right if the nodes in it are.
-        if self.shared.refresh_latencies() {
-            self.shared.send_fresh_program();
+        if let Err(error) = self.shared.activate(audio_config) {
+            log::warn!("audio-graph: sub-plugin failed to activate: {error}");
         }
         self.reported_latency = self.shared.latency();
         Some(self.reported_latency)
     }
 
     pub fn deactivate(&mut self) {
-        let processor = self.shared.audio().processor.take();
-        if let Some(processor) = processor {
-            processor.deactivate();
-        }
+        self.shared.deactivate();
         // The audio thread will not run again until the next activate, so give
         // the program back now rather than leaving the main thread's `Handoff`
         // holding a value nobody will ever collect.
@@ -414,10 +371,10 @@ impl Wrapper {
             }
         }
 
-        // Pick up a freshly compiled graph, if the editor has published one.
-        // Lock-free in both directions, so this costs nothing on the blocks
-        // where nothing has changed — which is nearly all of them.
-        self.engine.adopt(self.shared.programs());
+        let mut state = match self.shared.begin_block(&mut self.engine) {
+            Some(state) => state,
+            None => return pass_through(buffer, self.kind),
+        };
 
         // Read off the engine rather than off the compiler, so the DAW is told
         // about a program the audio is already coming out of: a sub-plugin that
@@ -431,15 +388,6 @@ impl Wrapper {
             context.set_latency_samples(latency);
         }
 
-        // `try_lock`, never `lock`. The main thread holds this only to start or
-        // stop a sub-plugin; missing it means a few blocks pass through
-        // unprocessed, which is the audible cost of swapping a plugin
-        // mid-playback, and never a blocked audio thread. Graph edits do not
-        // come this way at all.
-        let mut state = match self.shared.try_audio() {
-            Some(state) => state,
-            None => return pass_through(buffer, self.kind),
-        };
         // Throwing the graph's state away happens here rather than in
         // `reset`, which belongs to the DAW: this is the only place the
         // wrapper holds the engine, the sub-plugins and a way to tell the DAW

@@ -74,6 +74,156 @@ fn a_bounce_renders_the_audio_and_gives_it_back_afterwards() {
     wrapper.deactivate();
 }
 
+/// Changing parameter-lane order during playback never pairs a plan with another activation's map.
+#[test]
+fn changing_parameter_bindings_keeps_each_block_consistent() {
+    use audio_graph_engine::{
+        AudioIn, AudioOut, Constant, Graph, NodeKind, ParamPort, Plugin, PluginPorts,
+    };
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let mut wrapper = playing("audio-path-configurations");
+    let shared = wrapper.shared().clone();
+    let layout = shared.main().host.io_layout(0);
+    let graphs: Vec<_> = [false, true]
+        .into_iter()
+        .map(|reverse| {
+            let mut graph = Graph::new();
+            let input = graph.add(
+                NodeKind::AudioIn(AudioIn {
+                    bus: 0,
+                    channels: 2,
+                }),
+                [0.0, 0.0],
+            );
+            let output = graph.add(
+                NodeKind::AudioOut(AudioOut {
+                    bus: 0,
+                    channels: 2,
+                }),
+                [0.0, 0.0],
+            );
+            let mut ports = PluginPorts::from_layout(&layout, 0);
+            let first_parameter = ports.audio_in.len() + usize::from(ports.accepts_notes);
+            let ids = if reverse { [1, 0] } else { [0, 1] };
+            ports.params = ids
+                .iter()
+                .map(|&id| ParamPort {
+                    id,
+                    name: id.to_string(),
+                })
+                .collect();
+            let plugin = graph.add(NodeKind::Plugin(Plugin { instance: 0, ports }), [0.0, 0.0]);
+            graph.connect(input, 0, plugin, 0);
+            graph.connect(plugin, 0, output, 0);
+            for (index, id) in ids.into_iter().enumerate() {
+                let value = if id == 0 { 0.75 } else { 0.25 };
+                let constant = graph.add(NodeKind::Constant(Constant { value }), [0.0, 0.0]);
+                graph.connect(constant, 0, plugin, (first_parameter + index) as u8);
+            }
+            graph
+        })
+        .collect();
+    shared.patch().graph = graphs[0].clone();
+    shared.publish_graph();
+    let mut initial = Block::silent(32);
+    initial.fill(0.5).process(&mut wrapper, &mut Daw::playing());
+    assert!((initial.peak() - 0.25).abs() < 1e-6);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(2));
+    let audio = {
+        let stop = stop.clone();
+        let start = start.clone();
+        std::thread::spawn(move || {
+            let mut daw = Daw::playing();
+            let mut block = Block::silent(32);
+            let mut blocks = 0;
+            start.wait();
+            while !stop.load(Ordering::Acquire) || blocks == 0 {
+                block.fill(0.5).process(&mut wrapper, &mut daw);
+                let peak = block.peak();
+                // Gain 1.5 and offset -0.5 render 0.25. A suspended block passes
+                // 0.5 through; swapped parameter targets would instead render 0.75.
+                assert!(
+                    (peak - 0.25).abs() < 1e-6 || (peak - 0.5).abs() < 1e-6,
+                    "inconsistent block: {peak}"
+                );
+                blocks += 1;
+                std::thread::yield_now();
+            }
+            (wrapper, blocks)
+        })
+    };
+    start.wait();
+    for index in 0..500 {
+        shared.patch().graph = graphs[index % 2].clone();
+        shared.publish_graph();
+        std::thread::yield_now();
+    }
+    stop.store(true, Ordering::Release);
+    let (mut wrapper, blocks) = audio.join().unwrap();
+    assert!(blocks > 0);
+    wrapper.deactivate();
+}
+
+/// Failed bus reconfiguration cannot reuse the old processor and can recover.
+#[test]
+fn a_failed_configuration_is_silent_and_can_be_rebuilt() {
+    use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeKind, Plugin, PluginPorts};
+    let mut wrapper = playing("audio-path-failed-configuration");
+    let shared = wrapper.shared().clone();
+    let original = shared.patch().graph.clone();
+    let mut mono = Graph::new();
+    let input = mono.add(
+        NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0, 0.0],
+    );
+    let plugin = mono.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                audio_in: vec![2],
+                audio_out: vec![1],
+                ..Default::default()
+            },
+        }),
+        [0.0, 0.0],
+    );
+    let output = mono.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 1,
+        }),
+        [0.0, 0.0],
+    );
+    mono.connect(input, 0, plugin, 0);
+    mono.connect(plugin, 0, output, 0);
+    shared.patch().graph = mono;
+    assert!(shared.rebind().is_err());
+    assert!(
+        shared.patch().compile_error.is_none(),
+        "the graph is valid but the plugin refuses mono"
+    );
+    assert!(!shared.has_processors());
+    let mut block = Block::silent(32);
+    let mut daw = Daw::playing();
+    block.fill(0.5).process(&mut wrapper, &mut daw);
+    assert_eq!(block.peak(), 0.0);
+    shared.patch().graph = original;
+    shared.publish_graph();
+    assert!(shared.has_processors());
+    block.fill(0.5).process(&mut wrapper, &mut daw);
+    assert!((block.peak() - 0.5).abs() < 1e-6);
+    wrapper.deactivate();
+}
+
 /// A latency that appears while the project is playing reaches the DAW.
 ///
 /// Dropping a plugin with lookahead onto the canvas mid-take moves the whole
@@ -108,9 +258,6 @@ fn a_latency_that_appears_mid_session_reaches_the_daw() {
         .shared()
         .load_sub_state(0, &fixture_state(f64::from(LATENCY)))
         .expect("the fixture takes its state");
-    // A plugin answers for its latency when it starts, so the preset only
-    // becomes a number once it has been restarted around it.
-    wrapper.shared().rebind().expect("the fixture restarts");
     wrapper.shared().adopt_default_patch();
 
     block.process(&mut wrapper, &mut daw);
