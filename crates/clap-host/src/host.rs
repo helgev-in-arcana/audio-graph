@@ -47,7 +47,7 @@ use host_window::watch::{FdWatch, Interest, Readiness};
 use plugin_host_api::{HostContext, RestartReason};
 
 thread_local! {
-    /// Non-zero while this thread is inside `clap_plugin::process`.
+    /// Non-zero while this thread is inside a CLAP audio-thread entry point.
     ///
     /// Tracks recursion depth so nested process calls do not prematurely clear the audio thread mark.
     static AUDIO_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -438,9 +438,8 @@ static HOST_THREAD_CHECK: clap_host_thread_check = clap_host_thread_check {
 
 unsafe extern "C" fn is_main_thread(host: *const clap_host) -> bool {
     match unsafe { shim(host) } {
-        // Being inside `process` disqualifies the thread even if it is also the
-        // one the instance was created on, which is exactly the case an offline
-        // renderer creates.
+        // A symbolic audio-thread call excludes the main-thread role even when
+        // both roles use the same OS thread, as an offline renderer permits.
         Some(shim) => !on_audio_thread() && std::thread::current().id() == shim.main_thread,
         None => false,
     }

@@ -106,8 +106,6 @@ fn a_latency_that_appears_mid_session_reaches_the_daw() {
         .expect("the fixture loads");
     wrapper
         .shared()
-        .main()
-        .host
         .load_sub_state(0, &fixture_state(f64::from(LATENCY)))
         .expect("the fixture takes its state");
     // A plugin answers for its latency when it starts, so the preset only

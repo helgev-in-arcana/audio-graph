@@ -18,9 +18,9 @@ its parameters", "open its editor" and never learns which format answered.
 - **`scan` / `catalogue`** — finding installed modules and remembering what is
   inside them between runs. Product settings are owned by
   `audio-graph-settings`.
-- **`MainThread`** — the thread-affinity container. It lives here because the
-  rule it encodes (a controller call is pinned to the thread that created the
-  instance) is a *format's* rule.
+- **`MainThread` / `Processor` / `reclaim_main_thread`** — the common lifetime and
+  owner-thread destruction contract, re-exported from `plugin-host-api` so
+  backends and their callers use the same return path.
 - Re-exporting `plugin-host-api` wholesale, so a caller needs one dependency
   instead of two.
 

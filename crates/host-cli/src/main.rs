@@ -19,8 +19,8 @@ use std::process::ExitCode;
 use audio_graph_engine::{
     AudioIn, AudioOut, DelayRead, EnvelopeFollower, Mix, NodeKind, RangeMap, SlotIn,
 };
-use plugin_host::SubPluginMain;
 use plugin_host::{Format, Plugin};
+use plugin_host::{SubPluginMain, SubPluginProcessor};
 use subhost_adapter::SubHostConfig;
 
 /// The wrapper's ceilings, as `audio-graph-plugin` builds them.
@@ -749,7 +749,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
     );
     let mut sink = EventSink::new();
     processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
-    plugin.deactivate(processor);
+    processor.deactivate();
     Ok(())
 }
 
@@ -967,7 +967,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
             let processor = plugin
                 .activate(config)
                 .map_err(|e| format!("{}: activate: {e}", class.name))?;
-            plugin.deactivate(processor);
+            processor.deactivate();
             if round == 1 {
                 // Voices after activate, not before: an instrument that has no
                 // sample rate yet often declines to answer.
@@ -1008,11 +1008,11 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
         Ok(()) => {}
         // A plugin with no editor is not a failure; plenty have none.
         Err(e) if e.contains("no editor") => {
-            sub.deactivate(processor);
+            processor.deactivate();
             return Ok(());
         }
         Err(e) => {
-            sub.deactivate(processor);
+            processor.deactivate();
             return Err(format!("{name}: open editor: {e}"));
         }
     }
@@ -1028,11 +1028,11 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
     if reverse {
         // The whole instance goes away with the editor still open, which is
         // what a DAW does when it terminates a plugin without a close notice.
-        sub.deactivate(processor);
+        processor.deactivate();
         drop(sub);
     } else {
         sub.close_editor(0);
-        sub.deactivate(processor);
+        processor.deactivate();
         drop(sub);
     }
     plugin_host::pump_events();
@@ -3050,7 +3050,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
 
     let (open, elapsed) = hold_editor_open(&mut sub, hold);
     sub.close_editor(0);
-    sub.deactivate(processors);
+    processors.deactivate();
     sub.unload_all();
     println!(
         "{} after {:.1}s",

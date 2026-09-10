@@ -164,12 +164,9 @@ type Task = Box<dyn FnOnce(&Arc<Shared>) + Send>;
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // Hand every processor back before its plugin is released. A DAW always
-        // calls `deactivate` first and this never fires there — but a panic
-        // anywhere between activate and deactivate would otherwise turn into an
-        // access violation during unwinding, which is a much worse thing to
-        // debug than the panic that caused it.
-        self.suspend();
+        // The last Arc can be released by the executor or audio thread. Each
+        // processor carries its own owner-thread return path.
+        self.audio.get_mut().processor.take();
     }
 }
 
@@ -328,6 +325,10 @@ impl Shared {
     /// None of them happen while audio is flowing normally.
     pub fn audio(&self) -> parking_lot::MutexGuard<'_, AudioState> {
         self.audio.lock()
+    }
+
+    pub fn has_processors(&self) -> bool {
+        self.audio().processor.is_some()
     }
 
     pub fn programs(&self) -> &ProgramPublisher {
@@ -506,6 +507,15 @@ impl Shared {
         resumed
     }
 
+    /// Restores a sub-plugin's state with no processor concurrently using its configuration.
+    pub fn load_sub_state(&self, instance: usize, data: &[u8]) -> Result<(), String> {
+        self.suspend();
+        let result = self.main().host.load_sub_state(instance, data);
+        let resumed = self.resume();
+        result?;
+        resumed
+    }
+
     /// Give a patch that has no graph the one it was implicitly running.
     ///
     /// Patches saved when the wrapper passed audio through by itself relied on
@@ -665,7 +675,7 @@ impl Shared {
     fn suspend(&self) {
         let processor = self.audio().processor.take();
         if let Some(processor) = processor {
-            self.main().host.deactivate(processor);
+            processor.deactivate();
         }
     }
 

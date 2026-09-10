@@ -58,12 +58,12 @@ cargo xtask bundle audio-graph-plugin --release
 `plugin-host` クレートとして手に入ります。形式は拡張子から決まり、コードに形式名は現れません。
 
 ```rust
-use plugin_host::{Plugin, SubPluginMain};
+use plugin_host::{Plugin, SubPluginMain, SubPluginProcessor};
 
 let mut plugin = Plugin::load(path, None, host_context)?;   // .vst3 でも .clap でも同じ
 let mut processor = plugin.activate(config)?;
 processor.process(&mut buffers, &events, &time, &mut out_events);
-plugin.deactivate(processor);
+processor.deactivate();
 ```
 
 現時点では API は AudioGraph の内部利用が主で、安定していません。

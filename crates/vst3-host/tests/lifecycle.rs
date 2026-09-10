@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use plugin_host_api::{
-    AudioConfig, HostContext, ParamFlags, ParamId, RestartReason, SubPluginMain,
+    AudioConfig, HostContext, ParamFlags, ParamId, RestartReason, SubPluginMain, SubPluginProcessor,
 };
 use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin, default_plugin_directories, find_modules};
 
@@ -127,7 +127,7 @@ fn repeated_activation(module: &Module, class: &ClassInfo) {
                 ..Default::default()
             })
             .unwrap_or_else(|e| panic!("round {round}: activate: {e}"));
-        plugin.deactivate(processor);
+        processor.deactivate();
     }
 }
 
@@ -255,7 +255,7 @@ fn run_one_block(plugin: &mut Vst3Plugin) -> Result<(), String> {
     let mut sink = EventSink::new();
     processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
 
-    plugin.deactivate(processor);
+    processor.deactivate();
     Ok(())
 }
 

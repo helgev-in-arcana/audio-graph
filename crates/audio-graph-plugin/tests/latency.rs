@@ -83,8 +83,6 @@ fn two_plugins(shared: &Shared, path: &std::path::Path) -> Patch {
 /// Ask each fixture to claim `samples` of latency from now on.
 fn claims(shared: &Shared, instance: usize, samples: f64) {
     shared
-        .main()
-        .host
         .load_sub_state(instance, &fixture_state(samples))
         .expect("the fixture takes its state");
 }

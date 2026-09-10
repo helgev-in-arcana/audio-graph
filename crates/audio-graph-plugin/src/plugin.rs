@@ -376,7 +376,7 @@ impl Wrapper {
     pub fn deactivate(&mut self) {
         let processor = self.shared.audio().processor.take();
         if let Some(processor) = processor {
-            self.shared.main().host.deactivate(processor);
+            processor.deactivate();
         }
         // The audio thread will not run again until the next activate, so give
         // the program back now rather than leaving the main thread's `Handoff`
