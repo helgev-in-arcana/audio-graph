@@ -148,6 +148,10 @@ pub trait SubPluginProcessor: Send {
     /// Render one block. Must not allocate, lock, or block.
     ///
     /// `events` is ordered by `sample_offset`.
+    /// Buffers must match the activation's channels and aux buses, use planar
+    /// layout, and fit its maximum block size. A mismatch returns `Error` with
+    /// cleared audio output, without entering native processing. A matching
+    /// zero-frame block does not enter native processing either.
     fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,

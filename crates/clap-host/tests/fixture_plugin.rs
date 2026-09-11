@@ -76,6 +76,64 @@ fn lifecycle_config() -> AudioConfig {
     }
 }
 
+/// Rejected blocks cannot apply native parameter edits or write beyond their declared output.
+#[test]
+fn mismatched_blocks_never_enter_native_processing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let config = lifecycle_config();
+    assert!(
+        plugin
+            .activate(AudioConfig {
+                sample_rate: f64::NAN,
+                ..config
+            })
+            .is_err()
+    );
+    let mut processor = plugin.activate(config).unwrap();
+    let mut sink = EventSink::with_capacity(8);
+    let input = [0.5; 128];
+    for (channels, frames, layout, aux) in [
+        (1, 4, BufferLayout::Planar, AuxBuses::default()),
+        (2, 4, BufferLayout::Interleaved, AuxBuses::default()),
+        (2, 4, BufferLayout::Planar, AuxBuses::new(&[1])),
+        (2, 33, BufferLayout::Planar, AuxBuses::default()),
+    ] {
+        let mut output = [9.0; 128];
+        let mut buffers =
+            AudioBuffers::new(&input, &mut output, channels, channels, frames, layout)
+                .with_aux_inputs(aux);
+        let event = Event::Param(ParamEvent::SetValue {
+            id: PARAM_GAIN,
+            target: Target::Global,
+            value: 0.0,
+            sample_offset: 0,
+        });
+        assert_eq!(
+            processor.process(&mut buffers, &[event], &TimeContext::default(), &mut sink),
+            ProcessStatus::Error
+        );
+        let used = (channels * frames) as usize;
+        assert!(output[..used].iter().all(|&v| v == 0.0));
+        assert!(output[used..].iter().all(|&v| v == 9.0));
+    }
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+    assert_eq!(
+        output, [0.5; 8],
+        "rejected edits cannot reach the native gain"
+    );
+}
+
 /// A running processor retains its instance, module, and callbacks after main is dropped.
 #[test]
 fn the_processor_outlives_main_and_returns_to_its_owner() {

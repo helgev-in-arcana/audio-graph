@@ -614,6 +614,7 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
+        config.validate()?;
         reclaim_main_thread();
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState("plugin is already active"));
@@ -820,21 +821,20 @@ impl SubPluginProcessor for Vst3Processor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
+        out_events.clear();
+        if !buffers.matches_config(&self.config) {
+            buffers.clear_output();
+            return ProcessStatus::Error;
+        }
         let frames = buffers.frame_count();
         if frames == 0 {
             return ProcessStatus::Continue;
-        }
-        if frames > self.config.max_block_size {
-            // Louder than a silent clamp: the caller broke the contract it
-            // agreed to at activate, and clamping would silently drop audio.
-            return ProcessStatus::Error;
         }
 
         self.input_changes.clear();
         self.output_changes.clear();
         self.input_events.clear();
         self.output_events.clear();
-        out_events.clear();
 
         // Main-thread edits go in first, at offset 0, so an event stream for
         // this block still overrides them.
