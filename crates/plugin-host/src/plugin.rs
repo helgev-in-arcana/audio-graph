@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use plugin_host_api::{
     AudioConfig, Capabilities, HostContext, HostError, IoLayout, ParamId, ParamInfo, ParamSnapshot,
-    Result, SubPluginMain, SubPluginProcessor,
+    Processor, Result, SubPluginMain,
 };
 
 use crate::format::Format;
@@ -313,12 +313,8 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::latency_samples(p))
     }
 
-    fn activate(&mut self, config: AudioConfig) -> Result<Box<dyn SubPluginProcessor>> {
+    fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
         delegate!(mut self, p => SubPluginMain::activate(p, config))
-    }
-
-    fn deactivate(&mut self, processor: Box<dyn SubPluginProcessor>) {
-        delegate!(mut self, p => SubPluginMain::deactivate(p, processor))
     }
 }
 

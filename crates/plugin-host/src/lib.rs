@@ -29,18 +29,16 @@
 //! `subhost-adapter`'s job, and the test is: would an offline renderer or a
 //! plugin scanner still need it?
 //!
-//! [`MainThread`] is here by that test rather than in spite of it. The rule it
-//! encodes — VST3 pins a controller call to the thread that created the
-//! instance — is a format's rule, not a nesting one.
+//! [`MainThread`], [`Processor`] and [`reclaim_main_thread`] expose the shared
+//! ownership contract implemented by both backends. Their return records live
+//! on the thread responsible for native destruction.
 
 pub mod catalogue;
 mod format;
-mod main_thread;
 mod plugin;
 mod scan;
 
 pub use format::{FORMATS, Format};
-pub use main_thread::MainThread;
 pub use plugin::Plugin;
 pub use scan::{
     ClassInfo, PluginRef, default_plugin_directories, find_modules, installed_modules,
@@ -51,9 +49,10 @@ pub use scan::{
 // and get the vocabulary with it.
 pub use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, BusInfo, Capabilities, Event, EventSink,
-    HostContext, HostError, IoLayout, MAX_AUX_BUSES, NoteEvent, NoteExpression, NoteId, ParamEvent,
-    ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, RestartReason,
-    Result, SubPluginMain, SubPluginProcessor, Target, TimeContext, VoiceInfo,
+    HostContext, HostError, IoLayout, MAX_AUX_BUSES, MainThread, NoteEvent, NoteExpression, NoteId,
+    ParamEvent, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
+    Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, Target, TimeContext,
+    VoiceInfo, reclaim_main_thread,
 };
 
 // Window plumbing a host application needs and that no backend owns.
@@ -69,5 +68,6 @@ pub use host_window::{ContainerWindow, Key, Size, forward_key, poll, pump_events
 ///
 /// Idempotent; call it on every thread that will load a plugin.
 pub fn init_thread() {
+    reclaim_main_thread();
     vst3_host::init_apartment();
 }

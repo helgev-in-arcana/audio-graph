@@ -67,13 +67,26 @@ boundary from becoming chatty enough that IPC stops being viable.
 
 ### Main-thread and audio-thread surfaces are different traits
 
-`SubPluginMain` and `SubPluginProcessor` are separate on purpose, and `activate`
-hands out the processor **by value**. Calling `process` on an inactive plugin is
-therefore a compile error rather than a rule written down somewhere, and the
-configuration cannot change while a processor exists.
+`SubPluginMain` and `SubPluginProcessor` are separate. `activate` returns an owned
+`Processor` that retains the native instance, module, and callbacks needed for
+processing. `Processor::deactivate` consumes that activation directly; there is
+no separate destination instance to confuse with the instance that created it.
+An active instance rejects another activation and state restoration.
 
 `SubPluginMain` is deliberately not `Send`: both formats pin these calls to the
 thread that created the instance.
+
+`MainThread<T>` restricts both access and destruction to its creation thread.
+Releasing it, or a `Processor`, from another thread only marks a preallocated
+return record. Hosts call `reclaim_main_thread()` from their main-thread pump
+and during shutdown. Returning a processor on its owner thread reclaims it
+immediately. Processing uses its retained trait pointer directly, without
+reference-count updates or registry lookups.
+
+The owner thread drains returned resources when it exits. Resources still held
+by other threads are retained if their owner exits first: destroying them on an
+arbitrary thread would violate their contract. A normal shutdown returns active
+processors and reclaims them before the owner thread or its host module exits.
 
 ### The host's services are injected, never assumed
 

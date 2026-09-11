@@ -19,6 +19,8 @@
 
 VST3とCLAPを共通化します。
 
+`plugin-host-api` の `Processor` は、稼働に必要な実体・モジュール・コールバックの寿命を保持します。停止はprocessor自身を消費して行い、返却先として別のmain側インスタンスを受け取りません。`MainThread<T>` とprocessorは生成元スレッドで破棄され、他スレッドからの返却は事前確保した記録に保存されます。ホストのmainスレッドは `reclaim_main_thread()` で回収します。所有スレッドが未返却の資源を残して終了した場合は、別スレッドで破棄せず保持するため、通常終了ではprocessorの返却と回収を先に完了させます。
+
 `WebGPU` 規格や `winit` のAPIを参考に、 `plugin-host-api` で全て抽象化しています。各プラグイン規格でAPI実装を行い、 `plugin-host` にすべて集め、公開しています。
 結果として、ノードグラフもCLIもプラグイン規格に依存せず、将来新しい規格が増えても変更は plugin-host の分岐一箇所で済みます。
 
@@ -38,6 +40,8 @@ VST3とCLAPを共通化します。
 コンパイル結果の `Program` は外部から書き換えられず、`ProgramPublisher` が遅延リングを準備して `PreparedProgram` を公開します。`Engine::run_block` がスケジュール初期化とノート入力、パラメーターと音声のステージ実行をまとめて所有します。
 
 `audio-graph-plugin` がエディターと `nice-plug` を使ったプラグイン梱包を担当します。実行時にはDAWの音声・イベント・transportを変換し、ホストされたプラグインの処理器をエンジンへ接続します。
+
+グラフのI/Oやパラメーター対応が変わる場合、製品側が旧processorの使用終了、再設定、Programの公開を統括します。processor構成には必要なProgramの公開番号を記録し、ブロック開始時にその番号以降のProgramを実際に採用できた場合だけ実行します。公開番号は `ProgramPublisher` 内で単調増加し、エンジンの `publication()` が採用済み番号を返します。構成を変えない値の編集ではprocessorを再生成せず、オーディオ用mutexも取得しません。
 
 AudioGraph固有の設定ファイル、探索フォルダー、ピン留め、カタログの保存先は `audio-graph-settings` が所有し、製品とCLIで共有します。`plugin-host` は呼び出し側から渡された探索対象とカタログ保存先を扱います。ブラウザー上の表示分類は `audio-graph-plugin` が決定します。
 

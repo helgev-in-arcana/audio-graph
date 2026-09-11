@@ -16,8 +16,8 @@ use std::sync::Arc;
 use clap_host::{ClapPlugin, Module};
 use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, Event, EventSink, HostContext, NoteEvent,
-    ParamEvent, ParamFlags, ParamId, ProcessStatus, RestartReason, SubPluginMain, Target,
-    TimeContext,
+    ParamEvent, ParamFlags, ParamId, ProcessStatus, RestartReason, SubPluginMain,
+    SubPluginProcessor, Target, TimeContext,
 };
 
 /// Mirrors the fixture's own constants; a drift between the two should fail the
@@ -47,6 +47,113 @@ const NEW_LATENCY: u32 = 128;
 
 #[derive(Default)]
 struct TestHost;
+
+struct LifetimeHost(Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>);
+
+impl HostContext for LifetimeHost {
+    fn host_name(&self) -> &str {
+        "lifetime test"
+    }
+
+    fn request_restart(&self, _reason: RestartReason) {}
+}
+
+impl Drop for LifetimeHost {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().push(std::thread::current().id());
+    }
+}
+
+fn lifecycle_config() -> AudioConfig {
+    AudioConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 32,
+        input_channels: 2,
+        output_channels: 2,
+        aux_inputs: AuxBuses::default(),
+        aux_outputs: AuxBuses::default(),
+        offline: true,
+    }
+}
+
+/// A running processor retains its instance, module, and callbacks after main is dropped.
+#[test]
+fn the_processor_outlives_main_and_returns_to_its_owner() {
+    let module = Module::open(fixture_path()).unwrap();
+    let drops = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let context = Arc::new(LifetimeHost(drops.clone()));
+    let weak = Arc::downgrade(&context);
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", context).unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    drop(plugin);
+    drop(module);
+    assert!(
+        weak.upgrade().is_some(),
+        "the active instance retains its callbacks"
+    );
+
+    std::thread::spawn(move || {
+        let input = [0.5; 64];
+        let mut output = [0.0; 64];
+        let mut sink = EventSink::new();
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
+        assert_eq!(
+            processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+            ProcessStatus::Continue
+        );
+        assert!(output.iter().all(|&sample| sample == 0.5));
+        processor.deactivate();
+    })
+    .join()
+    .unwrap();
+
+    assert!(
+        drops.lock().unwrap().is_empty(),
+        "the audio thread cannot destroy callbacks"
+    );
+    plugin_host_api::reclaim_main_thread();
+    assert!(
+        weak.upgrade().is_none(),
+        "the owner reclaims the complete instance"
+    );
+    assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
+}
+
+/// Returning one activation leaves another instance active and permits its own next activation.
+#[test]
+fn processor_returns_are_bound_to_their_own_activation() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut first = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut second = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let first_processor = first.activate(lifecycle_config()).unwrap();
+    let second_processor = second.activate(lifecycle_config()).unwrap();
+    assert!(first.activate(lifecycle_config()).is_err());
+    assert!(
+        first.load_state(&[]).is_err(),
+        "state cannot replace an active configuration"
+    );
+    std::thread::spawn(move || drop(first_processor))
+        .join()
+        .unwrap();
+    let restarted = first.activate(lifecycle_config()).unwrap();
+    assert!(
+        second.activate(lifecycle_config()).is_err(),
+        "returning first cannot stop second"
+    );
+    restarted.deactivate();
+    second_processor.deactivate();
+}
 
 impl HostContext for TestHost {
     fn host_name(&self) -> &str {
@@ -420,7 +527,7 @@ fn the_backend_drives_a_real_clap_module() {
     // wrote it into the backend's scratch and the caller's region is
     // untouched. Ask for it and it arrives, packed after the main bus the same
     // way an aux *input* is packed after the main one.
-    SubPluginMain::deactivate(&mut plugin, processor);
+    processor.deactivate();
     let two_out = AudioConfig {
         aux_outputs: AuxBuses::new(&[2]),
         ..config
@@ -446,7 +553,7 @@ fn the_backend_drives_a_real_clap_module() {
         "the main bus changed when a second one was asked for: {:?}",
         &main_region[..4]
     );
-    SubPluginMain::deactivate(&mut plugin, processor);
+    processor.deactivate();
     let mut processor = SubPluginMain::activate(&mut plugin, config).expect("activates");
 
     // --- the plugin was told this is an offline render ---------------------
@@ -515,7 +622,7 @@ fn the_backend_drives_a_real_clap_module() {
         &output[..4]
     );
 
-    SubPluginMain::deactivate(&mut plugin, processor);
+    processor.deactivate();
 
     // --- processing, with a sidechain --------------------------------------
 
@@ -542,7 +649,7 @@ fn the_backend_drives_a_real_clap_module() {
         &output[..4]
     );
 
-    SubPluginMain::deactivate(&mut plugin, processor);
+    processor.deactivate();
 
     // --- and a live take is told it is a live take --------------------------
 
@@ -559,7 +666,7 @@ fn the_backend_drives_a_real_clap_module() {
         Some(0.0),
         "the offline mode from the previous activate was never taken back"
     );
-    SubPluginMain::deactivate(&mut plugin, processor);
+    processor.deactivate();
 
     // --- a configuration the plugin cannot have is refused ------------------
 

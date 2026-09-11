@@ -133,7 +133,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     shared.load(&path).expect("reload from the list");
     assert!(shared.main().host.is_loaded(0));
     assert!(
-        shared.audio().processor.is_some(),
+        shared.has_processors(),
         "a load while the DAW is running has to leave the sub-plugin processing; \
          otherwise picking a plugin mid-session silently mutes the track"
     );
@@ -147,10 +147,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         shared.main().host.slots().resolved(0).is_some(),
         "the binding has to resolve against the plugin it was just made from"
     );
-    assert!(
-        shared.audio().processor.is_some(),
-        "still processing after a rebind"
-    );
+    assert!(shared.has_processors(), "still processing after a rebind");
 
     // Every edit writes the state back, so the DAW always has something current
     // to save.
@@ -176,7 +173,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     shared.unload();
     assert!(!shared.main().host.is_loaded(0));
     assert!(
-        shared.audio().processor.is_none(),
+        !shared.has_processors(),
         "unloading has to take the processor with it, or the audio thread keeps \
          a processor whose plugin is gone"
     );
@@ -246,7 +243,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
     // The audio thread's side of the hand-off.
     let mut engine = Engine::new();
     assert!(
-        engine.adopt(shared.programs()),
+        shared.adopt_program(&mut engine),
         "the program has to arrive without a lock"
     );
     assert!(engine.drives_lane(SINK_LANE));
@@ -311,7 +308,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
         "a cycle has to be reported"
     );
     assert!(
-        !engine.adopt(shared.programs()),
+        !shared.adopt_program(&mut engine),
         "nothing new should have been published"
     );
     assert!(

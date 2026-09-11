@@ -118,7 +118,7 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
             let mut adopted = 0usize;
 
             while !stop.load(Ordering::Relaxed) {
-                if engine.adopt(shared.programs()) {
+                if shared.adopt_program(&mut engine) {
                     adopted += 1;
                 }
                 match shared.try_audio() {
@@ -220,12 +220,15 @@ fn the_old_program_is_freed_on_the_main_thread() {
 
     lfo_into(&shared, 1.0);
     shared.publish_graph();
-    assert!(engine.adopt(shared.programs()));
+    assert!(shared.adopt_program(&mut engine));
 
     for rate in 1..64 {
         lfo_into(&shared, rate as f64);
         shared.publish_graph();
-        assert!(engine.adopt(shared.programs()), "rate {rate} never arrived");
+        assert!(
+            shared.adopt_program(&mut engine),
+            "rate {rate} never arrived"
+        );
     }
 
     // The return path is four deep and the audio thread declines rather than
@@ -243,7 +246,7 @@ fn a_graph_that_drives_nothing_leaves_the_daws_automation_alone() {
     shared.publish_graph();
 
     let mut engine = Engine::new();
-    engine.adopt(shared.programs());
+    shared.adopt_program(&mut engine);
     assert!((0..SLOT_COUNT).all(|lane| !engine.drives_lane(lane)));
 
     let mut slots = vec![0.42; SLOT_COUNT];
@@ -268,7 +271,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
     shared.publish_graph();
 
     let mut engine = Engine::new();
-    assert!(engine.adopt(shared.programs()));
+    assert!(shared.adopt_program(&mut engine));
     assert!(engine.drives_lane(SINK_LANE));
 
     // Now the user closes a loop — halfway through rearranging something, and
@@ -298,7 +301,7 @@ fn a_graph_edit_that_does_not_compile_leaves_the_audio_running() {
 
     assert!(shared.patch().compile_error.is_some());
     assert!(
-        !engine.adopt(shared.programs()),
+        !shared.adopt_program(&mut engine),
         "a failed compile must publish nothing"
     );
     assert!(

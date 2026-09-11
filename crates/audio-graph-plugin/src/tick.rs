@@ -82,6 +82,7 @@ pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &Tick
     // with our editor closed — that check never passes, so anything left below
     // it would grow without bound for the life of the instance.
     shared.reclaim();
+    plugin_host::reclaim_main_thread();
 
     if !shared.on_main_thread() {
         // nice-plug runs GUI callbacks on a worker thread when it has no run

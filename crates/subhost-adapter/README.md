@@ -60,6 +60,12 @@ rather than being closed up, because renumbering would repoint every binding
 after it. This holds for `SubHost::instances`, `SubHostProcessors::entries`, and
 the saved `InstanceState` list alike.
 
+The index identifies a slot, not the lifetime of its current occupant.
+Each processor retains its own activation. `SubHostProcessors::deactivate`
+returns those activations directly, so unloading or replacing a slot cannot
+redirect an outstanding processor's return into another instance. A failed group
+activation also returns all processors created before the failure.
+
 ### A binding outlives what it points at
 
 Slot bindings are stored; their *resolution* against a loaded plugin is derived

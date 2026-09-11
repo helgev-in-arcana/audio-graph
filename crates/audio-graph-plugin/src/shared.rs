@@ -64,6 +64,7 @@ pub struct MainState {
     /// activate, like the slot bindings, so a new socket only reaches audio
     /// after a restart.
     pub graph_params: Vec<ParamTarget>,
+    rebind_required: bool,
 }
 
 /// The graph being edited, reachable from whichever thread the editor is on.
@@ -77,20 +78,19 @@ pub struct Patch {
     pub compile_error: Option<String>,
 }
 
-/// The live processor, and the only thing the audio thread ever waits on.
+/// The processor configuration and the earliest publication it can execute.
 pub struct AudioState {
-    /// `Some` between `activate` and `deactivate`, whether or not a sub-plugin
-    /// is loaded — an empty wrapper still runs, it just passes audio through.
-    pub processor: Option<SubHostProcessors>,
+    /// Missing or failed hosted processors are represented by silence through NoInstances.
+    pub(crate) processor: Option<SubHostProcessors>,
+    required_publication: u64,
+    ready: bool,
 }
 
 /// The handle both halves of the plugin hold.
 ///
-/// `main` is declared before `audio`, so Rust drops the sub-plugins *first* —
-/// which is exactly backwards, because a processor holds an interface pointer
-/// into the plugin that produced it. [`Drop`] below hands the processors back
-/// before anything is released; the field order is left alone because relying
-/// on it would be a rule nothing states.
+/// Processor handles retain native resources independently of the main-side
+/// table. Their return paths survive the last shared handle being released on
+/// an executor or audio thread.
 pub struct Shared {
     main: MainThread<RefCell<MainState>>,
     patch: Mutex<Patch>,
@@ -164,12 +164,9 @@ type Task = Box<dyn FnOnce(&Arc<Shared>) + Send>;
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // Hand every processor back before its plugin is released. A DAW always
-        // calls `deactivate` first and this never fires there — but a panic
-        // anywhere between activate and deactivate would otherwise turn into an
-        // access violation during unwinding, which is a much worse thing to
-        // debug than the panic that caused it.
-        self.suspend();
+        // The last Arc can be released by the executor or audio thread. Each
+        // processor carries its own owner-thread return path.
+        self.audio.get_mut().processor.take();
     }
 }
 
@@ -181,12 +178,17 @@ impl Shared {
                 config: None,
                 instance_io: Vec::new(),
                 graph_params: Vec::new(),
+                rebind_required: false,
             })),
             patch: Mutex::new(Patch {
                 graph: Graph::default_patch(),
                 compile_error: None,
             }),
-            audio: Mutex::new(AudioState { processor: None }),
+            audio: Mutex::new(AudioState {
+                processor: None,
+                required_publication: 0,
+                ready: true,
+            }),
             programs: ProgramPublisher::default(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
             // Until the DAW says otherwise. A wrong rate here only makes the
@@ -318,20 +320,41 @@ impl Shared {
         self.editor_open.store(open, Ordering::Relaxed);
     }
 
-    /// Audio-thread access to the processor. Declines rather than waiting.
-    pub fn try_audio(&self) -> Option<parking_lot::MutexGuard<'_, AudioState>> {
+    /// Observes availability without allowing callers to replace the configuration.
+    pub fn try_audio(&self) -> Option<impl std::ops::Deref<Target = AudioState> + '_> {
         self.audio.try_lock()
     }
 
     /// Blocking access, for the rare heavy operations that must not be skipped:
     /// starting a sub-plugin, stopping one, resetting after a transport jump.
     /// None of them happen while audio is flowing normally.
-    pub fn audio(&self) -> parking_lot::MutexGuard<'_, AudioState> {
+    pub(crate) fn audio(&self) -> parking_lot::MutexGuard<'_, AudioState> {
         self.audio.lock()
     }
 
-    pub fn programs(&self) -> &ProgramPublisher {
-        &self.programs
+    /// Attempts to adopt an update while its processor configuration is stable.
+    pub fn adopt_program(&self, engine: &mut audio_graph_engine::Engine) -> bool {
+        let Some(state) = self.try_audio() else {
+            return false;
+        };
+        state.ready && engine.adopt(&self.programs)
+    }
+
+    /// Locks the processor configuration for one block and admits only a matching plan.
+    pub(crate) fn begin_block(
+        &self,
+        engine: &mut audio_graph_engine::Engine,
+    ) -> Option<parking_lot::MutexGuard<'_, AudioState>> {
+        let state = self.audio.try_lock()?;
+        if !state.ready {
+            return None;
+        }
+        engine.adopt(&self.programs);
+        (engine.publication() >= state.required_publication).then_some(state)
+    }
+
+    pub fn has_processors(&self) -> bool {
+        self.audio().processor.is_some()
     }
 
     pub fn params(&self) -> &Arc<WrapperParams> {
@@ -403,81 +426,80 @@ impl Shared {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Compile the current graph, hand it to the audio thread, and re-activate
-    /// the sub-plugins if their buses moved with it.
-    ///
-    /// Called after every edit. A graph that will not compile leaves the last
-    /// working program running and records why, because the alternative —
-    /// silence, or the DAW's raw automation reappearing — would make the
-    /// editor's own error message the second thing the user noticed.
+    /// Publishes a valid graph while retaining the last runnable graph on compile failure.
     pub fn publish_graph(&self) {
-        if self.send_program()
-            && let Err(e) = self.rebind()
-        {
-            log::warn!("audio-graph: re-activating for new buses: {e}");
+        if let Err(error) = self.publish(false) {
+            log::warn!("audio-graph: graph publication failed: {error}");
         }
     }
 
-    /// Compile the current graph and hand it to the audio thread, with every
-    /// delay line's ring allocated afresh.
-    ///
-    /// For an activation, the publisher's history cannot be trusted: a
-    /// program waiting in the handoff when the DAW deactivates us is dropped
-    /// unread. A line the history calls unchanged would then arrive with no
-    /// ring at all, and a delay with no buffer to read is a delay that repeats
-    /// nothing.
-    pub(crate) fn send_fresh_program(&self) {
+    pub(crate) fn activate(&self, config: AudioConfig) -> Result<(), String> {
+        self.main().config = Some(config);
         self.programs.reset();
-        self.send_program();
+        self.publish(true)
     }
 
-    /// Compile the current graph and hand it to the audio thread.
-    ///
-    /// Returns whether the sub-plugins' buses or parameter targets moved with
-    /// it. Acting on that is [`Shared::rebind`]'s job, and a caller that is
-    /// about to activate them itself has nothing to do about it. `false` also
-    /// when the graph would not compile: nothing was sent, so nothing has to
-    /// be activated against it.
-    fn send_program(&self) -> bool {
-        // Copied, then compiled with nothing held. The editor draws under this
-        // same lock on its own thread, so holding it across a compile would
-        // cost it a frame every time the user drags a control — which is
-        // exactly when compiles happen.
-        let graph = self.patch().graph.clone();
-        let compiled = compile(&graph, SLOT_COUNT);
+    pub(crate) fn deactivate(&self) {
+        self.suspend();
+        self.main().config = None;
+    }
 
-        // One guard for the answer, so that the error and the graph it is about
-        // cannot be separated by an edit landing in between.
-        let program = {
-            let mut patch = self.patch();
-            match compiled {
-                Ok(program) => {
-                    patch.compile_error = None;
-                    program
-                }
-                Err(e) => {
-                    patch.compile_error = Some(e.to_string());
-                    return false;
-                }
+    fn compile_program(&self) -> Result<audio_graph_engine::Program, String> {
+        let graph = self.patch().graph.clone();
+        let compiled = compile(&graph, SLOT_COUNT).map_err(|error| error.to_string());
+        self.patch().compile_error = compiled.as_ref().err().cloned();
+        compiled
+    }
+
+    fn publish(&self, force_rebind: bool) -> Result<(), String> {
+        let mut program = self.compile_program()?;
+        let rebuild = {
+            let state = self.main();
+            force_rebind
+                || state.rebind_required
+                || state.instance_io != program.instances()
+                || state.graph_params != program.param_targets()
+        };
+        if !rebuild {
+            self.latency.store(program.latency(), Ordering::Relaxed);
+            self.programs
+                .publish(program, f64::from(self.sample_rate()));
+            return Ok(());
+        }
+
+        // Taking the processors waits for any block already using them. Until a
+        // complete replacement is installed, begin_block cannot run either plan.
+        self.suspend();
+        let activated = {
+            let mut state = self.main();
+            state.instance_io = program.instances().to_vec();
+            state.graph_params = program.param_targets().to_vec();
+            match state.config.filter(|_| state.host.any_loaded()) {
+                Some(config) => state
+                    .host
+                    .activate(config, program.instances(), program.param_targets())
+                    .map(Some),
+                None => Ok(None),
             }
         };
-
+        if self.refresh_latencies() {
+            program = self.compile_program()?;
+        }
         self.latency.store(program.latency(), Ordering::Relaxed);
-
-        let mut state = self.main();
-        // The publisher allocates delay rings here, on the main thread, and
-        // carries them inside the prepared program because the audio thread may
-        // not allocate. A graph edit can change which buses a sub-plugin needs:
-        // wiring a sidechain does that, and a bus cannot be switched on while the
-        // plugin is active. Whether the change has to be acted on is
-        // `rebind`'s decision; recording it is this one's.
-        let changed = state.instance_io != program.instances()
-            || state.graph_params != program.param_targets();
-        state.instance_io = program.instances().to_vec();
-        state.graph_params = program.param_targets().to_vec();
-        self.programs
+        let publication = self
+            .programs
             .publish(program, f64::from(self.sample_rate()));
-        changed
+        let (processor, result) = match activated {
+            Ok(processor) => (processor, Ok(())),
+            Err(error) => (None, Err(error)),
+        };
+        self.main().rebind_required = result.is_err();
+        *self.audio() = AudioState {
+            processor,
+            required_publication: publication,
+            ready: true,
+        };
+        result
     }
 
     /// Free anything the audio thread has handed back. Main thread, called from
@@ -499,11 +521,24 @@ impl Shared {
     /// where the sockets appear a moment later. A node whose plugin fails to
     /// load simply keeps no sockets, and says so.
     pub fn load_into(&self, instance: usize, path: &Path) -> Result<(), String> {
+        self.with_stopped_host(|host| host.load(instance, path, None))
+    }
+
+    /// Restores a sub-plugin's state with no processor concurrently using its configuration.
+    pub fn load_sub_state(&self, instance: usize, data: &[u8]) -> Result<(), String> {
+        self.with_stopped_host(|host| host.load_sub_state(instance, data))
+    }
+
+    fn with_stopped_host<T>(
+        &self,
+        edit: impl FnOnce(&mut SubHost) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.suspend();
-        let result = self.main().host.load(instance, path, None);
+        let result = edit(&mut self.main().host);
         let resumed = self.resume();
-        result?;
-        resumed
+        let value = result?;
+        resumed?;
+        Ok(value)
     }
 
     /// Give a patch that has no graph the one it was implicitly running.
@@ -649,45 +684,30 @@ impl Shared {
     }
 
     pub fn unload_instance(&self, instance: usize) {
-        self.suspend();
-        self.main().host.unload(instance);
-        let _ = self.resume();
+        let _ = self.with_stopped_host(|host| {
+            host.unload(instance);
+            Ok(())
+        });
     }
 
     /// Re-activate after something the processor caches has changed — the slot
     /// bindings, which are read once at activate.
     pub fn rebind(&self) -> Result<(), String> {
-        self.suspend();
-        self.resume()
+        self.publish(true)
     }
 
-    /// Stop the sub-plugin's processing, if it is running.
     fn suspend(&self) {
-        let processor = self.audio().processor.take();
-        if let Some(processor) = processor {
-            self.main().host.deactivate(processor);
-        }
+        self.main().rebind_required = true;
+        let processor = {
+            let mut state = self.audio();
+            state.ready = false;
+            state.processor.take()
+        };
+        drop(processor);
     }
 
-    /// Start it again under the configuration the DAW last gave us.
-    ///
-    /// A failure here is reported but not fatal: the wrapper falls back to
-    /// passing audio through, which is much better than the DAW deciding the
-    /// whole track is broken.
     fn resume(&self) -> Result<(), String> {
-        let mut state = self.main();
-        if !state.host.any_loaded() {
-            return Ok(());
-        }
-        let Some(config) = state.config else {
-            return Ok(());
-        };
-        let io = state.instance_io.clone();
-        let graph_params = state.graph_params.clone();
-        let processor = state.host.activate(config, &io, &graph_params)?;
-        drop(state);
-        self.audio().processor = Some(processor);
-        Ok(())
+        self.publish(true)
     }
 
     /// Serialise the sub-plugin, the slot table and the graph into the
@@ -758,6 +778,56 @@ mod tests {
             SubHost::new(Arc::new(SilentHost), SUB_HOST),
             WrapperParams::new(),
         )
+    }
+
+    /// A replacement configuration cannot run a program left from an older configuration.
+    #[test]
+    fn a_block_waits_until_the_required_publication_is_adopted() {
+        let shared = shared();
+        let mut engine = audio_graph_engine::Engine::new();
+        shared.publish_graph();
+        assert!(shared.begin_block(&mut engine).is_some());
+        let previous = engine.publication();
+
+        shared.audio().required_publication = previous + 1;
+        assert!(shared.begin_block(&mut engine).is_none());
+        assert_eq!(engine.publication(), previous);
+
+        shared.publish_graph();
+        assert!(shared.begin_block(&mut engine).is_some());
+        assert!(engine.publication() > previous);
+    }
+
+    /// A suspended configuration never runs, even if a newer plan is waiting.
+    #[test]
+    fn suspension_excludes_plan_adoption_and_execution() {
+        let shared = shared();
+        let mut engine = audio_graph_engine::Engine::new();
+        shared.publish_graph();
+        drop(shared.begin_block(&mut engine).unwrap());
+        let previous = engine.publication();
+        shared.suspend();
+        shared
+            .programs
+            .publish(shared.compile_program().unwrap(), 48_000.0);
+        assert!(shared.begin_block(&mut engine).is_none());
+        assert_eq!(engine.publication(), previous);
+        shared.resume().unwrap();
+        assert!(shared.begin_block(&mut engine).is_some());
+        assert!(engine.publication() > previous);
+    }
+
+    /// A valid edit can rebuild a suspended configuration with unchanged routing.
+    #[test]
+    fn publishing_after_suspension_rebuilds_the_configuration() {
+        let shared = shared();
+        let mut engine = audio_graph_engine::Engine::new();
+        shared.publish_graph();
+        drop(shared.begin_block(&mut engine).unwrap());
+        shared.suspend();
+        shared.publish_graph();
+        assert!(shared.begin_block(&mut engine).is_some());
+        assert!(!shared.main().rebind_required);
     }
 
     /// The wrapper's own last word on the state is not mistaken for the DAW's.

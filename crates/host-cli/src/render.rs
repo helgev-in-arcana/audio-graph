@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use plugin_host::{
     AudioBuffers, AudioConfig, BufferLayout, ClassInfo, Event, EventSink, NoteEvent, Plugin,
-    ProcessStatus, SubPluginMain, TimeContext,
+    ProcessStatus, SubPluginMain, SubPluginProcessor, TimeContext,
 };
 
 use crate::host::CliHost;
@@ -180,7 +180,7 @@ pub fn render_with_state(
         let status = processor.process(&mut buffers, &block_events, &context, &mut sink);
         emitted.extend_from_slice(sink.events());
         if status == ProcessStatus::Error {
-            plugin.deactivate(processor);
+            processor.deactivate();
             return Err(format!("plugin returned an error at sample {position}"));
         }
 
@@ -194,7 +194,7 @@ pub fn render_with_state(
         blocks += 1;
     }
 
-    plugin.deactivate(processor);
+    processor.deactivate();
 
     Ok(RenderOutcome {
         audio: output,

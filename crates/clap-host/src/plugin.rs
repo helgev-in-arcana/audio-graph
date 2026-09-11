@@ -56,8 +56,9 @@ use clap_sys::process::{
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
-    IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus, Result,
-    SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
+    IoLayout, MainThread, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
+    Processor, Result, SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
+    reclaim_main_thread,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -111,13 +112,7 @@ enum Binding {
 
 /// A loaded, initialised CLAP plugin instance. Main thread only.
 pub struct ClapPlugin {
-    /// Keeps the module (and therefore the code behind every pointer below)
-    /// alive for as long as the instance exists.
-    _module: Rc<ModuleInner>,
-    /// Declared before `plugin` so it outlives it: the instance holds the raw
-    /// pointer it was created with and may call back during `destroy`.
-    host: Box<HostShim>,
-    plugin: *const clap_plugin,
+    instance: Arc<MainThread<ClapInstance>>,
 
     class: ClassInfo,
     params: Vec<ParamInfo>,
@@ -145,7 +140,6 @@ pub struct ClapPlugin {
     /// The plugin's embedded GUI editor instance, if open.
     editor: Option<ClapEditor>,
 
-    active: Cell<bool>,
     latency: Cell<u32>,
     /// Last answer from `clap.voice-info`, re-read when the plugin says it
     /// changed. `None` when the plugin does not implement the extension.
@@ -244,9 +238,12 @@ impl ClapPlugin {
             unsafe { read_note_ports(plugin, ext_note_ports) };
 
         Ok(ClapPlugin {
-            _module: module.handle(),
-            host,
-            plugin,
+            instance: Arc::new(MainThread::new(ClapInstance {
+                plugin,
+                active: Cell::new(false),
+                host,
+                _module: module.handle(),
+            })),
             class,
             params,
             ports,
@@ -262,7 +259,6 @@ impl ClapPlugin {
             ext_voice_info,
             ext_ports_activation,
             editor: None,
-            active: Cell::new(false),
             latency: Cell::new(0),
             voices: Cell::new(unsafe { read_voice_info(plugin, ext_voice_info) }),
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EVENTS_PER_BLOCK))),
@@ -295,7 +291,7 @@ impl ClapPlugin {
             .filter(|id| {
                 // Safety: the instance is live for as long as `self` is, and
                 // `get_extension` is a main-thread call, which this is.
-                !unsafe { extension::<()>(self.plugin, id) }.is_null()
+                !unsafe { extension::<()>(self.instance.get().plugin, id) }.is_null()
             })
             .map(|id| id.to_str().expect("the ids are ASCII literals"))
             .collect()
@@ -329,7 +325,8 @@ impl ClapPlugin {
 
     /// Whether the open editor can be resized by the user.
     pub fn editor_can_resize(&self) -> bool {
-        !self.ext_gui.is_null() && unsafe { crate::gui::can_resize(self.plugin, self.ext_gui) }
+        !self.ext_gui.is_null()
+            && unsafe { crate::gui::can_resize(self.instance.get().plugin, self.ext_gui) }
     }
 
     /// Open the plugin's own editor in a top-level window.
@@ -351,7 +348,8 @@ impl ClapPlugin {
         let title = self.class.name.clone();
         // SAFETY: both pointers belong to this instance, and `self.editor` is
         // dropped in `Drop` before `destroy` runs.
-        let editor = unsafe { ClapEditor::open(self.plugin, self.ext_gui, &title, owner) }?;
+        let editor =
+            unsafe { ClapEditor::open(self.instance.get().plugin, self.ext_gui, &title, owner) }?;
         self.editor = Some(editor);
         Ok(())
     }
@@ -377,13 +375,13 @@ impl ClapPlugin {
     /// `subhost-adapter` calls on every frame, and skipping it makes an editor
     /// look frozen — plugins repaint from a timer, not from a paint message.
     pub fn tick(&mut self) {
-        let requests = self.host.take_requests();
+        let requests = self.instance.get().host.take_requests();
         self.apply(requests);
-        self.host.tick_timers();
+        self.instance.get().host.tick_timers();
         // Beside the timers, and for the same reason: on Linux a plugin's
         // toolkit waits on descriptors the host has to poll for it.
         #[cfg(all(unix, not(target_os = "macos")))]
-        self.host.tick_fds();
+        self.instance.get().host.tick_fds();
 
         if let Some(editor) = self.editor.as_mut() {
             editor.sync_size();
@@ -396,25 +394,25 @@ impl ClapPlugin {
     /// Act on everything the plugin asked for since the last tick.
     fn apply(&mut self, requests: PendingRequests) {
         if requests.callback
-            && let Some(on_main_thread) = unsafe { (*self.plugin).on_main_thread }
+            && let Some(on_main_thread) = unsafe { (*self.instance.get().plugin).on_main_thread }
         {
-            unsafe { on_main_thread(self.plugin) };
+            unsafe { on_main_thread(self.instance.get().plugin) };
         }
 
         if requests.param_rescan != 0 {
             // Re-read wholesale rather than by flag: the list is small, and
             // reading half of it because only `TEXT` was set is how a stale
             // range survives a plugin update.
-            self.params = unsafe { read_params(self.plugin, self.ext_params) };
+            self.params = unsafe { read_params(self.instance.get().plugin, self.ext_params) };
         }
 
         if requests.voice_info {
             self.voices
-                .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
+                .set(unsafe { read_voice_info(self.instance.get().plugin, self.ext_voice_info) });
         }
 
         if requests.latency {
-            let latency = unsafe { read_latency(self.plugin, self.ext_latency) };
+            let latency = unsafe { read_latency(self.instance.get().plugin, self.ext_latency) };
             if latency != self.latency.get() {
                 self.latency.set(latency);
                 self.context.latency_changed(latency);
@@ -465,8 +463,15 @@ impl ClapPlugin {
                 // The sample size is the buffer's, in bits, and zero when the
                 // port is being turned off. This backend is `f32` throughout.
                 let sample_size = if active { 32 } else { 0 };
-                let ok =
-                    unsafe { set_active(self.plugin, is_input, index as u32, active, sample_size) };
+                let ok = unsafe {
+                    set_active(
+                        self.instance.get().plugin,
+                        is_input,
+                        index as u32,
+                        active,
+                        sample_size,
+                    )
+                };
                 if !ok {
                     // Refusing is allowed, and means the port stays as it was.
                     // Nothing downstream depends on the answer: the buffers are
@@ -510,7 +515,7 @@ impl ClapPlugin {
         };
         if offline
             && let Some(hard) = unsafe { (*self.ext_render).has_hard_realtime_requirement }
-            && unsafe { hard(self.plugin) }
+            && unsafe { hard(self.instance.get().plugin) }
         {
             log::debug!(
                 "{}: has a hard realtime requirement; left in realtime mode",
@@ -524,7 +529,7 @@ impl ClapPlugin {
         } else {
             CLAP_RENDER_REALTIME
         };
-        if !unsafe { set(self.plugin, mode) } {
+        if !unsafe { set(self.instance.get().plugin, mode) } {
             // Refusing is allowed and costs nothing: the plugin simply renders
             // the way it always does.
             log::debug!("{}: refused render mode {mode}", self.class.name);
@@ -537,7 +542,7 @@ impl ClapPlugin {
     /// drains the same queue, so this must not be called then — CLAP says
     /// `flush` and `process` may never overlap.
     fn flush_params(&self) {
-        if self.ext_params.is_null() || self.active.get() {
+        if self.ext_params.is_null() || self.instance.get().active.get() {
             return;
         }
         let Some(flush) = (unsafe { (*self.ext_params).flush }) else {
@@ -563,7 +568,7 @@ impl ClapPlugin {
         drop(pending);
         let in_raw = input.as_raw();
         let out_raw = output.as_raw();
-        unsafe { flush(self.plugin, in_raw, out_raw) };
+        unsafe { flush(self.instance.get().plugin, in_raw, out_raw) };
         output.clear();
     }
 }
@@ -613,10 +618,12 @@ impl SubPluginMain for ClapPlugin {
                 .iter()
                 .filter_map(|p| {
                     let mut value = 0.0;
-                    unsafe { get_value(self.plugin, p.id.0, &mut value) }.then_some(ParamValue {
-                        id: p.id,
-                        plain: value,
-                    })
+                    unsafe { get_value(self.instance.get().plugin, p.id.0, &mut value) }.then_some(
+                        ParamValue {
+                            id: p.id,
+                            plain: value,
+                        },
+                    )
                 })
                 .collect(),
         }
@@ -628,8 +635,16 @@ impl SubPluginMain for ClapPlugin {
         }
         let to_text = unsafe { (*self.ext_params).value_to_text }?;
         let mut buf = vec![0 as c_char; PARAM_TEXT_CAPACITY];
-        unsafe { to_text(self.plugin, id.0, plain, buf.as_mut_ptr(), buf.len() as u32) }
-            .then(|| from_char_array(&buf))
+        unsafe {
+            to_text(
+                self.instance.get().plugin,
+                id.0,
+                plain,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        }
+        .then(|| from_char_array(&buf))
     }
 
     fn param_from_text(&self, id: ParamId, text: &str) -> Option<f64> {
@@ -639,7 +654,15 @@ impl SubPluginMain for ClapPlugin {
         let from_text = unsafe { (*self.ext_params).text_to_value }?;
         let c_text = CString::new(text).ok()?;
         let mut value = 0.0;
-        unsafe { from_text(self.plugin, id.0, c_text.as_ptr(), &mut value) }.then_some(value)
+        unsafe {
+            from_text(
+                self.instance.get().plugin,
+                id.0,
+                c_text.as_ptr(),
+                &mut value,
+            )
+        }
+        .then_some(value)
     }
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
@@ -668,13 +691,19 @@ impl SubPluginMain for ClapPlugin {
             .ok_or_else(|| HostError::State("the plugin's state extension has no save".into()))?;
         let mut stream = OutStream::new();
         let raw = stream.as_raw();
-        if !unsafe { save(self.plugin, raw) } {
+        if !unsafe { save(self.instance.get().plugin, raw) } {
             return Err(HostError::State("clap_plugin_state::save failed".into()));
         }
         Ok(stream.into_bytes())
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        reclaim_main_thread();
+        if self.instance.get().active.get() {
+            return Err(HostError::InvalidState(
+                "state restoration requires an inactive plugin",
+            ));
+        }
         if self.ext_state.is_null() {
             return if data.is_empty() {
                 Ok(())
@@ -688,7 +717,7 @@ impl SubPluginMain for ClapPlugin {
             .ok_or_else(|| HostError::State("the plugin's state extension has no load".into()))?;
         let mut stream = InStream::new(data);
         let raw = stream.as_raw();
-        if !unsafe { load(self.plugin, raw) } {
+        if !unsafe { load(self.instance.get().plugin, raw) } {
             return Err(HostError::State("clap_plugin_state::load failed".into()));
         }
         // The blob is newer than any edit made before it, so nothing may be
@@ -704,8 +733,9 @@ impl SubPluginMain for ClapPlugin {
         self.latency.get()
     }
 
-    fn activate(&mut self, config: AudioConfig) -> Result<Box<dyn SubPluginProcessor>> {
-        if self.active.get() {
+    fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
+        reclaim_main_thread();
+        if self.instance.get().active.get() {
             return Err(HostError::InvalidState("plugin is already active"));
         }
         // Anything queued while inactive has to reach the plugin before it
@@ -736,39 +766,53 @@ impl SubPluginMain for ClapPlugin {
         self.set_port_activation(&plan);
         self.set_render_mode(config.offline);
 
-        let activate = unsafe { (*self.plugin).activate }.ok_or_else(|| HostError::Backend {
-            context: "clap_plugin::activate is null".into(),
-            code: 0,
+        let activate = unsafe { (*self.instance.get().plugin).activate }.ok_or_else(|| {
+            HostError::Backend {
+                context: "clap_plugin::activate is null".into(),
+                code: 0,
+            }
         })?;
         // Activate with minimum block size of 1 frame up to max_block_size.
-        if !unsafe { activate(self.plugin, config.sample_rate, 1, config.max_block_size) } {
+        if !unsafe {
+            activate(
+                self.instance.get().plugin,
+                config.sample_rate,
+                1,
+                config.max_block_size,
+            )
+        } {
             return Err(HostError::UnsupportedBusConfig(format!(
                 "the plugin refused {} Hz with blocks up to {} frames",
                 config.sample_rate, config.max_block_size
             )));
         }
-        self.active.set(true);
+        self.instance.get().active.set(true);
 
         // Voice counts often are not knowable until the plugin has a patch and
         // a sample rate — Surge XT answers `false` before that — so this is
         // re-read here as well as when the plugin says it changed.
         self.voices
-            .set(unsafe { read_voice_info(self.plugin, self.ext_voice_info) });
+            .set(unsafe { read_voice_info(self.instance.get().plugin, self.ext_voice_info) });
 
         // Latency is only meaningful once activated, which is why it is read
         // here rather than at construction.
-        let latency = unsafe { read_latency(self.plugin, self.ext_latency) };
+        let latency = unsafe { read_latency(self.instance.get().plugin, self.ext_latency) };
         self.latency.set(latency);
 
-        if let Some(start) = unsafe { (*self.plugin).start_processing }
-            && !unsafe { start(self.plugin) }
-        {
+        let started = match unsafe { (*self.instance.get().plugin).start_processing } {
+            Some(start) => {
+                let _guard = AudioThreadGuard::enter();
+                unsafe { start(self.instance.get().plugin) }
+            }
+            None => true,
+        };
+        if !started {
             unsafe {
-                if let Some(deactivate) = (*self.plugin).deactivate {
-                    deactivate(self.plugin);
+                if let Some(deactivate) = (*self.instance.get().plugin).deactivate {
+                    deactivate(self.instance.get().plugin);
                 }
             }
-            self.active.set(false);
+            self.instance.get().active.set(false);
             return Err(HostError::Backend {
                 context: "clap_plugin::start_processing".into(),
                 code: 0,
@@ -777,39 +821,39 @@ impl SubPluginMain for ClapPlugin {
 
         self.context.latency_changed(latency);
 
-        Ok(Box::new(ClapProcessor::new(
-            self.plugin,
+        Ok(Processor::new(ClapProcessor::new(
+            self.instance.get().plugin,
             config,
             plan,
             Arc::clone(&self.pending_edits),
+            Arc::clone(&self.instance),
         )))
-    }
-
-    fn deactivate(&mut self, processor: Box<dyn SubPluginProcessor>) {
-        // Dropped first, so nothing is still holding buffers the plugin is
-        // about to be told it no longer has.
-        drop(processor);
-        unsafe {
-            if let Some(stop) = (*self.plugin).stop_processing {
-                stop(self.plugin);
-            }
-            if let Some(deactivate) = (*self.plugin).deactivate {
-                deactivate(self.plugin);
-            }
-        }
-        self.active.set(false);
     }
 }
 
 impl Drop for ClapPlugin {
     fn drop(&mut self) {
-        // The editor is closed before instance destruction.
         self.editor = None;
+    }
+}
 
+struct ClapInstance {
+    plugin: *const clap_plugin,
+    active: Cell<bool>,
+    host: Box<HostShim>,
+    // The host callback and native instance must be gone before their code is unloaded.
+    _module: Rc<ModuleInner>,
+}
+
+impl ClapInstance {
+    fn deactivate(&self) {
         if self.active.get() {
             unsafe {
-                if let Some(stop) = (*self.plugin).stop_processing {
-                    stop(self.plugin);
+                {
+                    let _guard = AudioThreadGuard::enter();
+                    if let Some(stop) = (*self.plugin).stop_processing {
+                        stop(self.plugin);
+                    }
                 }
                 if let Some(deactivate) = (*self.plugin).deactivate {
                     deactivate(self.plugin);
@@ -817,13 +861,17 @@ impl Drop for ClapPlugin {
             }
             self.active.set(false);
         }
+    }
+}
+
+impl Drop for ClapInstance {
+    fn drop(&mut self) {
+        self.deactivate();
         unsafe {
             if let Some(destroy) = (*self.plugin).destroy {
                 destroy(self.plugin);
             }
         }
-        // `host` drops after this, which is why it is declared before `plugin`:
-        // the instance may call back into it while destroying.
     }
 }
 
@@ -962,6 +1010,7 @@ pub struct ClapProcessor {
     /// Samples processed since activation, which is what CLAP's `steady_time`
     /// means. `-1` would mean "the host does not know", and we do.
     steady_time: i64,
+    instance: Arc<MainThread<ClapInstance>>,
 }
 
 // SAFETY: CLAP designates `process` as the audio-thread call; the whole point
@@ -976,6 +1025,7 @@ impl ClapProcessor {
         config: AudioConfig,
         plan: BindingPlan,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+        instance: Arc<MainThread<ClapInstance>>,
     ) -> ClapProcessor {
         let frames = config.max_block_size as usize;
         let in_channels: usize = plan.inputs.iter().map(|(c, _)| *c as usize).sum();
@@ -996,7 +1046,14 @@ impl ClapProcessor {
             out_events: OutputEvents::new(MAX_EVENTS_PER_BLOCK),
             pending_edits,
             steady_time: 0,
+            instance,
         }
+    }
+}
+
+impl Drop for ClapProcessor {
+    fn drop(&mut self) {
+        self.instance.get().deactivate();
     }
 }
 

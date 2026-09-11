@@ -22,9 +22,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use plugin_host_api::{
-    AudioBuffers, AudioConfig, Capabilities, Event, EventSink, HostContext, HostError, ParamFlags,
-    ParamId, ParamInfo, ParamSnapshot, ParamValue as ApiParamValue, ProcessStatus, Result,
-    SubPluginMain, SubPluginProcessor, TimeContext,
+    AudioBuffers, AudioConfig, Capabilities, Event, EventSink, HostContext, HostError, MainThread,
+    ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue as ApiParamValue, ProcessStatus,
+    Processor, Result, SubPluginMain, SubPluginProcessor, TimeContext, reclaim_main_thread,
 };
 use vst3::Steinberg::Vst::{
     IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentHandler, IComponentTrait,
@@ -72,27 +72,8 @@ const MAX_EVENTS_PER_BLOCK: usize = 2048;
 
 /// A loaded, initialised VST3 plugin instance. Main thread only.
 pub struct Vst3Plugin {
-    /// Keeps the module (and therefore the code these vtables point into)
-    /// alive for as long as any instance exists.
-    _module: Rc<ModuleInner>,
-    /// Same reason: the plugin holds raw pointers to these host objects.
-    _host_app: ComWrapper<HostApplication>,
-    _handler: ComWrapper<ComponentHandler>,
-
-    component: ComPtr<IComponent>,
-    processor: ComPtr<IAudioProcessor>,
-    controller: Option<ComPtr<IEditController>>,
-    /// Whether the controller is a distinct object from the component.
-    ///
-    /// A plugin may implement both interfaces on one object. When it does,
-    /// `initialize` and `terminate` must each be called exactly once for that
-    /// object — calling them a second time through the controller interface
-    /// leaves the plugin half torn down, and the next instantiation from the
-    /// same module faults.
-    controller_is_separate: bool,
-    /// The processor/controller connection, kept so it can be torn down in the
-    /// right order.
-    connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
+    instance: Arc<MainThread<Vst3Instance>>,
+    _main_thread: std::marker::PhantomData<Rc<()>>,
 
     params: Vec<ParamInfo>,
     /// Main-thread parameter edits waiting to be delivered to the processor.
@@ -107,8 +88,6 @@ pub struct Vst3Plugin {
     /// *tries* to lock: an edit that loses the race is delivered one block
     /// later rather than blocking the callback.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
-    /// True once `activate` has handed out a processor.
-    active: RefCell<bool>,
     latency: RefCell<u32>,
     context: Arc<dyn HostContext>,
 }
@@ -162,17 +141,20 @@ impl Vst3Plugin {
         let params = controller.as_ref().map(read_params).unwrap_or_default();
 
         Ok(Vst3Plugin {
-            _module: module.handle(),
-            _host_app: host_app,
-            _handler: handler,
-            component,
-            processor,
-            controller,
-            controller_is_separate,
-            connection,
+            _main_thread: std::marker::PhantomData,
+            instance: Arc::new(MainThread::new(Vst3Instance {
+                connection,
+                controller,
+                processor,
+                component,
+                _handler: handler,
+                _host_app: host_app,
+                _module: module.handle(),
+                controller_is_separate,
+                active: RefCell::new(false),
+            })),
             params,
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES))),
-            active: RefCell::new(false),
             latency: RefCell::new(0),
             context,
         })
@@ -256,18 +238,21 @@ impl Vst3Plugin {
         use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
 
         // Arrangements may only be set while deactivated.
-        if *self.active.borrow() {
+        if *self.instance.get().active.borrow() {
             return;
         }
         let audio = MediaTypes_::kAudio as i32;
         let current = |dir: i32| -> Vec<SpeakerArrangement> {
-            let count = unsafe { self.component.getBusCount(audio, dir) };
+            let count = unsafe { self.instance.get().component.getBusCount(audio, dir) };
             (0..count.max(0))
                 .map(|index| {
                     let mut arrangement: SpeakerArrangement = 0;
                     unsafe {
-                        self.processor
-                            .getBusArrangement(dir, index, &mut arrangement)
+                        self.instance.get().processor.getBusArrangement(
+                            dir,
+                            index,
+                            &mut arrangement,
+                        )
                     };
                     arrangement
                 })
@@ -286,7 +271,7 @@ impl Vst3Plugin {
             }
         }
         unsafe {
-            self.processor.setBusArrangements(
+            self.instance.get().processor.setBusArrangements(
                 inputs.as_mut_ptr(),
                 inputs.len() as i32,
                 outputs.as_mut_ptr(),
@@ -308,12 +293,16 @@ impl Vst3Plugin {
         self.prefer_stereo_main_buses();
 
         let buses = |media: i32, dir: i32| -> Vec<plugin_host_api::BusInfo> {
-            let count = unsafe { self.component.getBusCount(media, dir) };
+            let count = unsafe { self.instance.get().component.getBusCount(media, dir) };
             (0..count.max(0))
                 .filter_map(|index| {
                     let mut info: vst3::Steinberg::Vst::BusInfo = unsafe { std::mem::zeroed() };
-                    if unsafe { self.component.getBusInfo(media, dir, index, &mut info) }
-                        != kResultOk
+                    if unsafe {
+                        self.instance
+                            .get()
+                            .component
+                            .getBusInfo(media, dir, index, &mut info)
+                    } != kResultOk
                     {
                         return None;
                     }
@@ -342,14 +331,23 @@ impl Vst3Plugin {
     pub fn bus_channel_counts(&self) -> (u32, u32) {
         use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_};
         let count = |dir: i32| -> u32 {
-            let n = unsafe { self.component.getBusCount(MediaTypes_::kAudio as i32, dir) };
+            let n = unsafe {
+                self.instance
+                    .get()
+                    .component
+                    .getBusCount(MediaTypes_::kAudio as i32, dir)
+            };
             if n <= 0 {
                 return 0;
             }
             let mut info: vst3::Steinberg::Vst::BusInfo = unsafe { std::mem::zeroed() };
             if unsafe {
-                self.component
-                    .getBusInfo(MediaTypes_::kAudio as i32, dir, 0, &mut info)
+                self.instance.get().component.getBusInfo(
+                    MediaTypes_::kAudio as i32,
+                    dir,
+                    0,
+                    &mut info,
+                )
             } == kResultOk
             {
                 info.channelCount.max(0) as u32
@@ -379,8 +377,8 @@ impl Vst3Plugin {
 
         macro_rules! probe {
             ($($i:ident),* $(,)?) => {$(
-                if self.component.cast::<$i>().is_some()
-                    || self.controller.as_ref().is_some_and(|c| c.cast::<$i>().is_some())
+                if self.instance.get().component.cast::<$i>().is_some()
+                    || self.instance.get().controller.as_ref().is_some_and(|c| c.cast::<$i>().is_some())
                 {
                     found.push(stringify!($i));
                 }
@@ -428,7 +426,7 @@ impl Vst3Plugin {
     /// The caller owns the returned view and must tear it down in the required
     /// order; `vst3_host_view::EditorWindow` does exactly that.
     pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
-        let controller = self.controller.as_ref()?;
+        let controller = self.instance.get().controller.as_ref()?;
         // "editor" is the only view name VST3 defines.
         let name = c"editor";
         let ptr = unsafe { controller.createView(name.as_ptr()) };
@@ -442,7 +440,9 @@ impl Vst3Plugin {
     }
 
     fn controller(&self) -> Result<&ComPtr<IEditController>> {
-        self.controller
+        self.instance
+            .get()
+            .controller
             .as_ref()
             .ok_or(HostError::InvalidState("plugin has no edit controller"))
     }
@@ -463,7 +463,7 @@ impl SubPluginMain for Vst3Plugin {
         Capabilities {
             modulation: false,
             poly_modulation: false,
-            note_expression: self.controller.as_ref().is_some_and(|c| {
+            note_expression: self.instance.get().controller.as_ref().is_some_and(|c| {
                 c.cast::<vst3::Steinberg::Vst::INoteExpressionController>()
                     .is_some()
             }),
@@ -541,13 +541,13 @@ impl SubPluginMain for Vst3Plugin {
             let stream = MemoryStream::empty();
             let ptr = com_ref_ptr::<_, vst3::Steinberg::IBStream>(&stream);
             check(
-                unsafe { self.component.getState(ptr) },
+                unsafe { self.instance.get().component.getState(ptr) },
                 "IComponent::getState",
             )?;
             stream.contents()
         };
 
-        let controller_state = match &self.controller {
+        let controller_state = match &self.instance.get().controller {
             Some(ctrl) => {
                 let stream = MemoryStream::empty();
                 let ptr = com_ref_ptr::<_, vst3::Steinberg::IBStream>(&stream);
@@ -569,6 +569,12 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        reclaim_main_thread();
+        if *self.instance.get().active.borrow() {
+            return Err(HostError::InvalidState(
+                "state restoration requires an inactive plugin",
+            ));
+        }
         if data.len() < 8 {
             return Err(HostError::State("state blob is truncated".into()));
         }
@@ -583,11 +589,11 @@ impl SubPluginMain for Vst3Plugin {
         let stream = MemoryStream::from_bytes(component_state);
         let ptr = com_ref_ptr::<_, vst3::Steinberg::IBStream>(&stream);
         check(
-            unsafe { self.component.setState(ptr) },
+            unsafe { self.instance.get().component.setState(ptr) },
             "IComponent::setState",
         )?;
 
-        if let Some(ctrl) = &self.controller {
+        if let Some(ctrl) = &self.instance.get().controller {
             // The controller needs the *component* state as well as its own:
             // that is how it learns the parameter values the processor just
             // restored. Rewind first, since setState consumed the stream.
@@ -607,12 +613,17 @@ impl SubPluginMain for Vst3Plugin {
         *self.latency.borrow()
     }
 
-    fn activate(&mut self, config: AudioConfig) -> Result<Box<dyn SubPluginProcessor>> {
-        if *self.active.borrow() {
+    fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
+        reclaim_main_thread();
+        if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState("plugin is already active"));
         }
 
-        let declared = setup_buses(&self.component, &self.processor, &config)?;
+        let declared = setup_buses(
+            &self.instance.get().component,
+            &self.instance.get().processor,
+            &config,
+        )?;
 
         let mut setup = ProcessSetup {
             processMode: if config.offline {
@@ -625,36 +636,36 @@ impl SubPluginMain for Vst3Plugin {
             sampleRate: config.sample_rate,
         };
         check(
-            unsafe { self.processor.setupProcessing(&mut setup) },
+            unsafe { self.instance.get().processor.setupProcessing(&mut setup) },
             "IAudioProcessor::setupProcessing",
         )?;
 
         check(
-            unsafe { self.component.setActive(1) },
+            unsafe { self.instance.get().component.setActive(1) },
             "IComponent::setActive(true)",
         )?;
         // Latency is only meaningful once the plugin is set up, which is why
         // it is read here rather than at construction.
-        *self.latency.borrow_mut() = unsafe { self.processor.getLatencySamples() };
+        *self.latency.borrow_mut() = unsafe { self.instance.get().processor.getLatencySamples() };
         // setProcessing is optional: a plugin with no realtime/offline
         // distinction returns kNotImplemented, and six of the iZotope plugins
         // here do. Treating that as a failure refuses to load them.
-        let res = unsafe { self.processor.setProcessing(1) };
+        let res = unsafe { self.instance.get().processor.setProcessing(1) };
         if res != kResultOk && res != kResultTrue && res != kNotImplemented {
-            unsafe { self.component.setActive(0) };
-            *self.active.borrow_mut() = false;
+            unsafe { self.instance.get().component.setActive(0) };
+            *self.instance.get().active.borrow_mut() = false;
             return Err(HostError::Backend {
                 context: "IAudioProcessor::setProcessing(true)".into(),
                 code: res,
             });
         }
 
-        *self.active.borrow_mut() = true;
+        *self.instance.get().active.borrow_mut() = true;
         self.context.latency_changed(*self.latency.borrow());
 
         // Built here, on the main thread, because IEditController may only be
         // called from it — see param_map's module comment.
-        let map = match &self.controller {
+        let map = match &self.instance.get().controller {
             Some(ctrl) => ParamMap::build(&self.params, |id, normalized| unsafe {
                 ctrl.normalizedParamToPlain(id.0, normalized)
             }),
@@ -663,35 +674,52 @@ impl SubPluginMain for Vst3Plugin {
 
         // Same thread, same reason: IMidiMapping hangs off IEditController.
         let midi = MidiMap::build(
-            self.controller
+            self.instance
+                .get()
+                .controller
                 .as_ref()
                 .and_then(|c| c.cast::<IMidiMapping>())
                 .as_ref(),
         );
 
-        Ok(Box::new(Vst3Processor::new(
-            self.processor.clone(),
+        Ok(Processor::new(Vst3Processor::new(
+            self.instance.get().processor.clone(),
             config,
             &declared,
             map,
             midi,
             Arc::clone(&self.pending_edits),
+            Arc::clone(&self.instance),
         )))
-    }
-
-    fn deactivate(&mut self, processor: Box<dyn SubPluginProcessor>) {
-        // Dropping the processor first releases its clone of the interface
-        // pointer, so setActive(false) is the last thing touching it.
-        drop(processor);
-        unsafe {
-            self.processor.setProcessing(0);
-            self.component.setActive(0);
-        }
-        *self.active.borrow_mut() = false;
     }
 }
 
-impl Drop for Vst3Plugin {
+struct Vst3Instance {
+    connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
+    controller: Option<ComPtr<IEditController>>,
+    processor: ComPtr<IAudioProcessor>,
+    component: ComPtr<IComponent>,
+    _handler: ComWrapper<ComponentHandler>,
+    _host_app: ComWrapper<HostApplication>,
+    // Every interface and host callback must be released before the library.
+    _module: Rc<ModuleInner>,
+    controller_is_separate: bool,
+    active: RefCell<bool>,
+}
+
+impl Vst3Instance {
+    fn deactivate(&self) {
+        if *self.active.borrow() {
+            unsafe {
+                self.processor.setProcessing(0);
+                self.component.setActive(0);
+            }
+            *self.active.borrow_mut() = false;
+        }
+    }
+}
+
+impl Drop for Vst3Instance {
     fn drop(&mut self) {
         // Reverse of construction. Skipping the disconnect leaves each half
         // holding a pointer to the other, and plugins do dereference it during
@@ -702,12 +730,7 @@ impl Drop for Vst3Plugin {
                 controller_cp.disconnect(component_cp.as_ptr());
             }
         }
-        if *self.active.borrow() {
-            unsafe {
-                self.processor.setProcessing(0);
-                self.component.setActive(0);
-            }
-        }
+        self.deactivate();
         if let Some(ctrl) = &self.controller {
             unsafe { ctrl.setComponentHandler(std::ptr::null_mut()) };
             if self.controller_is_separate {
@@ -746,6 +769,7 @@ pub struct Vst3Processor {
     midi_map: MidiMap,
     /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+    instance: Arc<MainThread<Vst3Instance>>,
 }
 
 // SAFETY: VST3 designates IAudioProcessor as the audio-thread interface; the
@@ -761,6 +785,7 @@ impl Vst3Processor {
         param_map: ParamMap,
         midi_map: MidiMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+        instance: Arc<MainThread<Vst3Instance>>,
     ) -> Vst3Processor {
         Vst3Processor {
             processor,
@@ -776,7 +801,14 @@ impl Vst3Processor {
             param_map,
             midi_map,
             pending_edits,
+            instance,
         }
+    }
+}
+
+impl Drop for Vst3Processor {
+    fn drop(&mut self) {
+        self.instance.get().deactivate();
     }
 }
 

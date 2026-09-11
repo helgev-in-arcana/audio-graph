@@ -11,10 +11,10 @@
 //!   `activate` hands out the processor by value; you cannot hold one without
 //!   having activated.
 
-use crate::Result;
 use crate::buffers::{AudioBuffers, AudioConfig};
 use crate::events::{Event, EventSink, TimeContext};
 use crate::params::{Capabilities, IoLayout, ParamId, ParamInfo, ParamSnapshot, VoiceInfo};
+use crate::{Processor, Result};
 
 /// What the sub-plugin reported about its output for this block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,15 +134,12 @@ pub trait SubPluginMain {
     /// Reported processing latency in samples, valid once activated.
     fn latency_samples(&self) -> u32;
 
-    /// Enter the processing phase, yielding the audio-thread half.
+    /// Enter the processing phase, retaining every resource used by the processor.
     ///
-    /// Ownership transfer ensures that while the processor exists, the
-    /// configuration cannot be changed.
-    fn activate(&mut self, config: AudioConfig) -> Result<Box<dyn SubPluginProcessor>>;
-
-    /// Leave the processing phase. The processor must be handed back so it
-    /// cannot outlive the active state.
-    fn deactivate(&mut self, processor: Box<dyn SubPluginProcessor>);
+    /// The returned handle stops its own activation when released on this thread,
+    /// or when this thread next reclaims released resources.
+    /// An existing activation must finish before another can start.
+    fn activate(&mut self, config: AudioConfig) -> Result<Processor>;
 }
 
 /// Audio-thread surface. `Send` so it can be moved to the audio thread once,

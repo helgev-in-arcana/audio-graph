@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::schedule::ScheduleView;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
-    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, SubPluginMain, SubPluginProcessor,
-    Target, TimeContext,
+    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain,
+    SubPluginProcessor, Target, TimeContext,
 };
 
 use crate::instances::{InstanceIo, ParamTarget};
@@ -503,9 +503,10 @@ impl SubHost {
                 }
                 Err(e) => {
                     let message = e.to_string();
-                    self.deactivate(SubHostProcessors {
+                    SubHostProcessors {
                         entries: processors,
-                    });
+                    }
+                    .deactivate();
                     return Err(message);
                 }
             }
@@ -514,15 +515,6 @@ impl SubHost {
         Ok(SubHostProcessors {
             entries: processors,
         })
-    }
-
-    pub fn deactivate(&mut self, processors: SubHostProcessors) {
-        for (instance, entry) in processors.entries.into_iter().enumerate() {
-            let Some(processor) = entry else { continue };
-            if let Some(loaded) = self.at_mut(instance) {
-                loaded.plugin.deactivate(processor.processor);
-            }
-        }
     }
 
     /// Serializes sub-host state, including slot configuration and opaque
@@ -621,7 +613,7 @@ const INCOMING_EVENT_CAPACITY: usize = 1024;
 
 /// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
-    processor: Box<dyn SubPluginProcessor>,
+    processor: Processor,
     /// Parameter targets and their schedule lane indices, captured at
     /// activate so the audio thread never walks the slot table.
     targets: Vec<(usize, ResolvedTarget)>,
@@ -740,6 +732,9 @@ pub struct SubHostProcessors {
 }
 
 impl SubHostProcessors {
+    /// Returns each processor to the instance and activation that created it.
+    pub fn deactivate(self) {}
+
     pub fn is_empty(&self) -> bool {
         self.entries.iter().all(Option::is_none)
     }
@@ -895,7 +890,7 @@ mod tests {
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
-            processor: Box::new(Recorder { seen: seen.clone() }),
+            processor: Processor::new(Recorder { seen: seen.clone() }),
             targets,
             last_sent: vec![f64::NAN; LANES],
             scratch: Vec::with_capacity(4096),

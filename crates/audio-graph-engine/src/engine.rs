@@ -700,6 +700,13 @@ impl Engine {
         self.program.as_ref().is_some_and(|p| !p.is_empty())
     }
 
+    /// The adopted publication within its publisher, or zero before adoption.
+    pub fn publication(&self) -> u64 {
+        self.program
+            .as_ref()
+            .map_or(0, |program| program.publication)
+    }
+
     /// Picks up a newly compiled program if one is waiting in the handoff channel.
     ///
     /// Returns `true` if a new program was adopted. Realtime-safe: does not allocate or lock.
@@ -2291,7 +2298,10 @@ mod tests {
         // What the wrapper's `publish_graph` does, and for the same reason: the
         // rings are allocated on this side and ride over with the program.
         program.size_rings(RATE, &[]);
-        handoff.send(Box::new(PreparedProgram { program }));
+        handoff.send(Box::new(PreparedProgram {
+            program,
+            publication: 0,
+        }));
         assert!(engine.adopt_handoff(&handoff));
     }
 
@@ -5932,7 +5942,10 @@ mod tests {
         let mut engine = Engine::new();
         engine.prepare(128, &[2]);
         let handoff = Handoff::new();
-        handoff.send(Box::new(PreparedProgram { program }));
+        handoff.send(Box::new(PreparedProgram {
+            program,
+            publication: 0,
+        }));
         assert!(engine.adopt_handoff(&handoff));
 
         let daw_in = impulse(128, 8);
@@ -5954,7 +5967,10 @@ mod tests {
             "a changed line gets a new ring"
         );
         let handoff = Handoff::new();
-        handoff.send(Box::new(PreparedProgram { program: wider }));
+        handoff.send(Box::new(PreparedProgram {
+            program: wider,
+            publication: 0,
+        }));
         assert!(engine.adopt_handoff(&handoff));
 
         let mut daw_out = vec![0.0f32; 2 * 128];

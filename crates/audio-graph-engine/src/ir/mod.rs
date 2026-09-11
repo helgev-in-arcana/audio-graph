@@ -225,6 +225,7 @@ pub struct Program {
 #[derive(Debug, PartialEq)]
 pub struct PreparedProgram {
     pub(crate) program: Program,
+    pub(crate) publication: u64,
 }
 
 impl std::ops::Deref for PreparedProgram {
@@ -242,7 +243,13 @@ impl PreparedProgram {
         previous: &[(NodeId, usize)],
     ) -> (Self, Vec<(NodeId, usize)>) {
         let sizes = program.size_rings(sample_rate, previous);
-        (Self { program }, sizes)
+        (
+            Self {
+                program,
+                publication: 0,
+            },
+            sizes,
+        )
     }
 
     pub(crate) fn program_mut(&mut self) -> &mut Program {
@@ -290,14 +297,20 @@ impl PreparedProgram {
 /// Engine::new().adopt(&handoff);
 /// ```
 pub struct ProgramPublisher {
-    previous: std::sync::Mutex<Vec<(NodeId, usize)>>,
+    history: std::sync::Mutex<PublicationHistory>,
     handoff: crate::Handoff<PreparedProgram>,
+}
+
+#[derive(Default)]
+struct PublicationHistory {
+    rings: Vec<(NodeId, usize)>,
+    publication: u64,
 }
 
 impl Default for ProgramPublisher {
     fn default() -> Self {
         Self {
-            previous: std::sync::Mutex::new(Vec::new()),
+            history: std::sync::Mutex::new(PublicationHistory::default()),
             handoff: crate::Handoff::new(),
         }
     }
@@ -306,7 +319,7 @@ impl Default for ProgramPublisher {
 impl ProgramPublisher {
     /// Forces the next publication to supply every delay ring for a new activation.
     pub fn reset(&self) {
-        self.previous.lock().unwrap().clear();
+        self.history.lock().unwrap().rings.clear();
     }
 
     pub(crate) fn handoff(&self) -> &crate::Handoff<PreparedProgram> {
@@ -317,13 +330,22 @@ impl ProgramPublisher {
         self.handoff.reclaim();
     }
 
-    pub fn publish(&self, program: Program, sample_rate: f64) {
-        let mut previous = self.previous.lock().unwrap();
-        let (prepared, sizes) = PreparedProgram::prepare(program, sample_rate, &previous);
-        *previous = sizes;
+    /// Returns a monotonically increasing identifier within this publisher.
+    /// A consumer can distinguish publication from actual adoption through
+    /// [`Engine::publication`][crate::Engine::publication].
+    pub fn publish(&self, program: Program, sample_rate: f64) -> u64 {
+        let mut history = self.history.lock().unwrap();
+        let (mut prepared, sizes) = PreparedProgram::prepare(program, sample_rate, &history.rings);
+        history.rings = sizes;
+        history.publication = history
+            .publication
+            .checked_add(1)
+            .expect("publication identifiers exhausted");
+        prepared.publication = history.publication;
         self.handoff.send_with(Box::new(prepared), |next, pending| {
             next.carry_pending_rings(pending);
         });
+        history.publication
     }
 }
 
@@ -439,8 +461,14 @@ mod tests {
         next.audio_ring_len = vec![8, 4];
         next.audio_rings = vec![Vec::new(), Vec::new()];
 
-        let mut next = PreparedProgram { program: next };
-        let mut old = PreparedProgram { program: old };
+        let mut next = PreparedProgram {
+            program: next,
+            publication: 0,
+        };
+        let mut old = PreparedProgram {
+            program: old,
+            publication: 0,
+        };
         next.carry_pending_rings(&mut old);
 
         assert_eq!(next.program.audio_rings[1], vec![1.0; 8]);

@@ -14,6 +14,7 @@
 
 mod buffers;
 mod events;
+mod ownership;
 mod params;
 mod traits;
 
@@ -22,6 +23,7 @@ pub use events::{
     Event, EventSink, NoteEvent, NoteExpression, NoteId, ParamEvent, Target, TimeContext,
     note_id_from_wire, note_id_to_wire,
 };
+pub use ownership::{MainThread, Processor, reclaim_main_thread};
 pub use params::{
     BusInfo, Capabilities, IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
     VoiceInfo,

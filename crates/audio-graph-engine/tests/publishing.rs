@@ -4,6 +4,27 @@ use audio_graph_engine::{
 };
 use subhost_adapter::{NoInstances, SlotSchedule};
 
+/// Publication identifiers describe adoption and remain ordered across activation resets.
+#[test]
+fn publication_identity_follows_the_adopted_program() {
+    let publisher = ProgramPublisher::default();
+    let mut engine = Engine::new();
+    let first = publisher.publish(audio_graph_engine::Program::empty(), 48_000.0);
+    assert_eq!(engine.publication(), 0);
+    let second = publisher.publish(audio_graph_engine::Program::empty(), 48_000.0);
+    assert!(second > first);
+    assert!(engine.adopt(&publisher));
+    assert_eq!(engine.publication(), second);
+    publisher.reset();
+    let third = publisher.publish(audio_graph_engine::Program::empty(), 96_000.0);
+    assert!(third > second);
+    assert_eq!(engine.publication(), second);
+    assert!(engine.adopt(&publisher));
+    assert_eq!(engine.publication(), third);
+    drop(engine.release());
+    assert_eq!(engine.publication(), 0);
+}
+
 /// Coalesced publications supply new rings and preserve audio already held by unchanged rings.
 #[test]
 fn repeated_publications_keep_the_delay_audible() {
