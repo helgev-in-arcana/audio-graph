@@ -94,3 +94,26 @@ A backend never builds its own host object — `vst3-host` does not construct an
 `IHostApplication`, it receives a `HostContext`. That keeps "forwarded from the
 DAW" out of the core vocabulary entirely, so a standalone scanner and the nested
 wrapper are expressed by the same types.
+
+### Processing and metadata contracts
+
+Both backends validate `AudioConfig` at activation and check every `AudioBuffers`
+view against that configuration before constructing native pointers. Mismatched
+blocks return `Error` with cleared audio; zero-frame blocks do not call native DSP.
+
+Prepare `EventSink::with_capacity` off the audio thread. `push` never grows it;
+failure is sticky in `overflowed()` until the caller clears the collection interval.
+Backends append call-relative events and propagate native output capacity loss.
+The caller owns timestamp rebasing and recovery from incomplete output.
+
+Call `SubPluginMain::tick` on main even without an editor. Native restart requests
+are recorded and delivered there; callbacks schedule work instead of reentering
+the plugin. `refresh_metadata` reports `Unchanged`, `Refreshed`, or
+`NeedsDeactivation`. Return the processor and retry when required, then rebuild
+from the updated descriptors before activating. Failed updates remain pending.
+`io_layout` only reads; request desired main widths explicitly with
+`request_main_bus_channels` while inactive.
+
+`NoteEnd` represents native voice completion. `note_end_ports` identifies input
+ports that supply it. A caller's note-off reclamation policy for other ports must
+track actual deliveries; it must not fabricate native completion events.
