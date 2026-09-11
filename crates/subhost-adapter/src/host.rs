@@ -197,6 +197,11 @@ impl SubHost {
         // until it runs it still reports its old values. Same rule as in
         // `save_state`.
         loaded.plugin.tick();
+        loaded
+            .plugin
+            .refresh_metadata()
+            .map_err(|e| e.to_string())?;
+        self.resolve_instance_slots(instance);
         Ok(())
     }
 
@@ -258,8 +263,9 @@ impl SubHost {
         class_id: Option<&str>,
     ) -> Result<(), String> {
         self.reserve(instance)?;
-        let plugin =
+        let mut plugin =
             Plugin::load(path, class_id, Arc::clone(&self.context)).map_err(|e| e.to_string())?;
+        plugin.refresh_metadata().map_err(|e| e.to_string())?;
 
         let class = plugin.class();
         let reference = SubPluginRef {
@@ -388,6 +394,59 @@ impl SubHost {
         }
     }
 
+    /// Refresh each instance's descriptors and parameter bindings before rebuilding processors.
+    pub fn refresh_metadata(&mut self) -> Result<plugin_host::MetadataUpdate, String> {
+        use plugin_host::MetadataUpdate;
+        let mut result = MetadataUpdate::Unchanged;
+        for (instance, loaded) in self.instances.iter_mut().enumerate() {
+            let Some(loaded) = loaded.as_mut() else {
+                continue;
+            };
+            let loaded = loaded.get_mut();
+            let update = loaded
+                .plugin
+                .refresh_metadata()
+                .map_err(|e| e.to_string())?;
+            if update == MetadataUpdate::Refreshed {
+                self.slots.resolve_against(
+                    instance as u32,
+                    &loaded.reference.plugin_id,
+                    loaded.plugin.params(),
+                );
+            }
+            result = result.max(update);
+        }
+        Ok(result)
+    }
+
+    pub fn request_main_bus_channels(
+        &mut self,
+        instance: usize,
+        input: u16,
+        output: u16,
+    ) -> Result<(), String> {
+        let result = self
+            .at_mut(instance)
+            .ok_or("no sub-plugin loaded")?
+            .plugin
+            .request_main_bus_channels(input, output)
+            .map_err(|e| e.to_string());
+        self.resolve_instance_slots(instance);
+        result
+    }
+
+    fn resolve_instance_slots(&mut self, instance: usize) {
+        let Some(loaded) = self.instances.get(instance).and_then(Option::as_ref) else {
+            return;
+        };
+        let loaded = loaded.get();
+        self.slots.resolve_against(
+            instance as u32,
+            &loaded.reference.plugin_id,
+            loaded.plugin.params(),
+        );
+    }
+
     /// Binds a slot index to a parameter on the loaded sub-plugin at `instance`.
     pub fn bind_slot(
         &mut self,
@@ -493,9 +552,11 @@ impl SubHost {
             match loaded.plugin.activate(config) {
                 Ok(processor) => {
                     let latency = loaded.plugin.latency_samples();
+                    let note_end_ports = loaded.plugin.note_end_ports();
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
                         processor,
+                        note_end_ports,
                         targets,
                         last_sent: vec![f64::NAN; self.config.lanes],
                         scratch: Vec::with_capacity(capacity),
@@ -581,17 +642,11 @@ impl SubHost {
             }
             match entry.state_bytes() {
                 Some(bytes) => {
-                    if let Some(loaded) = self.at_mut(entry.instance) {
-                        if let Err(e) = loaded.plugin.load_state(&bytes) {
-                            problems.push(format!(
-                                "{} loaded but its settings did not restore: {e}",
-                                reference.display_name
-                            ));
-                        }
-                        // As in `load_sub_state`. This is the path a project
-                        // open takes, and it runs with the wrapper's own
-                        // editor closed, so nothing else would tick these.
-                        loaded.plugin.tick();
+                    if let Err(e) = self.load_sub_state(entry.instance, &bytes) {
+                        problems.push(format!(
+                            "{} loaded but its settings did not restore: {e}",
+                            reference.display_name
+                        ));
                     }
                 }
                 None => problems.push(format!(
@@ -613,6 +668,7 @@ const INCOMING_EVENT_CAPACITY: usize = 1024;
 
 /// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
+    note_end_ports: Vec<i16>,
     processor: Processor,
     /// Parameter targets and their schedule lane indices, captured at
     /// activate so the audio thread never walks the slot table.
@@ -781,6 +837,14 @@ pub struct BoundInstances<'a> {
 }
 
 impl crate::instances::AudioInstances for BoundInstances<'_> {
+    fn reports_note_end(&self, instance: u32, port: i16) -> bool {
+        self.processors
+            .entries
+            .get(instance as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|processor| processor.note_end_ports.contains(&port))
+    }
+
     fn process(
         &mut self,
         instance: u32,
@@ -819,6 +883,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
+        let first_output = self.out_events.events().len();
         processor.process(
             &mut buffers,
             schedule,
@@ -827,6 +892,9 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
             self.context,
             self.out_events,
         );
+        for event in &mut self.out_events.events_mut()[first_output..] {
+            *event = event.at_offset(event.sample_offset() + chunk.offset);
+        }
     }
 }
 
@@ -882,6 +950,79 @@ mod tests {
     const SLOTS: usize = 32;
     const LANES: usize = SLOTS + 64 + 16;
 
+    /// Several instances and chunks append block-relative output without losing overflow.
+    #[test]
+    fn output_collection_spans_instances_and_chunks() {
+        use crate::instances::{AudioChunk, AudioInstances};
+        struct Echo;
+        impl SubPluginProcessor for Echo {
+            fn process(
+                &mut self,
+                _: &mut AudioBuffers<'_>,
+                events: &[Event],
+                _: &TimeContext,
+                sink: &mut EventSink,
+            ) -> ProcessStatus {
+                for event in events {
+                    sink.push(*event);
+                }
+                ProcessStatus::Continue
+            }
+            fn reset(&mut self) {}
+        }
+        let mut processors = SubHostProcessors {
+            entries: (0..2)
+                .map(|_| {
+                    Some(SubHostProcessor {
+                        note_end_ports: Vec::new(),
+                        processor: Processor::new(Echo),
+                        targets: Vec::new(),
+                        last_sent: vec![f64::NAN; LANES],
+                        scratch: Vec::with_capacity(8),
+                    })
+                })
+                .collect(),
+        };
+        let mut sink = EventSink::with_capacity(2);
+        let context = TimeContext::default();
+        let mut schedule = SlotSchedule::new(LANES, 8, 4);
+        schedule.begin(8);
+        schedule.fill(&[0.0; LANES]);
+        for (instance, offset) in [(0, 0), (1, 4), (0, 4)] {
+            let event = Event::Note(NoteEvent::NoteOn {
+                note_id: Some(instance as i32),
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity: 1.0,
+                sample_offset: offset + 1,
+            });
+            processors.bind(&context, &mut sink).process(
+                instance,
+                &[event],
+                &[0.0; 8],
+                &mut [0.0; 8],
+                AudioChunk {
+                    input_channels: 2,
+                    output_channels: 2,
+                    aux_inputs: Default::default(),
+                    aux_outputs: Default::default(),
+                    frames: 4,
+                    offset,
+                },
+                schedule.view(),
+            );
+        }
+        assert_eq!(
+            sink.events()
+                .iter()
+                .map(Event::sample_offset)
+                .collect::<Vec<_>>(),
+            [1, 5]
+        );
+        assert!(sink.overflowed());
+    }
+
     fn harness(
         targets: Vec<(usize, ResolvedTarget)>,
     ) -> (
@@ -890,6 +1031,7 @@ mod tests {
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
+            note_end_ports: Vec::new(),
             processor: Processor::new(Recorder { seen: seen.clone() }),
             targets,
             last_sent: vec![f64::NAN; LANES],

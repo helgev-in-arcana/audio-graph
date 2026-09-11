@@ -34,6 +34,131 @@ fn playing(name: &str) -> Wrapper {
     wrapper
 }
 
+/// Main-thread refresh preserves running notes for labels, and rebuilds routing and slots for structural changes.
+#[test]
+fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
+    use audio_graph_engine::NodeKind;
+    use plugin_host::ParamId;
+    let mut wrapper = playing("metadata-refresh");
+    {
+        let mut patch = wrapper.shared().patch();
+        let (plugin, note_port) = patch
+            .graph
+            .nodes
+            .iter()
+            .find_map(|node| {
+                if let NodeKind::Plugin(plugin) = &node.kind {
+                    Some((node.id, plugin.ports.audio_in.len() as u8))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let notes = patch.graph.add(NodeKind::NoteIn, [0.0; 2]);
+        patch.graph.connect(notes, 0, plugin, note_port);
+    }
+    wrapper
+        .shared()
+        .main()
+        .host
+        .bind_slot(0, 0, ParamId(1))
+        .unwrap();
+    wrapper.shared().publish_graph();
+    wrapper.shared().rebind().unwrap();
+    let mut daw = Daw::playing();
+    daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
+        timing: 0,
+        voice_id: Some(42),
+        channel: 0,
+        note: 60,
+        velocity: 1.0,
+    });
+    let mut before = Block::silent(64);
+    before.process(&mut wrapper, &mut daw);
+    let ask = |wrapper: &mut Wrapper, daw: &mut Daw, value| {
+        wrapper
+            .shared()
+            .main()
+            .host
+            .set_sub_param(0, ParamId(5), value)
+            .unwrap();
+        Block::silent(64).process(wrapper, daw);
+        wrapper.tick();
+    };
+    ask(&mut wrapper, &mut daw, 8.0);
+    assert_eq!(wrapper.shared().main().host.params(0)[0].name, "Level");
+    let mut held = Block::silent(64);
+    held.process(&mut wrapper, &mut daw);
+    assert_eq!(
+        held.peak(),
+        before.peak(),
+        "renaming cannot deactivate the native voice"
+    );
+    ask(&mut wrapper, &mut daw, 7.0);
+    assert_eq!(wrapper.shared().main().host.params(0)[0].max, 4.0);
+    assert!(wrapper.shared().main().host.slots().resolved(0).is_none());
+    let patch = wrapper.shared().patch();
+    assert!(patch.compile_error.is_none(), "{:?}", patch.compile_error);
+    let ports = patch
+        .graph
+        .nodes
+        .iter()
+        .find_map(|node| {
+            if let NodeKind::Plugin(plugin) = &node.kind {
+                Some(&plugin.ports)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(ports.audio_in[0], 1);
+    assert_eq!(ports.audio_out[0], 1);
+    drop(patch);
+    let mut block = Block::silent(64);
+    block.fill(0.5);
+    block.process(&mut wrapper, &mut daw);
+    assert!((block.peak() - 0.5).abs() < 1e-6);
+    assert!(
+        daw.outgoing.iter().any(|event| matches!(
+            event,
+            nice_plug::prelude::NoteEvent::VoiceTerminated {
+                voice_id: Some(42),
+                ..
+            }
+        )),
+        "voices stopped by reconfiguration must also be returned to the DAW"
+    );
+    ask(&mut wrapper, &mut daw, 9.0);
+    assert!(wrapper.shared().patch().compile_error.is_some());
+    wrapper
+        .shared()
+        .main()
+        .host
+        .set_sub_param(0, ParamId(5), 8.0)
+        .unwrap();
+    wrapper.tick();
+    assert!(wrapper.shared().patch().compile_error.is_none());
+    block.process(&mut wrapper, &mut daw);
+    wrapper
+        .shared()
+        .load_sub_state(0, &fixture_state(0.0))
+        .unwrap();
+    assert_eq!(
+        wrapper
+            .shared()
+            .main()
+            .host
+            .io_layout(0)
+            .main_input_channels(),
+        2
+    );
+    assert!(wrapper.shared().main().host.slots().resolved(0).is_some());
+    assert!(wrapper.shared().patch().graph.nodes.iter().any(
+        |node| matches!(&node.kind, NodeKind::Plugin(plugin) if plugin.ports.audio_in[0] == 2)
+    ));
+    block.process(&mut wrapper, &mut daw);
+}
+
 /// A bounce renders the audio, and leaves the wrapper able to go on rendering
 /// it.
 ///

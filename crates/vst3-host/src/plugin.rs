@@ -76,6 +76,9 @@ pub struct Vst3Plugin {
     _main_thread: std::marker::PhantomData<Rc<()>>,
 
     params: Vec<ParamInfo>,
+    io: plugin_host_api::IoLayout,
+    metadata_dirty: bool,
+    metadata_structural: bool,
     /// Main-thread parameter edits waiting to be delivered to the processor.
     ///
     /// VST3 splits a plugin in two, and `IEditController::setParamNormalized`
@@ -93,6 +96,28 @@ pub struct Vst3Plugin {
 }
 
 impl Vst3Plugin {
+    /// Deliver recorded requests outside native callbacks, on the owning thread.
+    pub fn tick(&mut self) {
+        use plugin_host_api::RestartReason;
+        use vst3::Steinberg::Vst::RestartFlags_::{
+            kIoChanged, kIoTitlesChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
+        };
+        let flags = self.instance.get()._handler.take_restart_requests();
+        self.metadata_dirty |=
+            flags & (kIoChanged | kIoTitlesChanged | kLatencyChanged | kParamTitlesChanged) != 0;
+        self.metadata_structural |= flags & (kIoChanged | kLatencyChanged) != 0;
+        for (flag, reason) in [
+            (kParamValuesChanged, RestartReason::ParamValues),
+            (kParamTitlesChanged, RestartReason::ParamTitles),
+            (kLatencyChanged, RestartReason::Latency),
+            (kIoChanged | kIoTitlesChanged, RestartReason::IoConfig),
+        ] {
+            if flags & flag != 0 {
+                self.context.request_restart(reason);
+            }
+        }
+    }
+
     /// Create and fully initialise the class `cid` from `module`.
     pub fn create(module: &Module, cid: Cid, context: Arc<dyn HostContext>) -> Result<Vst3Plugin> {
         // Module-scoped, not instance-scoped: the factory retains the pointer
@@ -138,9 +163,7 @@ impl Vst3Plugin {
             }
         }
 
-        let params = controller.as_ref().map(read_params).unwrap_or_default();
-
-        Ok(Vst3Plugin {
+        let mut loaded = Vst3Plugin {
             _main_thread: std::marker::PhantomData,
             instance: Arc::new(MainThread::new(Vst3Instance {
                 connection,
@@ -153,11 +176,24 @@ impl Vst3Plugin {
                 controller_is_separate,
                 active: RefCell::new(false),
             })),
-            params,
+            params: Vec::new(),
+            io: plugin_host_api::IoLayout::default(),
+            metadata_dirty: false,
+            metadata_structural: false,
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES))),
             latency: RefCell::new(0),
             context,
-        })
+        };
+        loaded.params = loaded
+            .instance
+            .get()
+            .controller
+            .as_ref()
+            .map(read_params)
+            .transpose()?
+            .unwrap_or_default();
+        loaded.io = loaded.read_io_layout()?;
+        Ok(loaded)
     }
 
     fn create_controller(
@@ -226,20 +262,19 @@ impl Vst3Plugin {
         Some((cp_component, cp_controller))
     }
 
-    /// Offer stereo to a plugin whose main buses default to mono.
-    ///
-    /// A declared bus width is what the plugin starts as, not what it accepts.
-    /// The width that counts is whatever `getBusInfo` reports after this, so a
-    /// plugin that declines is left as it was.
-    ///
-    /// Aux buses are left alone: theirs are negotiated at activation, once the
-    /// caller knows which ones are wired.
-    fn prefer_stereo_main_buses(&self) {
+    fn request_main_channels(&mut self, input: u16, output: u16) -> Result<()> {
         use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
 
         // Arrangements may only be set while deactivated.
         if *self.instance.get().active.borrow() {
-            return;
+            return Err(HostError::InvalidState(
+                "bus negotiation requires an inactive plugin",
+            ));
+        }
+        if input > 2 || output > 2 {
+            return Err(HostError::UnsupportedBusConfig(
+                "only mono and stereo main arrangements are supported".into(),
+            ));
         }
         let audio = MediaTypes_::kAudio as i32;
         let current = |dir: i32| -> Vec<SpeakerArrangement> {
@@ -260,14 +295,13 @@ impl Vst3Plugin {
         };
         let mut inputs = current(BusDirections_::kInput as i32);
         let mut outputs = current(BusDirections_::kOutput as i32);
-        // Nothing to ask unless a main bus exists and is mono.
-        let mono = |b: Option<&SpeakerArrangement>| b == Some(&SpeakerArr::kMono);
-        if !mono(inputs.first()) && !mono(outputs.first()) {
-            return;
-        }
-        for bus in inputs.first_mut().into_iter().chain(outputs.first_mut()) {
-            if *bus == SpeakerArr::kMono {
-                *bus = SpeakerArr::kStereo;
+        for (buses, channels) in [(&mut inputs, input), (&mut outputs, output)] {
+            if let Some(main) = buses.first_mut() {
+                *main = match channels {
+                    0 => 0,
+                    1 => SpeakerArr::kMono,
+                    _ => SpeakerArr::kStereo,
+                };
             }
         }
         unsafe {
@@ -278,24 +312,33 @@ impl Vst3Plugin {
                 outputs.len() as i32,
             )
         };
+        self.metadata_dirty = true;
+        self.metadata_structural = true;
+        self.refresh_metadata()?;
+        if self.io.main_input_channels() == input
+            && self.io.outputs.first().map_or(0, |bus| bus.channels) == output
+        {
+            Ok(())
+        } else {
+            Err(HostError::UnsupportedBusConfig(
+                "plugin selected different main widths".into(),
+            ))
+        }
     }
 
     /// Returns every bus declared by the plugin and note input/output capabilities.
     ///
-    /// Read before activation, so these are the plugin's defaults, except that
-    /// a mono main bus is offered stereo first (see
-    /// [`prefer_stereo_main_buses`][Self::prefer_stereo_main_buses]). That is
-    /// the right thing to build sockets out of: the node has to offer a
-    /// sidechain socket before the graph can ask for one to be connected.
     pub fn io_layout(&self) -> plugin_host_api::IoLayout {
+        self.io.clone()
+    }
+
+    fn read_io_layout(&self) -> Result<plugin_host_api::IoLayout> {
         use vst3::Steinberg::Vst::{BusDirections_, BusTypes_, MediaTypes_};
 
-        self.prefer_stereo_main_buses();
-
-        let buses = |media: i32, dir: i32| -> Vec<plugin_host_api::BusInfo> {
+        let buses = |media: i32, dir: i32| -> Result<Vec<plugin_host_api::BusInfo>> {
             let count = unsafe { self.instance.get().component.getBusCount(media, dir) };
             (0..count.max(0))
-                .filter_map(|index| {
+                .map(|index| {
                     let mut info: vst3::Steinberg::Vst::BusInfo = unsafe { std::mem::zeroed() };
                     if unsafe {
                         self.instance
@@ -304,9 +347,9 @@ impl Vst3Plugin {
                             .getBusInfo(media, dir, index, &mut info)
                     } != kResultOk
                     {
-                        return None;
+                        return Err(HostError::InvalidState("bus enumeration failed"));
                     }
-                    Some(plugin_host_api::BusInfo {
+                    Ok(plugin_host_api::BusInfo {
                         name: crate::util::from_char16(&info.name),
                         channels: info.channelCount.max(0) as u16,
                         is_aux: info.busType == BusTypes_::kAux as i32,
@@ -319,12 +362,12 @@ impl Vst3Plugin {
         let event = MediaTypes_::kEvent as i32;
         let input = BusDirections_::kInput as i32;
         let output = BusDirections_::kOutput as i32;
-        plugin_host_api::IoLayout {
-            inputs: buses(audio, input),
-            outputs: buses(audio, output),
-            accepts_notes: !buses(event, input).is_empty(),
-            emits_notes: !buses(event, output).is_empty(),
-        }
+        Ok(plugin_host_api::IoLayout {
+            inputs: buses(audio, input)?,
+            outputs: buses(audio, output)?,
+            accepts_notes: !buses(event, input)?.is_empty(),
+            emits_notes: !buses(event, output)?.is_empty(),
+        })
     }
 
     /// The class's reported I/O, used to decide whether stereo is workable.
@@ -449,6 +492,54 @@ impl Vst3Plugin {
 }
 
 impl SubPluginMain for Vst3Plugin {
+    fn tick(&mut self) {
+        Vst3Plugin::tick(self);
+    }
+
+    fn request_main_bus_channels(&mut self, input: u16, output: u16) -> Result<()> {
+        self.request_main_channels(input, output)
+    }
+
+    fn refresh_metadata(&mut self) -> Result<plugin_host_api::MetadataUpdate> {
+        use plugin_host_api::MetadataUpdate;
+        reclaim_main_thread();
+        self.tick();
+        if !self.metadata_dirty {
+            return Ok(MetadataUpdate::Unchanged);
+        }
+        if self.metadata_structural && *self.instance.get().active.borrow() {
+            return Ok(MetadataUpdate::NeedsDeactivation);
+        }
+        let params = self
+            .instance
+            .get()
+            .controller
+            .as_ref()
+            .map(read_params)
+            .transpose()?
+            .unwrap_or_default();
+        let io = self.read_io_layout()?;
+        let mapping_changed = params.len() != self.params.len()
+            || params.iter().zip(&self.params).any(|(a, b)| {
+                (a.id, a.min, a.max, a.default, a.flags) != (b.id, b.min, b.max, b.default, b.flags)
+            });
+        if mapping_changed && *self.instance.get().active.borrow() {
+            self.metadata_structural = true;
+            return Ok(MetadataUpdate::NeedsDeactivation);
+        }
+        self.metadata_dirty = false;
+        self.metadata_structural = false;
+        self.tick();
+        if self.metadata_dirty {
+            return Err(HostError::InvalidState(
+                "metadata changed during refresh; retry",
+            ));
+        }
+        self.params = params;
+        self.io = io;
+        Ok(MetadataUpdate::Refreshed)
+    }
+
     fn params(&self) -> &[ParamInfo] {
         &self.params
     }
@@ -575,6 +666,7 @@ impl SubPluginMain for Vst3Plugin {
                 "state restoration requires an inactive plugin",
             ));
         }
+        self.tick();
         if data.len() < 8 {
             return Err(HostError::State("state blob is truncated".into()));
         }
@@ -584,6 +676,8 @@ impl SubPluginMain for Vst3Plugin {
             return Err(HostError::State("state blob is truncated".into()));
         }
         let component_state = data[8..8 + component_len].to_vec();
+        self.metadata_dirty = true;
+        self.metadata_structural = true;
         let controller_state = data[8 + component_len..8 + component_len + controller_len].to_vec();
 
         let stream = MemoryStream::from_bytes(component_state);
@@ -606,6 +700,7 @@ impl SubPluginMain for Vst3Plugin {
                 unsafe { ctrl.setState(ctrl_ptr) };
             }
         }
+        self.refresh_metadata()?;
         Ok(())
     }
 
@@ -614,7 +709,14 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
+        config.validate()?;
         reclaim_main_thread();
+        self.tick();
+        if self.metadata_dirty {
+            return Err(HostError::InvalidState(
+                "refresh metadata before activation",
+            ));
+        }
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState("plugin is already active"));
         }
@@ -624,6 +726,7 @@ impl SubPluginMain for Vst3Plugin {
             &self.instance.get().processor,
             &config,
         )?;
+        self.io = self.read_io_layout()?;
 
         let mut setup = ProcessSetup {
             processMode: if config.offline {
@@ -820,21 +923,19 @@ impl SubPluginProcessor for Vst3Processor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
+        if !buffers.matches_config(&self.config) {
+            buffers.clear_output();
+            return ProcessStatus::Error;
+        }
         let frames = buffers.frame_count();
         if frames == 0 {
             return ProcessStatus::Continue;
-        }
-        if frames > self.config.max_block_size {
-            // Louder than a silent clamp: the caller broke the contract it
-            // agreed to at activate, and clamping would silently drop audio.
-            return ProcessStatus::Error;
         }
 
         self.input_changes.clear();
         self.output_changes.clear();
         self.input_events.clear();
         self.output_events.clear();
-        out_events.clear();
 
         // Main-thread edits go in first, at offset 0, so an event stream for
         // this block still overrides them.
@@ -853,11 +954,6 @@ impl SubPluginProcessor for Vst3Processor {
             &self.input_changes,
             &self.input_events,
         );
-        // The format cannot tell us when a voice finishes, so the note-off is
-        // the last thing we will ever know about the note. See
-        // `end_notes_offered`.
-        vst_events::end_notes_offered(events, out_events);
-
         // Channel pointers into the caller's flat planar storage.
         let frame_len = frames as usize;
         let input_raw = buffers.raw_input().as_ptr();
@@ -921,6 +1017,9 @@ impl SubPluginProcessor for Vst3Processor {
         }
 
         vst_events::drain_outputs(&self.output_events, out_events);
+        if self.output_changes.overflowed() {
+            out_events.mark_overflow();
+        }
 
         // The plugin sets silence flags on the output bus when it has nothing
         // to say; honouring that is what lets a chain skip downstream work.
@@ -1108,7 +1207,7 @@ fn channel_count(arrangement: SpeakerArrangement) -> usize {
 }
 
 /// Read the controller's parameter list into the core's plain-valued model.
-fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
+fn read_params(controller: &ComPtr<IEditController>) -> Result<Vec<ParamInfo>> {
     use vst3::Steinberg::Vst::ParameterInfo_::ParameterFlags_ as F;
 
     let count = unsafe { controller.getParameterCount() };
@@ -1117,7 +1216,7 @@ fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
     for index in 0..count {
         let mut raw: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { controller.getParameterInfo(index, &mut raw) } != kResultOk {
-            continue;
+            return Err(HostError::InvalidState("parameter enumeration failed"));
         }
 
         let stepped = raw.stepCount > 0;
@@ -1153,7 +1252,7 @@ fn read_params(controller: &ComPtr<IEditController>) -> Vec<ParamInfo> {
         });
     }
 
-    out
+    Ok(out)
 }
 
 fn create_instance<I: Interface>(module: &Module, cid: TUID) -> Result<ComPtr<I>> {

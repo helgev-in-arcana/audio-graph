@@ -188,6 +188,10 @@ impl Wrapper {
             Err(e) => log::warn!("audio-graph: wrapper state unreadable: {e}"),
         }
         self.shared.adopt_default_patch();
+        if let Err(error) = self.shared.prepare_host_metadata() {
+            self.shared.patch().compile_error = Some(error);
+            return;
+        }
         self.shared.publish_graph();
         // Publish it back even when nothing was restored. A project saved
         // without the editor ever being opened would otherwise store the empty
@@ -375,6 +379,11 @@ impl Wrapper {
             Some(state) => state,
             None => return pass_through(buffer, self.kind),
         };
+        if std::mem::take(&mut state.reset_notes) {
+            self.ended_notes.clear();
+            self.engine.reset_notes(&mut self.ended_notes);
+            report_ended(&self.ended_notes, context);
+        }
 
         // Read off the engine rather than off the compiler, so the DAW is told
         // about a program the audio is already coming out of: a sub-plugin that
@@ -500,6 +509,15 @@ impl Wrapper {
             &mut self.output_scratch[..(out_channels * frames) as usize],
             nodes,
         );
+        if self.out_events.overflowed() {
+            self.ended_notes.clear();
+            self.engine.reset_notes(&mut self.ended_notes);
+            if let Some(processor) = state.processor.as_mut() {
+                processor.reset();
+            }
+            report_ended(&self.ended_notes, context);
+            self.out_events.clear();
+        }
         // What the editor's meters show. The DAW's own parameter value stops
         // being the answer the moment the graph drives a slot.
         self.shared
@@ -570,9 +588,8 @@ impl Wrapper {
 /// was gated shut — is one the DAW can stop holding a voice for. Saying so is
 /// the honest answer either way, and CLAP asks for it.
 ///
-/// VST3 has no `NOTE_END` to send back, so nothing arrives from that side; its
-/// backend ends the note when the note-off is delivered instead, which is the
-/// closest the format allows.
+/// The engine reclaims a port without native completion at delivery of its
+/// note-off; that bookkeeping policy does not claim its release tail is over.
 ///
 /// A free function rather than a method because the caller is holding a borrow
 /// of the shared audio state for the whole block.

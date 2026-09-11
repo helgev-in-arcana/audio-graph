@@ -24,8 +24,7 @@ use clap_sys::events::{
 };
 use clap_sys::ext::audio_ports::clap_host_audio_ports;
 use clap_sys::ext::audio_ports::{
-    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, CLAP_PORT_STEREO, clap_audio_port_info,
-    clap_plugin_audio_ports,
+    CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports,
 };
 use clap_sys::ext::audio_ports_activation::{
     CLAP_EXT_AUDIO_PORTS_ACTIVATION, clap_plugin_audio_ports_activation,
@@ -107,6 +106,13 @@ pub mod ask {
     /// moved. Set that one first, or the host is being told to re-read a value
     /// that has not changed and will rightly do nothing with it.
     pub const LATENCY_CHANGED: f64 = 4.0;
+    /// Emit more events than the host's native output scratch can hold (2048).
+    pub const OUTPUT_BURST: f64 = 5.0;
+    pub const RESTART_ON_CALLBACK: f64 = 6.0;
+    pub const CHANGE_LAYOUT: f64 = 7.0;
+    pub const RENAME: f64 = 8.0;
+    pub const FAIL_METADATA: f64 = 9.0;
+    pub const REQUEUE_METADATA: f64 = 10.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -170,11 +176,11 @@ impl Params {
 
     fn set(&mut self, id: clap_id, value: f64) {
         match id {
-            PARAM_GAIN => self.gain = value.clamp(0.0, 2.0),
+            PARAM_GAIN => self.gain = value.clamp(0.0, 4.0),
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, 4.0).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::REQUEUE_METADATA).round(),
             _ => {}
         }
     }
@@ -183,6 +189,10 @@ impl Params {
 mod gui;
 
 pub(crate) struct Instance {
+    wide_metadata: bool,
+    renamed: bool,
+    pending_metadata: bool,
+    metadata_read: u8,
     /// The struct handed to the host. First field so the pointer the host holds
     /// is also the pointer to this allocation, which `from_host` relies on.
     raw: clap_plugin,
@@ -344,6 +354,10 @@ unsafe extern "C" fn factory_create(
             get_extension: Some(plugin_get_extension),
             on_main_thread: Some(plugin_on_main_thread),
         },
+        wide_metadata: false,
+        renamed: false,
+        pending_metadata: false,
+        metadata_read: 0,
         params: Params::default(),
         held: [false; 128],
         host,
@@ -415,6 +429,12 @@ unsafe extern "C" fn plugin_activate(
 unsafe extern "C" fn plugin_deactivate(plugin: *const clap_plugin) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
         instance.active = false;
+        instance.held.fill(false);
+        if instance.pending_metadata {
+            instance.pending_metadata = false;
+            instance.wide_metadata = !instance.wide_metadata;
+            unsafe { instance.metadata_changed(true) };
+        }
     }
 }
 
@@ -440,7 +460,11 @@ unsafe extern "C" fn plugin_reset(plugin: *const clap_plugin) {
     }
 }
 
-unsafe extern "C" fn plugin_on_main_thread(_plugin: *const clap_plugin) {}
+unsafe extern "C" fn plugin_on_main_thread(plugin: *const clap_plugin) {
+    if let Some(instance) = unsafe { Instance::from_host(plugin) } {
+        unsafe { instance.answer_ask() };
+    }
+}
 
 unsafe extern "C" fn plugin_process(
     plugin: *const clap_plugin,
@@ -456,7 +480,49 @@ unsafe extern "C" fn plugin_process(
 
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
-    unsafe { apply_events(instance, data.in_events) };
+    unsafe { apply_events(instance, data.in_events, data.out_events) };
+    if instance.params.ask == ask::RESTART {
+        instance.params.ask = ask::NOTHING;
+        if let Some(request) = unsafe { (*instance.host).request_restart } {
+            unsafe { request(instance.host) };
+        }
+    }
+    if instance.params.ask == ask::CHANGE_LAYOUT {
+        instance.params.ask = ask::NOTHING;
+        instance.pending_metadata = true;
+        if let Some(request) = unsafe { (*instance.host).request_restart } {
+            unsafe { request(instance.host) };
+        }
+    } else if instance.params.ask >= ask::RENAME
+        && let Some(request) = unsafe { (*instance.host).request_callback }
+    {
+        unsafe { request(instance.host) };
+    }
+
+    if instance.params.ask == ask::OUTPUT_BURST && !data.out_events.is_null() {
+        instance.params.ask = ask::NOTHING;
+        if let Some(push) = unsafe { (*data.out_events).try_push } {
+            let event = clap_event_param_value {
+                header: clap_sys::events::clap_event_header {
+                    size: size_of::<clap_event_param_value>() as u32,
+                    time: 0,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_VALUE,
+                    flags: 0,
+                },
+                param_id: PARAM_GAIN,
+                cookie: std::ptr::null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value: instance.params.gain,
+            };
+            for _ in 0..2049 {
+                unsafe { push(data.out_events, &event.header) };
+            }
+        }
+    }
 
     let frames = data.frames_count as usize;
     let note_sum = instance.held.iter().filter(|&&on| on).count() as f32 * NOTE_LEVEL;
@@ -526,7 +592,11 @@ unsafe fn channel_ptr(bus: Option<&clap_audio_buffer>, channel: usize) -> Option
 
 /// # Safety
 /// `events` must be null or a live input event list.
-unsafe fn apply_events(instance: &mut Instance, events: *const clap_input_events) {
+unsafe fn apply_events(
+    instance: &mut Instance,
+    events: *const clap_input_events,
+    output: *const clap_output_events,
+) {
     if events.is_null() {
         return;
     }
@@ -557,12 +627,18 @@ unsafe fn apply_events(instance: &mut Instance, events: *const clap_input_events
                 }
             }
             CLAP_EVENT_NOTE_OFF => {
-                let e = unsafe { *header.cast::<clap_event_note>() };
+                let mut e = unsafe { *header.cast::<clap_event_note>() };
                 if let Some(slot) = usize::try_from(e.key)
                     .ok()
                     .and_then(|k| instance.held.get_mut(k))
                 {
                     *slot = false;
+                }
+                if !output.is_null()
+                    && let Some(push) = unsafe { (*output).try_push }
+                {
+                    e.header.type_ = clap_sys::events::CLAP_EVENT_NOTE_END;
+                    unsafe { push(output, &e.header) };
                 }
             }
             _ => {}
@@ -750,24 +826,39 @@ static EXT_PARAMS: clap_plugin_params = clap_plugin_params {
     flush: Some(params_flush),
 };
 
-unsafe extern "C" fn params_count(_plugin: *const clap_plugin) -> u32 {
-    PARAM_COUNT
+unsafe extern "C" fn params_count(plugin: *const clap_plugin) -> u32 {
+    PARAM_COUNT - u32::from(unsafe { Instance::from_host(plugin) }.is_some_and(|i| i.wide_metadata))
 }
 
 unsafe extern "C" fn params_get_info(
-    _plugin: *const clap_plugin,
+    plugin: *const clap_plugin,
     index: u32,
     info: *mut clap_param_info,
 ) -> bool {
     if info.is_null() || index >= PARAM_COUNT {
         return false;
     }
+    let Some(instance) = (unsafe { Instance::from_host(plugin) }) else {
+        return false;
+    };
+    if instance.metadata_read == 1 {
+        return false;
+    }
+    if instance.metadata_read == 2 {
+        instance.metadata_read = 0;
+        unsafe { instance.metadata_changed(false) };
+    }
+    let index = if instance.wide_metadata && index >= 1 {
+        index + 1
+    } else {
+        index
+    };
     let (name, module, min, max, default, flags) = match index {
         0 => (
-            "Gain",
+            if instance.renamed { "Level" } else { "Gain" },
             "",
             0.0,
-            2.0,
+            if instance.wide_metadata { 4.0 } else { 2.0 },
             1.0,
             CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_IS_MODULATABLE,
         ),
@@ -802,7 +893,14 @@ unsafe extern "C" fn params_get_info(
             65535.0,
             CLAP_PARAM_IS_STEPPED,
         ),
-        5 => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        5 => (
+            "Ask Host",
+            "",
+            0.0,
+            ask::REQUEUE_METADATA,
+            0.0,
+            CLAP_PARAM_IS_STEPPED,
+        ),
         6 => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
         _ => (
             "FD Calls",
@@ -925,7 +1023,7 @@ unsafe extern "C" fn params_flush(
     _out: *const clap_output_events,
 ) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
-        unsafe { apply_events(instance, in_) };
+        unsafe { apply_events(instance, in_, std::ptr::null()) };
         // Main thread, and — when this is the inactive flush — a moment when
         // every one of these calls is legal.
         unsafe { instance.answer_ask() };
@@ -933,6 +1031,38 @@ unsafe extern "C" fn params_flush(
 }
 
 impl Instance {
+    unsafe fn metadata_changed(&self, structural: bool) {
+        let Some(get) = (unsafe { (*self.host).get_extension }) else {
+            return;
+        };
+        let params = unsafe { get(self.host, CLAP_EXT_PARAMS.as_ptr()) }
+            .cast::<clap_sys::ext::params::clap_host_params>();
+        if !params.is_null()
+            && let Some(rescan) = unsafe { (*params).rescan }
+        {
+            let flags = if structural {
+                clap_sys::ext::params::CLAP_PARAM_RESCAN_ALL
+            } else {
+                clap_sys::ext::params::CLAP_PARAM_RESCAN_INFO
+            };
+            unsafe { rescan(self.host, flags) };
+        }
+        if structural {
+            let ports = unsafe { get(self.host, CLAP_EXT_AUDIO_PORTS.as_ptr()) }
+                .cast::<clap_host_audio_ports>();
+            if !ports.is_null()
+                && let Some(rescan) = unsafe { (*ports).rescan }
+            {
+                unsafe {
+                    rescan(
+                        self.host,
+                        clap_sys::ext::audio_ports::CLAP_AUDIO_PORTS_RESCAN_CHANNEL_COUNT,
+                    )
+                };
+            }
+        }
+    }
+
     /// Make the calls [`PARAM_ASK`] was set to, then forget it was set.
     ///
     /// # Safety
@@ -947,6 +1077,35 @@ impl Instance {
             None => return,
         };
         match ask {
+            ask::CHANGE_LAYOUT if self.active => {
+                self.pending_metadata = true;
+                if let Some(request) = unsafe { (*self.host).request_restart } {
+                    unsafe { request(self.host) };
+                }
+            }
+            ask::CHANGE_LAYOUT => {
+                self.wide_metadata = !self.wide_metadata;
+                unsafe { self.metadata_changed(true) };
+            }
+            ask::RENAME | ask::FAIL_METADATA | ask::REQUEUE_METADATA => {
+                self.metadata_read = if ask == ask::FAIL_METADATA {
+                    1
+                } else if ask == ask::REQUEUE_METADATA {
+                    2
+                } else {
+                    0
+                };
+                if ask == ask::RENAME {
+                    self.renamed = !self.renamed;
+                }
+                unsafe { self.metadata_changed(false) };
+            }
+            ask::RESTART_ON_CALLBACK => {
+                self.params.ask = ask::RESTART;
+                if let Some(request) = unsafe { (*self.host).request_callback } {
+                    unsafe { request(self.host) };
+                }
+            }
             ask::RESTART => {
                 if let Some(request) = unsafe { (*self.host).request_restart } {
                     unsafe { request(self.host) };
@@ -958,7 +1117,12 @@ impl Instance {
                 if !ext.is_null()
                     && let Some(rescan) = unsafe { (*ext).rescan }
                 {
-                    unsafe { rescan(self.host, 0) };
+                    unsafe {
+                        rescan(
+                            self.host,
+                            clap_sys::ext::audio_ports::CLAP_AUDIO_PORTS_RESCAN_CHANNEL_COUNT,
+                        )
+                    };
                 }
             }
             ask::NOTE_PORTS_RESCAN => {
@@ -967,7 +1131,12 @@ impl Instance {
                 if !ext.is_null()
                     && let Some(rescan) = unsafe { (*ext).rescan }
                 {
-                    unsafe { rescan(self.host, 0) };
+                    unsafe {
+                        rescan(
+                            self.host,
+                            clap_sys::ext::note_ports::CLAP_NOTE_PORTS_RESCAN_ALL,
+                        )
+                    };
                 }
             }
             ask::LATENCY_CHANGED => {
@@ -997,7 +1166,7 @@ unsafe extern "C" fn audio_ports_count(_plugin: *const clap_plugin, _is_input: b
 }
 
 unsafe extern "C" fn audio_ports_get(
-    _plugin: *const clap_plugin,
+    plugin: *const clap_plugin,
     index: u32,
     is_input: bool,
     info: *mut clap_audio_port_info,
@@ -1020,8 +1189,14 @@ unsafe extern "C" fn audio_ports_get(
         } else {
             0
         },
-        channel_count: 2,
-        port_type: CLAP_PORT_STEREO.as_ptr(),
+        channel_count: if index == 0
+            && unsafe { Instance::from_host(plugin) }.is_some_and(|i| i.wide_metadata)
+        {
+            1
+        } else {
+            2
+        },
+        port_type: std::ptr::null(),
         in_place_pair: clap_sys::id::CLAP_INVALID_ID,
     };
     write_chars(&mut out.name, name);
@@ -1135,6 +1310,7 @@ unsafe extern "C" fn state_load(plugin: *const clap_plugin, stream: *const clap_
     instance.params.gain = value(0);
     instance.params.offset = value(1);
     instance.params.mode = value(2);
+    instance.wide_metadata = instance.params.mode == 2.0;
     instance.params.latency = value(3);
     true
 }

@@ -76,6 +76,143 @@ fn lifecycle_config() -> AudioConfig {
     }
 }
 
+/// Rejected blocks cannot apply native parameter edits or write beyond their declared output.
+#[test]
+fn mismatched_blocks_never_enter_native_processing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let config = lifecycle_config();
+    assert!(
+        plugin
+            .activate(AudioConfig {
+                sample_rate: f64::NAN,
+                ..config
+            })
+            .is_err()
+    );
+    let mut processor = plugin.activate(config).unwrap();
+    let mut sink = EventSink::with_capacity(8);
+    let input = [0.5; 128];
+    for (channels, frames, layout, aux) in [
+        (1, 4, BufferLayout::Planar, AuxBuses::default()),
+        (2, 4, BufferLayout::Interleaved, AuxBuses::default()),
+        (2, 4, BufferLayout::Planar, AuxBuses::new(&[1])),
+        (2, 33, BufferLayout::Planar, AuxBuses::default()),
+    ] {
+        let mut output = [9.0; 128];
+        let mut buffers =
+            AudioBuffers::new(&input, &mut output, channels, channels, frames, layout)
+                .with_aux_inputs(aux);
+        let event = Event::Param(ParamEvent::SetValue {
+            id: PARAM_GAIN,
+            target: Target::Global,
+            value: 0.0,
+            sample_offset: 0,
+        });
+        assert_eq!(
+            processor.process(&mut buffers, &[event], &TimeContext::default(), &mut sink),
+            ProcessStatus::Error
+        );
+        let used = (channels * frames) as usize;
+        assert!(output[..used].iter().all(|&v| v == 0.0));
+        assert!(output[used..].iter().all(|&v| v == 9.0));
+    }
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+    assert_eq!(
+        output, [0.5; 8],
+        "rejected edits cannot reach the native gain"
+    );
+}
+
+/// Both native scratch loss and caller capacity loss remain visible across process calls.
+#[test]
+fn output_overflow_is_propagated_and_not_cleared_by_processing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [0.0; 8];
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    let burst = Event::Param(ParamEvent::SetValue {
+        id: PARAM_ASK,
+        target: Target::Global,
+        value: 5.0,
+        sample_offset: 0,
+    });
+    for capacity in [0, 1, 4096] {
+        let mut sink = EventSink::with_capacity(capacity);
+        processor.process(&mut buffers, &[burst], &TimeContext::default(), &mut sink);
+        assert!(sink.overflowed());
+        let retained = sink.events().len();
+        assert_eq!(retained, capacity.min(2048));
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+        assert!(sink.overflowed());
+        assert_eq!(sink.events().len(), retained);
+        sink.clear();
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+        assert!(!sink.overflowed());
+    }
+}
+
+/// Native completion identifies the input note, independently of output note ports.
+#[test]
+fn clap_note_ports_report_native_completion() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    assert_eq!(plugin.note_end_ports(), [0]);
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+    let mut sink = EventSink::with_capacity(2);
+    let on = Event::Note(NoteEvent::NoteOn {
+        note_id: Some(17),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 1.0,
+        sample_offset: 0,
+    });
+    processor.process(&mut buffers, &[on], &TimeContext::default(), &mut sink);
+    assert!(sink.is_empty());
+    let off = Event::Note(NoteEvent::NoteOff {
+        note_id: Some(17),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 0.0,
+        sample_offset: 2,
+    });
+    processor.process(&mut buffers, &[off], &TimeContext::default(), &mut sink);
+    assert!(matches!(
+        sink.events(),
+        [Event::Note(NoteEvent::NoteEnd {
+            note_id: Some(17),
+            sample_offset: 2,
+            ..
+        })]
+    ));
+}
+
 /// A running processor retains its instance, module, and callbacks after main is dropped.
 #[test]
 fn the_processor_outlives_main_and_returns_to_its_owner() {
@@ -167,6 +304,7 @@ impl HostContext for TestHost {
 struct RecordingHost {
     reasons: std::sync::Mutex<Vec<RestartReason>>,
     latencies: std::sync::Mutex<Vec<u32>>,
+    threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
 }
 
 impl HostContext for RecordingHost {
@@ -175,10 +313,159 @@ impl HostContext for RecordingHost {
     }
     fn request_restart(&self, reason: RestartReason) {
         self.reasons.lock().expect("not poisoned").push(reason);
+        self.threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
     }
     fn latency_changed(&self, samples: u32) {
         self.latencies.lock().expect("not poisoned").push(samples);
     }
+}
+
+/// Repeated audio-thread requests reach HostContext once, on a headless main-thread tick.
+#[test]
+fn audio_requests_are_delivered_only_by_the_main_thread() {
+    let module = Module::open(fixture_path()).unwrap();
+    let host = Arc::new(RecordingHost::default());
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", host.clone()).unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let processor = std::thread::spawn(move || {
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+        let request = Event::Param(ParamEvent::SetValue {
+            id: PARAM_ASK,
+            target: Target::Global,
+            value: ASK_RESTART,
+            sample_offset: 0,
+        });
+        for _ in 0..2 {
+            processor.process(
+                &mut buffers,
+                &[request],
+                &TimeContext::default(),
+                &mut EventSink::new(),
+            );
+        }
+        processor
+    })
+    .join()
+    .unwrap();
+    assert!(host.reasons.lock().unwrap().is_empty());
+    plugin.tick();
+    assert_eq!(*host.reasons.lock().unwrap(), [RestartReason::IoConfig]);
+    assert_eq!(*host.threads.lock().unwrap(), [std::thread::current().id()]);
+    processor.deactivate();
+    plugin.tick();
+    drop(plugin);
+    assert_eq!(host.reasons.lock().unwrap().len(), 1);
+}
+
+/// A request raised during a native main callback remains pending for the next tick.
+#[test]
+fn callback_requests_are_not_lost_while_servicing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let host = Arc::new(RecordingHost::default());
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", host.clone()).unwrap();
+    plugin.set_param(PARAM_ASK, 6.0).unwrap();
+    plugin.tick();
+    assert!(host.reasons.lock().unwrap().is_empty());
+    plugin.tick();
+    assert_eq!(*host.reasons.lock().unwrap(), [RestartReason::IoConfig]);
+    plugin.tick();
+    assert_eq!(host.reasons.lock().unwrap().len(), 1);
+}
+
+/// Descriptors change atomically, and only structural changes require giving back the processor.
+#[test]
+fn metadata_refresh_obeys_activation_and_preserves_failed_requests() {
+    use plugin_host_api::MetadataUpdate;
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let config = lifecycle_config();
+    let mut processor = plugin.activate(config).unwrap();
+    let mut send = |value| {
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+        let event = Event::Param(ParamEvent::SetValue {
+            id: PARAM_ASK,
+            target: Target::Global,
+            value,
+            sample_offset: 0,
+        });
+        assert_eq!(
+            processor.process(
+                &mut buffers,
+                &[event],
+                &TimeContext::default(),
+                &mut EventSink::new()
+            ),
+            ProcessStatus::Continue
+        );
+    };
+    send(8.0);
+    plugin.tick();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(plugin.params()[0].name, "Level");
+    send(7.0);
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::NeedsDeactivation
+    );
+    assert_eq!(plugin.io_layout().main_input_channels(), 2);
+    assert_eq!(plugin.params().len(), 8);
+    processor.deactivate();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(plugin.io_layout().main_input_channels(), 1);
+    assert_eq!(plugin.params().len(), 7);
+    assert_eq!(plugin.params()[0].max, 4.0);
+    assert!(!plugin.params().iter().any(|p| p.id == PARAM_OFFSET));
+    plugin
+        .activate(AudioConfig {
+            input_channels: 1,
+            output_channels: 1,
+            ..config
+        })
+        .unwrap()
+        .deactivate();
+    let params = plugin.params().to_vec();
+    plugin.set_param(PARAM_ASK, 9.0).unwrap();
+    assert!(plugin.refresh_metadata().is_err());
+    assert_eq!(plugin.params(), params);
+    assert!(plugin.activate(config).is_err());
+    plugin.set_param(PARAM_ASK, 8.0).unwrap();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    plugin.set_param(PARAM_ASK, 10.0).unwrap();
+    assert!(plugin.refresh_metadata().is_err());
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Unchanged
+    );
+    let mut state = plugin.save_state().unwrap();
+    state[16..24].copy_from_slice(&0.0f64.to_le_bytes());
+    plugin.load_state(&state).unwrap();
+    assert_eq!(plugin.params().len(), 8);
+    assert_eq!(plugin.io_layout().main_input_channels(), 2);
 }
 
 /// The plugin asks; the host has to hear it.
@@ -215,9 +502,15 @@ fn the_host_forwards_what_the_plugin_asks_for() {
         // `params.flush` — main thread, which is where all three calls are
         // legal.
         SubPluginMain::set_param(&mut plugin, PARAM_ASK, ask).expect("the ask lands");
+        assert!(host.reasons.lock().unwrap().is_empty());
+        plugin.tick();
 
         let seen = host.reasons.lock().unwrap().clone();
-        assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
+        if expected == RestartReason::Latency {
+            assert_eq!(*host.latencies.lock().unwrap(), [0]);
+        } else {
+            assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
+        }
     }
 }
 
@@ -451,6 +744,8 @@ fn the_backend_drives_a_real_clap_module() {
 
     // A truncated blob has to be refused rather than half-applied.
     assert!(SubPluginMain::load_state(&mut plugin, &saved[..4]).is_err());
+    assert!(plugin.activate(lifecycle_config()).is_err());
+    plugin.refresh_metadata().unwrap();
 
     // --- latency -----------------------------------------------------------
 

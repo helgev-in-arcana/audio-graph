@@ -451,14 +451,26 @@ impl Event {
 
 /// Collects events emitted *by* the sub-plugin during `process`.
 ///
-/// A plain owned buffer rather than a callback: a callback would be a
-/// reference crossing the boundary, which this API does not allow.
-#[derive(Debug, Clone, Default)]
+/// Capacity is fixed at construction. The caller clears it at the start of
+/// its collection interval; processors append, so multiple calls retain both
+/// their events and any capacity failure until the caller handles it.
+#[derive(Debug, Default)]
 pub struct EventSink {
     events: Vec<Event>,
+    overflowed: bool,
+}
+
+impl Clone for EventSink {
+    fn clone(&self) -> Self {
+        let mut copy = Self::with_capacity(self.events.capacity());
+        copy.events.extend_from_slice(&self.events);
+        copy.overflowed = self.overflowed;
+        copy
+    }
 }
 
 impl EventSink {
+    /// An empty sink with no capacity; any output records an overflow.
     pub fn new() -> Self {
         Self::default()
     }
@@ -467,11 +479,32 @@ impl EventSink {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             events: Vec::with_capacity(cap),
+            overflowed: false,
         }
     }
 
-    pub fn push(&mut self, event: Event) {
+    /// Returns false and records overflow instead of allocating when full.
+    pub fn push(&mut self, event: Event) -> bool {
+        if self.events.len() == self.events.capacity() {
+            self.mark_overflow();
+            return false;
+        }
         self.events.push(event);
+        true
+    }
+
+    /// Records loss in a backend's native output buffer as well as in this sink.
+    pub fn mark_overflow(&mut self) {
+        self.overflowed = true;
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Mutable events allow a caller to rebase sub-block timestamps without copying.
+    pub fn events_mut(&mut self) -> &mut [Event] {
+        &mut self.events
     }
 
     pub fn events(&self) -> &[Event] {
@@ -480,10 +513,36 @@ impl EventSink {
 
     pub fn clear(&mut self) {
         self.events.clear();
+        self.overflowed = false;
     }
 
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    /// Capacity and overflow survive cloning and repeated appends until the caller clears.
+    #[test]
+    fn capacity_is_a_limit_and_loss_is_sticky() {
+        let event = Event::Param(ParamEvent::GestureBegin { id: ParamId(0) });
+        assert!(!EventSink::new().push(event));
+        let mut sink = EventSink::with_capacity(2).clone();
+        assert!(sink.push(event));
+        assert!(sink.push(event));
+        assert!(!sink.overflowed());
+        assert!(!sink.push(event));
+        assert!(sink.overflowed());
+        assert_eq!(sink.events(), &[event, event]);
+        sink.clear();
+        assert!(!sink.overflowed());
+        assert!(sink.push(event));
+        sink.mark_overflow();
+        assert!(sink.push(event));
+        assert!(sink.overflowed());
     }
 }
 

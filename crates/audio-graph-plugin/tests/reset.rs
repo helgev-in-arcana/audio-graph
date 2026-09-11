@@ -217,3 +217,65 @@ fn a_reset_gives_the_daw_back_the_notes_the_graph_was_holding() {
         daw.outgoing
     );
 }
+
+/// Event loss releases DAW voices and resets native held notes before the next block.
+#[test]
+fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
+    plugin_host::init_thread();
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper
+        .shared()
+        .load(&harness::fixture_as_clap("event-overflow-reset"))
+        .unwrap();
+    wrapper.shared().adopt_default_patch();
+    {
+        let mut patch = wrapper.shared().patch();
+        let (plugin, note_port) = patch
+            .graph
+            .nodes
+            .iter()
+            .find_map(|node| {
+                if let NodeKind::Plugin(plugin) = &node.kind {
+                    Some((node.id, plugin.ports.audio_in.len() as u8))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let input = patch.graph.add(NodeKind::NoteIn, [0.0, 200.0]);
+        patch.graph.connect(input, 0, plugin, note_port);
+    }
+    wrapper.shared().publish_graph();
+    let mut daw = Daw::playing();
+    daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
+        timing: 0,
+        voice_id: Some(42),
+        channel: 0,
+        note: 60,
+        velocity: 1.0,
+    });
+    let mut held = Block::silent(FRAMES);
+    held.process(&mut wrapper, &mut daw);
+    assert!(held.peak() > 0.0);
+    assert!(daw.outgoing.is_empty());
+    wrapper
+        .shared()
+        .main()
+        .host
+        .set_sub_param(0, plugin_host::ParamId(5), 5.0)
+        .unwrap();
+    Block::silent(FRAMES).process(&mut wrapper, &mut daw);
+    assert!(daw.outgoing.iter().any(|event| matches!(
+        event,
+        nice_plug::prelude::NoteEvent::VoiceTerminated {
+            voice_id: Some(42),
+            ..
+        }
+    )));
+    let mut after = Block::silent(FRAMES);
+    after.process(&mut wrapper, &mut daw);
+    assert_eq!(after.peak(), 0.0, "the native voice must stop too");
+}

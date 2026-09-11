@@ -102,6 +102,33 @@ pub struct AudioConfig {
 }
 
 impl AudioConfig {
+    /// Reject dimensions that cannot be represented by the native processing APIs.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
+            return Err(crate::HostError::InvalidState("invalid sample rate"));
+        }
+        if self.max_block_size == 0 || self.max_block_size > i32::MAX as u32 {
+            return Err(crate::HostError::InvalidState("invalid maximum block size"));
+        }
+        for (main, aux) in [
+            (self.input_channels, self.aux_inputs),
+            (self.output_channels, self.aux_outputs),
+        ] {
+            let valid = main
+                .checked_add(aux.total_channels())
+                .is_some_and(|channels| {
+                    channels <= i32::MAX as u32
+                        && sample_count(channels, self.max_block_size).is_some()
+                });
+            if !valid || aux.iter().any(|width| width == 0) {
+                return Err(crate::HostError::InvalidState(
+                    "invalid audio bus dimensions",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Every input channel the plugin will be handed, main bus and aux buses
     /// together. This is the width of [`AudioBuffers`]'s input region.
     pub fn total_input_channels(&self) -> u32 {
@@ -112,6 +139,13 @@ impl AudioConfig {
     pub fn total_output_channels(&self) -> u32 {
         self.output_channels + self.aux_outputs.total_channels()
     }
+}
+
+fn sample_count(channels: u32, frames: u32) -> Option<usize> {
+    let samples = usize::try_from(channels)
+        .ok()?
+        .checked_mul(usize::try_from(frames).ok()?)?;
+    (samples <= isize::MAX as usize / size_of::<f32>()).then_some(samples)
 }
 
 impl Default for AudioConfig {
@@ -148,7 +182,7 @@ pub struct AudioBuffers<'a> {
 
 impl<'a> AudioBuffers<'a> {
     /// # Panics
-    /// If either slice is shorter than `channels * frame_count`.
+    /// If dimensions overflow the addressable sample range or either slice is too short.
     pub fn new(
         input: &'a [f32],
         output: &'a mut [f32],
@@ -158,11 +192,11 @@ impl<'a> AudioBuffers<'a> {
         layout: BufferLayout,
     ) -> Self {
         assert!(
-            input.len() >= (input_channels * frame_count) as usize,
+            sample_count(input_channels, frame_count).is_some_and(|n| input.len() >= n),
             "input buffer too small"
         );
         assert!(
-            output.len() >= (output_channels * frame_count) as usize,
+            sample_count(output_channels, frame_count).is_some_and(|n| output.len() >= n),
             "output buffer too small"
         );
         Self {
@@ -240,6 +274,19 @@ impl<'a> AudioBuffers<'a> {
         self.layout
     }
 
+    /// Whether native planar pointers can use this block with the activation's bus boundaries.
+    ///
+    /// Slice lengths are established by construction; matching totals alone would
+    /// still allow a main channel to be interpreted as a sidechain channel.
+    pub fn matches_config(&self, config: &AudioConfig) -> bool {
+        self.layout == BufferLayout::Planar
+            && self.frame_count <= config.max_block_size
+            && self.main_input_channels() == config.input_channels
+            && self.main_output_channels() == config.output_channels
+            && self.aux_inputs == config.aux_inputs
+            && self.aux_outputs == config.aux_outputs
+    }
+
     /// Contiguous input channel, only available in planar layout.
     pub fn input_channel(&self, channel: u32) -> Option<&[f32]> {
         if self.layout != BufferLayout::Planar || channel >= self.input_channels {
@@ -270,7 +317,7 @@ impl<'a> AudioBuffers<'a> {
     /// Zero the whole output region. Used when a plugin reports silence or a
     /// process call is skipped.
     pub fn clear_output(&mut self) {
-        let n = (self.output_channels * self.frame_count) as usize;
+        let n = self.output_channels as usize * self.frame_count as usize;
         self.output[..n].fill(0.0);
     }
 }
@@ -278,6 +325,87 @@ impl<'a> AudioBuffers<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native dimensions and sample ranges cannot wrap during activation.
+    #[test]
+    fn invalid_configurations_are_rejected() {
+        for sample_rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                AudioConfig {
+                    sample_rate,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for max_block_size in [0, u32::MAX] {
+            assert!(
+                AudioConfig {
+                    max_block_size,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let config = AudioConfig {
+            input_channels: u32::MAX,
+            aux_inputs: AuxBuses::new(&[2]),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert_eq!(sample_count(u32::MAX, u32::MAX), None);
+        assert!(AudioConfig::default().validate().is_ok());
+    }
+
+    /// Equal channel totals do not make different bus boundaries interchangeable.
+    #[test]
+    fn blocks_match_layout_and_bus_boundaries() {
+        let config = AudioConfig {
+            max_block_size: 4,
+            aux_inputs: AuxBuses::new(&[2]),
+            ..Default::default()
+        };
+        let input = [0.0; 16];
+        let mut output = [0.0; 8];
+        for frames in [0, 1, 4] {
+            let buffers =
+                AudioBuffers::new(&input, &mut output, 4, 2, frames, BufferLayout::Planar)
+                    .with_aux_inputs(AuxBuses::new(&[2]));
+            assert!(buffers.matches_config(&config));
+        }
+        for (layout, aux) in [
+            (BufferLayout::Interleaved, AuxBuses::new(&[2])),
+            (BufferLayout::Planar, AuxBuses::new(&[1, 1])),
+            (BufferLayout::Planar, AuxBuses::default()),
+        ] {
+            let buffers =
+                AudioBuffers::new(&input, &mut output, 4, 2, 4, layout).with_aux_inputs(aux);
+            assert!(!buffers.matches_config(&config));
+        }
+    }
+
+    /// Short storage is rejected before a buffer view can reach a processor.
+    #[test]
+    #[should_panic(expected = "input buffer too small")]
+    fn short_storage_is_rejected() {
+        AudioBuffers::new(&[0.0; 3], &mut [0.0; 4], 2, 2, 2, BufferLayout::Planar);
+    }
+
+    /// Multiplication overflow cannot turn enormous dimensions into a small slice.
+    #[test]
+    #[should_panic(expected = "input buffer too small")]
+    fn overflowing_storage_is_rejected() {
+        AudioBuffers::new(
+            &[],
+            &mut [],
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            BufferLayout::Planar,
+        );
+    }
 
     #[test]
     fn planar_channels_are_contiguous() {

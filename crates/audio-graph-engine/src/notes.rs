@@ -108,6 +108,7 @@ pub struct Ended {
 
 pub struct NoteLedger {
     entries: Vec<Entry>,
+    fallback: Vec<FallbackDestination>,
     /// Free entry indices. A stack, so a note reuses the most recently
     /// finished slot and the pool stays warm.
     free: Vec<Idx>,
@@ -120,6 +121,28 @@ pub struct NoteLedger {
     stolen: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Delivery {
+    serial: u64,
+    count: u16,
+    port: i16,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct FallbackDestination {
+    instance: u32,
+    notes: [Delivery; MAX_LIVE_NOTES],
+}
+
+impl FallbackDestination {
+    pub(crate) fn new(instance: u32) -> Self {
+        Self {
+            instance,
+            notes: [Delivery::default(); MAX_LIVE_NOTES],
+        }
+    }
+}
+
 impl Default for NoteLedger {
     fn default() -> Self {
         Self::new()
@@ -130,6 +153,7 @@ impl NoteLedger {
     pub fn new() -> NoteLedger {
         NoteLedger {
             entries: vec![Entry::EMPTY; MAX_LIVE_NOTES],
+            fallback: Vec::new(),
             free: (0..MAX_LIVE_NOTES as Idx).rev().collect(),
             head: vec![None; CHANNELS * KEYS],
             next_serial: 0,
@@ -148,6 +172,9 @@ impl NoteLedger {
     /// dropping the entries silently would leave it holding voices for notes
     /// that will never be spoken of again.
     pub fn clear(&mut self) {
+        for destination in &mut self.fallback {
+            destination.notes.fill(Delivery::default());
+        }
         self.entries.iter_mut().for_each(|e| *e = Entry::EMPTY);
         self.free.clear();
         self.free.extend((0..MAX_LIVE_NOTES as Idx).rev());
@@ -416,6 +443,54 @@ impl NoteLedger {
         }
     }
 
+    pub(crate) fn adopt_destinations(&mut self, next: &mut Vec<FallbackDestination>) {
+        for previous in &self.fallback {
+            if let Some(destination) = next.iter_mut().find(|d| d.instance == previous.instance) {
+                destination.notes = previous.notes;
+            } else {
+                for (entry, delivery) in self.entries.iter_mut().zip(previous.notes) {
+                    if entry.live && entry.serial == delivery.serial {
+                        entry.voices = entry.voices.saturating_sub(delivery.count);
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut self.fallback, next);
+    }
+
+    pub(crate) fn delivered_with_fallback(&mut self, id: i32, instance: u32, port: i16) {
+        self.delivered(id);
+        let Some(entry) = self.entries.get(id as usize).filter(|e| e.live) else {
+            return;
+        };
+        let Some(destination) = self.fallback.iter_mut().find(|d| d.instance == instance) else {
+            return;
+        };
+        let delivery = &mut destination.notes[id as usize];
+        if delivery.serial != entry.serial || delivery.port != port {
+            *delivery = Delivery {
+                serial: entry.serial,
+                port,
+                count: 0,
+            };
+        }
+        delivery.count = delivery.count.saturating_add(1);
+    }
+
+    pub(crate) fn released_to(&mut self, id: i32, instance: u32, port: i16) {
+        let Some(entry) = self.entries.get(id as usize).filter(|e| e.live) else {
+            return;
+        };
+        let Some(destination) = self.fallback.iter_mut().find(|d| d.instance == instance) else {
+            return;
+        };
+        let delivery = &mut destination.notes[id as usize];
+        if delivery.serial == entry.serial && delivery.port == port && delivery.count != 0 {
+            delivery.count -= 1;
+            self.finished(id);
+        }
+    }
+
     /// A sub-plugin says it has finished with this note.
     pub fn finished(&mut self, id: i32) {
         if let Some(entry) = self.entry_mut(id) {
@@ -477,6 +552,40 @@ impl NoteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delivery ownership survives program swaps and cannot attach to a reused note id.
+    #[test]
+    fn fallback_ownership_survives_swaps_and_expires_with_the_note() {
+        let mut ledger = NoteLedger::new();
+        ledger.adopt_destinations(&mut vec![
+            FallbackDestination::new(7),
+            FallbackDestination::new(9),
+        ]);
+        let id = id_of(ledger.translate(on(0, 60, None))).unwrap();
+        ledger.delivered_with_fallback(id, 7, 0);
+        ledger.delivered(id);
+        ledger.adopt_destinations(&mut vec![
+            FallbackDestination::new(9),
+            FallbackDestination::new(7),
+        ]);
+        ledger.released_to(id, 9, 0);
+        ledger.released_to(id, 7, 1);
+        assert_eq!(ledger.entries[id as usize].voices, 2);
+        ledger.released_to(id, 7, 0);
+        ledger.released_to(id, 7, 0);
+        assert_eq!(ledger.entries[id as usize].voices, 1);
+        ledger.finished(id);
+        ledger.translate(off(0, 60, None));
+        ledger.end_block(&mut Vec::with_capacity(1));
+        let next = id_of(ledger.translate(on(0, 61, None))).unwrap();
+        assert_eq!(id, next);
+        ledger.delivered(next);
+        ledger.released_to(next, 7, 0);
+        assert_eq!(ledger.entries[next as usize].voices, 1);
+        ledger.delivered_with_fallback(next, 7, 0);
+        ledger.adopt_destinations(&mut vec![FallbackDestination::new(9)]);
+        assert_eq!(ledger.entries[next as usize].voices, 1);
+    }
 
     fn on(channel: i16, key: i16, id: Option<i32>) -> NoteEvent {
         NoteEvent::NoteOn {

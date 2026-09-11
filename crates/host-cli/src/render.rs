@@ -40,8 +40,23 @@ pub fn load(
     host: Arc<dyn plugin_host::HostContext>,
 ) -> Result<(ClassInfo, Plugin), String> {
     let class = choose_class(path, wanted)?;
-    let plugin = Plugin::load(path, Some(&class.id), host).map_err(|e| e.to_string())?;
+    let mut plugin = Plugin::load(path, Some(&class.id), host).map_err(|e| e.to_string())?;
+    prefer_stereo(&mut plugin)?;
     Ok((class, plugin))
+}
+
+pub fn prefer_stereo(plugin: &mut Plugin) -> Result<(), String> {
+    let layout = plugin.io_layout();
+    let input = layout.main_input_channels();
+    let output = layout.outputs.first().map_or(0, |bus| bus.channels);
+    if input == 1 || output == 1 {
+        let _ = plugin.request_main_bus_channels(
+            if input == 1 { 2 } else { input },
+            if output == 1 { 2 } else { output },
+        );
+    }
+    plugin.refresh_metadata().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Main-bus widths, as a harness has to activate with them: `(in, out)`.
@@ -64,9 +79,7 @@ pub struct RenderOutcome {
     pub host_log: Vec<String>,
     /// What the plugin sent back, gathered across every block.
     ///
-    /// A backend clears the sink each call, so watching one block would only
-    /// ever show the last one's worth. This is how a note the plugin says it
-    /// has finished with becomes visible from outside.
+    /// The render loop clears its per-block sink after collecting its output.
     pub emitted: Vec<Event>,
 }
 
@@ -108,6 +121,7 @@ pub fn render_with_state(
         // activate, and it has to know which one by then.
         plugin.load_state(state).map_err(|e| e.to_string())?;
     }
+    prefer_stereo(&mut plugin)?;
 
     let layout = SubPluginMain::io_layout(&plugin);
     // An instrument reports no input bus; feeding it one would fail bus setup.
@@ -147,6 +161,15 @@ pub fn render_with_state(
     let mut blocks = 0usize;
 
     while position < input.frames {
+        if plugin.refresh_metadata().map_err(|e| e.to_string())?
+            == plugin_host::MetadataUpdate::NeedsDeactivation
+        {
+            processor.deactivate();
+            plugin.refresh_metadata().map_err(|e| e.to_string())?;
+            return Err(format!(
+                "plugin metadata requires a new render configuration at sample {position}"
+            ));
+        }
         let frames = block_size.min((input.frames - position) as u32);
 
         for ch in 0..input_channels as usize {
@@ -177,10 +200,17 @@ pub fn render_with_state(
             BufferLayout::Planar,
         );
 
+        sink.clear();
         let status = processor.process(&mut buffers, &block_events, &context, &mut sink);
+        if sink.overflowed() {
+            processor.deactivate();
+            plugin.tick();
+            return Err(format!("plugin event output overflow at sample {position}"));
+        }
         emitted.extend_from_slice(sink.events());
         if status == ProcessStatus::Error {
             processor.deactivate();
+            plugin.tick();
             return Err(format!("plugin returned an error at sample {position}"));
         }
 
@@ -195,6 +225,7 @@ pub fn render_with_state(
     }
 
     processor.deactivate();
+    plugin.tick();
 
     Ok(RenderOutcome {
         audio: output,

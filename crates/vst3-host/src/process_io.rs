@@ -16,6 +16,7 @@ use vst3::{Class, ComWrapper};
 /// Points for one parameter within one block.
 pub struct ValueQueue {
     id: Cell<ParamID>,
+    overflowed: Cell<bool>,
     /// `(sample_offset, normalized_value)`, kept sorted by offset.
     points: RefCell<Vec<(int32, ParamValue)>>,
 }
@@ -24,12 +25,14 @@ impl ValueQueue {
     fn new(capacity: usize) -> ComWrapper<ValueQueue> {
         ComWrapper::new(ValueQueue {
             id: Cell::new(0),
+            overflowed: Cell::new(false),
             points: RefCell::new(Vec::with_capacity(capacity)),
         })
     }
 
     fn reset(&self, id: ParamID) {
         self.id.set(id);
+        self.overflowed.set(false);
         self.points.borrow_mut().clear();
     }
 
@@ -37,6 +40,7 @@ impl ValueQueue {
     fn push(&self, sample_offset: int32, value: ParamValue) -> bool {
         let mut points = self.points.borrow_mut();
         if points.len() == points.capacity() {
+            self.overflowed.set(true);
             return false;
         }
         points.push((sample_offset, value));
@@ -101,6 +105,7 @@ pub struct ParameterChanges {
     /// Pre-built queues, reused every block. `used` is how many are live now.
     pool: Vec<ComWrapper<ValueQueue>>,
     used: Cell<usize>,
+    overflowed: Cell<bool>,
 }
 
 impl ParameterChanges {
@@ -112,11 +117,20 @@ impl ParameterChanges {
                 .map(|_| ValueQueue::new(max_points))
                 .collect(),
             used: Cell::new(0),
+            overflowed: Cell::new(false),
         })
     }
 
     pub fn clear(&self) {
         self.used.set(0);
+        self.overflowed.set(false);
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.get()
+            || self.pool[..self.used.get()]
+                .iter()
+                .any(|q| q.overflowed.get())
     }
 
     /// Record `value` (normalized) for `id` at `sample_offset`.
@@ -131,6 +145,7 @@ impl ParameterChanges {
             }
         }
         let Some(queue) = self.pool.get(used) else {
+            self.overflowed.set(true);
             return false;
         };
         queue.reset(id);
@@ -194,6 +209,7 @@ impl IParameterChangesTrait for ParameterChanges {
         }
 
         let Some(queue) = self.pool.get(used) else {
+            self.overflowed.set(true);
             return std::ptr::null_mut();
         };
         queue.reset(id);
@@ -210,23 +226,31 @@ impl IParameterChangesTrait for ParameterChanges {
 /// The `IEventList` handed to `process`, in both directions.
 pub struct EventList {
     events: RefCell<Vec<Event>>,
+    overflowed: Cell<bool>,
 }
 
 impl EventList {
     pub fn new(capacity: usize) -> ComWrapper<EventList> {
         ComWrapper::new(EventList {
             events: RefCell::new(Vec::with_capacity(capacity)),
+            overflowed: Cell::new(false),
         })
     }
 
     pub fn clear(&self) {
         self.events.borrow_mut().clear();
+        self.overflowed.set(false);
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.get()
     }
 
     /// Returns false if the pre-allocated capacity is full.
     pub fn push(&self, event: Event) -> bool {
         let mut events = self.events.borrow_mut();
         if events.len() == events.capacity() {
+            self.overflowed.set(true);
             return false;
         }
         events.push(event);
@@ -310,8 +334,13 @@ mod tests {
         assert!(changes.add_point(1, 0, 0.0));
         // Second point for the same parameter: point capacity exhausted.
         assert!(!changes.add_point(1, 1, 0.0));
+        assert!(changes.overflowed());
+        changes.clear();
+        assert!(!changes.overflowed());
+        assert!(changes.add_point(1, 0, 0.0));
         // Second parameter: queue pool exhausted.
         assert!(!changes.add_point(2, 0, 0.0));
+        assert!(changes.overflowed());
     }
 
     #[test]
@@ -320,7 +349,9 @@ mod tests {
         let event: Event = unsafe { std::mem::zeroed() };
         assert!(list.push(event));
         assert!(!list.push(event));
+        assert!(list.overflowed());
         list.clear();
+        assert!(!list.overflowed());
         assert!(list.push(event));
     }
 }

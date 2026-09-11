@@ -63,6 +63,13 @@ impl AudioChunk {
 /// caller decides *when* each instance runs and *what* it hears, and nothing
 /// about the plugin format crosses back.
 pub trait AudioInstances {
+    /// Whether an input port supplies explicit voice completion events.
+    /// Implementations providing completion themselves can keep this default;
+    /// hosts of formats without it must report false for the affected ports.
+    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+        true
+    }
+
     /// Processes audio and events for the specified sub-plugin instance.
     ///
     /// Reads planar audio channels from `input` and writes planar channels to
@@ -93,6 +100,10 @@ pub trait AudioInstances {
 pub struct NoInstances;
 
 impl AudioInstances for NoInstances {
+    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+        false
+    }
+
     fn process(
         &mut self,
         _instance: u32,

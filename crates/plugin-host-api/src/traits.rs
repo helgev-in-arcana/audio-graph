@@ -34,7 +34,11 @@ pub enum ProcessStatus {
 /// vocabulary entirely, so a standalone scanner and the nested wrapper are
 /// expressed by the same types.
 ///
-/// All methods are called on the main thread.
+/// All methods are called on the main thread. Native restart requests are
+/// coalesced and delivered by `SubPluginMain::tick`; GUI parameter edits and
+/// activation latency can be reported synchronously. Callbacks must schedule
+/// reconfiguration rather than reenter the same plugin. Call a final tick
+/// before normal shutdown; undelivered requests are discarded on destruction.
 pub trait HostContext: Send + Sync {
     /// Shown to the plugin; some plugins branch on it.
     fn host_name(&self) -> &str;
@@ -73,11 +77,47 @@ pub enum RestartReason {
     IoConfig,
 }
 
+/// Result of an explicit metadata refresh on the owning main thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataUpdate {
+    Unchanged,
+    Refreshed,
+    /// Return the processor, then retry before reading metadata for reactivation.
+    NeedsDeactivation,
+}
+
 /// Main-thread surface of a loaded sub-plugin.
 ///
 /// Deliberately not `Send`: both VST3 and CLAP pin these calls to the thread
 /// that created the instance.
 pub trait SubPluginMain {
+    /// Service callbacks on the owning main thread, even with no editor open.
+    /// Requests arriving during delivery remain pending for a subsequent tick.
+    fn tick(&mut self) {}
+
+    /// Complete pending descriptor updates, preserving requests that cannot yet be applied.
+    /// A failure leaves the update pending and must not be followed by activation
+    /// until a later refresh succeeds.
+    fn refresh_metadata(&mut self) -> Result<MetadataUpdate> {
+        Ok(MetadataUpdate::Unchanged)
+    }
+
+    /// Request main-bus widths while inactive. Read `io_layout` afterwards even
+    /// on refusal: native negotiation may select a different arrangement.
+    /// Auxiliary buses keep their declared widths until activation.
+    fn request_main_bus_channels(&mut self, input: u16, output: u16) -> Result<()> {
+        let layout = self.io_layout();
+        if layout.main_input_channels() == input
+            && layout.outputs.first().map_or(0, |bus| bus.channels) == output
+        {
+            Ok(())
+        } else {
+            Err(crate::HostError::UnsupportedBusConfig(
+                "main bus widths are fixed".into(),
+            ))
+        }
+    }
+
     /// Full parameter list. Batched by construction — there is no `param(id)`
     /// accessor anywhere in this API.
     fn params(&self) -> &[ParamInfo];
@@ -101,6 +141,13 @@ pub trait SubPluginMain {
     /// this answers is whether any plugin here would actually benefit from us
     /// speaking MIDI 2.0, which is otherwise easy to guess at and hard to know.
     fn note_dialects(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Input ports whose native note dialect reports voice completion with `NoteEnd`.
+    /// A host may reclaim other ports' note bookkeeping at delivery of NoteOff;
+    /// that policy does not describe the duration of their audible release tails.
+    fn note_end_ports(&self) -> Vec<i16> {
         Vec::new()
     }
 
@@ -148,6 +195,13 @@ pub trait SubPluginProcessor: Send {
     /// Render one block. Must not allocate, lock, or block.
     ///
     /// `events` is ordered by `sample_offset`.
+    /// Buffers must match the activation's channels and aux buses, use planar
+    /// layout, and fit its maximum block size. A mismatch returns `Error` with
+    /// cleared audio output, without entering native processing. A matching
+    /// zero-frame block does not enter native processing either.
+    /// Output events append to `out_events` with call-relative sample offsets.
+    /// The caller clears the sink before its collection interval and handles
+    /// `overflowed()` afterwards; backends propagate native capacity failures.
     fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,

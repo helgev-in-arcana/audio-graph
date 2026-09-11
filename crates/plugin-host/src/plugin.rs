@@ -223,7 +223,8 @@ impl Plugin {
     /// running the main-thread callbacks and timers a plugin repaints from.
     pub fn tick(&mut self) {
         match &mut self.inner {
-            Backend::Vst3 { editor, .. } => {
+            Backend::Vst3 { plugin, editor, .. } => {
+                plugin.tick();
                 let Some(window) = editor.as_mut() else {
                     return;
                 };
@@ -265,6 +266,18 @@ macro_rules! delegate {
 }
 
 impl SubPluginMain for Plugin {
+    fn tick(&mut self) {
+        Plugin::tick(self);
+    }
+
+    fn refresh_metadata(&mut self) -> Result<plugin_host_api::MetadataUpdate> {
+        delegate!(mut self, p => SubPluginMain::refresh_metadata(p))
+    }
+
+    fn request_main_bus_channels(&mut self, input: u16, output: u16) -> Result<()> {
+        delegate!(mut self, p => SubPluginMain::request_main_bus_channels(p, input, output))
+    }
+
     fn params(&self) -> &[ParamInfo] {
         delegate!(self, p => SubPluginMain::params(p))
     }
@@ -279,6 +292,10 @@ impl SubPluginMain for Plugin {
 
     fn note_dialects(&self) -> Vec<&'static str> {
         delegate!(self, p => SubPluginMain::note_dialects(p))
+    }
+
+    fn note_end_ports(&self) -> Vec<i16> {
+        delegate!(self, p => SubPluginMain::note_end_ports(p))
     }
 
     fn io_layout(&self) -> IoLayout {

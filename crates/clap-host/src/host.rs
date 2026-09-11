@@ -22,8 +22,7 @@ use clap_sys::ext::note_ports::{
     clap_note_dialect,
 };
 use clap_sys::ext::params::{
-    CLAP_EXT_PARAMS, CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT,
-    CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_clear_flags, clap_param_rescan_flags,
+    CLAP_EXT_PARAMS, clap_host_params, clap_param_clear_flags, clap_param_rescan_flags,
 };
 #[cfg(all(unix, not(target_os = "macos")))]
 use clap_sys::ext::posix_fd_support::{
@@ -44,7 +43,7 @@ use clap_sys::version::CLAP_VERSION;
 use host_window::watch::TimerWheel;
 #[cfg(all(unix, not(target_os = "macos")))]
 use host_window::watch::{FdWatch, Interest, Readiness};
-use plugin_host_api::{HostContext, RestartReason};
+use plugin_host_api::HostContext;
 
 thread_local! {
     /// Non-zero while this thread is inside a CLAP audio-thread entry point.
@@ -92,7 +91,8 @@ pub struct PendingRequests {
     /// Its reported latency changed.
     pub latency: bool,
     /// Its bus layout changed.
-    pub audio_ports: bool,
+    pub audio_ports: u32,
+    pub note_ports: u32,
     /// Its voice count or capacity changed.
     pub voice_info: bool,
     /// Its editor asked to be resized, in logical pixels.
@@ -112,7 +112,7 @@ pub(crate) struct HostShim {
     /// Kept alive because `raw` holds borrowed pointers into them.
     _strings: HostStrings,
 
-    context: Arc<dyn HostContext>,
+    _context: Arc<dyn HostContext>,
 
     /// Set once the instance exists, so a callback that needs to ask the plugin
     /// something (its new latency, its new size) can.
@@ -127,7 +127,8 @@ pub(crate) struct HostShim {
     process: AtomicBool,
     param_rescan: AtomicU32,
     latency: AtomicBool,
-    audio_ports: AtomicBool,
+    audio_ports: AtomicU32,
+    note_ports: AtomicU32,
     voice_info: AtomicBool,
     /// Packed `(width << 32) | height`, or `NO_RESIZE` for "nothing pending".
     gui_resize: AtomicU64,
@@ -195,7 +196,7 @@ impl HostShim {
                 request_callback: Some(request_callback),
             },
             _strings: strings,
-            context,
+            _context: context,
             plugin: AtomicPtr::new(std::ptr::null_mut()),
             main_thread: std::thread::current().id(),
             restart: AtomicBool::new(false),
@@ -203,7 +204,8 @@ impl HostShim {
             process: AtomicBool::new(false),
             param_rescan: AtomicU32::new(0),
             latency: AtomicBool::new(false),
-            audio_ports: AtomicBool::new(false),
+            audio_ports: AtomicU32::new(0),
+            note_ports: AtomicU32::new(0),
             voice_info: AtomicBool::new(false),
             gui_resize: AtomicU64::new(NO_RESIZE),
             gui_closed: AtomicBool::new(false),
@@ -240,7 +242,8 @@ impl HostShim {
             process: self.process.swap(false, Ordering::AcqRel),
             param_rescan: self.param_rescan.swap(0, Ordering::AcqRel),
             latency: self.latency.swap(false, Ordering::AcqRel),
-            audio_ports: self.audio_ports.swap(false, Ordering::AcqRel),
+            audio_ports: self.audio_ports.swap(0, Ordering::AcqRel),
+            note_ports: self.note_ports.swap(0, Ordering::AcqRel),
             voice_info: self.voice_info.swap(false, Ordering::AcqRel),
             gui_resize: (packed != NO_RESIZE)
                 .then_some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)),
@@ -389,7 +392,6 @@ unsafe extern "C" fn get_extension(host: *const clap_host, id: *const c_char) ->
 unsafe extern "C" fn request_restart(host: *const clap_host) {
     if let Some(shim) = unsafe { shim(host) } {
         shim.restart.store(true, Ordering::Release);
-        shim.context.request_restart(RestartReason::IoConfig);
     }
 }
 
@@ -462,20 +464,6 @@ unsafe extern "C" fn params_rescan(host: *const clap_host, flags: clap_param_res
         return;
     };
     shim.param_rescan.fetch_or(flags, Ordering::AcqRel);
-
-    // Translated for the wrapper, which does not speak CLAP: the distinction
-    // that matters to it is whether the *set* of parameters changed (sockets
-    // have to be rebuilt) or only their values or labels.
-    let reason = if flags & (CLAP_PARAM_RESCAN_ALL | CLAP_PARAM_RESCAN_INFO) != 0 {
-        RestartReason::ParamList
-    } else if flags & CLAP_PARAM_RESCAN_TEXT != 0 {
-        RestartReason::ParamTitles
-    } else if flags & CLAP_PARAM_RESCAN_VALUES != 0 {
-        RestartReason::ParamValues
-    } else {
-        return;
-    };
-    shim.context.request_restart(reason);
 }
 
 unsafe extern "C" fn params_clear(
@@ -504,7 +492,6 @@ static HOST_LATENCY: clap_host_latency = clap_host_latency {
 unsafe extern "C" fn latency_changed(host: *const clap_host) {
     if let Some(shim) = unsafe { shim(host) } {
         shim.latency.store(true, Ordering::Release);
-        shim.context.request_restart(RestartReason::Latency);
     }
 }
 
@@ -678,10 +665,9 @@ unsafe extern "C" fn audio_ports_flag_supported(_host: *const clap_host, _flag: 
     true
 }
 
-unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, _flags: u32) {
+unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
-        shim.audio_ports.store(true, Ordering::Release);
-        shim.context.request_restart(RestartReason::IoConfig);
+        shim.audio_ports.fetch_or(flags, Ordering::Release);
     }
 }
 
@@ -697,10 +683,9 @@ unsafe extern "C" fn note_supported_dialects(_host: *const clap_host) -> clap_no
     CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI
 }
 
-unsafe extern "C" fn note_ports_rescan(host: *const clap_host, _flags: u32) {
+unsafe extern "C" fn note_ports_rescan(host: *const clap_host, flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
-        shim.audio_ports.store(true, Ordering::Release);
-        shim.context.request_restart(RestartReason::IoConfig);
+        shim.note_ports.fetch_or(flags, Ordering::Release);
     }
 }
 

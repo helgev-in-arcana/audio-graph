@@ -411,6 +411,7 @@ fn cmd_params(args: &[String]) -> Result<(), String> {
     // host ticks every frame; this is the harness catching up with it.
     plugin.tick();
 
+    render::prefer_stereo(&mut plugin)?;
     let (ins, outs) = render::bus_widths(&plugin);
     println!("{} [{}]", class.name, class.category);
     println!("buses: {ins} in / {outs} out");
@@ -724,6 +725,7 @@ fn state_round_trip(
 fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
     use plugin_host::{AudioBuffers, AudioConfig, BufferLayout, EventSink, TimeContext};
 
+    render::prefer_stereo(plugin)?;
     let (ins, outs) = render::bus_widths(plugin);
     let config = AudioConfig {
         sample_rate: 48_000.0,
@@ -747,9 +749,13 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         frames,
         BufferLayout::Planar,
     );
-    let mut sink = EventSink::new();
+    let mut sink = EventSink::with_capacity(256);
     processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+    if sink.overflowed() {
+        return Err("plugin event output overflow".into());
+    }
     processor.deactivate();
+    plugin.tick();
     Ok(())
 }
 
@@ -953,6 +959,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
         for round in 0..2 {
             let mut plugin = Plugin::load(Path::new(path), Some(&class.id), host.clone())
                 .map_err(|e| format!("{}: round {round}: {e}", class.name))?;
+            render::prefer_stereo(&mut plugin)?;
             let params = SubPluginMain::params(&plugin).len();
             let (ins, outs) = render::bus_widths(&plugin);
             let config = plugin_host::AudioConfig {
