@@ -117,6 +117,9 @@ pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &Tick
         main.host.tick_editors();
         main.host.any_loaded()
     };
+    if let Err(error) = shared.refresh_metadata() {
+        shared.patch().compile_error = Some(error);
+    }
 
     // After the editors, because a plugin says its latency has moved from its
     // own main-thread callback and that is what turns one. Recompiling is what

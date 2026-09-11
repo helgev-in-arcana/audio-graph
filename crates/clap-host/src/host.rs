@@ -91,7 +91,8 @@ pub struct PendingRequests {
     /// Its reported latency changed.
     pub latency: bool,
     /// Its bus layout changed.
-    pub audio_ports: bool,
+    pub audio_ports: u32,
+    pub note_ports: u32,
     /// Its voice count or capacity changed.
     pub voice_info: bool,
     /// Its editor asked to be resized, in logical pixels.
@@ -126,7 +127,8 @@ pub(crate) struct HostShim {
     process: AtomicBool,
     param_rescan: AtomicU32,
     latency: AtomicBool,
-    audio_ports: AtomicBool,
+    audio_ports: AtomicU32,
+    note_ports: AtomicU32,
     voice_info: AtomicBool,
     /// Packed `(width << 32) | height`, or `NO_RESIZE` for "nothing pending".
     gui_resize: AtomicU64,
@@ -202,7 +204,8 @@ impl HostShim {
             process: AtomicBool::new(false),
             param_rescan: AtomicU32::new(0),
             latency: AtomicBool::new(false),
-            audio_ports: AtomicBool::new(false),
+            audio_ports: AtomicU32::new(0),
+            note_ports: AtomicU32::new(0),
             voice_info: AtomicBool::new(false),
             gui_resize: AtomicU64::new(NO_RESIZE),
             gui_closed: AtomicBool::new(false),
@@ -239,7 +242,8 @@ impl HostShim {
             process: self.process.swap(false, Ordering::AcqRel),
             param_rescan: self.param_rescan.swap(0, Ordering::AcqRel),
             latency: self.latency.swap(false, Ordering::AcqRel),
-            audio_ports: self.audio_ports.swap(false, Ordering::AcqRel),
+            audio_ports: self.audio_ports.swap(0, Ordering::AcqRel),
+            note_ports: self.note_ports.swap(0, Ordering::AcqRel),
             voice_info: self.voice_info.swap(false, Ordering::AcqRel),
             gui_resize: (packed != NO_RESIZE)
                 .then_some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)),
@@ -661,9 +665,9 @@ unsafe extern "C" fn audio_ports_flag_supported(_host: *const clap_host, _flag: 
     true
 }
 
-unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, _flags: u32) {
+unsafe extern "C" fn audio_ports_rescan(host: *const clap_host, flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
-        shim.audio_ports.store(true, Ordering::Release);
+        shim.audio_ports.fetch_or(flags, Ordering::Release);
     }
 }
 
@@ -679,9 +683,9 @@ unsafe extern "C" fn note_supported_dialects(_host: *const clap_host) -> clap_no
     CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI
 }
 
-unsafe extern "C" fn note_ports_rescan(host: *const clap_host, _flags: u32) {
+unsafe extern "C" fn note_ports_rescan(host: *const clap_host, flags: u32) {
     if let Some(shim) = unsafe { shim(host) } {
-        shim.audio_ports.store(true, Ordering::Release);
+        shim.note_ports.fetch_or(flags, Ordering::Release);
     }
 }
 

@@ -197,6 +197,11 @@ impl SubHost {
         // until it runs it still reports its old values. Same rule as in
         // `save_state`.
         loaded.plugin.tick();
+        loaded
+            .plugin
+            .refresh_metadata()
+            .map_err(|e| e.to_string())?;
+        self.resolve_instance_slots(instance);
         Ok(())
     }
 
@@ -258,8 +263,9 @@ impl SubHost {
         class_id: Option<&str>,
     ) -> Result<(), String> {
         self.reserve(instance)?;
-        let plugin =
+        let mut plugin =
             Plugin::load(path, class_id, Arc::clone(&self.context)).map_err(|e| e.to_string())?;
+        plugin.refresh_metadata().map_err(|e| e.to_string())?;
 
         let class = plugin.class();
         let reference = SubPluginRef {
@@ -386,6 +392,59 @@ impl SubHost {
                 loaded.plugin.tick();
             }
         }
+    }
+
+    /// Refresh each instance's descriptors and parameter bindings before rebuilding processors.
+    pub fn refresh_metadata(&mut self) -> Result<plugin_host::MetadataUpdate, String> {
+        use plugin_host::MetadataUpdate;
+        let mut result = MetadataUpdate::Unchanged;
+        for (instance, loaded) in self.instances.iter_mut().enumerate() {
+            let Some(loaded) = loaded.as_mut() else {
+                continue;
+            };
+            let loaded = loaded.get_mut();
+            let update = loaded
+                .plugin
+                .refresh_metadata()
+                .map_err(|e| e.to_string())?;
+            if update == MetadataUpdate::Refreshed {
+                self.slots.resolve_against(
+                    instance as u32,
+                    &loaded.reference.plugin_id,
+                    loaded.plugin.params(),
+                );
+            }
+            result = result.max(update);
+        }
+        Ok(result)
+    }
+
+    pub fn request_main_bus_channels(
+        &mut self,
+        instance: usize,
+        input: u16,
+        output: u16,
+    ) -> Result<(), String> {
+        let result = self
+            .at_mut(instance)
+            .ok_or("no sub-plugin loaded")?
+            .plugin
+            .request_main_bus_channels(input, output)
+            .map_err(|e| e.to_string());
+        self.resolve_instance_slots(instance);
+        result
+    }
+
+    fn resolve_instance_slots(&mut self, instance: usize) {
+        let Some(loaded) = self.instances.get(instance).and_then(Option::as_ref) else {
+            return;
+        };
+        let loaded = loaded.get();
+        self.slots.resolve_against(
+            instance as u32,
+            &loaded.reference.plugin_id,
+            loaded.plugin.params(),
+        );
     }
 
     /// Binds a slot index to a parameter on the loaded sub-plugin at `instance`.
@@ -583,17 +642,11 @@ impl SubHost {
             }
             match entry.state_bytes() {
                 Some(bytes) => {
-                    if let Some(loaded) = self.at_mut(entry.instance) {
-                        if let Err(e) = loaded.plugin.load_state(&bytes) {
-                            problems.push(format!(
-                                "{} loaded but its settings did not restore: {e}",
-                                reference.display_name
-                            ));
-                        }
-                        // As in `load_sub_state`. This is the path a project
-                        // open takes, and it runs with the wrapper's own
-                        // editor closed, so nothing else would tick these.
-                        loaded.plugin.tick();
+                    if let Err(e) = self.load_sub_state(entry.instance, &bytes) {
+                        problems.push(format!(
+                            "{} loaded but its settings did not restore: {e}",
+                            reference.display_name
+                        ));
                     }
                 }
                 None => problems.push(format!(

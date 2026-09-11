@@ -378,6 +378,96 @@ fn callback_requests_are_not_lost_while_servicing() {
     assert_eq!(host.reasons.lock().unwrap().len(), 1);
 }
 
+/// Descriptors change atomically, and only structural changes require giving back the processor.
+#[test]
+fn metadata_refresh_obeys_activation_and_preserves_failed_requests() {
+    use plugin_host_api::MetadataUpdate;
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let config = lifecycle_config();
+    let mut processor = plugin.activate(config).unwrap();
+    let mut send = |value| {
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+        let event = Event::Param(ParamEvent::SetValue {
+            id: PARAM_ASK,
+            target: Target::Global,
+            value,
+            sample_offset: 0,
+        });
+        assert_eq!(
+            processor.process(
+                &mut buffers,
+                &[event],
+                &TimeContext::default(),
+                &mut EventSink::new()
+            ),
+            ProcessStatus::Continue
+        );
+    };
+    send(8.0);
+    plugin.tick();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(plugin.params()[0].name, "Level");
+    send(7.0);
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::NeedsDeactivation
+    );
+    assert_eq!(plugin.io_layout().main_input_channels(), 2);
+    assert_eq!(plugin.params().len(), 8);
+    processor.deactivate();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(plugin.io_layout().main_input_channels(), 1);
+    assert_eq!(plugin.params().len(), 7);
+    assert_eq!(plugin.params()[0].max, 4.0);
+    assert!(!plugin.params().iter().any(|p| p.id == PARAM_OFFSET));
+    plugin
+        .activate(AudioConfig {
+            input_channels: 1,
+            output_channels: 1,
+            ..config
+        })
+        .unwrap()
+        .deactivate();
+    let params = plugin.params().to_vec();
+    plugin.set_param(PARAM_ASK, 9.0).unwrap();
+    assert!(plugin.refresh_metadata().is_err());
+    assert_eq!(plugin.params(), params);
+    assert!(plugin.activate(config).is_err());
+    plugin.set_param(PARAM_ASK, 8.0).unwrap();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    plugin.set_param(PARAM_ASK, 10.0).unwrap();
+    assert!(plugin.refresh_metadata().is_err());
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Refreshed
+    );
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Unchanged
+    );
+    let mut state = plugin.save_state().unwrap();
+    state[16..24].copy_from_slice(&0.0f64.to_le_bytes());
+    plugin.load_state(&state).unwrap();
+    assert_eq!(plugin.params().len(), 8);
+    assert_eq!(plugin.io_layout().main_input_channels(), 2);
+}
+
 /// The plugin asks; the host has to hear it.
 ///
 /// `request_restart`, `audio-ports.rescan` and `note-ports.rescan` are the
@@ -654,6 +744,8 @@ fn the_backend_drives_a_real_clap_module() {
 
     // A truncated blob has to be refused rather than half-applied.
     assert!(SubPluginMain::load_state(&mut plugin, &saved[..4]).is_err());
+    assert!(plugin.activate(lifecycle_config()).is_err());
+    plugin.refresh_metadata().unwrap();
 
     // --- latency -----------------------------------------------------------
 

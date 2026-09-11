@@ -118,6 +118,8 @@ pub struct ClapPlugin {
     class: ClassInfo,
     params: Vec<ParamInfo>,
     ports: PortLayout,
+    metadata_dirty: bool,
+    metadata_structural: bool,
     note_inputs: usize,
     note_outputs: usize,
     note_end_ports: Vec<i16>,
@@ -232,21 +234,24 @@ impl ClapPlugin {
             };
         }
 
-        let params = unsafe { read_params(plugin, ext_params) };
-        let ports = unsafe { read_ports(plugin, ext_audio_ports) };
+        let instance = Arc::new(MainThread::new(ClapInstance {
+            plugin,
+            active: Cell::new(false),
+            host,
+            _module: module.handle(),
+        }));
+        let params = unsafe { read_params(plugin, ext_params) }?;
+        let ports = unsafe { read_ports(plugin, ext_audio_ports) }?;
         let (note_inputs, note_outputs, note_end_ports, note_dialects) =
-            unsafe { read_note_ports(plugin, ext_note_ports) };
+            unsafe { read_note_ports(plugin, ext_note_ports) }?;
 
         Ok(ClapPlugin {
-            instance: Arc::new(MainThread::new(ClapInstance {
-                plugin,
-                active: Cell::new(false),
-                host,
-                _module: module.handle(),
-            })),
+            instance,
             class,
             params,
             ports,
+            metadata_dirty: false,
+            metadata_structural: false,
             note_inputs,
             note_outputs,
             note_end_ports,
@@ -260,7 +265,7 @@ impl ClapPlugin {
             ext_ports_activation,
             editor: None,
             latency: Cell::new(0),
-            voices: Cell::new(unsafe { read_voice_info(plugin, ext_voice_info) }),
+            voices: Cell::new(None),
             pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EVENTS_PER_BLOCK))),
             flush_buffers: RefCell::new((
                 InputEvents::new(MAX_EVENTS_PER_BLOCK),
@@ -400,16 +405,14 @@ impl ClapPlugin {
         }
 
         if requests.param_rescan != 0 {
-            // Re-read wholesale rather than by flag: the list is small, and
-            // reading half of it because only `TEXT` was set is how a stale
-            // range survives a plugin update.
-            self.params = unsafe { read_params(self.instance.get().plugin, self.ext_params) };
+            self.metadata_dirty |= requests.param_rescan & !CLAP_PARAM_RESCAN_VALUES != 0;
+            self.metadata_structural |= requests.param_rescan & CLAP_PARAM_RESCAN_ALL != 0;
             for (flags, reason) in [
+                (CLAP_PARAM_RESCAN_ALL, RestartReason::ParamList),
                 (
-                    CLAP_PARAM_RESCAN_ALL | CLAP_PARAM_RESCAN_INFO,
-                    RestartReason::ParamList,
+                    CLAP_PARAM_RESCAN_TEXT | CLAP_PARAM_RESCAN_INFO,
+                    RestartReason::ParamTitles,
                 ),
-                (CLAP_PARAM_RESCAN_TEXT, RestartReason::ParamTitles),
                 (CLAP_PARAM_RESCAN_VALUES, RestartReason::ParamValues),
             ] {
                 if requests.param_rescan & flags != 0 {
@@ -418,7 +421,7 @@ impl ClapPlugin {
             }
         }
 
-        if requests.voice_info {
+        if requests.voice_info && self.instance.get().active.get() {
             self.voices
                 .set(unsafe { read_voice_info(self.instance.get().plugin, self.ext_voice_info) });
         }
@@ -439,7 +442,14 @@ impl ClapPlugin {
             self.editor = None;
         }
 
-        if requests.restart || requests.audio_ports {
+        if requests.restart || requests.audio_ports != 0 || requests.note_ports != 0 {
+            self.metadata_dirty = true;
+            self.metadata_structural |= requests.restart
+                || requests.audio_ports
+                    & !clap_sys::ext::audio_ports::CLAP_AUDIO_PORTS_RESCAN_NAMES
+                    != 0
+                || requests.note_ports & !clap_sys::ext::note_ports::CLAP_NOTE_PORTS_RESCAN_NAMES
+                    != 0;
             self.context.request_restart(RestartReason::IoConfig);
         }
     }
@@ -590,6 +600,51 @@ impl SubPluginMain for ClapPlugin {
         ClapPlugin::tick(self);
     }
 
+    fn refresh_metadata(&mut self) -> Result<plugin_host_api::MetadataUpdate> {
+        use plugin_host_api::MetadataUpdate;
+        reclaim_main_thread();
+        self.tick();
+        if !self.metadata_dirty {
+            return Ok(MetadataUpdate::Unchanged);
+        }
+        if self.metadata_structural && self.instance.get().active.get() {
+            return Ok(MetadataUpdate::NeedsDeactivation);
+        }
+        let plugin = self.instance.get().plugin;
+        let params = unsafe { read_params(plugin, self.ext_params) }?;
+        let ext_audio =
+            unsafe { extension::<clap_plugin_audio_ports>(plugin, CLAP_EXT_AUDIO_PORTS) };
+        let ext_notes = unsafe { extension::<clap_plugin_note_ports>(plugin, CLAP_EXT_NOTE_PORTS) };
+        let ports = unsafe { read_ports(plugin, ext_audio) }?;
+        let notes = unsafe { read_note_ports(plugin, ext_notes) }?;
+        let mapping_changed = params.len() != self.params.len()
+            || params.iter().zip(&self.params).any(|(a, b)| {
+                (a.id, a.min, a.max, a.default, a.flags) != (b.id, b.min, b.max, b.default, b.flags)
+            });
+        if mapping_changed && self.instance.get().active.get() {
+            self.metadata_structural = true;
+            return Ok(MetadataUpdate::NeedsDeactivation);
+        }
+        self.metadata_dirty = false;
+        self.metadata_structural = false;
+        let requests = self.instance.get().host.take_requests();
+        self.apply(requests);
+        if self.metadata_dirty {
+            return Err(HostError::InvalidState(
+                "metadata changed during refresh; retry",
+            ));
+        }
+        self.params = params;
+        self.ports = ports;
+        (
+            self.note_inputs,
+            self.note_outputs,
+            self.note_end_ports,
+            self.note_dialects,
+        ) = notes;
+        Ok(MetadataUpdate::Refreshed)
+    }
+
     fn params(&self) -> &[ParamInfo] {
         &self.params
     }
@@ -737,6 +792,8 @@ impl SubPluginMain for ClapPlugin {
             .ok_or_else(|| HostError::State("the plugin's state extension has no load".into()))?;
         let mut stream = InStream::new(data);
         let raw = stream.as_raw();
+        self.metadata_dirty = true;
+        self.metadata_structural = true;
         if !unsafe { load(self.instance.get().plugin, raw) } {
             return Err(HostError::State("clap_plugin_state::load failed".into()));
         }
@@ -746,6 +803,7 @@ impl SubPluginMain for ClapPlugin {
         if let Ok(mut pending) = self.pending_edits.lock() {
             pending.clear();
         }
+        self.refresh_metadata()?;
         Ok(())
     }
 
@@ -756,6 +814,12 @@ impl SubPluginMain for ClapPlugin {
     fn activate(&mut self, config: AudioConfig) -> Result<Processor> {
         config.validate()?;
         reclaim_main_thread();
+        self.tick();
+        if self.metadata_dirty {
+            return Err(HostError::InvalidState(
+                "refresh metadata before activation",
+            ));
+        }
         if self.instance.get().active.get() {
             return Err(HostError::InvalidState("plugin is already active"));
         }
@@ -782,6 +846,13 @@ impl SubPluginMain for ClapPlugin {
             }
         }
 
+        let requests = self.instance.get().host.take_requests();
+        self.apply(requests);
+        if self.metadata_dirty {
+            return Err(HostError::InvalidState(
+                "refresh metadata before activation",
+            ));
+        }
         let plan = bind_ports(&self.ports, &config)?;
         // Before `activate`, which is when CLAP allows it unconditionally.
         self.set_port_activation(&plan);
@@ -1336,12 +1407,12 @@ unsafe fn read_voice_info(
 unsafe fn read_params(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_params,
-) -> Vec<ParamInfo> {
+) -> Result<Vec<ParamInfo>> {
     if ext.is_null() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let (Some(count), Some(get_info)) = (unsafe { ((*ext).count, (*ext).get_info) }) else {
-        return Vec::new();
+        return Err(HostError::InvalidState("incomplete parameter extension"));
     };
 
     let total = unsafe { count(plugin) };
@@ -1349,7 +1420,7 @@ unsafe fn read_params(
     for index in 0..total {
         let mut raw: clap_param_info = unsafe { std::mem::zeroed() };
         if !unsafe { get_info(plugin, index, &mut raw) } {
-            continue;
+            return Err(HostError::InvalidState("parameter enumeration failed"));
         }
 
         let mut flags = ParamFlags::NONE;
@@ -1392,7 +1463,7 @@ unsafe fn read_params(
             flags,
         });
     }
-    out
+    Ok(out)
 }
 
 /// # Safety
@@ -1400,23 +1471,23 @@ unsafe fn read_params(
 unsafe fn read_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_audio_ports,
-) -> PortLayout {
+) -> Result<PortLayout> {
     if ext.is_null() {
-        return PortLayout::default();
+        return Ok(PortLayout::default());
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return PortLayout::default();
+        return Err(HostError::InvalidState("incomplete audio port extension"));
     };
 
-    let side = |is_input: bool| -> Vec<Port> {
+    let side = |is_input: bool| -> Result<Vec<Port>> {
         let total = unsafe { count(plugin, is_input) };
         (0..total)
-            .filter_map(|index| {
+            .map(|index| {
                 let mut raw: clap_audio_port_info = unsafe { std::mem::zeroed() };
                 if !unsafe { get(plugin, index, is_input, &mut raw) } {
-                    return None;
+                    return Err(HostError::InvalidState("audio port enumeration failed"));
                 }
-                Some(Port {
+                Ok(Port {
                     name: from_char_array(&raw.name[..CLAP_NAME_SIZE]),
                     channels: raw.channel_count.min(u32::from(u16::MAX)) as u16,
                     // Port 0 is the main bus by convention even when the flag is
@@ -1427,10 +1498,10 @@ unsafe fn read_ports(
             .collect()
     };
 
-    PortLayout {
-        inputs: side(true),
-        outputs: side(false),
-    }
+    Ok(PortLayout {
+        inputs: side(true)?,
+        outputs: side(false)?,
+    })
 }
 
 /// Note port counts, whether the input speaks CLAP's own note dialect, and
@@ -1441,12 +1512,12 @@ unsafe fn read_ports(
 unsafe fn read_note_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_note_ports,
-) -> (usize, usize, Vec<i16>, Vec<&'static str>) {
+) -> Result<(usize, usize, Vec<i16>, Vec<&'static str>)> {
     if ext.is_null() {
-        return (0, 0, Vec::new(), Vec::new());
+        return Ok((0, 0, Vec::new(), Vec::new()));
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return (0, 0, Vec::new(), Vec::new());
+        return Err(HostError::InvalidState("incomplete note port extension"));
     };
 
     let inputs = unsafe { count(plugin, true) } as usize;
@@ -1458,13 +1529,14 @@ unsafe fn read_note_ports(
     let mut note_end_ports = Vec::new();
     for index in 0..inputs as u32 {
         let mut raw: clap_note_port_info = unsafe { std::mem::zeroed() };
-        if unsafe { get(plugin, index, true, &mut raw) } {
-            dialects |= raw.supported_dialects;
-            if raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0
-                && let Ok(port) = i16::try_from(index)
-            {
-                note_end_ports.push(port);
-            }
+        if !unsafe { get(plugin, index, true, &mut raw) } {
+            return Err(HostError::InvalidState("note port enumeration failed"));
+        }
+        dialects |= raw.supported_dialects;
+        if raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0
+            && let Ok(port) = i16::try_from(index)
+        {
+            note_end_ports.push(port);
         }
     }
 
@@ -1480,7 +1552,7 @@ unsafe fn read_note_ports(
         .map(|(_, name)| *name)
         .collect();
 
-    (inputs, outputs, note_end_ports, supported)
+    Ok((inputs, outputs, note_end_ports, supported))
 }
 
 #[cfg(test)]

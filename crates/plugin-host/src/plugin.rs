@@ -270,6 +270,14 @@ impl SubPluginMain for Plugin {
         Plugin::tick(self);
     }
 
+    fn refresh_metadata(&mut self) -> Result<plugin_host_api::MetadataUpdate> {
+        delegate!(mut self, p => SubPluginMain::refresh_metadata(p))
+    }
+
+    fn request_main_bus_channels(&mut self, input: u16, output: u16) -> Result<()> {
+        delegate!(mut self, p => SubPluginMain::request_main_bus_channels(p, input, output))
+    }
+
     fn params(&self) -> &[ParamInfo] {
         delegate!(self, p => SubPluginMain::params(p))
     }

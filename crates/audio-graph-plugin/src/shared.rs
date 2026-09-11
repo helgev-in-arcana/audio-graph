@@ -82,6 +82,7 @@ pub struct Patch {
 pub struct AudioState {
     /// Missing or failed hosted processors are represented by silence through NoInstances.
     pub(crate) processor: Option<SubHostProcessors>,
+    pub(crate) reset_notes: bool,
     required_publication: u64,
     ready: bool,
 }
@@ -186,6 +187,7 @@ impl Shared {
             }),
             audio: Mutex::new(AudioState {
                 processor: None,
+                reset_notes: false,
                 required_publication: 0,
                 ready: true,
             }),
@@ -496,6 +498,7 @@ impl Shared {
         self.main().rebind_required = result.is_err();
         *self.audio() = AudioState {
             processor,
+            reset_notes: true,
             required_publication: publication,
             ready: true,
         };
@@ -534,11 +537,69 @@ impl Shared {
         edit: impl FnOnce(&mut SubHost) -> Result<T, String>,
     ) -> Result<T, String> {
         self.suspend();
-        let result = edit(&mut self.main().host);
-        let resumed = self.resume();
-        let value = result?;
-        resumed?;
+        let value = edit(&mut self.main().host)?;
+        self.prepare_host_metadata()?;
+        self.resume()?;
         Ok(value)
+    }
+
+    pub(crate) fn prepare_host_metadata(&self) -> Result<(), String> {
+        {
+            let mut main = self.main();
+            for instance in 0..main.host.instance_count() {
+                let layout = main.host.io_layout(instance);
+                let input = layout.main_input_channels();
+                let output = layout.outputs.first().map_or(0, |bus| bus.channels);
+                if input == 1 || output == 1 {
+                    let _ = main.host.request_main_bus_channels(
+                        instance,
+                        if input == 1 { 2 } else { input },
+                        if output == 1 { 2 } else { output },
+                    );
+                }
+            }
+            main.host.refresh_metadata()?;
+        }
+        self.update_all_ports();
+        Ok(())
+    }
+
+    /// Complete descriptor changes before publishing a graph that depends on them.
+    pub fn refresh_metadata(&self) -> Result<(), String> {
+        use plugin_host::MetadataUpdate;
+        let result = self.main().host.refresh_metadata();
+        let update = match result {
+            Ok(update) => update,
+            Err(error) => {
+                self.suspend();
+                return Err(error);
+            }
+        };
+        if update == MetadataUpdate::NeedsDeactivation || self.main().rebind_required {
+            self.suspend();
+            if self.main().host.refresh_metadata()? == MetadataUpdate::NeedsDeactivation {
+                return Err("metadata still requires deactivation".into());
+            }
+            self.prepare_host_metadata()?;
+            self.resume()?;
+        } else if update == MetadataUpdate::Refreshed {
+            self.changed();
+        }
+        Ok(())
+    }
+
+    fn update_all_ports(&self) {
+        let nodes: Vec<_> = self
+            .patch()
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Plugin(_)))
+            .map(|node| node.id)
+            .collect();
+        for node in nodes {
+            self.update_ports(node);
+        }
     }
 
     /// Give a patch that has no graph the one it was implicitly running.
@@ -629,6 +690,11 @@ impl Shared {
     /// sockets that no longer exist are dropped by `prune`, which is the same
     /// rule a patch reopened against a newer plugin follows.
     pub fn discover_ports(&self, node: NodeId) {
+        self.update_ports(node);
+        self.publish_graph();
+    }
+
+    fn update_ports(&self, node: NodeId) {
         let instance = {
             let mut patch = self.patch();
             // Before anything is read off the node: a patch older than
@@ -675,8 +741,6 @@ impl Shared {
             }
         }
         patch.graph.prune();
-        drop(patch);
-        self.publish_graph();
     }
 
     pub fn unload(&self) {

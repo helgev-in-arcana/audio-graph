@@ -77,6 +77,15 @@ pub enum RestartReason {
     IoConfig,
 }
 
+/// Result of an explicit metadata refresh on the owning main thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataUpdate {
+    Unchanged,
+    Refreshed,
+    /// Return the processor, then retry before reading metadata for reactivation.
+    NeedsDeactivation,
+}
+
 /// Main-thread surface of a loaded sub-plugin.
 ///
 /// Deliberately not `Send`: both VST3 and CLAP pin these calls to the thread
@@ -85,6 +94,29 @@ pub trait SubPluginMain {
     /// Service callbacks on the owning main thread, even with no editor open.
     /// Requests arriving during delivery remain pending for a subsequent tick.
     fn tick(&mut self) {}
+
+    /// Complete pending descriptor updates, preserving requests that cannot yet be applied.
+    /// A failure leaves the update pending and must not be followed by activation
+    /// until a later refresh succeeds.
+    fn refresh_metadata(&mut self) -> Result<MetadataUpdate> {
+        Ok(MetadataUpdate::Unchanged)
+    }
+
+    /// Request main-bus widths while inactive. Read `io_layout` afterwards even
+    /// on refusal: native negotiation may select a different arrangement.
+    /// Auxiliary buses keep their declared widths until activation.
+    fn request_main_bus_channels(&mut self, input: u16, output: u16) -> Result<()> {
+        let layout = self.io_layout();
+        if layout.main_input_channels() == input
+            && layout.outputs.first().map_or(0, |bus| bus.channels) == output
+        {
+            Ok(())
+        } else {
+            Err(crate::HostError::UnsupportedBusConfig(
+                "main bus widths are fixed".into(),
+            ))
+        }
+    }
 
     /// Full parameter list. Batched by construction — there is no `param(id)`
     /// accessor anywhere in this API.

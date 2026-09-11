@@ -49,10 +49,10 @@ pub use scan::{
 // and get the vocabulary with it.
 pub use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, BusInfo, Capabilities, Event, EventSink,
-    HostContext, HostError, IoLayout, MAX_AUX_BUSES, MainThread, NoteEvent, NoteExpression, NoteId,
-    ParamEvent, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
-    Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, Target, TimeContext,
-    VoiceInfo, reclaim_main_thread,
+    HostContext, HostError, IoLayout, MAX_AUX_BUSES, MainThread, MetadataUpdate, NoteEvent,
+    NoteExpression, NoteId, ParamEvent, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
+    ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, Target,
+    TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 // Window plumbing a host application needs and that no backend owns.

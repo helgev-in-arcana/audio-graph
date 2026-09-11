@@ -28,7 +28,9 @@ pub use params::{
     BusInfo, Capabilities, IoLayout, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
     VoiceInfo,
 };
-pub use traits::{HostContext, ProcessStatus, RestartReason, SubPluginMain, SubPluginProcessor};
+pub use traits::{
+    HostContext, MetadataUpdate, ProcessStatus, RestartReason, SubPluginMain, SubPluginProcessor,
+};
 
 /// Errors surfaced across the host API boundary.
 ///
