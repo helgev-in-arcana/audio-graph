@@ -458,7 +458,7 @@ unsafe extern "C" fn plugin_process(
 
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
-    unsafe { apply_events(instance, data.in_events) };
+    unsafe { apply_events(instance, data.in_events, data.out_events) };
 
     if instance.params.ask == ask::OUTPUT_BURST && !data.out_events.is_null() {
         instance.params.ask = ask::NOTHING;
@@ -553,7 +553,11 @@ unsafe fn channel_ptr(bus: Option<&clap_audio_buffer>, channel: usize) -> Option
 
 /// # Safety
 /// `events` must be null or a live input event list.
-unsafe fn apply_events(instance: &mut Instance, events: *const clap_input_events) {
+unsafe fn apply_events(
+    instance: &mut Instance,
+    events: *const clap_input_events,
+    output: *const clap_output_events,
+) {
     if events.is_null() {
         return;
     }
@@ -584,12 +588,18 @@ unsafe fn apply_events(instance: &mut Instance, events: *const clap_input_events
                 }
             }
             CLAP_EVENT_NOTE_OFF => {
-                let e = unsafe { *header.cast::<clap_event_note>() };
+                let mut e = unsafe { *header.cast::<clap_event_note>() };
                 if let Some(slot) = usize::try_from(e.key)
                     .ok()
                     .and_then(|k| instance.held.get_mut(k))
                 {
                     *slot = false;
+                }
+                if !output.is_null()
+                    && let Some(push) = unsafe { (*output).try_push }
+                {
+                    e.header.type_ = clap_sys::events::CLAP_EVENT_NOTE_END;
+                    unsafe { push(output, &e.header) };
                 }
             }
             _ => {}
@@ -959,7 +969,7 @@ unsafe extern "C" fn params_flush(
     _out: *const clap_output_events,
 ) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
-        unsafe { apply_events(instance, in_) };
+        unsafe { apply_events(instance, in_, std::ptr::null()) };
         // Main thread, and — when this is the inactive flush — a moment when
         // every one of these calls is legal.
         unsafe { instance.answer_ask() };

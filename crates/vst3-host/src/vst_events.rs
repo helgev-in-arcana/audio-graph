@@ -222,47 +222,14 @@ pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
         let Some(vst) = list.get(index) else { continue };
         let sample_offset = vst.sampleOffset.max(0) as u32;
 
-        // Forward note-off lifecycle events to the host event sink. They are what the
-        // engine needs to release per-voice graph state.
         if vst.r#type == EventTypes_::kNoteOffEvent as u16 {
             let off = unsafe { vst.__field0.noteOff };
-            sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
+            sink.push(ApiEvent::Note(NoteEvent::NoteOff {
                 note_id: note_id_from_wire(off.noteId),
-                port: 0,
+                port: vst.busIndex as i16,
                 channel: off.channel,
                 key: off.pitch,
-                sample_offset,
-            }));
-        }
-    }
-}
-
-/// Say a note has ended for every note-off handed to the plugin.
-///
-/// VST3 has no counterpart to CLAP's `NOTE_END`: `EventTypes` simply has no
-/// such event, so a VST3 plugin has no way to tell a host that a voice has
-/// finished ringing. Without this, a caller counting how many plugins still
-/// hold a note would wait forever on every VST3 in the graph.
-///
-/// Ending it at the note-off is early — the voice is usually still in its
-/// release — and it is the closest the format allows. The alternative is not
-/// a later answer but no answer.
-pub fn end_notes_offered(events: &[ApiEvent], sink: &mut EventSink) {
-    for event in events {
-        if let ApiEvent::Note(NoteEvent::NoteOff {
-            note_id,
-            port,
-            channel,
-            key,
-            sample_offset,
-            ..
-        }) = *event
-        {
-            sink.push(ApiEvent::Note(NoteEvent::NoteEnd {
-                note_id,
-                port,
-                channel,
-                key,
+                velocity: f64::from(off.velocity),
                 sample_offset,
             }));
         }
@@ -314,6 +281,34 @@ pub fn to_process_context(context: &TimeContext, sample_rate: f64) -> ProcessCon
 mod tests {
     use super::*;
     use plugin_host_api::{ParamFlags, ParamId, ParamInfo};
+
+    /// A plugin's musical note-off output cannot terminate an input voice implicitly.
+    #[test]
+    fn output_note_off_is_not_voice_completion() {
+        let list = EventList::new(1);
+        let mut event: VstEvent = unsafe { std::mem::zeroed() };
+        event.r#type = EventTypes_::kNoteOffEvent as u16;
+        event.busIndex = 2;
+        event.__field0.noteOff = NoteOffEvent {
+            channel: 1,
+            pitch: 60,
+            velocity: 0.5,
+            noteId: 7,
+            tuning: 0.0,
+        };
+        list.push(event);
+        let mut sink = EventSink::with_capacity(1);
+        drain_outputs(&list, &mut sink);
+        assert!(matches!(
+            sink.events(),
+            [ApiEvent::Note(NoteEvent::NoteOff {
+                note_id: Some(7),
+                port: 2,
+                velocity: 0.5,
+                ..
+            })]
+        ));
+    }
 
     /// A single linear 0..1 parameter, so tests exercise translation rather
     /// than the mapping curve (which `param_map` covers on its own).

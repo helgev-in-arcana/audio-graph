@@ -119,8 +119,7 @@ pub struct ClapPlugin {
     ports: PortLayout,
     note_inputs: usize,
     note_outputs: usize,
-    /// True when the plugin's note input speaks CLAP's own dialect.
-    clap_notes: bool,
+    note_end_ports: Vec<i16>,
     /// Diagnostic only; see `SubPluginMain::note_dialects`.
     note_dialects: Vec<&'static str>,
 
@@ -234,7 +233,7 @@ impl ClapPlugin {
 
         let params = unsafe { read_params(plugin, ext_params) };
         let ports = unsafe { read_ports(plugin, ext_audio_ports) };
-        let (note_inputs, note_outputs, clap_notes, note_dialects) =
+        let (note_inputs, note_outputs, note_end_ports, note_dialects) =
             unsafe { read_note_ports(plugin, ext_note_ports) };
 
         Ok(ClapPlugin {
@@ -249,7 +248,7 @@ impl ClapPlugin {
             ports,
             note_inputs,
             note_outputs,
-            clap_notes,
+            note_end_ports,
             note_dialects,
             ext_params,
             ext_state,
@@ -590,6 +589,10 @@ impl SubPluginMain for ClapPlugin {
         self.note_dialects.clone()
     }
 
+    fn note_end_ports(&self) -> Vec<i16> {
+        self.note_end_ports.clone()
+    }
+
     fn capabilities(&self) -> Capabilities {
         // Probed based on parameters and port dialects.
         let any = |flag: ParamFlags| self.params.iter().any(|p| p.flags.contains(flag));
@@ -598,7 +601,7 @@ impl SubPluginMain for ClapPlugin {
             poly_modulation: any(ParamFlags::POLY_MODULATABLE),
             // CLAP note expressions ride the plugin's note input, and only the
             // CLAP dialect carries them; a MIDI-only port cannot.
-            note_expression: self.note_inputs > 0 && self.clap_notes,
+            note_expression: !self.note_end_ports.is_empty(),
             // CLAP plugins may add and remove parameters and tell the host
             // through `clap.params`, which `tick` acts on.
             dynamic_params: true,
@@ -1421,12 +1424,12 @@ unsafe fn read_ports(
 unsafe fn read_note_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_note_ports,
-) -> (usize, usize, bool, Vec<&'static str>) {
+) -> (usize, usize, Vec<i16>, Vec<&'static str>) {
     if ext.is_null() {
-        return (0, 0, false, Vec::new());
+        return (0, 0, Vec::new(), Vec::new());
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return (0, 0, false, Vec::new());
+        return (0, 0, Vec::new(), Vec::new());
     };
 
     let inputs = unsafe { count(plugin, true) } as usize;
@@ -1435,10 +1438,16 @@ unsafe fn read_note_ports(
     // Unioned across input ports rather than reported per port: the caller is
     // asking what this plugin can be spoken to in, not which socket does what.
     let mut dialects = 0u32;
+    let mut note_end_ports = Vec::new();
     for index in 0..inputs as u32 {
         let mut raw: clap_note_port_info = unsafe { std::mem::zeroed() };
         if unsafe { get(plugin, index, true, &mut raw) } {
             dialects |= raw.supported_dialects;
+            if raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0
+                && let Ok(port) = i16::try_from(index)
+            {
+                note_end_ports.push(port);
+            }
         }
     }
 
@@ -1454,12 +1463,7 @@ unsafe fn read_note_ports(
         .map(|(_, name)| *name)
         .collect();
 
-    (
-        inputs,
-        outputs,
-        dialects & CLAP_NOTE_DIALECT_CLAP != 0,
-        supported,
-    )
+    (inputs, outputs, note_end_ports, supported)
 }
 
 #[cfg(test)]

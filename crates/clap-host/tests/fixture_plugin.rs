@@ -169,6 +169,50 @@ fn output_overflow_is_propagated_and_not_cleared_by_processing() {
     }
 }
 
+/// Native completion identifies the input note, independently of output note ports.
+#[test]
+fn clap_note_ports_report_native_completion() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    assert_eq!(plugin.note_end_ports(), [0]);
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+    let mut sink = EventSink::with_capacity(2);
+    let on = Event::Note(NoteEvent::NoteOn {
+        note_id: Some(17),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 1.0,
+        sample_offset: 0,
+    });
+    processor.process(&mut buffers, &[on], &TimeContext::default(), &mut sink);
+    assert!(sink.is_empty());
+    let off = Event::Note(NoteEvent::NoteOff {
+        note_id: Some(17),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 0.0,
+        sample_offset: 2,
+    });
+    processor.process(&mut buffers, &[off], &TimeContext::default(), &mut sink);
+    assert!(matches!(
+        sink.events(),
+        [Event::Note(NoteEvent::NoteEnd {
+            note_id: Some(17),
+            sample_offset: 2,
+            ..
+        })]
+    ));
+}
+
 /// A running processor retains its instance, module, and callbacks after main is dropped.
 #[test]
 fn the_processor_outlives_main_and_returns_to_its_owner() {

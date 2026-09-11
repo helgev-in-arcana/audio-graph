@@ -579,9 +579,8 @@ impl Wrapper {
 /// was gated shut — is one the DAW can stop holding a voice for. Saying so is
 /// the honest answer either way, and CLAP asks for it.
 ///
-/// VST3 has no `NOTE_END` to send back, so nothing arrives from that side; its
-/// backend ends the note when the note-off is delivered instead, which is the
-/// closest the format allows.
+/// The engine reclaims a port without native completion at delivery of its
+/// note-off; that bookkeeping policy does not claim its release tail is over.
 ///
 /// A free function rather than a method because the caller is holding a borrow
 /// of the shared audio state for the whole block.

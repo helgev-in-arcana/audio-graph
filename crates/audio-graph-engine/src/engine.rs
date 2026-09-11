@@ -729,6 +729,13 @@ impl Engine {
         if !handoff.take(&mut self.program) {
             return false;
         }
+        self.ledger.adopt_destinations(
+            &mut self
+                .program
+                .as_mut()
+                .expect("take reported a swap")
+                .fallback_destinations,
+        );
         let next = self.program.as_ref().expect("take reported a swap");
 
         for (i, &node) in next.lfo_nodes.iter().take(MAX_LFOS).enumerate() {
@@ -1440,11 +1447,26 @@ impl Engine {
                     // would never be counted back down, and the note would
                     // never be reported ended.
                     for event in events {
-                        if let Event::Note(NoteEvent::NoteOn {
-                            note_id: Some(id), ..
-                        }) = event
-                        {
-                            self.ledger.delivered(*id);
+                        match event {
+                            Event::Note(NoteEvent::NoteOn {
+                                note_id: Some(id),
+                                port,
+                                ..
+                            }) => {
+                                if nodes.reports_note_end(*instance, *port) {
+                                    self.ledger.delivered(*id);
+                                } else {
+                                    self.ledger.delivered_with_fallback(*id, *instance, *port);
+                                }
+                            }
+                            Event::Note(NoteEvent::NoteOff {
+                                note_id: Some(id),
+                                port,
+                                ..
+                            }) if !nodes.reports_note_end(*instance, *port) => {
+                                self.ledger.released_to(*id, *instance, *port)
+                            }
+                            _ => {}
                         }
                     }
                     let (heard_in, heard_out): (&[f32], &mut [f32]) = if short {
@@ -2294,14 +2316,8 @@ mod tests {
 
     fn load(engine: &mut Engine, graph: &Graph) {
         let handoff = Handoff::new();
-        let mut program = compile(graph, SLOTS).unwrap();
-        // What the wrapper's `publish_graph` does, and for the same reason: the
-        // rings are allocated on this side and ride over with the program.
-        program.size_rings(RATE, &[]);
-        handoff.send(Box::new(PreparedProgram {
-            program,
-            publication: 0,
-        }));
+        let program = compile(graph, SLOTS).unwrap();
+        handoff.send(Box::new(PreparedProgram::prepare(program, RATE, &[]).0));
         assert!(engine.adopt_handoff(&handoff));
     }
 
@@ -3377,6 +3393,128 @@ mod tests {
             &mut ended,
         );
         assert_eq!(ended.len(), 1, "and now it is not");
+    }
+
+    /// Fallback releases only its own delivery; a native-completion branch still has to finish.
+    #[test]
+    fn completion_policy_can_differ_between_instances() {
+        struct Mixed {
+            heard: Heard,
+            native: bool,
+        }
+        impl AudioInstances for Mixed {
+            fn reports_note_end(&self, instance: u32, _: i16) -> bool {
+                self.native && instance == 1
+            }
+            fn process(
+                &mut self,
+                instance: u32,
+                events: &[Event],
+                input: &[f32],
+                output: &mut [f32],
+                chunk: AudioChunk,
+                schedule: ScheduleView<'_>,
+            ) {
+                self.heard
+                    .process(instance, events, input, output, chunk, schedule);
+            }
+        }
+        for (native, shut) in [(false, false), (true, false), (true, true)] {
+            let mut graph = Graph::new();
+            let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+            let first = note_plugin(&mut graph, 0);
+            let second = note_plugin(&mut graph, 1);
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: Vec::new(),
+                }),
+                [0.0; 2],
+            );
+            let out = graph.add(
+                NodeKind::AudioOut(AudioOut {
+                    bus: 0,
+                    channels: 2,
+                }),
+                [0.0; 2],
+            );
+            if shut {
+                let control = graph.add(NodeKind::Constant(Constant { value: 0.0 }), [0.0; 2]);
+                let gate = graph.add(
+                    NodeKind::NoteGate(NoteGate {
+                        threshold: 0.5,
+                        invert: false,
+                    }),
+                    [0.0; 2],
+                );
+                graph.connect(notes, 0, gate, 0);
+                graph.connect(control, 0, gate, 1);
+                graph.connect(gate, 0, first, 0);
+            } else {
+                graph.connect(notes, 0, first, 0);
+            }
+            graph.connect(notes, 0, second, 0);
+            graph.connect(first, 0, mix, 0);
+            graph.connect(second, 0, mix, 2);
+            graph.connect(mix, 0, out, 0);
+            let mut engine = Engine::new();
+            engine.prepare(8, &[]);
+            load(&mut engine, &graph);
+            let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+            let mut row = vec![0.0; width];
+            let mut nodes = Mixed {
+                heard: Heard::default(),
+                native,
+            };
+            for event in [note_on(60, 0), note_off(60, 5)] {
+                engine.begin_block(&[event]);
+                engine.run(&ctx(8), &mut row);
+                engine.run_audio(
+                    &AudioContext {
+                        frames: 8,
+                        quantum: 4,
+                        sample_rate: RATE,
+                        lanes: &row,
+                        lanes_per_row: width,
+                    },
+                    &[0.0; 16],
+                    &mut [0.0; 16],
+                    &mut nodes,
+                );
+            }
+            let id = named(&nodes.heard.0[&1][0]).unwrap();
+            let mut ended = Vec::with_capacity(8);
+            engine.end_block(
+                &[Event::Note(NoteEvent::NoteOff {
+                    note_id: Some(id),
+                    port: 0,
+                    channel: 0,
+                    key: 60,
+                    velocity: 0.0,
+                    sample_offset: 0,
+                })],
+                &mut ended,
+            );
+            assert_eq!(
+                ended.len(),
+                usize::from(!native),
+                "native={native}, shut={shut}"
+            );
+            if native {
+                engine.end_block(
+                    &[Event::Note(NoteEvent::NoteEnd {
+                        note_id: Some(id),
+                        port: 0,
+                        channel: 0,
+                        key: 60,
+                        sample_offset: 0,
+                    })],
+                    &mut ended,
+                );
+                assert_eq!(ended.len(), 1);
+            }
+        }
     }
 
     /// Each sub-block gets its own events, once. Handing every chunk the whole
@@ -5943,6 +6081,7 @@ mod tests {
         engine.prepare(128, &[2]);
         let handoff = Handoff::new();
         handoff.send(Box::new(PreparedProgram {
+            fallback_destinations: Vec::new(),
             program,
             publication: 0,
         }));
@@ -5968,6 +6107,7 @@ mod tests {
         );
         let handoff = Handoff::new();
         handoff.send(Box::new(PreparedProgram {
+            fallback_destinations: Vec::new(),
             program: wider,
             publication: 0,
         }));

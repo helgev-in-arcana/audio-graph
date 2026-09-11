@@ -493,9 +493,11 @@ impl SubHost {
             match loaded.plugin.activate(config) {
                 Ok(processor) => {
                     let latency = loaded.plugin.latency_samples();
+                    let note_end_ports = loaded.plugin.note_end_ports();
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
                         processor,
+                        note_end_ports,
                         targets,
                         last_sent: vec![f64::NAN; self.config.lanes],
                         scratch: Vec::with_capacity(capacity),
@@ -613,6 +615,7 @@ const INCOMING_EVENT_CAPACITY: usize = 1024;
 
 /// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
+    note_end_ports: Vec<i16>,
     processor: Processor,
     /// Parameter targets and their schedule lane indices, captured at
     /// activate so the audio thread never walks the slot table.
@@ -781,6 +784,14 @@ pub struct BoundInstances<'a> {
 }
 
 impl crate::instances::AudioInstances for BoundInstances<'_> {
+    fn reports_note_end(&self, instance: u32, port: i16) -> bool {
+        self.processors
+            .entries
+            .get(instance as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|processor| processor.note_end_ports.contains(&port))
+    }
+
     fn process(
         &mut self,
         instance: u32,
@@ -910,6 +921,7 @@ mod tests {
             entries: (0..2)
                 .map(|_| {
                     Some(SubHostProcessor {
+                        note_end_ports: Vec::new(),
                         processor: Processor::new(Echo),
                         targets: Vec::new(),
                         last_sent: vec![f64::NAN; LANES],
@@ -966,6 +978,7 @@ mod tests {
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
+            note_end_ports: Vec::new(),
             processor: Processor::new(Recorder { seen: seen.clone() }),
             targets,
             last_sent: vec![f64::NAN; LANES],

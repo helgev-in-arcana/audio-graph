@@ -224,6 +224,7 @@ pub struct Program {
 /// ```
 #[derive(Debug, PartialEq)]
 pub struct PreparedProgram {
+    pub(crate) fallback_destinations: Vec<crate::notes::FallbackDestination>,
     pub(crate) program: Program,
     pub(crate) publication: u64,
 }
@@ -245,6 +246,11 @@ impl PreparedProgram {
         let sizes = program.size_rings(sample_rate, previous);
         (
             Self {
+                fallback_destinations: program
+                    .instances
+                    .iter()
+                    .map(|io| crate::notes::FallbackDestination::new(io.instance))
+                    .collect(),
                 program,
                 publication: 0,
             },
@@ -462,10 +468,12 @@ mod tests {
         next.audio_rings = vec![Vec::new(), Vec::new()];
 
         let mut next = PreparedProgram {
+            fallback_destinations: Vec::new(),
             program: next,
             publication: 0,
         };
         let mut old = PreparedProgram {
+            fallback_destinations: Vec::new(),
             program: old,
             publication: 0,
         };

@@ -104,6 +104,13 @@ pub trait SubPluginMain {
         Vec::new()
     }
 
+    /// Input ports whose native note dialect reports voice completion with `NoteEnd`.
+    /// A host may reclaim other ports' note bookkeeping at delivery of NoteOff;
+    /// that policy does not describe the duration of their audible release tails.
+    fn note_end_ports(&self) -> Vec<i16> {
+        Vec::new()
+    }
+
     /// The plugin's audio buses and note input/output layout.
     ///
     /// Read after loading and used to build the node's sockets. Batched for the

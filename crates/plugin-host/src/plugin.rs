@@ -281,6 +281,10 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::note_dialects(p))
     }
 
+    fn note_end_ports(&self) -> Vec<i16> {
+        delegate!(self, p => SubPluginMain::note_end_ports(p))
+    }
+
     fn io_layout(&self) -> IoLayout {
         delegate!(self, p => SubPluginMain::io_layout(p))
     }
