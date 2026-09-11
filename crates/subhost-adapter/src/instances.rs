@@ -100,6 +100,10 @@ pub trait AudioInstances {
 pub struct NoInstances;
 
 impl AudioInstances for NoInstances {
+    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+        false
+    }
+
     fn process(
         &mut self,
         _instance: u32,
