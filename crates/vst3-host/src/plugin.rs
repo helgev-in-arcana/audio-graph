@@ -93,6 +93,25 @@ pub struct Vst3Plugin {
 }
 
 impl Vst3Plugin {
+    /// Deliver recorded requests outside native callbacks, on the owning thread.
+    pub fn tick(&mut self) {
+        use plugin_host_api::RestartReason;
+        use vst3::Steinberg::Vst::RestartFlags_::{
+            kIoChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
+        };
+        let flags = self.instance.get()._handler.take_restart_requests();
+        for (flag, reason) in [
+            (kParamValuesChanged, RestartReason::ParamValues),
+            (kParamTitlesChanged, RestartReason::ParamTitles),
+            (kLatencyChanged, RestartReason::Latency),
+            (kIoChanged, RestartReason::IoConfig),
+        ] {
+            if flags & flag != 0 {
+                self.context.request_restart(reason);
+            }
+        }
+    }
+
     /// Create and fully initialise the class `cid` from `module`.
     pub fn create(module: &Module, cid: Cid, context: Arc<dyn HostContext>) -> Result<Vst3Plugin> {
         // Module-scoped, not instance-scoped: the factory retains the pointer
@@ -449,6 +468,10 @@ impl Vst3Plugin {
 }
 
 impl SubPluginMain for Vst3Plugin {
+    fn tick(&mut self) {
+        Vst3Plugin::tick(self);
+    }
+
     fn params(&self) -> &[ParamInfo] {
         &self.params
     }

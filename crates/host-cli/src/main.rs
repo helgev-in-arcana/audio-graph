@@ -753,6 +753,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         return Err("plugin event output overflow".into());
     }
     processor.deactivate();
+    plugin.tick();
     Ok(())
 }
 

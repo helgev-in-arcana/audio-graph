@@ -64,9 +64,7 @@ pub struct RenderOutcome {
     pub host_log: Vec<String>,
     /// What the plugin sent back, gathered across every block.
     ///
-    /// A backend clears the sink each call, so watching one block would only
-    /// ever show the last one's worth. This is how a note the plugin says it
-    /// has finished with becomes visible from outside.
+    /// The render loop clears its per-block sink after collecting its output.
     pub emitted: Vec<Event>,
 }
 
@@ -147,6 +145,7 @@ pub fn render_with_state(
     let mut blocks = 0usize;
 
     while position < input.frames {
+        plugin.tick();
         let frames = block_size.min((input.frames - position) as u32);
 
         for ch in 0..input_channels as usize {
@@ -181,11 +180,13 @@ pub fn render_with_state(
         let status = processor.process(&mut buffers, &block_events, &context, &mut sink);
         if sink.overflowed() {
             processor.deactivate();
+            plugin.tick();
             return Err(format!("plugin event output overflow at sample {position}"));
         }
         emitted.extend_from_slice(sink.events());
         if status == ProcessStatus::Error {
             processor.deactivate();
+            plugin.tick();
             return Err(format!("plugin returned an error at sample {position}"));
         }
 
@@ -200,6 +201,7 @@ pub fn render_with_state(
     }
 
     processor.deactivate();
+    plugin.tick();
 
     Ok(RenderOutcome {
         audio: output,

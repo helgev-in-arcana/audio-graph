@@ -223,7 +223,8 @@ impl Plugin {
     /// running the main-thread callbacks and timers a plugin repaints from.
     pub fn tick(&mut self) {
         match &mut self.inner {
-            Backend::Vst3 { editor, .. } => {
+            Backend::Vst3 { plugin, editor, .. } => {
+                plugin.tick();
                 let Some(window) = editor.as_mut() else {
                     return;
                 };
@@ -265,6 +266,10 @@ macro_rules! delegate {
 }
 
 impl SubPluginMain for Plugin {
+    fn tick(&mut self) {
+        Plugin::tick(self);
+    }
+
     fn params(&self) -> &[ParamInfo] {
         delegate!(self, p => SubPluginMain::params(p))
     }

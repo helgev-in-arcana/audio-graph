@@ -304,6 +304,7 @@ impl HostContext for TestHost {
 struct RecordingHost {
     reasons: std::sync::Mutex<Vec<RestartReason>>,
     latencies: std::sync::Mutex<Vec<u32>>,
+    threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
 }
 
 impl HostContext for RecordingHost {
@@ -312,10 +313,69 @@ impl HostContext for RecordingHost {
     }
     fn request_restart(&self, reason: RestartReason) {
         self.reasons.lock().expect("not poisoned").push(reason);
+        self.threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
     }
     fn latency_changed(&self, samples: u32) {
         self.latencies.lock().expect("not poisoned").push(samples);
     }
+}
+
+/// Repeated audio-thread requests reach HostContext once, on a headless main-thread tick.
+#[test]
+fn audio_requests_are_delivered_only_by_the_main_thread() {
+    let module = Module::open(fixture_path()).unwrap();
+    let host = Arc::new(RecordingHost::default());
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", host.clone()).unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let processor = std::thread::spawn(move || {
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&[0.0; 8], &mut output, 2, 2, 4, BufferLayout::Planar);
+        let request = Event::Param(ParamEvent::SetValue {
+            id: PARAM_ASK,
+            target: Target::Global,
+            value: ASK_RESTART,
+            sample_offset: 0,
+        });
+        for _ in 0..2 {
+            processor.process(
+                &mut buffers,
+                &[request],
+                &TimeContext::default(),
+                &mut EventSink::new(),
+            );
+        }
+        processor
+    })
+    .join()
+    .unwrap();
+    assert!(host.reasons.lock().unwrap().is_empty());
+    plugin.tick();
+    assert_eq!(*host.reasons.lock().unwrap(), [RestartReason::IoConfig]);
+    assert_eq!(*host.threads.lock().unwrap(), [std::thread::current().id()]);
+    processor.deactivate();
+    plugin.tick();
+    drop(plugin);
+    assert_eq!(host.reasons.lock().unwrap().len(), 1);
+}
+
+/// A request raised during a native main callback remains pending for the next tick.
+#[test]
+fn callback_requests_are_not_lost_while_servicing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let host = Arc::new(RecordingHost::default());
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", host.clone()).unwrap();
+    plugin.set_param(PARAM_ASK, 6.0).unwrap();
+    plugin.tick();
+    assert!(host.reasons.lock().unwrap().is_empty());
+    plugin.tick();
+    assert_eq!(*host.reasons.lock().unwrap(), [RestartReason::IoConfig]);
+    plugin.tick();
+    assert_eq!(host.reasons.lock().unwrap().len(), 1);
 }
 
 /// The plugin asks; the host has to hear it.
@@ -352,9 +412,15 @@ fn the_host_forwards_what_the_plugin_asks_for() {
         // `params.flush` — main thread, which is where all three calls are
         // legal.
         SubPluginMain::set_param(&mut plugin, PARAM_ASK, ask).expect("the ask lands");
+        assert!(host.reasons.lock().unwrap().is_empty());
+        plugin.tick();
 
         let seen = host.reasons.lock().unwrap().clone();
-        assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
+        if expected == RestartReason::Latency {
+            assert_eq!(*host.latencies.lock().unwrap(), [0]);
+        } else {
+            assert_eq!(seen, vec![expected], "ask {ask} was not forwarded");
+        }
     }
 }
 

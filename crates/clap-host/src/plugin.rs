@@ -38,7 +38,8 @@ use clap_sys::ext::params::{
     CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
     CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_CHANNEL,
     CLAP_PARAM_IS_MODULATABLE_PER_KEY, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
-    CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, clap_param_info,
+    CLAP_PARAM_IS_PERIODIC, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_ALL,
+    CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES, clap_param_info,
     clap_plugin_params,
 };
 use clap_sys::ext::render::{
@@ -57,7 +58,7 @@ use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
     IoLayout, MainThread, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
-    Processor, Result, SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
+    Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
     reclaim_main_thread,
 };
 
@@ -403,6 +404,18 @@ impl ClapPlugin {
             // reading half of it because only `TEXT` was set is how a stale
             // range survives a plugin update.
             self.params = unsafe { read_params(self.instance.get().plugin, self.ext_params) };
+            for (flags, reason) in [
+                (
+                    CLAP_PARAM_RESCAN_ALL | CLAP_PARAM_RESCAN_INFO,
+                    RestartReason::ParamList,
+                ),
+                (CLAP_PARAM_RESCAN_TEXT, RestartReason::ParamTitles),
+                (CLAP_PARAM_RESCAN_VALUES, RestartReason::ParamValues),
+            ] {
+                if requests.param_rescan & flags != 0 {
+                    self.context.request_restart(reason);
+                }
+            }
         }
 
         if requests.voice_info {
@@ -412,10 +425,8 @@ impl ClapPlugin {
 
         if requests.latency {
             let latency = unsafe { read_latency(self.instance.get().plugin, self.ext_latency) };
-            if latency != self.latency.get() {
-                self.latency.set(latency);
-                self.context.latency_changed(latency);
-            }
+            self.latency.set(latency);
+            self.context.latency_changed(latency);
         }
 
         if let Some((width, height)) = requests.gui_resize
@@ -428,7 +439,9 @@ impl ClapPlugin {
             self.editor = None;
         }
 
-        // `restart`, `process` and `audio_ports` are forwarded to the host context.
+        if requests.restart || requests.audio_ports {
+            self.context.request_restart(RestartReason::IoConfig);
+        }
     }
 
     /// Tell the plugin which of its ports the graph actually wired.
@@ -573,6 +586,10 @@ impl ClapPlugin {
 }
 
 impl SubPluginMain for ClapPlugin {
+    fn tick(&mut self) {
+        ClapPlugin::tick(self);
+    }
+
     fn params(&self) -> &[ParamInfo] {
         &self.params
     }

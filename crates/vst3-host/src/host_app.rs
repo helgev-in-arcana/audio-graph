@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use plugin_host_api::HostContext;
 use vst3::Steinberg::Vst::{
@@ -22,7 +23,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::{
     IPlugFrame, TUID, char16, int64, kInvalidArgument, kNotImplemented, kResultFalse, kResultOk,
-    kResultTrue, tresult, uint32,
+    tresult, uint32,
 };
 use vst3::{Class, ComWrapper, Interface};
 
@@ -336,11 +337,19 @@ impl IMessageTrait for HostMessage {
 /// disable their UI controls when given a null handler.
 pub struct ComponentHandler {
     context: Arc<dyn HostContext>,
+    restart: AtomicI32,
 }
 
 impl ComponentHandler {
     pub fn new(context: Arc<dyn HostContext>) -> ComWrapper<ComponentHandler> {
-        ComWrapper::new(ComponentHandler { context })
+        ComWrapper::new(ComponentHandler {
+            context,
+            restart: AtomicI32::new(0),
+        })
+    }
+
+    pub fn take_restart_requests(&self) -> i32 {
+        self.restart.swap(0, Ordering::AcqRel)
     }
 }
 
@@ -366,26 +375,8 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn restartComponent(&self, flags: i32) -> tresult {
-        use plugin_host_api::RestartReason;
-        use vst3::Steinberg::Vst::RestartFlags_::{
-            kIoChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
-        };
-
-        // A single call can carry several flags; each is a distinct request.
-        let mut handled = false;
-        for (flag, reason) in [
-            (kParamValuesChanged, RestartReason::ParamValues),
-            (kParamTitlesChanged, RestartReason::ParamTitles),
-            (kLatencyChanged, RestartReason::Latency),
-            (kIoChanged, RestartReason::IoConfig),
-        ] {
-            if flags & flag != 0 {
-                self.context.request_restart(reason);
-                handled = true;
-            }
-        }
-
-        if handled { kResultOk } else { kResultTrue }
+        self.restart.fetch_or(flags, Ordering::Release);
+        kResultOk
     }
 }
 
@@ -404,5 +395,36 @@ impl IComponentHandler2Trait for ComponentHandler {
 
     unsafe fn finishGroupEdit(&self) -> tresult {
         kResultOk
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    struct Host;
+    impl HostContext for Host {
+        fn host_name(&self) -> &str {
+            "test"
+        }
+        fn request_restart(&self, _: plugin_host_api::RestartReason) {
+            panic!("native callbacks must not deliver notifications");
+        }
+    }
+
+    /// Taking one batch does not erase requests recorded afterwards.
+    #[test]
+    fn native_requests_are_coalesced_until_main_takes_them() {
+        let handler = ComponentHandler::new(Arc::new(Host));
+        unsafe {
+            handler.restartComponent(1);
+            handler.restartComponent(2);
+        }
+        assert_eq!(handler.take_restart_requests(), 3);
+        unsafe {
+            handler.restartComponent(4);
+        }
+        assert_eq!(handler.take_restart_requests(), 4);
+        assert_eq!(handler.take_restart_requests(), 0);
     }
 }

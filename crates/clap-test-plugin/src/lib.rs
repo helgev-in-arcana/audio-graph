@@ -109,6 +109,7 @@ pub mod ask {
     pub const LATENCY_CHANGED: f64 = 4.0;
     /// Emit more events than the host's native output scratch can hold (2048).
     pub const OUTPUT_BURST: f64 = 5.0;
+    pub const RESTART_ON_CALLBACK: f64 = 6.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -176,7 +177,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, ask::OUTPUT_BURST).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::RESTART_ON_CALLBACK).round(),
             _ => {}
         }
     }
@@ -442,7 +443,11 @@ unsafe extern "C" fn plugin_reset(plugin: *const clap_plugin) {
     }
 }
 
-unsafe extern "C" fn plugin_on_main_thread(_plugin: *const clap_plugin) {}
+unsafe extern "C" fn plugin_on_main_thread(plugin: *const clap_plugin) {
+    if let Some(instance) = unsafe { Instance::from_host(plugin) } {
+        unsafe { instance.answer_ask() };
+    }
+}
 
 unsafe extern "C" fn plugin_process(
     plugin: *const clap_plugin,
@@ -459,6 +464,12 @@ unsafe extern "C" fn plugin_process(
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
     unsafe { apply_events(instance, data.in_events, data.out_events) };
+    if instance.params.ask == ask::RESTART {
+        instance.params.ask = ask::NOTHING;
+        if let Some(request) = unsafe { (*instance.host).request_restart } {
+            unsafe { request(instance.host) };
+        }
+    }
 
     if instance.params.ask == ask::OUTPUT_BURST && !data.out_events.is_null() {
         instance.params.ask = ask::NOTHING;
@@ -843,7 +854,7 @@ unsafe extern "C" fn params_get_info(
             "Ask Host",
             "",
             0.0,
-            ask::OUTPUT_BURST,
+            ask::RESTART_ON_CALLBACK,
             0.0,
             CLAP_PARAM_IS_STEPPED,
         ),
@@ -991,6 +1002,12 @@ impl Instance {
             None => return,
         };
         match ask {
+            ask::RESTART_ON_CALLBACK => {
+                self.params.ask = ask::RESTART;
+                if let Some(request) = unsafe { (*self.host).request_callback } {
+                    unsafe { request(self.host) };
+                }
+            }
             ask::RESTART => {
                 if let Some(request) = unsafe { (*self.host).request_restart } {
                     unsafe { request(self.host) };
