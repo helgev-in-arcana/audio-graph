@@ -819,6 +819,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
+        let first_output = self.out_events.events().len();
         processor.process(
             &mut buffers,
             schedule,
@@ -827,6 +828,9 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
             self.context,
             self.out_events,
         );
+        for event in &mut self.out_events.events_mut()[first_output..] {
+            *event = event.at_offset(event.sample_offset() + chunk.offset);
+        }
     }
 }
 
@@ -881,6 +885,78 @@ mod tests {
     /// Test configuration constants for slot and lane counts.
     const SLOTS: usize = 32;
     const LANES: usize = SLOTS + 64 + 16;
+
+    /// Several instances and chunks append block-relative output without losing overflow.
+    #[test]
+    fn output_collection_spans_instances_and_chunks() {
+        use crate::instances::{AudioChunk, AudioInstances};
+        struct Echo;
+        impl SubPluginProcessor for Echo {
+            fn process(
+                &mut self,
+                _: &mut AudioBuffers<'_>,
+                events: &[Event],
+                _: &TimeContext,
+                sink: &mut EventSink,
+            ) -> ProcessStatus {
+                for event in events {
+                    sink.push(*event);
+                }
+                ProcessStatus::Continue
+            }
+            fn reset(&mut self) {}
+        }
+        let mut processors = SubHostProcessors {
+            entries: (0..2)
+                .map(|_| {
+                    Some(SubHostProcessor {
+                        processor: Processor::new(Echo),
+                        targets: Vec::new(),
+                        last_sent: vec![f64::NAN; LANES],
+                        scratch: Vec::with_capacity(8),
+                    })
+                })
+                .collect(),
+        };
+        let mut sink = EventSink::with_capacity(2);
+        let context = TimeContext::default();
+        let mut schedule = SlotSchedule::new(LANES, 8, 4);
+        schedule.begin(8);
+        schedule.fill(&[0.0; LANES]);
+        for (instance, offset) in [(0, 0), (1, 4), (0, 4)] {
+            let event = Event::Note(NoteEvent::NoteOn {
+                note_id: Some(instance as i32),
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity: 1.0,
+                sample_offset: offset + 1,
+            });
+            processors.bind(&context, &mut sink).process(
+                instance,
+                &[event],
+                &[0.0; 8],
+                &mut [0.0; 8],
+                AudioChunk {
+                    input_channels: 2,
+                    output_channels: 2,
+                    aux_inputs: Default::default(),
+                    aux_outputs: Default::default(),
+                    frames: 4,
+                    offset,
+                },
+                schedule.view(),
+            );
+        }
+        assert_eq!(
+            sink.events()
+                .iter()
+                .map(Event::sample_offset)
+                .collect::<Vec<_>>(),
+            [1, 5]
+        );
+        assert!(sink.overflowed());
+    }
 
     fn harness(
         targets: Vec<(usize, ResolvedTarget)>,

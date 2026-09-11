@@ -821,7 +821,6 @@ impl SubPluginProcessor for Vst3Processor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
-        out_events.clear();
         if !buffers.matches_config(&self.config) {
             buffers.clear_output();
             return ProcessStatus::Error;
@@ -921,6 +920,9 @@ impl SubPluginProcessor for Vst3Processor {
         }
 
         vst_events::drain_outputs(&self.output_events, out_events);
+        if self.output_changes.overflowed() {
+            out_events.mark_overflow();
+        }
 
         // The plugin sets silence flags on the output bus when it has nothing
         // to say; honouring that is what lets a chain skip downstream work.

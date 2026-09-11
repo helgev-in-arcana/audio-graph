@@ -134,6 +134,41 @@ fn mismatched_blocks_never_enter_native_processing() {
     );
 }
 
+/// Both native scratch loss and caller capacity loss remain visible across process calls.
+#[test]
+fn output_overflow_is_propagated_and_not_cleared_by_processing() {
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [0.0; 8];
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    let burst = Event::Param(ParamEvent::SetValue {
+        id: PARAM_ASK,
+        target: Target::Global,
+        value: 5.0,
+        sample_offset: 0,
+    });
+    for capacity in [0, 1, 4096] {
+        let mut sink = EventSink::with_capacity(capacity);
+        processor.process(&mut buffers, &[burst], &TimeContext::default(), &mut sink);
+        assert!(sink.overflowed());
+        let retained = sink.events().len();
+        assert_eq!(retained, capacity.min(2048));
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+        assert!(sink.overflowed());
+        assert_eq!(sink.events().len(), retained);
+        sink.clear();
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+        assert!(!sink.overflowed());
+    }
+}
+
 /// A running processor retains its instance, module, and callbacks after main is dropped.
 #[test]
 fn the_processor_outlives_main_and_returns_to_its_owner() {

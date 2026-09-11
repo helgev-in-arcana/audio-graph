@@ -747,8 +747,11 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         frames,
         BufferLayout::Planar,
     );
-    let mut sink = EventSink::new();
+    let mut sink = EventSink::with_capacity(256);
     processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+    if sink.overflowed() {
+        return Err("plugin event output overflow".into());
+    }
     processor.deactivate();
     Ok(())
 }

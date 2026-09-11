@@ -1066,7 +1066,6 @@ impl SubPluginProcessor for ClapProcessor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
-        out_events.clear();
         if !buffers.matches_config(&self.config) {
             buffers.clear_output();
             return ProcessStatus::Error;

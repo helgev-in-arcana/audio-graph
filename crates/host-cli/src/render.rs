@@ -177,7 +177,12 @@ pub fn render_with_state(
             BufferLayout::Planar,
         );
 
+        sink.clear();
         let status = processor.process(&mut buffers, &block_events, &context, &mut sink);
+        if sink.overflowed() {
+            processor.deactivate();
+            return Err(format!("plugin event output overflow at sample {position}"));
+        }
         emitted.extend_from_slice(sink.events());
         if status == ProcessStatus::Error {
             processor.deactivate();

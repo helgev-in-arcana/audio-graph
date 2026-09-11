@@ -51,9 +51,12 @@ impl SubPluginProcessor for Counter {
         _: &mut AudioBuffers<'_>,
         _: &[Event],
         _: &TimeContext,
-        _: &mut EventSink,
+        sink: &mut EventSink,
     ) -> ProcessStatus {
         self.calls += 1;
+        sink.push(Event::Param(plugin_host_api::ParamEvent::GestureBegin {
+            id: plugin_host_api::ParamId(0),
+        }));
         ProcessStatus::Continue
     }
 
@@ -81,7 +84,7 @@ fn processing_and_foreign_return_do_not_touch_the_allocator() {
         let _ = std::thread::current().id();
         let mut output = [0.0; 32];
         let mut buffers = AudioBuffers::new(&[], &mut output, 0, 1, 32, BufferLayout::Planar);
-        let mut sink = EventSink::new();
+        let mut sink = EventSink::with_capacity(1);
         let time = TimeContext::default();
         ALLOCATIONS.set(0);
         DEALLOCATIONS.set(0);
@@ -92,6 +95,8 @@ fn processing_and_foreign_return_do_not_touch_the_allocator() {
         processor.reset();
         processor.deactivate();
         COUNTING.set(false);
+        assert_eq!(sink.events().len(), 1);
+        assert!(sink.overflowed());
         assert_eq!(ALLOCATIONS.get(), 0);
         assert_eq!(DEALLOCATIONS.get(), 0);
     })

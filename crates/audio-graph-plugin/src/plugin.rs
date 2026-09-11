@@ -500,6 +500,15 @@ impl Wrapper {
             &mut self.output_scratch[..(out_channels * frames) as usize],
             nodes,
         );
+        if self.out_events.overflowed() {
+            self.ended_notes.clear();
+            self.engine.reset_notes(&mut self.ended_notes);
+            if let Some(processor) = state.processor.as_mut() {
+                processor.reset();
+            }
+            report_ended(&self.ended_notes, context);
+            self.out_events.clear();
+        }
         // What the editor's meters show. The DAW's own parameter value stops
         // being the answer the moment the graph drives a slot.
         self.shared

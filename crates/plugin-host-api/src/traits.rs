@@ -152,6 +152,9 @@ pub trait SubPluginProcessor: Send {
     /// layout, and fit its maximum block size. A mismatch returns `Error` with
     /// cleared audio output, without entering native processing. A matching
     /// zero-frame block does not enter native processing either.
+    /// Output events append to `out_events` with call-relative sample offsets.
+    /// The caller clears the sink before its collection interval and handles
+    /// `overflowed()` afterwards; backends propagate native capacity failures.
     fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,

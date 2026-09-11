@@ -107,6 +107,8 @@ pub mod ask {
     /// moved. Set that one first, or the host is being told to re-read a value
     /// that has not changed and will rightly do nothing with it.
     pub const LATENCY_CHANGED: f64 = 4.0;
+    /// Emit more events than the host's native output scratch can hold (2048).
+    pub const OUTPUT_BURST: f64 = 5.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -174,7 +176,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, 4.0).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::OUTPUT_BURST).round(),
             _ => {}
         }
     }
@@ -457,6 +459,31 @@ unsafe extern "C" fn plugin_process(
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
     unsafe { apply_events(instance, data.in_events) };
+
+    if instance.params.ask == ask::OUTPUT_BURST && !data.out_events.is_null() {
+        instance.params.ask = ask::NOTHING;
+        if let Some(push) = unsafe { (*data.out_events).try_push } {
+            let event = clap_event_param_value {
+                header: clap_sys::events::clap_event_header {
+                    size: size_of::<clap_event_param_value>() as u32,
+                    time: 0,
+                    space_id: CLAP_CORE_EVENT_SPACE_ID,
+                    type_: CLAP_EVENT_PARAM_VALUE,
+                    flags: 0,
+                },
+                param_id: PARAM_GAIN,
+                cookie: std::ptr::null_mut(),
+                note_id: -1,
+                port_index: -1,
+                channel: -1,
+                key: -1,
+                value: instance.params.gain,
+            };
+            for _ in 0..2049 {
+                unsafe { push(data.out_events, &event.header) };
+            }
+        }
+    }
 
     let frames = data.frames_count as usize;
     let note_sum = instance.held.iter().filter(|&&on| on).count() as f32 * NOTE_LEVEL;
@@ -802,7 +829,14 @@ unsafe extern "C" fn params_get_info(
             65535.0,
             CLAP_PARAM_IS_STEPPED,
         ),
-        5 => ("Ask Host", "", 0.0, 3.0, 0.0, CLAP_PARAM_IS_STEPPED),
+        5 => (
+            "Ask Host",
+            "",
+            0.0,
+            ask::OUTPUT_BURST,
+            0.0,
+            CLAP_PARAM_IS_STEPPED,
+        ),
         6 => ("Render Mode", "", 0.0, 1.0, 0.0, CLAP_PARAM_IS_STEPPED),
         _ => (
             "FD Calls",

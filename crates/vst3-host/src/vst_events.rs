@@ -215,6 +215,9 @@ fn expression_type_id(expression: NoteExpression) -> Option<u32> {
 
 /// Convert what the plugin emitted back into the core model.
 pub fn drain_outputs(list: &ComWrapper<EventList>, sink: &mut EventSink) {
+    if list.overflowed() {
+        sink.mark_overflow();
+    }
     for index in 0..list.len() {
         let Some(vst) = list.get(index) else { continue };
         let sample_offset = vst.sampleOffset.max(0) as u32;

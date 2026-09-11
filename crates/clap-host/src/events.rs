@@ -489,11 +489,13 @@ unsafe extern "C" fn input_get(
 pub(crate) struct OutputEvents {
     raw: clap_output_events,
     events: Vec<RawEvent>,
+    overflowed: bool,
 }
 
 impl OutputEvents {
     pub(crate) fn new(capacity: usize) -> OutputEvents {
         OutputEvents {
+            overflowed: false,
             raw: clap_output_events {
                 ctx: std::ptr::null_mut(),
                 try_push: Some(output_try_push),
@@ -504,6 +506,7 @@ impl OutputEvents {
 
     pub(crate) fn clear(&mut self) {
         self.events.clear();
+        self.overflowed = false;
     }
 
     pub(crate) fn as_raw(&mut self) -> *const clap_output_events {
@@ -513,6 +516,9 @@ impl OutputEvents {
 
     /// Move everything the plugin emitted into the core's sink.
     pub(crate) fn drain_into(&mut self, sink: &mut EventSink) {
+        if self.overflowed {
+            sink.mark_overflow();
+        }
         for raw in &self.events {
             if let Some(event) = unsafe { decode(raw) } {
                 sink.push(event);
@@ -535,6 +541,7 @@ unsafe extern "C" fn output_try_push(
     if events.events.len() == events.events.capacity() {
         // False is the format's "I could not take it", which is the honest
         // answer; growing here would allocate on the audio thread.
+        events.overflowed = true;
         return false;
     }
     let header = unsafe { *event };
