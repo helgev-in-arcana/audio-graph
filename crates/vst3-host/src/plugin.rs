@@ -666,6 +666,7 @@ impl SubPluginMain for Vst3Plugin {
                 "state restoration requires an inactive plugin",
             ));
         }
+        self.tick();
         if data.len() < 8 {
             return Err(HostError::State("state blob is truncated".into()));
         }

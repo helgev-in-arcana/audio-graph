@@ -779,6 +779,7 @@ impl SubPluginMain for ClapPlugin {
                 "state restoration requires an inactive plugin",
             ));
         }
+        self.tick();
         if self.ext_state.is_null() {
             return if data.is_empty() {
                 Ok(())

@@ -139,6 +139,24 @@ fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
     wrapper.tick();
     assert!(wrapper.shared().patch().compile_error.is_none());
     block.process(&mut wrapper, &mut daw);
+    wrapper
+        .shared()
+        .load_sub_state(0, &fixture_state(0.0))
+        .unwrap();
+    assert_eq!(
+        wrapper
+            .shared()
+            .main()
+            .host
+            .io_layout(0)
+            .main_input_channels(),
+        2
+    );
+    assert!(wrapper.shared().main().host.slots().resolved(0).is_some());
+    assert!(wrapper.shared().patch().graph.nodes.iter().any(
+        |node| matches!(&node.kind, NodeKind::Plugin(plugin) if plugin.ports.audio_in[0] == 2)
+    ));
+    block.process(&mut wrapper, &mut daw);
 }
 
 /// A bounce renders the audio, and leaves the wrapper able to go on rendering
