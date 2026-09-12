@@ -15,6 +15,58 @@ use std::sync::{Arc, Mutex};
 
 static FIXTURE: Mutex<()> = Mutex::new(());
 
+/// Plugin-requested flushes work without host edits and supersede older activation replays.
+#[test]
+fn plugin_flush_requests_deliver_values_while_inactive_and_active() {
+    struct Host(Mutex<Vec<f64>>);
+    impl HostContext for Host {
+        fn host_name(&self) -> &str {
+            "flush test"
+        }
+        fn request_restart(&self, _: RestartReason) {}
+        fn param_edited(&self, id: ParamId, value: f64) {
+            if id == PARAM_GAIN {
+                self.0.lock().unwrap().push(value);
+            }
+        }
+    }
+    let _fixture = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let context = Arc::new(Host(Mutex::new(Vec::new())));
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", context.clone()).unwrap();
+    plugin.set_param(PARAM_GAIN, 1.5).unwrap();
+    plugin.set_param(PARAM_ASK, 12.0).unwrap();
+    plugin.tick();
+    assert_eq!(*context.0.lock().unwrap(), [0.375]);
+    plugin.tick();
+    assert_eq!(context.0.lock().unwrap().len(), 1);
+    plugin.set_param(PARAM_ASK, 0.0).unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [1.0; 8];
+    let mut output = [0.0; 8];
+    let mut sink = EventSink::with_capacity(8);
+    let mut run = || {
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        assert_eq!(
+            processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+            ProcessStatus::Continue
+        );
+        output[0]
+    };
+    assert_eq!(run(), 0.375);
+    plugin.set_param(PARAM_GAIN, 1.0).unwrap();
+    plugin.set_param(PARAM_ASK, 12.0).unwrap();
+    assert_eq!(run(), 1.0);
+    plugin.tick();
+    plugin.tick();
+    assert_eq!(run(), 0.375);
+    assert!(matches!(
+        sink.events(),
+        [Event::Param(ParamEvent::SetValue { value: 0.375, .. })]
+    ));
+}
+
 mod allocations {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};

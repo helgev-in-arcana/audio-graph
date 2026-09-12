@@ -483,6 +483,15 @@ pub(crate) struct OutputEvents {
 }
 
 impl OutputEvents {
+    pub(crate) fn decoded(&self) -> impl Iterator<Item = Event> + '_ {
+        self.events
+            .iter()
+            .filter_map(|event| unsafe { decode(event) })
+    }
+
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
     pub(crate) fn new(capacity: usize) -> OutputEvents {
         OutputEvents {
             overflowed: false,
@@ -509,10 +518,8 @@ impl OutputEvents {
         if self.overflowed {
             sink.mark_overflow();
         }
-        for raw in &self.events {
-            if let Some(event) = unsafe { decode(raw) } {
-                sink.push(event);
-            }
+        for event in self.decoded() {
+            sink.push(event);
         }
         self.events.clear();
     }

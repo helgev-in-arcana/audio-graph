@@ -30,7 +30,7 @@ enum Curve {
     /// monotonically ordered as VST3 requires.
     Sampled(Box<[f64; TABLE_SIZE]>),
     /// Range is degenerate; every plain value maps to 0.
-    Constant,
+    Constant(f64),
 }
 
 struct Entry {
@@ -67,9 +67,25 @@ impl ParamMap {
     pub fn normalize(&self, id: ParamId, plain: f64) -> Option<f64> {
         let entry = self.entries.iter().find(|e| e.id == id)?;
         Some(match &entry.curve {
-            Curve::Constant => 0.0,
+            Curve::Constant(_) => 0.0,
             Curve::Linear { min, span } => ((plain - min) / span).clamp(0.0, 1.0),
             Curve::Sampled(table) => invert_table(table, plain),
+        })
+    }
+    pub fn denormalize(&self, id: ParamId, normalized: f64) -> Option<f64> {
+        let entry = self.entries.iter().find(|e| e.id == id)?;
+        let n = normalized.clamp(0.0, 1.0);
+        if !n.is_finite() {
+            return None;
+        }
+        Some(match &entry.curve {
+            Curve::Constant(value) => *value,
+            Curve::Linear { min, span } => min + n * span,
+            Curve::Sampled(table) => {
+                let position = n * (TABLE_SIZE - 1) as f64;
+                let index = (position as usize).min(TABLE_SIZE - 2);
+                table[index] + (table[index + 1] - table[index]) * (position - index as f64)
+            }
         })
     }
 }
@@ -79,7 +95,7 @@ fn build_curve(param: &ParamInfo, sample: &mut impl FnMut(ParamId, f64) -> f64) 
     let max = sample(param.id, 1.0);
     let span = max - min;
     if span == 0.0 || !span.is_finite() {
-        return Curve::Constant;
+        return Curve::Constant(min);
     }
 
     // Probe the curve before committing to a table. Linear is overwhelmingly
@@ -171,6 +187,7 @@ mod tests {
         assert_eq!(map.normalize(ParamId(1), 12.0), Some(1.0));
         let mid = map.normalize(ParamId(1), -24.0).unwrap();
         assert!((mid - 0.5).abs() < 1e-12);
+        assert_eq!(map.denormalize(ParamId(1), mid), Some(-24.0));
     }
 
     #[test]
@@ -184,6 +201,8 @@ mod tests {
         for target in [20.0, 100.0, 440.0, 1000.0, 8000.0, 20_000.0] {
             let n = map.normalize(ParamId(2), target).unwrap();
             let back = curve(n);
+            let plain = map.denormalize(ParamId(2), n).unwrap();
+            assert!((plain - target).abs() / target < 1e-3);
             assert!(
                 (back - target).abs() / target < 1e-3,
                 "{target} Hz round-tripped to {back} Hz"
@@ -212,6 +231,7 @@ mod tests {
         let params = [info(5, 1.0, 1.0)];
         let map = ParamMap::build(&params, |_, _| 1.0);
         assert_eq!(map.normalize(ParamId(5), 1.0), Some(0.0));
+        assert_eq!(map.denormalize(ParamId(5), 0.5), Some(1.0));
     }
 
     #[test]

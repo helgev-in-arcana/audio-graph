@@ -171,11 +171,21 @@ impl IComponentTrait for GainProcessor {
     }
 
     unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+        let stream = ComRef::from_raw(_state).unwrap();
+        let mut value = 0.0f64;
+        let mut read = 0;
+        let result = stream.read((&mut value as *mut f64).cast(), 8, &mut read);
+        if result != kResultOk || read != 8 {
+            return kResultFalse;
+        }
+        self.gain.store(value.to_bits(), Ordering::Relaxed);
         kResultOk
     }
 
     unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+        let stream = ComRef::from_raw(_state).unwrap();
+        let mut value = f64::from_bits(self.gain.load(Ordering::Relaxed));
+        return stream.write((&mut value as *mut f64).cast(), 8, ptr::null_mut());
     }
 }
 
@@ -248,6 +258,7 @@ impl IAudioProcessorTrait for GainProcessor {
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let process_data = &*data;
         if AUDIT_EMIT.swap(false, Ordering::SeqCst) {
+            self.gain.store(0.6f64.to_bits(), Ordering::Relaxed);
             let changes = ComRef::from_raw(process_data.outputParameterChanges).unwrap();
             let id = 0;
             let mut index = 0;
@@ -364,7 +375,15 @@ impl IPluginBaseTrait for GainController {
 
 impl IEditControllerTrait for GainController {
     unsafe fn setComponentState(&self, _state: *mut IBStream) -> tresult {
-        kNotImplemented
+        let stream = ComRef::from_raw(_state).unwrap();
+        let mut value = 0.0f64;
+        let mut read = 0;
+        let result = stream.read((&mut value as *mut f64).cast(), 8, &mut read);
+        if result != kResultOk || read != 8 {
+            return kResultFalse;
+        }
+        self.gain.set(value);
+        kResultOk
     }
 
     unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
@@ -442,14 +461,14 @@ impl IEditControllerTrait for GainController {
 
     unsafe fn normalizedParamToPlain(&self, id: u32, value_normalized: f64) -> f64 {
         match id {
-            0 => value_normalized,
+            0 => value_normalized * f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
             _ => 0.0,
         }
     }
 
     unsafe fn plainParamToNormalized(&self, id: u32, plain_value: f64) -> f64 {
         match id {
-            0 => plain_value,
+            0 => plain_value / f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
             _ => 0.0,
         }
     }
@@ -626,6 +645,11 @@ static AUDIT_HANDLER: std::sync::atomic::AtomicPtr<IComponentHandler> =
 static AUDIT_CONTROLLER: std::sync::atomic::AtomicPtr<GainController> =
     std::sync::atomic::AtomicPtr::new(ptr::null_mut());
 static AUDIT_EMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AUDIT_SCALE: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_scale(value: f64) {
+    AUDIT_SCALE.store(value.to_bits(), Ordering::Relaxed);
+}
 static AUDIT_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static AUDIT_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static AUDIT_EXIT_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

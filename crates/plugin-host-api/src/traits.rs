@@ -35,7 +35,7 @@ pub enum ProcessStatus {
 /// expressed by the same types.
 ///
 /// All methods are called on the main thread. Native restart requests are
-/// coalesced and delivered by `SubPluginMain::tick`; GUI parameter edits and
+/// coalesced and delivered by `SubPluginMain::tick`; inactive parameter flushes and
 /// activation latency can be reported synchronously. Callbacks must schedule
 /// reconfiguration rather than reenter the same plugin. Call a final tick
 /// before normal shutdown; undelivered requests are discarded on destruction.
@@ -54,10 +54,9 @@ pub trait HostContext: Send + Sync {
         self.request_restart(RestartReason::Latency);
     }
 
-    /// The sub-plugin edited a parameter from its own GUI.
-    ///
-    /// Swallowed today: the wrapper is the sole authority for values, so there
-    /// is nothing to forward to the DAW. It is still logged.
+    /// A main-thread parameter notification in plain units. Native DSP/controller
+    /// synchronization does not depend on this callback. Changes emitted during
+    /// processing are returned through the process output event sink.
     fn param_edited(&self, id: ParamId, plain: f64) {
         let _ = (id, plain);
     }
@@ -91,7 +90,8 @@ pub enum MetadataUpdate {
 /// Deliberately not `Send`: both VST3 and CLAP pin these calls to the thread
 /// that created the instance.
 pub trait SubPluginMain {
-    /// Service callbacks on the owning main thread, even with no editor open.
+    /// Service callbacks and reflect completed DSP parameter values on the owning
+    /// main thread, even with no editor open. Display feedback may coalesce.
     /// Requests arriving during delivery remain pending for a subsequent tick.
     fn tick(&mut self) {}
 
@@ -159,6 +159,7 @@ pub trait SubPluginMain {
     fn io_layout(&self) -> IoLayout;
 
     /// Current values of every parameter, in one round trip.
+    /// Call `tick` first to reflect completed processing in main-thread caches.
     fn snapshot(&self) -> ParamSnapshot;
 
     /// Format the value the way the plugin itself would.

@@ -398,6 +398,10 @@ impl ClapPlugin {
 
     /// Act on everything the plugin asked for since the last tick.
     fn apply(&mut self, requests: PendingRequests) {
+        if requests.flush {
+            // Active plugins exchange these values in the next process call.
+            self.flush_params(true);
+        }
         if requests.callback
             && let Some(on_main_thread) = unsafe { (*self.instance.get().plugin).on_main_thread }
         {
@@ -563,7 +567,7 @@ impl ClapPlugin {
     /// The inactive half of `set_param`. While audio is running the processor
     /// drains the same queue, so this must not be called then — CLAP says
     /// `flush` and `process` may never overlap.
-    fn flush_params(&self) {
+    fn flush_params(&self, requested: bool) {
         if self.ext_params.is_null() || self.instance.get().active.get() {
             return;
         }
@@ -573,7 +577,7 @@ impl ClapPlugin {
         let Ok(mut pending) = self.pending_edits.lock() else {
             return;
         };
-        if pending.is_empty() {
+        if pending.is_empty() && !requested {
             return;
         }
         let mut buffers = self.flush_buffers.borrow_mut();
@@ -591,6 +595,29 @@ impl ClapPlugin {
         let in_raw = input.as_raw();
         let out_raw = output.as_raw();
         unsafe { flush(self.instance.get().plugin, in_raw, out_raw) };
+        let notify = |id, value| {
+            self.flushed
+                .borrow_mut()
+                .retain(|(old, plain)| *old != id || *plain == value);
+            self.context.param_edited(id, value);
+        };
+        if output.overflowed() {
+            for value in self.snapshot().values {
+                notify(value.id, value.plain);
+            }
+        } else {
+            for event in output.decoded() {
+                if let Event::Param(plugin_host_api::ParamEvent::SetValue {
+                    id,
+                    value,
+                    target: plugin_host_api::Target::Global,
+                    ..
+                }) = event
+                {
+                    notify(id, value);
+                }
+            }
+        }
         output.clear();
     }
 }
@@ -758,7 +785,7 @@ impl SubPluginMain for ClapPlugin {
         pending.retain(|(existing, _)| *existing != id);
         pending.push((id, plain));
         drop(pending);
-        self.flush_params();
+        self.flush_params(false);
         Ok(())
     }
 
@@ -832,7 +859,7 @@ impl SubPluginMain for ClapPlugin {
         }
         // Anything queued while inactive has to reach the plugin before it
         // starts, or the first block renders with the old values.
-        self.flush_params();
+        self.flush_params(false);
         // And again on the first block, for a plugin that took the flush into
         // its parameter cache but not into its DSP. See `flushed`.
         {

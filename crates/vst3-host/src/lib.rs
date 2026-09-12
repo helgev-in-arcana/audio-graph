@@ -18,6 +18,7 @@ mod midi_map;
 mod module;
 mod moduleinfo;
 mod param_map;
+mod param_sync;
 mod plugin;
 mod process_io;
 mod stream;

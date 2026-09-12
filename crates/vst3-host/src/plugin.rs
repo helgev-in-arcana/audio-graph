@@ -55,6 +55,7 @@ use crate::host_app::{ComponentHandler, HostApplication};
 use crate::midi_map::MidiMap;
 use crate::module::{Module, ModuleInner};
 use crate::param_map::ParamMap;
+use crate::param_sync::ParamFeedback;
 use crate::process_io::{EventList, ParameterChanges};
 use crate::stream::MemoryStream;
 use crate::util::{from_char16, to_char16};
@@ -79,7 +80,7 @@ pub struct Vst3Plugin {
     io: plugin_host_api::IoLayout,
     metadata_dirty: bool,
     metadata_structural: bool,
-    /// Main-thread parameter edits waiting to be delivered to the processor.
+    /// Normalized main-thread edits waiting to be delivered to the processor.
     ///
     /// VST3 splits a plugin in two, and `IEditController::setParamNormalized`
     /// only reaches one half. The processor learns values solely through the
@@ -91,6 +92,7 @@ pub struct Vst3Plugin {
     /// *tries* to lock: an edit that loses the race is delivered one block
     /// later rather than blocking the callback.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+    feedback: Arc<ParamFeedback>,
     latency: RefCell<u32>,
     context: Arc<dyn HostContext>,
 }
@@ -103,6 +105,25 @@ impl Vst3Plugin {
             kIoChanged, kIoTitlesChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
         };
         let flags = self.instance.get()._handler.take_restart_requests();
+        if flags & kParamValuesChanged != 0 {
+            // Native value invalidation supersedes feedback collected before the notification.
+            self.feedback.drain(|_, _| {});
+        }
+        if let Some(controller) = self.instance.get().controller.as_ref() {
+            self.feedback.drain(|id, value| {
+                let queued = self
+                    .pending_edits
+                    .lock()
+                    .is_ok_and(|pending| pending.iter().any(|(other, _)| *other == id));
+                if !queued {
+                    unsafe { controller.setParamNormalized(id.0, value) };
+                }
+            });
+            for (id, normalized) in self.instance.get()._handler.take_edits() {
+                let plain = unsafe { controller.normalizedParamToPlain(id.0, normalized) };
+                self.context.param_edited(id, plain);
+            }
+        }
         self.metadata_dirty |=
             flags & (kIoChanged | kIoTitlesChanged | kLatencyChanged | kParamTitlesChanged) != 0;
         self.metadata_structural |= flags & (kIoChanged | kLatencyChanged) != 0;
@@ -140,7 +161,8 @@ impl Vst3Plugin {
                 code: 0,
             })?;
 
-        let handler = ComponentHandler::new(Arc::clone(&context));
+        let pending_edits = Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES)));
+        let handler = ComponentHandler::new(Arc::clone(&pending_edits));
         let (controller, controller_is_separate) =
             Self::create_controller(module, &component, host_unknown, &handler)?;
         // Only meaningful between two distinct objects. A single object
@@ -180,7 +202,8 @@ impl Vst3Plugin {
             io: plugin_host_api::IoLayout::default(),
             metadata_dirty: false,
             metadata_structural: false,
-            pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES))),
+            pending_edits,
+            feedback: Arc::new(ParamFeedback::new(&[])),
             latency: RefCell::new(0),
             context,
         };
@@ -595,8 +618,14 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
+        if !self.params.iter().any(|param| param.id == id) {
+            return Err(HostError::InvalidState("no such parameter"));
+        }
         let ctrl = self.controller()?;
         let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        if !self.instance.get()._handler.queue_edit(id, normalized) {
+            return Err(HostError::InvalidState("parameter queue unavailable"));
+        }
         // The return value is advisory. Every iZotope plugin here answers
         // kResultFalse and applies the value anyway, and the SDK's own hosts
         // ignore it too. The caller can see what actually happened through
@@ -609,18 +638,6 @@ impl SubPluginMain for Vst3Plugin {
             });
         }
 
-        // The other half of the plugin still has to hear about it.
-        let mut pending = self
-            .pending_edits
-            .lock()
-            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?;
-        if pending.len() == pending.capacity()
-            && !pending.iter().any(|(existing, _)| *existing == id)
-        {
-            return Err(HostError::InvalidState("parameter queue full"));
-        }
-        pending.retain(|(existing, _)| *existing != id);
-        pending.push((id, plain));
         Ok(())
     }
 
@@ -676,6 +693,11 @@ impl SubPluginMain for Vst3Plugin {
             return Err(HostError::State("state blob is truncated".into()));
         }
         let component_state = data[8..8 + component_len].to_vec();
+        self.pending_edits
+            .lock()
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?
+            .clear();
+        self.feedback.drain(|_, _| {});
         self.metadata_dirty = true;
         self.metadata_structural = true;
         let controller_state = data[8 + component_len..8 + component_len + controller_len].to_vec();
@@ -785,14 +807,15 @@ impl SubPluginMain for Vst3Plugin {
                 .as_ref(),
         );
 
+        self.feedback = Arc::new(ParamFeedback::new(&self.params));
         Ok(Processor::new(Vst3Processor::new(
-            self.instance.get().processor.clone(),
+            Arc::clone(&self.instance),
             config,
             &declared,
             map,
             midi,
             Arc::clone(&self.pending_edits),
-            Arc::clone(&self.instance),
+            Arc::clone(&self.feedback),
         )))
     }
 }
@@ -886,6 +909,7 @@ pub struct Vst3Processor {
     midi_map: MidiMap,
     /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+    feedback: Arc<ParamFeedback>,
     instance: Arc<MainThread<Vst3Instance>>,
 }
 
@@ -896,16 +920,16 @@ unsafe impl Send for Vst3Processor {}
 
 impl Vst3Processor {
     fn new(
-        processor: ComPtr<IAudioProcessor>,
+        instance: Arc<MainThread<Vst3Instance>>,
         config: AudioConfig,
         declared: &DeclaredBuses,
         param_map: ParamMap,
         midi_map: MidiMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
-        instance: Arc<MainThread<Vst3Instance>>,
+        feedback: Arc<ParamFeedback>,
     ) -> Vst3Processor {
         Vst3Processor {
-            processor,
+            processor: instance.get().processor.clone(),
             config,
             input_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
             output_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
@@ -918,6 +942,7 @@ impl Vst3Processor {
             param_map,
             midi_map,
             pending_edits,
+            feedback,
             instance,
         }
     }
@@ -955,10 +980,8 @@ impl SubPluginProcessor for Vst3Processor {
         // this block still overrides them.
         let mut pending = self.pending_edits.try_lock().ok();
         if let Some(pending) = pending.as_ref() {
-            for &(id, plain) in pending.iter() {
-                if let Some(normalized) = self.param_map.normalize(id, plain) {
-                    self.input_changes.add_point(id.0, 0, normalized);
-                }
+            for &(id, normalized) in pending.iter() {
+                self.input_changes.add_point(id.0, 0, normalized);
             }
         }
 
@@ -1043,6 +1066,21 @@ impl SubPluginProcessor for Vst3Processor {
             return ProcessStatus::Error;
         }
 
+        self.input_changes
+            .for_each_last(|id, value| self.feedback.publish(id, value));
+        self.output_changes
+            .for_each_last(|id, value| self.feedback.publish(id, value));
+        self.output_changes
+            .for_each_point(|id, offset, normalized| {
+                if let Some(value) = self.param_map.denormalize(ParamId(id), normalized) {
+                    out_events.push(Event::Param(plugin_host_api::ParamEvent::SetValue {
+                        id: ParamId(id),
+                        target: plugin_host_api::Target::Global,
+                        value,
+                        sample_offset: offset.max(0) as u32,
+                    }));
+                }
+            });
         vst_events::drain_outputs(&self.output_events, out_events);
         if self.output_changes.overflowed() {
             out_events.mark_overflow();
