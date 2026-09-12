@@ -8,6 +8,7 @@ static FIXTURE: Mutex<()> = Mutex::new(());
 /// GUI edits, automation and native output converge in plain units without overriding newer edits.
 #[test]
 fn parameter_values_cross_both_native_threads() {
+    let _thread = vst3_host::init_apartment().unwrap();
     use plugin_host_api::*;
     struct Edits(Mutex<Vec<f64>>);
     impl HostContext for Edits {
@@ -102,6 +103,7 @@ fn parameter_values_cross_both_native_threads() {
 /// A full parameter queue rejects its batch without applying a prefix or losing main edits.
 #[test]
 fn input_overflow_preserves_pending_main_edits() {
+    let _thread = vst3_host::init_apartment().unwrap();
     use plugin_host_api::*;
     let _lock = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
@@ -138,6 +140,7 @@ fn input_overflow_preserves_pending_main_edits() {
 /// Refused widths and missing buses cannot yield a processor for a different configuration.
 #[test]
 fn activation_requires_the_actual_requested_bus_layout() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let _lock = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let cid = module.audio_modules().unwrap()[0].cid;
@@ -198,6 +201,7 @@ fn fixture_path() -> PathBuf {
 /// Only the owning thread can reuse an initialized binary; release permits a new owner.
 #[test]
 fn module_ownership_is_shared_locally_and_exclusive_across_threads() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let _lock = FIXTURE.lock().unwrap();
     let path = fixture_path();
     let first = Module::open(&path).unwrap();
@@ -223,6 +227,7 @@ fn module_ownership_is_shared_locally_and_exclusive_across_threads() {
 /// A view keeps the native instance and module initialized after its main handle is released.
 #[test]
 fn view_retains_its_native_owner() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let _lock = FIXTURE.lock().unwrap();
     let path = fixture_path();
     // The observer keeps code mapped even if an ownership regression ends the module too early.

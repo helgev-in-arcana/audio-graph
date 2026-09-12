@@ -36,7 +36,13 @@ const SUB_HOST: SubHostConfig = SubHostConfig {
 
 fn main() -> ExitCode {
     fault::install_crash_handler();
-    plugin_host::init_thread();
+    let _thread = match plugin_host::init_thread() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {

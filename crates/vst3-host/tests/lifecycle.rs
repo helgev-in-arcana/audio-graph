@@ -50,8 +50,6 @@ const MAX_PARAMS_FOR_PROBE: usize = 200;
 const CANDIDATES: usize = 8;
 
 fn candidates() -> Vec<PathBuf> {
-    // Initialize COM STA apartment on test runner thread because plugins assume one exists.
-    vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
         .flat_map(|d| find_modules(d))
@@ -95,6 +93,7 @@ fn find_stereo_effect() -> Option<(PathBuf, Cid)> {
 
 #[test]
 fn vst3_lifecycle_against_installed_plugins() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let Some((path, cid)) = find_stereo_effect() else {
         eprintln!("no stereo VST3 effect installed; skipping");
         return;
