@@ -1090,123 +1090,100 @@ fn setup_buses(
 ) -> Result<DeclaredBuses> {
     use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
 
-    let arrangement = |channels: u32| -> SpeakerArrangement {
-        match channels {
-            0 => 0,
-            1 => SpeakerArr::kMono,
-            // Channel counts above 1 are negotiated as stereo.
-            _ => SpeakerArr::kStereo,
-        }
-    };
-
-    // Negotiate all main and auxiliary input arrangements in a single pass.
-    let mut inputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_inputs.len());
-    if config.input_channels > 0 {
-        inputs.push(arrangement(config.input_channels));
-    }
-    for width in config.aux_inputs.iter() {
-        inputs.push(arrangement(u32::from(width)));
-    }
-    // Negotiate main and auxiliary output arrangements.
-    let mut outputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_outputs.len());
-    if config.output_channels > 0 {
-        outputs.push(arrangement(config.output_channels));
-        for width in config.aux_outputs.iter() {
-            outputs.push(arrangement(u32::from(width)));
-        }
-    }
-    let num_in = inputs.len() as i32;
-    let num_out = outputs.len() as i32;
-
-    let res = unsafe {
-        processor.setBusArrangements(inputs.as_mut_ptr(), num_in, outputs.as_mut_ptr(), num_out)
-    };
-    // kResultFalse means "I chose something else", not failure. Verify rather
-    // than trust: a plugin that quietly picked mono would otherwise corrupt
-    // the second channel's memory.
-    if res != kResultOk {
-        for (index, wanted) in outputs.iter().enumerate() {
-            let mut actual: SpeakerArrangement = 0;
-            if unsafe {
-                processor.getBusArrangement(
-                    BusDirections_::kOutput as i32,
-                    index as i32,
-                    &mut actual,
-                )
-            } == kResultOk
-                && actual != *wanted
-            {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "plugin refused the arrangement asked for on output bus {index}"
-                )));
+    let arrangements =
+        |main: u32, aux: plugin_host_api::AuxBuses| -> Result<Vec<SpeakerArrangement>> {
+            if main == 0 && !aux.is_empty() {
+                return Err(HostError::UnsupportedBusConfig(
+                    "aux buses require a connected main bus".into(),
+                ));
             }
-        }
-        // An aux bus that came back different matters just as much: the buffer
-        // handed to it is sized from what was asked for, and a plugin that
-        // settled on mono would read past the end of its sidechain.
-        for (index, wanted) in inputs.iter().enumerate() {
-            let mut actual: SpeakerArrangement = 0;
-            if unsafe {
-                processor.getBusArrangement(
-                    BusDirections_::kInput as i32,
-                    index as i32,
-                    &mut actual,
-                )
-            } == kResultOk
-                && actual != *wanted
-            {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "plugin refused the arrangement asked for on input bus {index}"
-                )));
-            }
-        }
+            std::iter::once(main)
+                .filter(|&n| n != 0)
+                .chain(aux.iter().map(u32::from))
+                .map(|channels| match channels {
+                    1 => Ok(SpeakerArr::kMono),
+                    2 => Ok(SpeakerArr::kStereo),
+                    _ => Err(HostError::UnsupportedBusConfig(
+                        "only mono and stereo arrangements are supported".into(),
+                    )),
+                })
+                .collect()
+        };
+    let mut inputs = arrangements(config.input_channels, config.aux_inputs)?;
+    let mut outputs = arrangements(config.output_channels, config.aux_outputs)?;
+    // Native negotiation is advisory; the resulting buses are the authority even on success.
+    unsafe {
+        processor.setBusArrangements(
+            inputs.as_mut_ptr(),
+            inputs.len() as i32,
+            outputs.as_mut_ptr(),
+            outputs.len() as i32,
+        );
     }
 
-    // Buses default to inactive; a plugin with an inactive output bus writes
-    // nothing at all. Only as many input buses as were negotiated are switched
-    // on: an active sidechain that never receives audio is worse than an
-    // inactive one, because a compressor will duck to silence against it.
     let mut declared = DeclaredBuses {
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
-    for (media, dir, active) in [
-        (MediaTypes_::kAudio, BusDirections_::kInput, num_in as usize),
+    for (dir, wanted, buses) in [
+        (BusDirections_::kInput as i32, &inputs, &mut declared.inputs),
         (
-            MediaTypes_::kAudio,
-            BusDirections_::kOutput,
-            num_out as usize,
+            BusDirections_::kOutput as i32,
+            &outputs,
+            &mut declared.outputs,
         ),
+    ] {
+        let count = unsafe { component.getBusCount(MediaTypes_::kAudio as i32, dir) };
+        if count < 0 || (count as usize) < wanted.len() {
+            return Err(HostError::UnsupportedBusConfig(
+                "requested audio buses are missing".into(),
+            ));
+        }
+        for index in 0..count {
+            let arrangement = wanted.get(index as usize);
+            let channels = if let Some(&wanted) = arrangement {
+                let mut actual = 0;
+                let mut info = unsafe { std::mem::zeroed() };
+                if unsafe { processor.getBusArrangement(dir, index, &mut actual) } != kResultOk
+                    || unsafe {
+                        component.getBusInfo(MediaTypes_::kAudio as i32, dir, index, &mut info)
+                    } != kResultOk
+                    || actual != wanted
+                    || info.channelCount != channel_count(wanted) as i32
+                {
+                    return Err(HostError::UnsupportedBusConfig(format!(
+                        "audio bus {dir}:{index} differs from its requested arrangement"
+                    )));
+                }
+                channel_count(actual)
+            } else {
+                0
+            };
+            buses.push(DeclaredBus { channels });
+        }
+    }
+    // Validate both directions before changing which buses are active.
+    for (media, dir, active) in [
+        (MediaTypes_::kAudio, BusDirections_::kInput, inputs.len()),
+        (MediaTypes_::kAudio, BusDirections_::kOutput, outputs.len()),
         (MediaTypes_::kEvent, BusDirections_::kInput, 1),
         (MediaTypes_::kEvent, BusDirections_::kOutput, 0),
     ] {
         let count = unsafe { component.getBusCount(media as i32, dir as i32) };
         for index in 0..count {
-            let on = (index as usize) < active;
-            unsafe { component.activateBus(media as i32, dir as i32, index, u8::from(on)) };
-            if media as i32 != MediaTypes_::kAudio as i32 {
-                continue;
-            }
-            let width = if dir as i32 == BusDirections_::kInput as i32 {
-                inputs.get(index as usize).copied()
-            } else {
-                outputs.get(index as usize).copied()
-            };
-            let bus = DeclaredBus {
-                channels: if on {
-                    width.map_or(0, channel_count)
-                } else {
-                    0
+            check(
+                unsafe {
+                    component.activateBus(
+                        media as i32,
+                        dir as i32,
+                        index,
+                        u8::from((index as usize) < active),
+                    )
                 },
-            };
-            if dir as i32 == BusDirections_::kInput as i32 {
-                declared.inputs.push(bus);
-            } else {
-                declared.outputs.push(bus);
-            }
+                "IComponent::activateBus",
+            )?;
         }
     }
-
     Ok(declared)
 }
 

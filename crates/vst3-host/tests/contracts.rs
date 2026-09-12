@@ -1,9 +1,45 @@
-use plugin_host_api::{HostContext, RestartReason};
+use plugin_host_api::{AudioConfig, AuxBuses, HostContext, RestartReason, SubPluginMain};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use vst3_host::{Module, Vst3Plugin};
 
 static FIXTURE: Mutex<()> = Mutex::new(());
+
+/// Refused widths and missing buses cannot yield a processor for a different configuration.
+#[test]
+fn activation_requires_the_actual_requested_bus_layout() {
+    let _lock = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    for config in [
+        AudioConfig {
+            input_channels: 6,
+            output_channels: 6,
+            ..AudioConfig::default()
+        },
+        AudioConfig {
+            input_channels: 1,
+            output_channels: 1,
+            ..AudioConfig::default()
+        },
+        AudioConfig {
+            aux_inputs: AuxBuses::new(&[2]),
+            ..AudioConfig::default()
+        },
+        AudioConfig {
+            input_channels: 0,
+            aux_inputs: AuxBuses::new(&[2]),
+            ..AudioConfig::default()
+        },
+    ] {
+        assert!(plugin.activate(config).is_err());
+        plugin
+            .activate(AudioConfig::default())
+            .unwrap()
+            .deactivate();
+    }
+}
 
 struct Host;
 impl HostContext for Host {

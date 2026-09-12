@@ -186,6 +186,8 @@ pub trait SubPluginMain {
     /// The returned handle stops its own activation when released on this thread,
     /// or when this thread next reclaims released resources.
     /// An existing activation must finish before another can start.
+    /// Success guarantees that the native buffer plan matches `config`; unsupported
+    /// dimensions must be rejected rather than silently adapted.
     fn activate(&mut self, config: AudioConfig) -> Result<Processor>;
 }
 
