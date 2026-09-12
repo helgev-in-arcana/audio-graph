@@ -40,6 +40,8 @@ pub use traits::{
 pub enum HostError {
     /// The module (bundle / DLL / .so) could not be loaded.
     ModuleLoad(String),
+    /// The binary is loading, or still belongs to another main thread. Retrying is allowed.
+    ModuleBusy(String),
     /// The module loaded but did not expose a usable plugin factory.
     NoFactory(String),
     /// No class with the requested identity exists in the module.
@@ -58,6 +60,7 @@ impl std::fmt::Display for HostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HostError::ModuleLoad(s) => write!(f, "module load failed: {s}"),
+            HostError::ModuleBusy(s) => write!(f, "module is busy: {s}"),
             HostError::NoFactory(s) => write!(f, "no plugin factory: {s}"),
             HostError::ClassNotFound(s) => write!(f, "class not found: {s}"),
             HostError::Backend { context, code } => {

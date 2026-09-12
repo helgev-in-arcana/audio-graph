@@ -144,7 +144,7 @@ const fn platform_dir() -> (&'static str, &'static str) {
 }
 
 /// Map a `.vst3` path to the shared library that actually has to be `dlopen`ed.
-fn resolve_binary(path: &Path) -> Result<PathBuf, HostError> {
+pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, HostError> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }

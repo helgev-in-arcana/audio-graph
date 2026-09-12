@@ -4,10 +4,11 @@
 //! to ensure entry points are initialized exactly once per module.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
+use std::sync::{Mutex, OnceLock};
 
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -66,9 +67,8 @@ pub struct FactoryInfo {
 
 /// A loaded `.clap` module.
 ///
-/// Not `Send`/`Sync`: `clap_plugin_entry::init` and the factory calls are
-/// `[main-thread]` in the format's own annotations, and `Rc` here makes that a
-/// property of the type rather than a comment.
+/// The host assigns each binary one owning thread so entry/exit cannot overlap
+/// another instance's native calls. Handles on that thread share one initialization.
 pub struct Module {
     inner: Rc<ModuleInner>,
 }
@@ -81,6 +81,27 @@ pub(crate) struct ModuleInner {
     factory: *const clap_plugin_factory,
     library: Library,
     path: PathBuf,
+    _lease: ModuleLease,
+}
+
+static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+struct ModuleLease(PathBuf);
+
+impl ModuleLease {
+    fn acquire(key: PathBuf) -> Result<Self> {
+        let mut claimed = CLAIMED.get_or_init(Mutex::default).lock().unwrap();
+        if !claimed.insert(key.clone()) {
+            return Err(HostError::ModuleBusy(key.display().to_string()));
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for ModuleLease {
+    fn drop(&mut self) {
+        CLAIMED.get().unwrap().lock().unwrap().remove(&self.0);
+    }
 }
 
 impl Drop for ModuleInner {
@@ -112,9 +133,11 @@ impl Module {
     ///
     /// Opening the same path twice returns handles onto one underlying module,
     /// so the entry point runs once.
+    /// A binary still owned by another thread returns `HostError::ModuleBusy`.
     pub fn open(path: impl AsRef<Path>) -> Result<Module> {
         let path = path.as_ref();
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let binary = crate::library::resolve_binary(path)?;
+        let key = std::fs::canonicalize(&binary).unwrap_or(binary);
 
         if let Some(existing) =
             LOADED.with(|loaded| loaded.borrow().get(&key).and_then(Weak::upgrade))
@@ -122,6 +145,7 @@ impl Module {
             return Ok(Module { inner: existing });
         }
 
+        let lease = ModuleLease::acquire(key.clone())?;
         let library = Library::open(path)?;
 
         let Some(sym) = library.symbol("clap_entry") else {
@@ -188,6 +212,7 @@ impl Module {
             factory,
             library,
             path: path.to_path_buf(),
+            _lease: lease,
         });
         LOADED.with(|loaded| loaded.borrow_mut().insert(key, Rc::downgrade(&inner)));
 

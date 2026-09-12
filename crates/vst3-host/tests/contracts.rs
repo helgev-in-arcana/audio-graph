@@ -29,6 +29,31 @@ fn fixture_path() -> PathBuf {
     path
 }
 
+/// Only the owning thread can reuse an initialized binary; release permits a new owner.
+#[test]
+fn module_ownership_is_shared_locally_and_exclusive_across_threads() {
+    let _lock = FIXTURE.lock().unwrap();
+    let path = fixture_path();
+    let first = Module::open(&path).unwrap();
+    let second = Module::open(&path).unwrap();
+    drop(first);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                assert!(matches!(
+                    Module::open(&path),
+                    Err(plugin_host_api::HostError::ModuleBusy(_))
+                ))
+            })
+            .join()
+            .unwrap();
+    });
+    drop(second);
+    std::thread::spawn(move || assert!(Module::open(path).is_ok()))
+        .join()
+        .unwrap();
+}
+
 /// A view keeps the native instance and module initialized after its main handle is released.
 #[test]
 fn view_retains_its_native_owner() {

@@ -1,10 +1,11 @@
 //! Loading a VST3 module and enumerating the classes it offers.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 use plugin_host_api::{HostError, Result};
 use vst3::Steinberg::{
@@ -83,6 +84,27 @@ pub(crate) struct ModuleInner {
     #[allow(dead_code)]
     library: Library,
     path: PathBuf,
+    _lease: ModuleLease,
+}
+
+static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+struct ModuleLease(PathBuf);
+
+impl ModuleLease {
+    fn acquire(key: PathBuf) -> Result<Self> {
+        let mut claimed = CLAIMED.get_or_init(Mutex::default).lock().unwrap();
+        if !claimed.insert(key.clone()) {
+            return Err(HostError::ModuleBusy(key.display().to_string()));
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for ModuleLease {
+    fn drop(&mut self) {
+        CLAIMED.get().unwrap().lock().unwrap().remove(&self.0);
+    }
 }
 
 thread_local! {
@@ -108,9 +130,11 @@ impl Module {
     ///
     /// Opening the same path twice returns handles onto one underlying module,
     /// so the entry point runs once.
+    /// A binary still owned by another thread returns `HostError::ModuleBusy`.
     pub fn open(path: impl AsRef<Path>) -> Result<Module> {
         let path = path.as_ref();
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let binary = crate::library::resolve_binary(path)?;
+        let key = std::fs::canonicalize(&binary).unwrap_or(binary);
 
         if let Some(existing) =
             LOADED.with(|loaded| loaded.borrow().get(&key).and_then(Weak::upgrade))
@@ -118,6 +142,7 @@ impl Module {
             return Ok(Module { inner: existing });
         }
 
+        let lease = ModuleLease::acquire(key.clone())?;
         let library = Library::open(path)?;
 
         let Some(sym) = library.lookup("GetPluginFactory") else {
@@ -146,6 +171,7 @@ impl Module {
             host_app: RefCell::new(None),
             library,
             path: path.to_path_buf(),
+            _lease: lease,
         });
         LOADED.with(|loaded| loaded.borrow_mut().insert(key, Rc::downgrade(&inner)));
 
