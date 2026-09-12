@@ -458,23 +458,18 @@ impl Vst3Plugin {
         &self.params
     }
 
-    /// Creates the plugin's editor view (`IPlugView`), if supported.
-    ///
-    /// Returns the raw `IPlugView`. That is deliberate: everything to do with
-    /// windows lives in `vst3-host-view`, and handing it the interface is the
-    /// whole seam between the two crates. `plugin-host-api` never sees it, so
-    /// the rule about backend types staying out of the shared API surface is
-    /// untouched.
-    ///
-    /// The caller owns the returned view and must tear it down in the required
-    /// order; `vst3_host_view::EditorWindow` does exactly that.
-    pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
+    /// Creates a view retaining its native instance and module until the view is released.
+    pub fn create_view(&self) -> Option<Vst3View> {
         let controller = self.instance.get().controller.as_ref()?;
         // "editor" is the only view name VST3 defines.
         let name = c"editor";
         let ptr = unsafe { controller.createView(name.as_ptr()) };
         // createView returns an owned reference.
-        unsafe { ComPtr::from_raw(ptr) }
+        Some(Vst3View {
+            view: unsafe { ComPtr::from_raw(ptr) }?,
+            _instance: Arc::clone(&self.instance),
+            _main_thread: std::marker::PhantomData,
+        })
     }
 
     /// Whether the plugin offers an editor at all.
@@ -794,6 +789,20 @@ impl SubPluginMain for Vst3Plugin {
             Arc::clone(&self.pending_edits),
             Arc::clone(&self.instance),
         )))
+    }
+}
+
+/// An editor view whose code and controller remain alive until its final release.
+pub struct Vst3View {
+    view: ComPtr<vst3::Steinberg::IPlugView>,
+    _instance: Arc<MainThread<Vst3Instance>>,
+    _main_thread: std::marker::PhantomData<Rc<()>>,
+}
+
+impl Vst3View {
+    /// Borrows the native interface. Any derived interfaces must be released before this handle.
+    pub fn as_ptr(&self) -> *mut vst3::Steinberg::IPlugView {
+        self.view.as_ptr()
     }
 }
 

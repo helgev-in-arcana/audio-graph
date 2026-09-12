@@ -1,0 +1,12 @@
+[package]
+name = "vst3-test-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vst3.workspace = true

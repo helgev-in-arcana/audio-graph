@@ -2402,6 +2402,7 @@ name = "vst3-host"
 version = "0.1.5"
 dependencies = [
  "libc",
+ "libloading",
  "log",
  "plugin-host-api",
  "serde",
@@ -2418,7 +2419,15 @@ dependencies = [
  "libc",
  "log",
  "vst3",
+ "vst3-host",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "vst3-test-plugin"
+version = "0.1.5"
+dependencies = [
+ "vst3",
 ]
 
 [[package]]
