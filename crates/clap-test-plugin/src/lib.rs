@@ -113,6 +113,7 @@ pub mod ask {
     pub const RENAME: f64 = 8.0;
     pub const FAIL_METADATA: f64 = 9.0;
     pub const REQUEUE_METADATA: f64 = 10.0;
+    pub const PROCESS_ERROR: f64 = 11.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -180,7 +181,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, ask::REQUEUE_METADATA).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::PROCESS_ERROR).round(),
             _ => {}
         }
     }
@@ -481,6 +482,10 @@ unsafe extern "C" fn plugin_process(
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
     unsafe { apply_events(instance, data.in_events, data.out_events) };
+    if instance.params.ask == ask::PROCESS_ERROR {
+        instance.params.ask = ask::NOTHING;
+        return CLAP_PROCESS_ERROR;
+    }
     if instance.params.ask == ask::RESTART {
         instance.params.ask = ask::NOTHING;
         if let Some(request) = unsafe { (*instance.host).request_restart } {
@@ -897,7 +902,7 @@ unsafe extern "C" fn params_get_info(
             "Ask Host",
             "",
             0.0,
-            ask::REQUEUE_METADATA,
+            ask::PROCESS_ERROR,
             0.0,
             CLAP_PARAM_IS_STEPPED,
         ),

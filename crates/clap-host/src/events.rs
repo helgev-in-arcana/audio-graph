@@ -45,10 +45,6 @@ impl RawEvent {
         // are written before the event is ever read.
         unsafe { std::mem::zeroed() }
     }
-
-    fn time(&self) -> u32 {
-        unsafe { self.header.time }
-    }
 }
 
 fn header(size: usize, time: u32, kind: u16) -> clap_event_header {
@@ -407,6 +403,7 @@ fn decode_target(note_id: i32, port: i16, channel: i16, key: i16) -> Target {
 pub(crate) struct InputEvents {
     raw: clap_input_events,
     events: Vec<RawEvent>,
+    pub(crate) overflowed: bool,
 }
 
 impl InputEvents {
@@ -414,6 +411,7 @@ impl InputEvents {
     /// to avoid allocations on real-time threads.
     pub(crate) fn new(capacity: usize) -> InputEvents {
         InputEvents {
+            overflowed: false,
             raw: clap_input_events {
                 ctx: std::ptr::null_mut(),
                 size: Some(input_size),
@@ -425,12 +423,13 @@ impl InputEvents {
 
     pub(crate) fn clear(&mut self) {
         self.events.clear();
+        self.overflowed = false;
     }
 
-    /// Append a core event. Silently ignored once the buffer is full: dropping
-    /// one automation point beats allocating on the audio thread.
+    /// Capacity loss prevents the whole input batch from entering native processing.
     pub(crate) fn push(&mut self, event: &Event) {
         if self.events.len() == self.events.capacity() {
+            self.overflowed = true;
             return;
         }
         if let Some(raw) = encode(event) {
@@ -446,15 +445,6 @@ impl InputEvents {
             value,
             sample_offset,
         }));
-    }
-
-    /// Sort by time, which CLAP requires of `in_events` and does not check.
-    ///
-    /// A stable sort so two events on the same sample keep the order they were
-    /// pushed in — which is what makes "gesture begin, value, gesture end" hold
-    /// together.
-    pub(crate) fn sort(&mut self) {
-        self.events.sort_by_key(RawEvent::time);
     }
 
     /// The pointer to put in `clap_process`. Re-points `ctx` first, so moving
@@ -828,9 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn the_input_list_sorts_by_time() {
+    fn the_input_list_preserves_delivery_order() {
         let mut list = InputEvents::new(8);
-        for offset in [30u32, 10, 20] {
+        for offset in [10u32, 20, 20, 30] {
             list.push(&Event::Param(ParamEvent::SetValue {
                 id: ParamId(1),
                 target: Target::Global,
@@ -838,9 +828,12 @@ mod tests {
                 sample_offset: offset,
             }));
         }
-        list.sort();
-        let times: Vec<u32> = list.events.iter().map(RawEvent::time).collect();
-        assert_eq!(times, vec![10, 20, 30]);
+        let times: Vec<u32> = list
+            .events
+            .iter()
+            .map(|event| unsafe { event.header.time })
+            .collect();
+        assert_eq!(times, vec![10, 20, 20, 30]);
     }
 
     #[test]
@@ -851,6 +844,9 @@ mod tests {
             list.push_param(ParamId(1), 0.0, 0);
         }
         assert_eq!(list.events.len(), capacity);
+        assert!(list.overflowed);
+        list.clear();
+        assert!(!list.overflowed);
         assert_eq!(list.events.capacity(), capacity, "the buffer reallocated");
     }
 }

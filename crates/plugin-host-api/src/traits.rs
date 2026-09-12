@@ -197,6 +197,8 @@ pub trait SubPluginProcessor: Send {
     /// Render one block. Must not allocate, lock, or block.
     ///
     /// `events` is ordered by `sample_offset`.
+    /// Input capacity loss or invalid ordering/timestamps returns `Error` without
+    /// partially delivering the batch. Callers must reset held notes after an error.
     /// Buffers must match the activation's channels and aux buses, use planar
     /// layout, and fit its maximum block size. A mismatch returns `Error` with
     /// cleared audio output, without entering native processing. A matching

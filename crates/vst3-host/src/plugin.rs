@@ -610,12 +610,17 @@ impl SubPluginMain for Vst3Plugin {
         }
 
         // The other half of the plugin still has to hear about it.
-        if let Ok(mut pending) = self.pending_edits.lock() {
-            pending.retain(|(existing, _)| *existing != id);
-            if pending.len() < pending.capacity() {
-                pending.push((id, plain));
-            }
+        let mut pending = self
+            .pending_edits
+            .lock()
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?;
+        if pending.len() == pending.capacity()
+            && !pending.iter().any(|(existing, _)| *existing == id)
+        {
+            return Err(HostError::InvalidState("parameter queue full"));
         }
+        pending.retain(|(existing, _)| *existing != id);
+        pending.push((id, plain));
         Ok(())
     }
 
@@ -948,8 +953,9 @@ impl SubPluginProcessor for Vst3Processor {
 
         // Main-thread edits go in first, at offset 0, so an event stream for
         // this block still overrides them.
-        if let Ok(mut pending) = self.pending_edits.try_lock() {
-            for (id, plain) in pending.drain(..) {
+        let mut pending = self.pending_edits.try_lock().ok();
+        if let Some(pending) = pending.as_ref() {
+            for &(id, plain) in pending.iter() {
                 if let Some(normalized) = self.param_map.normalize(id, plain) {
                     self.input_changes.add_point(id.0, 0, normalized);
                 }
@@ -963,6 +969,18 @@ impl SubPluginProcessor for Vst3Processor {
             &self.input_changes,
             &self.input_events,
         );
+        if self.input_changes.overflowed()
+            || self.input_events.overflowed()
+            || !events.is_sorted_by_key(Event::sample_offset)
+            || events.iter().any(|event| event.sample_offset() >= frames)
+        {
+            buffers.clear_output();
+            return ProcessStatus::Error;
+        }
+        if let Some(pending) = pending.as_mut() {
+            pending.clear();
+        }
+        drop(pending);
         // Channel pointers into the caller's flat planar storage.
         let frame_len = frames as usize;
         let input_raw = buffers.raw_input().as_ptr();

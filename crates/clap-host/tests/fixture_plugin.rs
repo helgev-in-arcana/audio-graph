@@ -15,6 +15,113 @@ use std::sync::{Arc, Mutex};
 
 static FIXTURE: Mutex<()> = Mutex::new(());
 
+mod allocations {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! { static COUNTS: Cell<Option<(usize, usize)>> = const { Cell::new(None) }; }
+    struct Allocator;
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a + 1, d)));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a, d + 1)));
+                }
+            });
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    /// Filling a native input batch performs no host allocations or frees on the audio thread.
+    #[test]
+    fn a_full_native_input_batch_does_not_allocate() {
+        let _fixture = FIXTURE.lock().unwrap();
+        let module = Module::open(fixture_path()).unwrap();
+        let mut plugin = ClapPlugin::create(
+            &module,
+            "dev.audio-graph.clap-test-plugin",
+            Arc::new(TestHost),
+        )
+        .unwrap();
+        let mut processor = plugin.activate(lifecycle_config()).unwrap();
+        let events = vec![
+            Event::Param(ParamEvent::SetValue {
+                id: PARAM_GAIN,
+                target: Target::Global,
+                value: 1.0,
+                sample_offset: 0
+            });
+            2048
+        ];
+        let mut sink = EventSink::with_capacity(8);
+        let input = [1.0; 8];
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        COUNTS.with(|c| c.set(Some((0, 0))));
+        let status = processor.process(&mut buffers, &events, &TimeContext::default(), &mut sink);
+        let counts = COUNTS.with(|c| c.replace(None)).unwrap();
+        assert_eq!(status, ProcessStatus::Continue);
+        assert_eq!(counts, (0, 0));
+    }
+}
+
+/// Rejected input cannot partially update native state or consume queued main-thread edits.
+#[test]
+fn input_overflow_is_rejected_before_native_delivery() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [1.0; 8];
+    let mut output = [9.0; 8];
+    let mut sink = EventSink::with_capacity(8);
+    plugin.set_param(PARAM_GAIN, 0.5).unwrap();
+    let mut events = vec![
+        Event::Param(ParamEvent::SetValue {
+            id: PARAM_GAIN,
+            target: Target::Global,
+            value: 0.0,
+            sample_offset: 0
+        });
+        2048
+    ];
+    events.push(Event::Note(NoteEvent::NoteOff {
+        note_id: Some(7),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 0.0,
+        sample_offset: 0,
+    }));
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &events, &TimeContext::default(), &mut sink),
+        ProcessStatus::Error
+    );
+    assert_eq!(output, [0.0; 8]);
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+    assert_eq!(output, [0.5; 8]);
+}
+
 use clap_host::{ClapPlugin, Module};
 use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, Event, EventSink, HostContext, NoteEvent,

@@ -746,12 +746,18 @@ impl SubPluginMain for ClapPlugin {
         }
         // CLAP has no setter: a value reaches the plugin only as an event, and
         // the only question is whether it rides a `flush` or the next block.
-        if let Ok(mut pending) = self.pending_edits.lock() {
-            pending.retain(|(existing, _)| *existing != id);
-            if pending.len() < pending.capacity() {
-                pending.push((id, plain));
-            }
+        let mut pending = self
+            .pending_edits
+            .lock()
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?;
+        if pending.len() == pending.capacity()
+            && !pending.iter().any(|(existing, _)| *existing == id)
+        {
+            return Err(HostError::InvalidState("parameter queue full"));
         }
+        pending.retain(|(existing, _)| *existing != id);
+        pending.push((id, plain));
+        drop(pending);
         self.flush_params();
         Ok(())
     }
@@ -838,6 +844,13 @@ impl SubPluginMain for ClapPlugin {
             if !flushed.is_empty()
                 && let Ok(mut pending) = self.pending_edits.lock()
             {
+                let additional = flushed
+                    .iter()
+                    .filter(|(id, _)| !pending.iter().any(|(queued, _)| queued == id))
+                    .count();
+                if additional > pending.capacity() - pending.len() {
+                    return Err(HostError::InvalidState("activation parameter queue full"));
+                }
                 for (id, plain) in flushed.drain(..) {
                     pending.retain(|(existing, _)| *existing != id);
                     if pending.len() < pending.capacity() {
@@ -1172,18 +1185,26 @@ impl SubPluginProcessor for ClapProcessor {
 
         // Main-thread edits go in first, at offset 0, so this block's own
         // event stream still overrides them.
-        if let Ok(mut pending) = self.pending_edits.try_lock() {
-            for (id, plain) in pending.drain(..) {
+        let mut pending = self.pending_edits.try_lock().ok();
+        if let Some(pending) = pending.as_ref() {
+            for &(id, plain) in pending.iter() {
                 self.in_events.push_param(id, plain, 0);
             }
         }
         for event in events {
             self.in_events.push(event);
         }
-        // CLAP requires `in_events` sorted by time and does not check; the
-        // caller's stream is sorted, but the edits just prepended are not
-        // necessarily before it.
-        self.in_events.sort();
+        if self.in_events.overflowed
+            || !events.is_sorted_by_key(Event::sample_offset)
+            || events.iter().any(|event| event.sample_offset() >= frames)
+        {
+            buffers.clear_output();
+            return ProcessStatus::Error;
+        }
+        if let Some(pending) = pending.as_mut() {
+            pending.clear();
+        }
+        drop(pending);
 
         let frame_len = frames as usize;
         let input_base = buffers.raw_input().as_ptr();

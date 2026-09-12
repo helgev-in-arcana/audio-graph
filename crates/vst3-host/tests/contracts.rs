@@ -5,6 +5,42 @@ use vst3_host::{Module, Vst3Plugin};
 
 static FIXTURE: Mutex<()> = Mutex::new(());
 
+/// A full parameter queue rejects its batch without applying a prefix or losing main edits.
+#[test]
+fn input_overflow_preserves_pending_main_edits() {
+    use plugin_host_api::*;
+    let _lock = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    let mut processor = plugin.activate(AudioConfig::default()).unwrap();
+    plugin.set_param(ParamId(0), 0.5).unwrap();
+    let events = vec![
+        Event::Param(ParamEvent::SetValue {
+            id: ParamId(0),
+            target: Target::Global,
+            value: 0.25,
+            sample_offset: 0
+        });
+        513
+    ];
+    let mut sink = EventSink::with_capacity(8);
+    let input = [1.0; 8];
+    let mut output = [9.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &events, &TimeContext::default(), &mut sink),
+        ProcessStatus::Error
+    );
+    assert_eq!(output, [0.0; 8]);
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+    assert_eq!(output, [0.5; 8]);
+}
+
 /// Refused widths and missing buses cannot yield a processor for a different configuration.
 #[test]
 fn activation_requires_the_actual_requested_bus_layout() {
