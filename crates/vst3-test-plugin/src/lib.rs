@@ -2,6 +2,8 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+// VST3 binding scalar types depend on the target's C++ ABI.
+#![allow(clippy::unnecessary_cast)]
 
 use std::cell::Cell;
 use std::ffi::{CString, c_char, c_void};
@@ -19,10 +21,10 @@ fn copy_cstring(src: &str, dst: &mut [c_char]) {
         *dst = *src as c_char;
     }
 
-    if bytes.len() > dst.len() {
-        if let Some(last) = dst.last_mut() {
-            *last = 0;
-        }
+    if bytes.len() > dst.len()
+        && let Some(last) = dst.last_mut()
+    {
+        *last = 0;
     }
 }
 
@@ -50,7 +52,7 @@ unsafe fn len_wstring(string: *const TChar) -> usize {
     len as usize
 }
 
-const PLUGIN_NAME: &'static str = "Gain (vst3-rs example plugin)";
+const PLUGIN_NAME: &str = "Gain (vst3-rs example plugin)";
 
 struct GainProcessor {
     gain: AtomicU64,
@@ -185,7 +187,7 @@ impl IComponentTrait for GainProcessor {
     unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
         let stream = ComRef::from_raw(_state).unwrap();
         let mut value = f64::from_bits(self.gain.load(Ordering::Relaxed));
-        return stream.write((&mut value as *mut f64).cast(), 8, ptr::null_mut());
+        stream.write((&mut value as *mut f64).cast(), 8, ptr::null_mut())
     }
 }
 
@@ -275,21 +277,15 @@ impl IAudioProcessorTrait for GainProcessor {
                     let param_id = param_queue.getParameterId();
                     let point_count = param_queue.getPointCount();
 
-                    match param_id {
-                        0 => {
-                            let mut sample_offset = 0;
-                            let mut value = 0.0;
-                            let result = param_queue.getPoint(
-                                point_count - 1,
-                                &mut sample_offset,
-                                &mut value,
-                            );
+                    if param_id == 0 {
+                        let mut sample_offset = 0;
+                        let mut value = 0.0;
+                        let result =
+                            param_queue.getPoint(point_count - 1, &mut sample_offset, &mut value);
 
-                            if result == kResultTrue {
-                                self.gain.store(value.to_bits(), Ordering::Relaxed);
-                            }
+                        if result == kResultTrue {
+                            self.gain.store(value.to_bits(), Ordering::Relaxed);
                         }
-                        _ => {}
                     }
                 }
             }
@@ -447,11 +443,10 @@ impl IEditControllerTrait for GainController {
                 let len = len_wstring(string as *const TChar);
                 if let Ok(string) =
                     String::from_utf16(slice::from_raw_parts(string as *const u16, len))
+                    && let Ok(value) = f64::from_str(&string)
                 {
-                    if let Ok(value) = f64::from_str(&string) {
-                        *value_normalized = value;
-                        return kResultOk;
-                    }
+                    *value_normalized = value;
+                    return kResultOk;
                 }
                 kInvalidArgument
             }
