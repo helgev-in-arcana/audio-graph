@@ -566,6 +566,7 @@ impl SubHost {
                     let message = e.to_string();
                     SubHostProcessors {
                         entries: processors,
+                        failed: false,
                     }
                     .deactivate();
                     return Err(message);
@@ -575,6 +576,7 @@ impl SubHost {
 
         Ok(SubHostProcessors {
             entries: processors,
+            failed: false,
         })
     }
 
@@ -706,6 +708,7 @@ impl SubHostProcessor {
         out_events: &mut EventSink,
     ) -> ProcessStatus {
         self.scratch.clear();
+        let mut complete = true;
         // Everything before the chunk was sent on an earlier call;
         // everything after it belongs to a later one.
         let events = slice(events, &chunk);
@@ -728,7 +731,7 @@ impl SubHostProcessor {
                 && events[next_note].sample_offset() - chunk.start < offset
             {
                 let event = events[next_note];
-                push(
+                complete &= push(
                     &mut self.scratch,
                     event.at_offset(event.sample_offset() - chunk.start),
                 );
@@ -747,7 +750,7 @@ impl SubHostProcessor {
                     continue;
                 }
                 self.last_sent[slot] = normalized;
-                push(
+                complete &= push(
                     &mut self.scratch,
                     Event::Param(ParamEvent::SetValue {
                         id: target.id,
@@ -760,14 +763,23 @@ impl SubHostProcessor {
         }
 
         for &event in &events[next_note..] {
-            push(
+            complete &= push(
                 &mut self.scratch,
                 event.at_offset(event.sample_offset() - chunk.start),
             );
         }
 
-        self.processor
-            .process(buffers, &self.scratch, context, out_events)
+        let status = if complete {
+            self.processor
+                .process(buffers, &self.scratch, context, out_events)
+        } else {
+            buffers.clear_output();
+            ProcessStatus::Error
+        };
+        if status == ProcessStatus::Error {
+            self.last_sent.fill(f64::NAN);
+        }
+        status
     }
 
     pub fn reset(&mut self) {
@@ -785,9 +797,14 @@ impl SubHostProcessor {
 /// instance by index.
 pub struct SubHostProcessors {
     entries: Vec<Option<SubHostProcessor>>,
+    failed: bool,
 }
 
 impl SubHostProcessors {
+    /// Whether any instance failed during the current block binding.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
     /// Returns each processor to the instance and activation that created it.
     pub fn deactivate(self) {}
 
@@ -800,6 +817,7 @@ impl SubHostProcessors {
     }
 
     pub fn reset(&mut self) {
+        self.failed = false;
         for processor in self.entries.iter_mut().flatten() {
             processor.reset();
         }
@@ -821,6 +839,7 @@ impl SubHostProcessors {
         context: &'a TimeContext,
         out_events: &'a mut EventSink,
     ) -> BoundInstances<'a> {
+        self.failed = false;
         BoundInstances {
             processors: self,
             context,
@@ -884,7 +903,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
         let first_output = self.out_events.events().len();
-        processor.process(
+        let status = processor.process(
             &mut buffers,
             schedule,
             notes,
@@ -892,6 +911,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
             self.context,
             self.out_events,
         );
+        self.processors.failed |= status == ProcessStatus::Error;
         for event in &mut self.out_events.events_mut()[first_output..] {
             *event = event.at_offset(event.sample_offset() + chunk.offset);
         }
@@ -915,9 +935,12 @@ fn slice<'a>(events: &'a [Event], chunk: &Range<u32>) -> &'a [Event] {
 /// Dropping an event is bad; growing a `Vec` inside an audio callback is
 /// worse, and the capacity reserved at activate is the worst case plus a wide
 /// margin.
-fn push(scratch: &mut Vec<Event>, event: Event) {
+fn push(scratch: &mut Vec<Event>, event: Event) -> bool {
     if scratch.len() < scratch.capacity() {
         scratch.push(event);
+        true
+    } else {
+        false
     }
 }
 
@@ -926,6 +949,53 @@ mod tests {
     use super::*;
     use crate::SlotSchedule;
     use plugin_host::{BufferLayout, NoteEvent, ParamFlags};
+
+    /// Scratch loss rejects the entire chunk and remains observable through the block binding.
+    #[test]
+    fn input_loss_is_not_hidden_by_the_instance_adapter() {
+        use crate::instances::{AudioChunk, AudioInstances};
+        let (mut processor, seen) = harness(Vec::new());
+        processor.scratch = Vec::with_capacity(1);
+        let mut processors = SubHostProcessors {
+            entries: vec![Some(processor)],
+            failed: false,
+        };
+        let event = Event::Note(NoteEvent::NoteOff {
+            note_id: Some(7),
+            port: 0,
+            channel: 0,
+            key: 60,
+            velocity: 0.0,
+            sample_offset: 0,
+        });
+        let mut schedule = SlotSchedule::new(LANES, 4, 32);
+        schedule.begin(4);
+        let mut output = [9.0; 8];
+        let mut sink = EventSink::with_capacity(8);
+        let time = TimeContext::default();
+        let chunk = AudioChunk {
+            input_channels: 2,
+            output_channels: 2,
+            frames: 4,
+            offset: 0,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+        };
+        let mut bound = processors.bind(&time, &mut sink);
+        bound.process(
+            0,
+            &[event, event],
+            &[0.0; 8],
+            &mut output,
+            chunk,
+            schedule.view(),
+        );
+        bound.process(0, &[], &[0.0; 8], &mut output, chunk, schedule.view());
+        assert!(processors.failed());
+        assert!(seen.lock().unwrap().is_empty());
+        processors.reset();
+        assert!(!processors.failed());
+    }
 
     /// A processor that records what it was handed.
     struct Recorder {
@@ -971,6 +1041,7 @@ mod tests {
             fn reset(&mut self) {}
         }
         let mut processors = SubHostProcessors {
+            failed: false,
             entries: (0..2)
                 .map(|_| {
                     Some(SubHostProcessor {
@@ -1352,6 +1423,7 @@ mod tests {
         let (wired, wired_saw) = harness(Vec::new());
         let (idle, idle_saw) = harness(Vec::new());
         let mut processors = SubHostProcessors {
+            failed: false,
             entries: vec![Some(wired), Some(idle)],
         };
 

@@ -11,8 +11,9 @@
 //! parent and take the child with it tells the plugin nothing — it keeps posting timers
 //! and calling `resizeView` against a dead window, and crashes.
 
-use vst3::ComPtr;
+use vst3::ComRef;
 use vst3::Steinberg::{IPlugFrame, IPlugView, IPlugViewTrait, ViewRect, kResultOk, kResultTrue};
+use vst3_host::Vst3View;
 
 use crate::PLATFORM_TYPE;
 use crate::frame::PlugFrame;
@@ -25,7 +26,7 @@ use host_window::{ContainerWindow, Size};
 pub struct EditorWindow {
     /// Declared first so it is dropped first. `Drop` runs the sequence
     /// explicitly anyway; the ordering here is the belt to that's braces.
-    view: ComPtr<IPlugView>,
+    view: Vst3View,
     window: ContainerWindow,
     frame: PlugFrame,
     /// Guards against running the teardown twice, since `close` is public and
@@ -43,7 +44,7 @@ impl EditorWindow {
     /// [`ContainerWindow::new`] for why it must be the root and not the
     /// wrapper's own editor view.
     pub fn open(
-        view: ComPtr<IPlugView>,
+        view: Vst3View,
         title: &str,
         owner: *mut std::ffi::c_void,
     ) -> Result<EditorWindow, String> {
@@ -51,7 +52,8 @@ impl EditorWindow {
         // type has no editor we can show, and finding that out after creating a
         // window means unwinding it again.
         let platform = std::ffi::CString::new(PLATFORM_TYPE).unwrap();
-        if unsafe { view.isPlatformTypeSupported(platform.as_ptr()) } != kResultTrue {
+        let interface = native(&view);
+        if unsafe { interface.isPlatformTypeSupported(platform.as_ptr()) } != kResultTrue {
             return Err(format!(
                 "the plugin's editor does not support {PLATFORM_TYPE} windows"
             ));
@@ -65,7 +67,9 @@ impl EditorWindow {
         // divides by the factor while laying out — Chroma does — faults on its
         // first paint if the host never says anything. This has to happen
         // before `attached`, because that is when the first paint can occur.
-        if let Some(scale_support) = view.cast::<vst3::Steinberg::IPlugViewContentScaleSupport>() {
+        if let Some(scale_support) =
+            interface.cast::<vst3::Steinberg::IPlugViewContentScaleSupport>()
+        {
             use vst3::Steinberg::IPlugViewContentScaleSupportTrait;
             unsafe { scale_support.setContentScaleFactor(window.scale_factor() as f32) };
         }
@@ -75,17 +79,17 @@ impl EditorWindow {
         // dropped resize or a crash, depending on the plugin.
         let frame = PlugFrame::new();
         let frame_ptr = frame.com_ptr();
-        unsafe { view.setFrame(frame_ptr) };
+        unsafe { interface.setFrame(frame_ptr) };
 
         // Shown before attaching: a plugin that paints during `attached` needs
         // a parent that already has a valid device context and size.
         window.show();
 
-        let res = unsafe { view.attached(window.platform_handle(), platform.as_ptr()) };
+        let res = unsafe { interface.attached(window.platform_handle(), platform.as_ptr()) };
         if res != kResultOk {
             // Undo in reverse. Leaving a frame set on a view we are about to
             // drop leaves the plugin holding a pointer to freed memory.
-            unsafe { view.setFrame(std::ptr::null_mut()) };
+            unsafe { interface.setFrame(std::ptr::null_mut()) };
             return Err(format!("IPlugView::attached failed ({res:#010x})"));
         }
 
@@ -134,14 +138,14 @@ impl EditorWindow {
             let mut rect = to_rect(requested);
             // Complete the resize round-trip: the plugin requested a size, the host resized
             // the container, and now we must tell the plugin what size it actually got.
-            unsafe { self.view.onSize(&mut rect) };
+            unsafe { native(&self.view).onSize(&mut rect) };
             return;
         }
 
         let current = self.window.client_size();
         if current != self.frame.last_reported_size() && current.width > 0 && current.height > 0 {
             let mut rect = to_rect(current);
-            if unsafe { self.view.onSize(&mut rect) } == kResultOk {
+            if unsafe { native(&self.view).onSize(&mut rect) } == kResultOk {
                 self.frame.set_last_reported_size(current);
             }
         }
@@ -159,10 +163,10 @@ impl EditorWindow {
         unsafe {
             // 1. The plugin removes its child window from ours while both are
             //    still alive.
-            self.view.removed();
+            native(&self.view).removed();
             // 2. Drop the frame it was given, so it cannot call back into an
             //    object we are about to release.
-            self.view.setFrame(std::ptr::null_mut());
+            native(&self.view).setFrame(std::ptr::null_mut());
         }
         // 3. and 4. happen as the fields drop: the view's reference, then the
         //    container window itself.
@@ -187,14 +191,19 @@ fn to_rect(size: Size) -> ViewRect {
     }
 }
 
-fn view_size(view: &ComPtr<IPlugView>) -> Option<Size> {
+fn native(view: &Vst3View) -> ComRef<'_, IPlugView> {
+    // SAFETY: the owned view retains the interface and its native module for this borrow.
+    unsafe { ComRef::from_raw(view.as_ptr()) }.unwrap()
+}
+
+fn view_size(view: &Vst3View) -> Option<Size> {
     let mut rect = ViewRect {
         left: 0,
         top: 0,
         right: 0,
         bottom: 0,
     };
-    if unsafe { view.getSize(&mut rect) } != kResultOk {
+    if unsafe { native(view).getSize(&mut rect) } != kResultOk {
         return None;
     }
     let size = Size::new(rect.right - rect.left, rect.bottom - rect.top);
@@ -204,8 +213,8 @@ fn view_size(view: &ComPtr<IPlugView>) -> Option<Size> {
 }
 
 /// Whether a view can be resized by the user.
-pub fn can_resize(view: &ComPtr<IPlugView>) -> bool {
-    unsafe { view.canResize() == kResultTrue }
+pub fn can_resize(view: &Vst3View) -> bool {
+    unsafe { native(view).canResize() == kResultTrue }
 }
 
 /// Suppress the unused-import warning on platforms without a window backend.

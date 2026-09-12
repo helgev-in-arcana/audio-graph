@@ -45,7 +45,7 @@ const MACOS_BUNDLE_DIR: &str = "MacOS";
 ///
 /// On Windows and Linux the two are the same file. On macOS the path is a
 /// bundle directory, so this walks into it.
-fn resolve_binary(path: &Path) -> Result<PathBuf, HostError> {
+pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, HostError> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }

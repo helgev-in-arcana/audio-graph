@@ -62,7 +62,7 @@ fn fixture_as_clap() -> PathBuf {
 
 #[test]
 fn the_facade_loads_a_clap_by_path_alone() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let path = fixture_as_clap();
 
     // The extension is the only thing that says which backend answers.
@@ -114,7 +114,7 @@ fn the_facade_loads_a_clap_by_path_alone() {
 
 #[test]
 fn the_facade_loads_an_installed_vst3() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
 
     // First module that yields a class. Some installed plugins are wrappers
     // around a scanner and export nothing loadable, so this is a search rather

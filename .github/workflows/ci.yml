@@ -85,7 +85,7 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      # clap-host's tests load clap-test-plugin's cdylib. cargo will not build
+      # CLAP and VST3 host tests load their fixture cdylibs. cargo will not build
       # another package's cdylib on its own, so it is built once before the
       # tests run.
       #

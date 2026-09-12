@@ -57,17 +57,14 @@ pub use plugin_host_api::{
 
 // Window plumbing a host application needs and that no backend owns.
 pub use host_window::{ContainerWindow, Key, Size, forward_key, poll, pump_events, root_window};
+pub use vst3_host::ApartmentGuard as ThreadGuard;
 
 /// Prepares the calling thread for hosting plugins.
 ///
-/// Today this is COM's apartment initialisation, which VST3 plugins on Windows
-/// assume has happened and which crashes them when it has not. CLAP needs
-/// nothing, and neither format needs anything on other platforms — but a
-/// caller should not have to know that, so there is one call and it is always
-/// correct.
-///
-/// Idempotent; call it on every thread that will load a plugin.
-pub fn init_thread() {
+/// Hold the returned guard until every plugin and processor has been released
+/// and returned resources reclaimed. Incompatible Windows apartments are rejected.
+pub fn init_thread() -> Result<ThreadGuard> {
+    let guard = vst3_host::init_apartment()?;
     reclaim_main_thread();
-    vst3_host::init_apartment();
+    Ok(guard)
 }

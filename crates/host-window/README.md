@@ -53,11 +53,14 @@ every Linux host does today for the same reason.
   instance, not here — this crate used to carry a `Deferred` for it and the
   queue's owner turned out to be the wrong place for it to live.
 - **`watch` never calls a plugin back with its list locked, and re-checks
-  liveness before every callback.** A plugin is entitled to unregister from
+  registration identity before every callback.** Replacing or retiming a watch
+  invalidates callbacks collected for its previous generation. A plugin may unregister from
   inside its own callback, including somebody else's registration. Both rules
   live here precisely so that the two backends cannot drift on them.
 - **`WM_CLOSE` is recorded, not obeyed.** Destroying the window there would take
   the plugin's child window with it without the plugin ever being told.
+- **The Win32 class lives with its windows.** Registration uses the module
+  containing the window procedure and is released after its last window is destroyed.
 - **The backend that is missing is an honest stub.** macOS returns an error
   rather than half-working.
 - **The tests open real windows.** `cargo test` on X11 therefore needs a display;

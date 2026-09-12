@@ -18,6 +18,7 @@ mod midi_map;
 mod module;
 mod moduleinfo;
 mod param_map;
+mod param_sync;
 mod plugin;
 mod process_io;
 mod stream;
@@ -25,10 +26,10 @@ mod util;
 mod vst_events;
 
 pub use cid::Cid;
-pub use com::init_apartment;
+pub use com::{ApartmentGuard, init_apartment};
 pub use module::{ClassInfo, FactoryInfo, Module, scan_without_loading};
 pub use moduleinfo::{ModuleClass, ModuleInfo, ModuleInfoError};
-pub use plugin::{Vst3Plugin, Vst3Processor};
+pub use plugin::{Vst3Plugin, Vst3Processor, Vst3View};
 
 /// The file extension of a VST3 module, bundle or bare library alike.
 pub const VST3_EXTENSION: &str = "vst3";

@@ -79,7 +79,7 @@ fn feedback_delay(shared: &Shared) {
 /// that brings the plugin back to the desk once the file is written.
 #[test]
 fn every_activation_leaves_the_audio_thread_a_program() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = Wrapper::default();
     let layout = fx_layout();
 

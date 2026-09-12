@@ -22,6 +22,7 @@
 //!   may have dropped a later one.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -87,7 +88,8 @@ impl Readiness {
 /// is what both formats unregister by.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub struct FdWatch<K> {
-    watched: Mutex<Vec<(K, RawFd, Interest)>>,
+    watched: Mutex<Vec<(K, RawFd, Interest, u64)>>,
+    generation: AtomicU64,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -95,6 +97,7 @@ impl<K> Default for FdWatch<K> {
     fn default() -> FdWatch<K> {
         FdWatch {
             watched: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -106,7 +109,7 @@ impl<K: Copy> FdWatch<K> {
         let Ok(mut watched) = self.watched.lock() else {
             return false;
         };
-        if watched.iter().any(|(_, other, _)| *other == fd) {
+        if watched.iter().any(|(_, other, _, _)| *other == fd) {
             // Both formats say to modify rather than register twice, and a
             // duplicate would have the plugin told twice per turn.
             return false;
@@ -115,7 +118,8 @@ impl<K: Copy> FdWatch<K> {
             log::warn!("a plugin asked to watch more than {MAX_WATCHED} descriptors");
             return false;
         }
-        watched.push((key, fd, interest));
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        watched.push((key, fd, interest, generation));
         true
     }
 
@@ -124,9 +128,10 @@ impl<K: Copy> FdWatch<K> {
         let Ok(mut watched) = self.watched.lock() else {
             return false;
         };
-        match watched.iter_mut().find(|(_, other, _)| *other == fd) {
+        match watched.iter_mut().find(|(_, other, _, _)| *other == fd) {
             Some(entry) => {
                 entry.2 = interest;
+                entry.3 = self.generation.fetch_add(1, Ordering::Relaxed);
                 true
             }
             None => false,
@@ -148,21 +153,23 @@ impl<K: Copy> FdWatch<K> {
             return false;
         };
         let before = watched.len();
-        watched.retain(|(key, fd, _)| !doomed(key, fd));
+        watched.retain(|(key, fd, _, _)| !doomed(key, fd));
         before != watched.len()
     }
 
-    fn is_watched(&self, fd: RawFd) -> bool {
-        self.watched
-            .lock()
-            .is_ok_and(|watched| watched.iter().any(|(_, other, _)| *other == fd))
+    fn is_watched(&self, fd: RawFd, generation: u64) -> bool {
+        self.watched.lock().is_ok_and(|watched| {
+            watched
+                .iter()
+                .any(|(_, other, _, serial)| *other == fd && *serial == generation)
+        })
     }
 
     /// Tell `ready` about every watched descriptor that has something for it.
     ///
     /// Does not block: the caller has a frame to get back to.
     pub fn dispatch(&self, ready: impl Fn(K, RawFd, Readiness)) {
-        let watched: Vec<(K, RawFd, Interest)> = {
+        let watched = {
             let Ok(watched) = self.watched.lock() else {
                 return;
             };
@@ -174,7 +181,7 @@ impl<K: Copy> FdWatch<K> {
 
         let mut polls: Vec<libc::pollfd> = watched
             .iter()
-            .map(|(_, fd, interest)| libc::pollfd {
+            .map(|(_, fd, interest, _)| libc::pollfd {
                 fd: *fd,
                 events: events_of(*interest),
                 revents: 0,
@@ -185,18 +192,17 @@ impl<K: Copy> FdWatch<K> {
             return;
         }
 
-        for (poll, (key, fd, _)) in polls.iter().zip(&watched) {
+        for (poll, (key, fd, _, generation)) in polls.iter().zip(&watched) {
+            if !self.is_watched(*fd, *generation) {
+                continue;
+            }
             match outcome_of(poll.revents) {
                 Outcome::Quiet => {}
                 Outcome::Gone => {
                     self.forget(*fd);
                 }
                 Outcome::Ready(readiness) => {
-                    // Against the live list, not the copy: an earlier callback
-                    // in this very loop may have dropped this one.
-                    if self.is_watched(*fd) {
-                        ready(*key, *fd, readiness);
-                    }
+                    ready(*key, *fd, readiness);
                 }
             }
         }
@@ -209,18 +215,21 @@ impl<K: Copy> FdWatch<K> {
 /// the handler under VST3.
 pub struct TimerWheel<K> {
     timers: Mutex<Vec<Timer<K>>>,
+    generation: AtomicU64,
 }
 
 struct Timer<K> {
     key: K,
     period: Duration,
     due: Instant,
+    generation: u64,
 }
 
 impl<K> Default for TimerWheel<K> {
     fn default() -> TimerWheel<K> {
         TimerWheel {
             timers: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         }
     }
 }
@@ -235,16 +244,23 @@ impl<K: Copy + PartialEq> TimerWheel<K> {
         };
         let period = period.clamp(MIN_PERIOD, MAX_PERIOD);
         let due = Instant::now() + period;
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         if let Some(timer) = timers.iter_mut().find(|t| t.key == key) {
             timer.period = period;
             timer.due = due;
+            timer.generation = generation;
             return true;
         }
         if timers.len() >= MAX_WATCHED {
             log::warn!("a plugin asked for more than {MAX_WATCHED} timers");
             return false;
         }
-        timers.push(Timer { key, period, due });
+        timers.push(Timer {
+            key,
+            period,
+            due,
+            generation,
+        });
         true
     }
 
@@ -258,16 +274,18 @@ impl<K: Copy + PartialEq> TimerWheel<K> {
         before != timers.len()
     }
 
-    fn is_armed(&self, key: K) -> bool {
-        self.timers
-            .lock()
-            .is_ok_and(|timers| timers.iter().any(|t| t.key == key))
+    fn is_armed(&self, key: K, generation: u64) -> bool {
+        self.timers.lock().is_ok_and(|timers| {
+            timers
+                .iter()
+                .any(|t| t.key == key && t.generation == generation)
+        })
     }
 
     /// Run every timer that has come due.
     pub fn dispatch(&self, fire: impl Fn(K)) {
         let now = Instant::now();
-        let due: Vec<K> = {
+        let due: Vec<_> = {
             let Ok(mut timers) = self.timers.lock() else {
                 return;
             };
@@ -278,15 +296,15 @@ impl<K: Copy + PartialEq> TimerWheel<K> {
                     // From now, not from when it was due: a UI thread that
                     // stalled must not come back to a burst of catch-up ticks.
                     timer.due = now + timer.period;
-                    timer.key
+                    (timer.key, timer.generation)
                 })
                 .collect()
         };
 
-        for key in due {
+        for (key, generation) in due {
             // Same rule as descriptors: an earlier callback may have stopped
             // this one.
-            if !self.is_armed(key) {
+            if !self.is_armed(key, generation) {
                 continue;
             }
             fire(key);
@@ -348,6 +366,30 @@ fn readiness_of(revents: libc::c_short) -> Readiness {
 mod descriptors {
     use super::*;
     use std::cell::RefCell;
+
+    /// Reusing a descriptor cannot deliver readiness to its previous handler.
+    #[test]
+    fn a_replaced_registration_does_not_receive_old_readiness() {
+        let first = Pipe::new();
+        let second = Pipe::new();
+        first.fill();
+        second.fill();
+        let watch = FdWatch::default();
+        assert!(watch.watch(1, first.read, Interest::READ));
+        assert!(watch.watch(2, second.read, Interest::READ));
+        let fired = RefCell::new(Vec::new());
+        watch.dispatch(|key, _, _| {
+            fired.borrow_mut().push(key);
+            if key == 1 {
+                assert!(watch.forget(second.read));
+                assert!(watch.watch(3, second.read, Interest::READ));
+            }
+        });
+        assert_eq!(*fired.borrow(), [1]);
+        watch.forget(first.read);
+        watch.dispatch(|key, _, _| fired.borrow_mut().push(key));
+        assert_eq!(*fired.borrow(), [1, 3]);
+    }
 
     /// A pipe with a byte in it, which is the smallest thing that is reliably
     /// readable without a plugin to produce one.
@@ -474,6 +516,28 @@ mod descriptors {
 mod timers {
     use super::*;
     use std::cell::RefCell;
+
+    /// Retiming or replacing a timer invalidates callbacks already collected for it.
+    #[test]
+    fn rearming_cannot_fire_the_previous_deadline() {
+        for replace in [false, true] {
+            let wheel = TimerWheel::default();
+            wheel.arm(1, MIN_PERIOD);
+            wheel.arm(2, MIN_PERIOD);
+            std::thread::sleep(MIN_PERIOD * 2);
+            let fired = RefCell::new(Vec::new());
+            wheel.dispatch(|key| {
+                fired.borrow_mut().push(key);
+                if key == 1 {
+                    if replace {
+                        assert!(wheel.disarm(2));
+                    }
+                    wheel.arm(2, MAX_PERIOD);
+                }
+            });
+            assert_eq!(*fired.borrow(), [1]);
+        }
+    }
 
     #[test]
     fn a_timer_fires_once_its_period_is_up() {

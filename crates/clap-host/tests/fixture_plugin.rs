@@ -11,7 +11,168 @@
 //! permits. It is the same reason `vst3-host/tests/lifecycle.rs` is one test.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+static FIXTURE: Mutex<()> = Mutex::new(());
+
+/// Plugin-requested flushes work without host edits and supersede older activation replays.
+#[test]
+fn plugin_flush_requests_deliver_values_while_inactive_and_active() {
+    struct Host(Mutex<Vec<f64>>);
+    impl HostContext for Host {
+        fn host_name(&self) -> &str {
+            "flush test"
+        }
+        fn request_restart(&self, _: RestartReason) {}
+        fn param_edited(&self, id: ParamId, value: f64) {
+            if id == PARAM_GAIN {
+                self.0.lock().unwrap().push(value);
+            }
+        }
+    }
+    let _fixture = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let context = Arc::new(Host(Mutex::new(Vec::new())));
+    let mut plugin =
+        ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", context.clone()).unwrap();
+    plugin.set_param(PARAM_GAIN, 1.5).unwrap();
+    plugin.set_param(PARAM_ASK, 12.0).unwrap();
+    plugin.tick();
+    assert_eq!(*context.0.lock().unwrap(), [0.375]);
+    plugin.tick();
+    assert_eq!(context.0.lock().unwrap().len(), 1);
+    plugin.set_param(PARAM_ASK, 0.0).unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [1.0; 8];
+    let mut output = [0.0; 8];
+    let mut sink = EventSink::with_capacity(8);
+    let mut run = || {
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        assert_eq!(
+            processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+            ProcessStatus::Continue
+        );
+        output[0]
+    };
+    assert_eq!(run(), 0.375);
+    plugin.set_param(PARAM_GAIN, 1.0).unwrap();
+    plugin.set_param(PARAM_ASK, 12.0).unwrap();
+    assert_eq!(run(), 1.0);
+    plugin.tick();
+    plugin.tick();
+    assert_eq!(run(), 0.375);
+    assert!(matches!(
+        sink.events(),
+        [Event::Param(ParamEvent::SetValue { value: 0.375, .. })]
+    ));
+}
+
+mod allocations {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! { static COUNTS: Cell<Option<(usize, usize)>> = const { Cell::new(None) }; }
+    struct Allocator;
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a + 1, d)));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a, d + 1)));
+                }
+            });
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    /// Filling a native input batch performs no host allocations or frees on the audio thread.
+    #[test]
+    fn a_full_native_input_batch_does_not_allocate() {
+        let _fixture = FIXTURE.lock().unwrap();
+        let module = Module::open(fixture_path()).unwrap();
+        let mut plugin = ClapPlugin::create(
+            &module,
+            "dev.audio-graph.clap-test-plugin",
+            Arc::new(TestHost),
+        )
+        .unwrap();
+        let mut processor = plugin.activate(lifecycle_config()).unwrap();
+        let events = vec![
+            Event::Param(ParamEvent::SetValue {
+                id: PARAM_GAIN,
+                target: Target::Global,
+                value: 1.0,
+                sample_offset: 0
+            });
+            2048
+        ];
+        let mut sink = EventSink::with_capacity(8);
+        let input = [1.0; 8];
+        let mut output = [0.0; 8];
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        COUNTS.with(|c| c.set(Some((0, 0))));
+        let status = processor.process(&mut buffers, &events, &TimeContext::default(), &mut sink);
+        let counts = COUNTS.with(|c| c.replace(None)).unwrap();
+        assert_eq!(status, ProcessStatus::Continue);
+        assert_eq!(counts, (0, 0));
+    }
+}
+
+/// Rejected input cannot partially update native state or consume queued main-thread edits.
+#[test]
+fn input_overflow_is_rejected_before_native_delivery() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let input = [1.0; 8];
+    let mut output = [9.0; 8];
+    let mut sink = EventSink::with_capacity(8);
+    plugin.set_param(PARAM_GAIN, 0.5).unwrap();
+    let mut events = vec![
+        Event::Param(ParamEvent::SetValue {
+            id: PARAM_GAIN,
+            target: Target::Global,
+            value: 0.0,
+            sample_offset: 0
+        });
+        2048
+    ];
+    events.push(Event::Note(NoteEvent::NoteOff {
+        note_id: Some(7),
+        port: 0,
+        channel: 0,
+        key: 60,
+        velocity: 0.0,
+        sample_offset: 0,
+    }));
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &events, &TimeContext::default(), &mut sink),
+        ProcessStatus::Error
+    );
+    assert_eq!(output, [0.0; 8]);
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+    assert_eq!(output, [0.5; 8]);
+}
 
 use clap_host::{ClapPlugin, Module};
 use plugin_host_api::{
@@ -79,6 +240,7 @@ fn lifecycle_config() -> AudioConfig {
 /// Rejected blocks cannot apply native parameter edits or write beyond their declared output.
 #[test]
 fn mismatched_blocks_never_enter_native_processing() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let mut plugin = ClapPlugin::create(
         &module,
@@ -137,6 +299,7 @@ fn mismatched_blocks_never_enter_native_processing() {
 /// Both native scratch loss and caller capacity loss remain visible across process calls.
 #[test]
 fn output_overflow_is_propagated_and_not_cleared_by_processing() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let mut plugin = ClapPlugin::create(
         &module,
@@ -172,6 +335,7 @@ fn output_overflow_is_propagated_and_not_cleared_by_processing() {
 /// Native completion identifies the input note, independently of output note ports.
 #[test]
 fn clap_note_ports_report_native_completion() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let mut plugin = ClapPlugin::create(
         &module,
@@ -216,6 +380,7 @@ fn clap_note_ports_report_native_completion() {
 /// A running processor retains its instance, module, and callbacks after main is dropped.
 #[test]
 fn the_processor_outlives_main_and_returns_to_its_owner() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let drops = Arc::new(std::sync::Mutex::new(Vec::new()));
     let context = Arc::new(LifetimeHost(drops.clone()));
@@ -260,6 +425,7 @@ fn the_processor_outlives_main_and_returns_to_its_owner() {
 /// Returning one activation leaves another instance active and permits its own next activation.
 #[test]
 fn processor_returns_are_bound_to_their_own_activation() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let mut first = ClapPlugin::create(
         &module,
@@ -326,6 +492,7 @@ impl HostContext for RecordingHost {
 /// Repeated audio-thread requests reach HostContext once, on a headless main-thread tick.
 #[test]
 fn audio_requests_are_delivered_only_by_the_main_thread() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let host = Arc::new(RecordingHost::default());
     let mut plugin =
@@ -365,6 +532,7 @@ fn audio_requests_are_delivered_only_by_the_main_thread() {
 /// A request raised during a native main callback remains pending for the next tick.
 #[test]
 fn callback_requests_are_not_lost_while_servicing() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).unwrap();
     let host = Arc::new(RecordingHost::default());
     let mut plugin =
@@ -381,6 +549,7 @@ fn callback_requests_are_not_lost_while_servicing() {
 /// Descriptors change atomically, and only structural changes require giving back the processor.
 #[test]
 fn metadata_refresh_obeys_activation_and_preserves_failed_requests() {
+    let _fixture = FIXTURE.lock().unwrap();
     use plugin_host_api::MetadataUpdate;
     let module = Module::open(fixture_path()).unwrap();
     let mut plugin = ClapPlugin::create(
@@ -478,6 +647,7 @@ fn metadata_refresh_obeys_activation_and_preserves_failed_requests() {
 /// fixture has a parameter whose whole job is to make the call.
 #[test]
 fn the_host_forwards_what_the_plugin_asks_for() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).expect("the fixture opens");
 
     for (ask, expected) in [
@@ -523,6 +693,7 @@ fn the_host_forwards_what_the_plugin_asks_for() {
 /// exactly the stale figure the plugin was trying to correct.
 #[test]
 fn a_latency_that_moves_is_read_back() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).expect("the fixture opens");
     let host = Arc::new(RecordingHost::default());
     let mut plugin = ClapPlugin::create(
@@ -572,6 +743,7 @@ fn a_latency_that_moves_is_read_back() {
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn the_host_polls_the_descriptors_a_plugin_registers() {
+    let _fixture = FIXTURE.lock().unwrap();
     let module = Module::open(fixture_path()).expect("the fixture opens");
     let context: Arc<dyn HostContext> = Arc::new(TestHost);
     let mut plugin = ClapPlugin::create(&module, "dev.audio-graph.clap-test-plugin", context)
@@ -636,6 +808,7 @@ pub fn fixture_path() -> PathBuf {
 
 #[test]
 fn the_backend_drives_a_real_clap_module() {
+    let _fixture = FIXTURE.lock().unwrap();
     let path = fixture_path();
 
     // --- module and factory ------------------------------------------------

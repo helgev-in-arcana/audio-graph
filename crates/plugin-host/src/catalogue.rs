@@ -194,7 +194,12 @@ pub fn refresh(directories: &[PathBuf], cache_path: Option<&Path>) -> Vec<Module
             out.push(hit.clone());
             continue;
         }
-        out.push(scan_one(format, &path, stamp));
+        if let Some(module) = scan_one(format, &path, stamp) {
+            out.push(module);
+        } else if let Some(previous) = known.iter().find(|m| m.path == path && m.format == format) {
+            // Keep the old stamp so a deferred scan is retried after the owner releases it.
+            out.push(previous.clone());
+        }
     }
 
     // Sorted so the file is stable between runs and a diff of it means
@@ -209,9 +214,9 @@ pub fn refresh(directories: &[PathBuf], cache_path: Option<&Path>) -> Vec<Module
 }
 
 /// Opens one module and writes down what it holds.
-fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
+fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Option<Module> {
     match crate::scan::scan_module_as(format, path) {
-        Ok(classes) => Module {
+        Ok(classes) => Some(Module {
             path: path.to_path_buf(),
             format,
             stamp,
@@ -225,16 +230,20 @@ fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Module {
                 })
                 .collect(),
             error: None,
-        },
+        }),
+        Err(crate::HostError::ModuleBusy(_)) => {
+            log::debug!("plugin-host: deferring busy module {}", path.display());
+            None
+        }
         Err(e) => {
             log::warn!("plugin-host: {} could not be scanned: {e}", path.display());
-            Module {
+            Some(Module {
                 path: path.to_path_buf(),
                 format,
                 stamp,
                 classes: Vec::new(),
                 error: Some(e.to_string()),
-            }
+            })
         }
     }
 }

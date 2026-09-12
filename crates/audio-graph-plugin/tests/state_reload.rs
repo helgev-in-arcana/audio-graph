@@ -25,7 +25,7 @@ fn wires(wrapper: &Wrapper) -> usize {
 /// just opened.
 #[test]
 fn a_project_loaded_over_a_running_patch_is_read_in() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = Wrapper::default();
     let layout = fx_layout();
 

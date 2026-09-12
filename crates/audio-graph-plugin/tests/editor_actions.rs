@@ -81,9 +81,6 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
 }
 
 fn candidate_paths() -> Vec<std::path::PathBuf> {
-    // Initialize COM/STA apartment state on Windows.
-    // A test thread is not an initialized STA, but plugins assume one.
-    plugin_host::init_thread();
     if let Ok(explicit) = std::env::var("AUDIO_GRAPH_TEST_SUB") {
         return vec![std::path::PathBuf::from(explicit)];
     }
@@ -101,6 +98,7 @@ fn candidate_paths() -> Vec<std::path::PathBuf> {
 
 #[test]
 fn the_editors_actions_work_against_an_installed_plugin() {
+    let _thread = plugin_host::init_thread().unwrap();
     let Some((path, shared)) = a_plugin_with_parameters() else {
         eprintln!("no installed plugin with parameters; skipping");
         return;
@@ -410,6 +408,7 @@ fn a_graph_survives_the_state_round_trip() {
 /// socket, and drive it from the graph against a real installed plugin.
 #[test]
 fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
+    let _thread = plugin_host::init_thread().unwrap();
     use audio_graph_engine::{AudioOut, Constant, NodeKind, Plugin, PluginPorts};
 
     let Some((path, shared)) = a_plugin_with_parameters() else {

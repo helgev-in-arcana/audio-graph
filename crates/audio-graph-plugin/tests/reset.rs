@@ -25,7 +25,6 @@ const LEVEL: f32 = 0.5;
 /// No sub-plugin anywhere in it: a delay is state the engine holds itself, so
 /// this asks about the wrapper and the engine and nothing else.
 fn one_block_of_delay() -> Wrapper {
-    plugin_host::init_thread();
     let mut wrapper = Wrapper::default();
     wrapper
         .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
@@ -103,6 +102,7 @@ fn echo(wrapper: &mut Wrapper, daw: &mut Daw, between: impl FnOnce(&Wrapper, &mu
 /// on, which is the thing the user pressed it to stop.
 #[test]
 fn the_reset_button_empties_what_the_graph_is_still_holding() {
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = one_block_of_delay();
     let mut daw = Daw::playing();
 
@@ -128,6 +128,7 @@ fn the_reset_button_empties_what_the_graph_is_still_holding() {
 /// the sake of a message that only ever meant "nothing is playing".
 #[test]
 fn an_all_notes_off_does_not_empty_the_patch() {
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = one_block_of_delay();
     let mut daw = Daw::playing();
 
@@ -155,7 +156,7 @@ fn an_all_notes_off_does_not_empty_the_patch() {
 /// every key that happened to be down, for the rest of the session.
 #[test]
 fn a_reset_gives_the_daw_back_the_notes_the_graph_was_holding() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = Wrapper::default();
     wrapper
         .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
@@ -218,64 +219,68 @@ fn a_reset_gives_the_daw_back_the_notes_the_graph_was_holding() {
     );
 }
 
-/// Event loss releases DAW voices and resets native held notes before the next block.
+/// Event loss and processing failure release DAW voices and reset native held notes.
 #[test]
 fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
-    plugin_host::init_thread();
-    let mut wrapper = Wrapper::default();
-    wrapper
-        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
-        .unwrap();
-    wrapper
-        .shared()
-        .load(&harness::fixture_as_clap("event-overflow-reset"))
-        .unwrap();
-    wrapper.shared().adopt_default_patch();
-    {
-        let mut patch = wrapper.shared().patch();
-        let (plugin, note_port) = patch
-            .graph
-            .nodes
-            .iter()
-            .find_map(|node| {
-                if let NodeKind::Plugin(plugin) = &node.kind {
-                    Some((node.id, plugin.ports.audio_in.len() as u8))
-                } else {
-                    None
-                }
-            })
+    let _thread = plugin_host::init_thread().unwrap();
+    for command in [5.0, 11.0] {
+        let mut wrapper = Wrapper::default();
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
             .unwrap();
-        let input = patch.graph.add(NodeKind::NoteIn, [0.0, 200.0]);
-        patch.graph.connect(input, 0, plugin, note_port);
-    }
-    wrapper.shared().publish_graph();
-    let mut daw = Daw::playing();
-    daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
-        timing: 0,
-        voice_id: Some(42),
-        channel: 0,
-        note: 60,
-        velocity: 1.0,
-    });
-    let mut held = Block::silent(FRAMES);
-    held.process(&mut wrapper, &mut daw);
-    assert!(held.peak() > 0.0);
-    assert!(daw.outgoing.is_empty());
-    wrapper
-        .shared()
-        .main()
-        .host
-        .set_sub_param(0, plugin_host::ParamId(5), 5.0)
-        .unwrap();
-    Block::silent(FRAMES).process(&mut wrapper, &mut daw);
-    assert!(daw.outgoing.iter().any(|event| matches!(
-        event,
-        nice_plug::prelude::NoteEvent::VoiceTerminated {
-            voice_id: Some(42),
-            ..
+        wrapper
+            .shared()
+            .load(&harness::fixture_as_clap(&format!(
+                "event-failure-reset-{command}"
+            )))
+            .unwrap();
+        wrapper.shared().adopt_default_patch();
+        {
+            let mut patch = wrapper.shared().patch();
+            let (plugin, note_port) = patch
+                .graph
+                .nodes
+                .iter()
+                .find_map(|node| {
+                    if let NodeKind::Plugin(plugin) = &node.kind {
+                        Some((node.id, plugin.ports.audio_in.len() as u8))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let input = patch.graph.add(NodeKind::NoteIn, [0.0, 200.0]);
+            patch.graph.connect(input, 0, plugin, note_port);
         }
-    )));
-    let mut after = Block::silent(FRAMES);
-    after.process(&mut wrapper, &mut daw);
-    assert_eq!(after.peak(), 0.0, "the native voice must stop too");
+        wrapper.shared().publish_graph();
+        let mut daw = Daw::playing();
+        daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
+            timing: 0,
+            voice_id: Some(42),
+            channel: 0,
+            note: 60,
+            velocity: 1.0,
+        });
+        let mut held = Block::silent(FRAMES);
+        held.process(&mut wrapper, &mut daw);
+        assert!(held.peak() > 0.0);
+        assert!(daw.outgoing.is_empty());
+        wrapper
+            .shared()
+            .main()
+            .host
+            .set_sub_param(0, plugin_host::ParamId(5), command)
+            .unwrap();
+        Block::silent(FRAMES).process(&mut wrapper, &mut daw);
+        assert!(daw.outgoing.iter().any(|event| matches!(
+            event,
+            nice_plug::prelude::NoteEvent::VoiceTerminated {
+                voice_id: Some(42),
+                ..
+            }
+        )));
+        let mut after = Block::silent(FRAMES);
+        after.process(&mut wrapper, &mut daw);
+        assert_eq!(after.peak(), 0.0, "the native voice must stop too");
+    }
 }

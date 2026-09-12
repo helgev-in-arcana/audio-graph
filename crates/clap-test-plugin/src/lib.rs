@@ -113,6 +113,8 @@ pub mod ask {
     pub const RENAME: f64 = 8.0;
     pub const FAIL_METADATA: f64 = 9.0;
     pub const REQUEUE_METADATA: f64 = 10.0;
+    pub const PROCESS_ERROR: f64 = 11.0;
+    pub const REQUEST_FLUSH: f64 = 12.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -180,7 +182,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, ask::REQUEUE_METADATA).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::REQUEST_FLUSH).round(),
             _ => {}
         }
     }
@@ -193,6 +195,7 @@ pub(crate) struct Instance {
     renamed: bool,
     pending_metadata: bool,
     metadata_read: u8,
+    pending_gui: bool,
     /// The struct handed to the host. First field so the pointer the host holds
     /// is also the pointer to this allocation, which `from_host` relies on.
     raw: clap_plugin,
@@ -358,6 +361,7 @@ unsafe extern "C" fn factory_create(
         renamed: false,
         pending_metadata: false,
         metadata_read: 0,
+        pending_gui: false,
         params: Params::default(),
         held: [false; 128],
         host,
@@ -477,10 +481,15 @@ unsafe extern "C" fn plugin_process(
         return CLAP_PROCESS_ERROR;
     }
     let data = unsafe { &*process };
+    unsafe { instance.emit_gui(data.out_events) };
 
     // Events first, at offset 0 only: a fixture that honoured sample offsets
     // would be testing its own scheduler rather than the host's translation.
     unsafe { apply_events(instance, data.in_events, data.out_events) };
+    if instance.params.ask == ask::PROCESS_ERROR {
+        instance.params.ask = ask::NOTHING;
+        return CLAP_PROCESS_ERROR;
+    }
     if instance.params.ask == ask::RESTART {
         instance.params.ask = ask::NOTHING;
         if let Some(request) = unsafe { (*instance.host).request_restart } {
@@ -897,7 +906,7 @@ unsafe extern "C" fn params_get_info(
             "Ask Host",
             "",
             0.0,
-            ask::REQUEUE_METADATA,
+            ask::REQUEST_FLUSH,
             0.0,
             CLAP_PARAM_IS_STEPPED,
         ),
@@ -1023,6 +1032,7 @@ unsafe extern "C" fn params_flush(
     _out: *const clap_output_events,
 ) {
     if let Some(instance) = unsafe { Instance::from_host(plugin) } {
+        unsafe { instance.emit_gui(_out) };
         unsafe { apply_events(instance, in_, std::ptr::null()) };
         // Main thread, and — when this is the inactive flush — a moment when
         // every one of these calls is legal.
@@ -1031,6 +1041,26 @@ unsafe extern "C" fn params_flush(
 }
 
 impl Instance {
+    unsafe fn emit_gui(&mut self, output: *const clap_output_events) {
+        if !self.pending_gui || output.is_null() {
+            return;
+        }
+        self.params.gain = 0.375;
+        let mut event: clap_event_param_value = unsafe { std::mem::zeroed() };
+        event.header.size = std::mem::size_of::<clap_event_param_value>() as u32;
+        event.header.type_ = CLAP_EVENT_PARAM_VALUE;
+        event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        event.param_id = PARAM_GAIN;
+        event.note_id = -1;
+        event.port_index = -1;
+        event.channel = -1;
+        event.key = -1;
+        event.value = self.params.gain;
+        if let Some(push) = unsafe { (*output).try_push } {
+            self.pending_gui = !unsafe { push(output, &event.header) };
+        }
+    }
+
     unsafe fn metadata_changed(&self, structural: bool) {
         let Some(get) = (unsafe { (*self.host).get_extension }) else {
             return;
@@ -1077,6 +1107,16 @@ impl Instance {
             None => return,
         };
         match ask {
+            ask::REQUEST_FLUSH => {
+                self.pending_gui = true;
+                let params = unsafe { get(self.host, CLAP_EXT_PARAMS.as_ptr()) }
+                    .cast::<clap_sys::ext::params::clap_host_params>();
+                if !params.is_null()
+                    && let Some(flush) = unsafe { (*params).request_flush }
+                {
+                    unsafe { flush(self.host) };
+                }
+            }
             ask::CHANGE_LAYOUT if self.active => {
                 self.pending_metadata = true;
                 if let Some(request) = unsafe { (*self.host).request_restart } {
