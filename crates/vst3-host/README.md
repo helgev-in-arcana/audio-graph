@@ -12,7 +12,8 @@ else lives here.
 - Translating between VST3's vocabulary and the shared one in `plugin-host-api`:
   parameter ids and normalised values, note expressions, bus layouts, process
   contexts, state streams.
-- Handing out the raw `IPlugView` for an editor — and nothing further.
+- Creating `Vst3View`, an owning view handle that keeps its instance and module alive.
+- Synchronizing controller edits, processor automation, and native parameter output.
 
 ## Not this crate's job
 
@@ -22,22 +23,27 @@ else lives here.
   `plugin-host`, not here.
 - **Anything about nesting.** No transport forwarding, no latency arithmetic, no
   slot tables. This crate does not know a DAW is above it.
-- **Providing host services.** `IHostApplication` and friends are *injected*
-  through `plugin_host_api::HostContext`; this crate never builds its own.
+- **Choosing host policy.** The caller supplies `plugin_host_api::HostContext`;
+  this backend implements the native `IHostApplication` and callback shims.
 
 ## Invariants
 
 - **The two-trait split is the activation gate.** `Vst3Plugin` is the
-  main-thread half and `activate` yields `Vst3Processor` by value, so a processor
+  main-thread half and `activate` yields an owning `Processor`, so a processor
   cannot exist before the sequence that makes one valid has run.
-- **The processing containers are sized before any audio runs.** The sub-block
-  quantiser bounds how many parameter points a block can carry, so the ceilings
-  are fixed rather than derived and `process` never allocates.
+- **The processing containers are sized before any audio runs.** Input batches
+  that exceed capacity or violate event timing are rejected before native processing.
+  Main-thread edits remain queued until a complete batch can be delivered.
+- **Successful activation matches the requested buses.** The backend verifies
+  native arrangements and channel counts; it does not silently substitute stereo.
 - **The host context is module-scoped.** The factory keeps the pointer it is
-  given for the module's whole lifetime, and on Linux it is also where a plugin
-  picks up its run loop — so it must outlive any editor.
+  given for the module's whole lifetime. Each binary has one owner thread within
+  this backend; another thread receives `HostError::ModuleBusy` until it is released.
+- **Thread initialization has an owner.** Hold the `ApartmentGuard` returned by
+  `init_apartment()` until every plugin, view and returned processor is released.
+  An incompatible Windows apartment is reported as an error.
 - **Component and controller are connected only when they are distinct
   objects.** A single object implementing both would be connected to itself,
   which plugins do not expect and at least one corrupts its heap over.
-- **No VST3 type reaches a public signature outside this crate**, with the single
-  deliberate exception of the `IPlugView` handed to `vst3-host-view`.
+- **The editor seam owns native lifetime.** `vst3-host-view` receives `Vst3View`.
+  Its raw pointer is borrowed; derived native references must not outlive the handle.
