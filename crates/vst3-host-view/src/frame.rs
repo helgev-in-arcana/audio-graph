@@ -170,11 +170,14 @@ mod run_loop {
         pub(super) fn dispatch(&self) {
             self.events.dispatch(|handler, fd, _| {
                 if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
+                    // A callback may unregister itself and release the plugin's last reference.
+                    let handler = handler.to_com_ptr();
                     unsafe { handler.onFDIsSet(fd) };
                 }
             });
             self.timers.dispatch(|handler| {
                 if let Some(handler) = unsafe { vst3::ComRef::from_raw(handler) } {
+                    let handler = handler.to_com_ptr();
                     unsafe { handler.onTimer() };
                 }
             });
