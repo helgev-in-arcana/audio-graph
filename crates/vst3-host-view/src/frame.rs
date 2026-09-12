@@ -26,6 +26,18 @@ use host_window::Size;
 ///
 /// A handle, not the object: what the plugin holds references to is the
 /// `FrameImpl` inside, and it outlives this if the plugin kept one.
+///
+/// The frame's UI state cannot be shared with another thread.
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<vst3_host_view::PlugFrame>();
+/// ```
+///
+/// ```compile_fail
+/// let frame = vst3_host_view::PlugFrame::new();
+/// std::thread::spawn(move || frame.take_requested_size());
+/// ```
 pub struct PlugFrame(ComWrapper<FrameImpl>);
 
 /// The COM object, and everything the frame remembers.
@@ -38,13 +50,6 @@ pub struct FrameImpl {
     #[cfg(all(unix, not(target_os = "macos")))]
     run_loop: run_loop::RunLoop,
 }
-
-// SAFETY: `Cell` is not `Sync`, and this object has to be because the COM
-// wrapper is. VST3 confines every call on `IPlugFrame` — and, on Linux, on
-// `IRunLoop` — to the UI thread, which is also the only thread `EditorWindow`
-// touches it from, so there is never a second thread to race with.
-unsafe impl Send for FrameImpl {}
-unsafe impl Sync for FrameImpl {}
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 impl Class for FrameImpl {
@@ -158,11 +163,6 @@ mod run_loop {
         events: FdWatch<*mut IEventHandler>,
         timers: TimerWheel<*mut ITimerHandler>,
     }
-
-    // SAFETY: the same argument as `FrameImpl`'s — these are COM pointers the
-    // UI thread owns and no other thread ever sees.
-    unsafe impl Send for RunLoop {}
-    unsafe impl Sync for RunLoop {}
 
     impl RunLoop {
         /// Tell the plugin about every descriptor that has data and every timer
