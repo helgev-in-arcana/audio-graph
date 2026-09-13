@@ -18,7 +18,8 @@
 use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp, Span,
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp, NoteStream,
+    NoteStreamKind, Span,
 };
 use crate::nodes::NodeKind;
 
@@ -52,6 +53,7 @@ struct Pending {
 pub(crate) struct Notes {
     pub ops: Vec<NoteOp>,
     pub bufs: u16,
+    pub streams: Vec<NoteStream>,
     /// Which stage each op belongs to, and the spans that fall out of it once
     /// `resolve_lanes` has dropped the ops whose lane never materialised.
     stages: Vec<usize>,
@@ -90,6 +92,7 @@ pub(crate) fn compile_notes(
     let mut notes = Notes {
         ops: Vec::new(),
         bufs: 0,
+        streams: Vec::new(),
         stages: Vec::new(),
         spans: Vec::new(),
         outputs: Vec::new(),
@@ -144,7 +147,12 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
     drop.sort_unstable();
     drop.dedup();
     for op in drop.into_iter().rev() {
-        notes.ops.remove(op);
+        let out = match notes.ops.remove(op) {
+            NoteOp::Input { out, .. } | NoteOp::Filter { out, .. } | NoteOp::Emit { out, .. } => {
+                out
+            }
+        };
+        notes.streams[usize::from(out)].kind = NoteStreamKind::Empty;
         notes.stages.remove(op);
     }
 
@@ -184,7 +192,15 @@ fn route(
     kind: &NodeKind,
 ) -> Result<(), CompileError> {
     if let Some(bus) = kind.note_source() {
-        let out = alloc_buf(notes)?;
+        let out = alloc_buf(
+            notes,
+            NoteStream {
+                node: id,
+                port: 0,
+                source: None,
+                kind: NoteStreamKind::Input(bus),
+            },
+        )?;
         notes.ops.push(NoteOp::Input { out, bus });
         notes.outputs.push(((id, 0), out));
         return Ok(());
@@ -204,7 +220,15 @@ fn route(
             .and_then(|input| notes.source_of(graph, id, input));
 
         if let Some((channel, cc)) = kind.note_emits(port) {
-            let out = alloc_buf(notes)?;
+            let out = alloc_buf(
+                notes,
+                NoteStream {
+                    node: id,
+                    port,
+                    source: a,
+                    kind: NoteStreamKind::Emit { channel, cc },
+                },
+            )?;
             let state = alloc_state(notes)?;
             notes.ops.push(NoteOp::Emit {
                 a,
@@ -241,7 +265,20 @@ fn route(
         let out = if passes_everything {
             a
         } else {
-            let out = alloc_buf(notes)?;
+            let out = alloc_buf(
+                notes,
+                NoteStream {
+                    node: id,
+                    port,
+                    source: Some(a),
+                    kind: NoteStreamKind::Filter {
+                        gated,
+                        mute,
+                        channels,
+                        controllers,
+                    },
+                },
+            )?;
             notes.ops.push(NoteOp::Filter {
                 a,
                 out,
@@ -274,7 +311,7 @@ fn readers_of(graph: &Graph, order: &[NodeId], node: NodeId, port: u8) -> usize 
         .count()
 }
 
-fn alloc_buf(notes: &mut Notes) -> Result<NoteBuf, CompileError> {
+fn alloc_buf(notes: &mut Notes, stream: NoteStream) -> Result<NoteBuf, CompileError> {
     if usize::from(notes.bufs) >= MAX_NOTE_BUFS {
         return Err(CompileError::TooLarge {
             what: "note buffers",
@@ -283,6 +320,7 @@ fn alloc_buf(notes: &mut Notes) -> Result<NoteBuf, CompileError> {
     }
     let buf = notes.bufs;
     notes.bufs += 1;
+    notes.streams.push(stream);
     Ok(buf)
 }
 

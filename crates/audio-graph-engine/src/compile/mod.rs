@@ -190,6 +190,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_ops: audio.ops,
         note_ops: notes.ops,
         note_bufs: notes.bufs,
+        note_streams: notes.streams,
         param_targets: param.param_targets,
         audio_lane_base: (slot_count + crate::ir::MAX_GRAPH_PARAMS) as u16,
         instances: audio.instances,

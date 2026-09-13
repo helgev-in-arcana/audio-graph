@@ -4,6 +4,117 @@ use audio_graph_engine::{
 };
 use subhost_adapter::{NoInstances, SlotSchedule};
 
+/// An unrelated filter edit cannot reset held notes on a branch whose buffers moved.
+#[test]
+fn note_state_follows_stream_identity_across_coalesced_publications() {
+    use audio_graph_engine::{Follow, NoteFilter, NoteFollow, ParamPort, Plugin, PluginPorts};
+    use plugin_host::{Event, NoteEvent};
+    let mut graph = Graph::new();
+    let input = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let filters = [
+        graph.add(NodeKind::NoteFilter(NoteFilter::default()), [0.0; 2]),
+        graph.add(
+            NodeKind::NoteFilter(NoteFilter {
+                channels: vec![1],
+                ..Default::default()
+            }),
+            [0.0; 2],
+        ),
+    ];
+    let sink = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: (0..2)
+                    .map(|id| ParamPort {
+                        id,
+                        name: String::new(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        }),
+        [0.0; 2],
+    );
+    for (port, filter) in filters.into_iter().enumerate() {
+        let follow = graph.add(
+            NodeKind::NoteFollow(NoteFollow { what: Follow::Gate }),
+            [0.0; 2],
+        );
+        graph.connect(input, 0, filter, 0);
+        graph.connect(filter, 0, follow, 0);
+        graph.connect(follow, 0, sink, port as u8);
+    }
+    let publisher = ProgramPublisher::default();
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    let program = compile(&graph, 0).unwrap();
+    let targets = program.param_targets().to_vec();
+    publisher.publish(program, 48_000.0);
+    assert!(engine.adopt(&publisher));
+    let mut schedule = SlotSchedule::new(MAX_GRAPH_PARAMS + MAX_AUDIO_LANES, 64, 32).unwrap();
+    let run = |engine: &mut Engine, schedule: &mut SlotSchedule, events: &[Event]| {
+        assert!(engine.run_block(
+            schedule,
+            &[],
+            events,
+            64,
+            32,
+            48_000.0,
+            120.0,
+            &[],
+            &mut [],
+            &mut NoInstances
+        ));
+        engine.end_block(&[], &mut Vec::with_capacity(256));
+        [schedule.block(0)[0], schedule.block(0)[1]]
+    };
+    let on = Event::Note(NoteEvent::NoteOn {
+        note_id: Some(17),
+        port: 0,
+        channel: 1,
+        key: 60,
+        velocity: 0.5,
+        sample_offset: 40,
+    });
+    run(&mut engine, &mut schedule, &[on]);
+    assert_eq!(run(&mut engine, &mut schedule, &[]), [1.0, 1.0]);
+    for (channels, expected) in [(vec![0], [0.0, 1.0]), (vec![], [1.0, 1.0])] {
+        let NodeKind::NoteFilter(filter) = &mut graph.node_mut(filters[0]).unwrap().kind else {
+            unreachable!()
+        };
+        filter.channels = channels;
+        let mut skipped = graph.clone();
+        let NodeKind::NoteFilter(filter) = &mut skipped.node_mut(filters[1]).unwrap().kind else {
+            unreachable!()
+        };
+        filter.channels = vec![2];
+        publisher.publish(compile(&skipped, 0).unwrap(), 48_000.0);
+        let program = compile(&graph, 0).unwrap();
+        assert_eq!(program.param_targets(), targets);
+        publisher.publish(program, 48_000.0);
+        assert!(engine.adopt(&publisher));
+        assert_eq!(run(&mut engine, &mut schedule, &[]), expected);
+    }
+    let replacement_input = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    graph.connect(replacement_input, 0, filters[1], 0);
+    publisher.publish(compile(&graph, 0).unwrap(), 48_000.0);
+    engine.adopt(&publisher);
+    assert_eq!(run(&mut engine, &mut schedule, &[]), [1.0, 0.0]);
+    graph.connect(input, 0, filters[1], 0);
+    publisher.publish(compile(&graph, 0).unwrap(), 48_000.0);
+    engine.adopt(&publisher);
+    run(&mut engine, &mut schedule, &[on]);
+    assert_eq!(run(&mut engine, &mut schedule, &[]), [1.0, 1.0]);
+    let NodeKind::NoteFilter(filter) = &mut graph.node_mut(filters[1]).unwrap().kind else {
+        unreachable!()
+    };
+    filter.channels = vec![2];
+    publisher.publish(compile(&graph, 0).unwrap(), 48_000.0);
+    engine.adopt(&publisher);
+    assert_eq!(run(&mut engine, &mut schedule, &[]), [1.0, 0.0]);
+}
+
 /// Publication identifiers describe adoption and remain ordered across activation resets.
 #[test]
 fn publication_identity_follows_the_adopted_program() {

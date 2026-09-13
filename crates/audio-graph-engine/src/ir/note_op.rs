@@ -44,6 +44,31 @@ pub const ALL_CONTROLLERS: u128 = u128::MAX;
 /// Ceiling on the ops that remember the last value they sent.
 pub const MAX_NOTE_EMITS: usize = 16;
 
+/// Buffer numbers move with compilation; a stream is its producer and upstream meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NoteStream {
+    pub node: super::NodeId,
+    pub port: u8,
+    pub source: Option<NoteBuf>,
+    pub kind: NoteStreamKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteStreamKind {
+    Empty,
+    Input(u16),
+    Filter {
+        gated: bool,
+        mute: u128,
+        channels: u16,
+        controllers: u128,
+    },
+    Emit {
+        channel: u8,
+        cc: u8,
+    },
+}
+
 /// One step of the note half of a program.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteOp {
