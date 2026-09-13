@@ -88,3 +88,88 @@ fn a_project_loaded_over_a_running_patch_is_read_in() {
 
     wrapper.deactivate();
 }
+
+/// Unavailable plugins preserve every saved socket and wire until native processing can resume.
+#[test]
+fn unavailable_plugins_keep_their_wiring_through_save_and_recovery() {
+    use audio_graph_engine::{Constant, Graph, NodeKind, ParamPort};
+    use audio_graph_plugin::WrapperState;
+    use harness::{Block, Daw};
+
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper
+        .shared()
+        .load(&fixture_as_clap("missing-wiring"))
+        .unwrap();
+    wrapper.shared().adopt_default_patch();
+    {
+        let mut patch = wrapper.shared().patch();
+        let (id, note_port, param_port) = patch
+            .graph
+            .nodes
+            .iter_mut()
+            .find_map(|node| {
+                let NodeKind::Plugin(plugin) = &mut node.kind else {
+                    return None;
+                };
+                assert!(plugin.ports.accepts_notes);
+                plugin.ports.params.push(ParamPort {
+                    id: 0,
+                    name: "Gain".into(),
+                });
+                let note_port = plugin.ports.audio_in.len() as u8;
+                Some((node.id, note_port, note_port + 1))
+            })
+            .unwrap();
+        let notes = patch.graph.add(NodeKind::NoteIn, [0.0; 2]);
+        let value = patch
+            .graph
+            .add(NodeKind::Constant(Constant { value: 0.75 }), [0.0; 2]);
+        patch.graph.connect(notes, 0, id, note_port);
+        patch.graph.connect(value, 0, id, param_port);
+    }
+    wrapper.shared().publish_graph();
+    wrapper.store_state();
+    let original: WrapperState =
+        serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+    let original_graph: Graph = serde_json::from_value(original.graph.clone().unwrap()).unwrap();
+    assert_eq!(original_graph.links.len(), 4);
+
+    for unsupported_format in [true, false] {
+        let mut missing = original.clone();
+        if unsupported_format {
+            missing.sub_plugins[0].reference.format = "unavailable-format".into();
+        } else {
+            missing.sub_plugins[0].state = Some("AQID".into());
+        }
+        *wrapper.wrapper_params().state.0.write().unwrap() =
+            serde_json::to_string(&missing).unwrap();
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        assert!(!wrapper.shared().main().host.is_loaded(0));
+        let mut block = Block::silent(64);
+        block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+        assert_eq!(block.peak(), 0.0);
+        wrapper.store_state();
+        let retained: WrapperState =
+            serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+        assert_eq!(retained.sub_plugins, missing.sub_plugins);
+        assert_eq!(retained.graph, original.graph);
+
+        *wrapper.wrapper_params().state.0.write().unwrap() =
+            serde_json::to_string(&original).unwrap();
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        assert!(wrapper.shared().main().host.is_loaded(0));
+        block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+        assert_eq!(block.peak(), 0.375);
+        assert_eq!(wrapper.shared().patch().graph, original_graph);
+    }
+    wrapper.deactivate();
+}

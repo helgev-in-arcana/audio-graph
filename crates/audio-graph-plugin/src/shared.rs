@@ -711,6 +711,10 @@ impl Shared {
         // are never held at once for a question that needs only one of them.
         let (layout, latency) = {
             let state = self.main();
+            // An unavailable instance still owns its saved sockets and wiring.
+            if !state.host.is_loaded(instance) {
+                return;
+            }
             (
                 state.host.io_layout(instance),
                 state.host.sub_latency(instance),
