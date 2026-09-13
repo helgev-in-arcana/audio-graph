@@ -396,7 +396,7 @@ impl Node for Plugin {
     #[cfg(feature = "ui")]
     fn ui_title(&self, cx: &NodeUi<'_>) -> String {
         match cx.instances.get(self.instance) {
-            Some(view) if view.loaded && !view.name.is_empty() => {
+            Some(view) if !view.name.is_empty() => {
                 format!("{}: {}", self.instance + 1, view.name)
             }
             _ => self.title(),

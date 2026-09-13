@@ -30,6 +30,8 @@ pub struct SubHost {
     /// Empty entries stay empty rather than being closed up: callers name an
     /// instance by index, so renumbering would repoint every one of them.
     instances: Vec<Option<MainThread<Loaded>>>,
+    /// Document entries survive unavailable modules and failed native state operations.
+    saved: Vec<InstanceState>,
     slots: SlotTable,
     context: Arc<dyn HostContext>,
     /// Latency in samples for each instance, cached so the DAW can be answered
@@ -69,6 +71,7 @@ impl SubHost {
     pub fn new(context: Arc<dyn HostContext>, config: SubHostConfig) -> SubHost {
         SubHost {
             instances: Vec::new(),
+            saved: Vec::new(),
             slots: SlotTable::new(config.slot_count),
             config,
             context,
@@ -171,9 +174,12 @@ impl SubHost {
         self.latencies.get(instance).copied().unwrap_or(0)
     }
 
-    /// Returns the reference metadata for the loaded sub-plugin at `instance`.
+    /// Returns the saved identity even when its native plugin is unavailable.
     pub fn reference(&self, instance: usize) -> Option<&SubPluginRef> {
-        self.at(instance).map(|l| &l.reference)
+        self.saved
+            .iter()
+            .find(|e| e.instance == instance)
+            .map(|e| &e.reference)
     }
 
     /// Returns the capabilities of the loaded sub-plugin at `instance`.
@@ -202,6 +208,9 @@ impl SubHost {
             .refresh_metadata()
             .map_err(|e| e.to_string())?;
         self.resolve_instance_slots(instance);
+        if let Some(entry) = self.saved.iter_mut().find(|e| e.instance == instance) {
+            entry.state = Some(crate::state::base64_encode(blob));
+        }
         Ok(())
     }
 
@@ -236,7 +245,7 @@ impl SubHost {
     /// Reused rather than always-increasing, so that dropping one sub-plugin
     /// and adding another does not walk off the end of `max_instances`.
     pub fn free_instance(&self) -> Option<usize> {
-        (0..self.config.max_instances).find(|&i| !self.is_loaded(i))
+        (0..self.config.max_instances).find(|&i| self.reference(i).is_none())
     }
 
     pub fn params(&self, instance: usize) -> &[ParamInfo] {
@@ -283,11 +292,21 @@ impl SubHost {
             &reference.plugin_id,
             SubPluginMain::params(&plugin),
         );
+        self.remember(InstanceState {
+            instance,
+            reference: reference.clone(),
+            state: None,
+        });
         self.instances[instance] = Some(MainThread::new(Loaded { plugin, reference }));
         Ok(())
     }
 
     pub fn unload(&mut self, instance: usize) {
+        self.detach(instance);
+        self.saved.retain(|entry| entry.instance != instance);
+    }
+
+    fn detach(&mut self, instance: usize) {
         // Dropping the entry tears down editor, instance and module in that
         // order — see the note on `Loaded`.
         if let Some(slot) = self.instances.get_mut(instance) {
@@ -303,6 +322,7 @@ impl SubHost {
 
     pub fn unload_all(&mut self) {
         self.instances.clear();
+        self.saved.clear();
         self.latencies.clear();
         self.slots.unresolve_all();
     }
@@ -588,34 +608,36 @@ impl SubHost {
     /// callbacks rather than immediately; without the tick, such a plugin
     /// saves the values it held before the last edit.
     pub fn save_state(&mut self) -> SubHostState {
-        let mut state = SubHostState {
-            slots: self.slots.to_state(),
-            instances: Vec::new(),
-        };
-        for instance in 0..self.instances.len() {
+        for index in 0..self.saved.len() {
+            let instance = self.saved[index].instance;
             if let Some(loaded) = self.at_mut(instance) {
                 loaded.plugin.tick();
             }
             let Some(loaded) = self.at(instance) else {
                 continue;
             };
-            // The wrapper's own state is still worth saving when a plugin
-            // will not give up its own: losing the graph and the bindings as
-            // well would turn one plugin's failure into a lost project.
-            let bytes = match loaded.plugin.save_state() {
-                Ok(bytes) => Some(bytes),
+            match loaded.plugin.save_state() {
+                Ok(bytes) => self.saved[index].state = Some(crate::state::base64_encode(&bytes)),
                 Err(e) => {
                     log::error!("sub-plugin {instance} state could not be saved: {e}");
-                    None
                 }
-            };
-            state.instances.push(InstanceState {
-                instance,
-                reference: loaded.reference.clone(),
-                state: bytes.as_deref().map(crate::state::base64_encode),
-            });
+            }
         }
-        state
+        SubHostState {
+            slots: self.slots.to_state(),
+            instances: self.saved.clone(),
+        }
+    }
+
+    fn remember(&mut self, entry: InstanceState) {
+        match self
+            .saved
+            .iter_mut()
+            .find(|old| old.instance == entry.instance)
+        {
+            Some(old) => *old = entry,
+            None => self.saved.push(entry),
+        }
     }
 
     /// Restores sub-host state, attempting to locate and reload each saved sub-plugin instance.
@@ -633,31 +655,24 @@ impl SubHost {
 
         for entry in &state.instances {
             let reference = &entry.reference;
-            let Some(path) = Self::resolve_reference(reference, search_directories) else {
+            let result = (|| {
+                self.reserve(entry.instance)?;
+                let path = Self::resolve_reference(reference, search_directories)
+                    .ok_or("plugin could not be found")?;
+                self.load(entry.instance, &path, Some(&reference.plugin_id))?;
+                if entry.state.is_some() {
+                    let bytes = entry.state_bytes().ok_or("invalid saved state encoding")?;
+                    self.load_sub_state(entry.instance, &bytes)?;
+                }
+                Ok::<_, String>(())
+            })();
+            if let Err(error) = result {
+                self.detach(entry.instance);
+                self.remember(entry.clone());
                 problems.push(format!(
-                    "{} could not be found; its slot bindings are kept and will \
-                     resolve if it is reinstalled",
+                    "{}: {error}; saved settings are retained",
                     reference.display_name
                 ));
-                continue;
-            };
-            if let Err(e) = self.load(entry.instance, &path, Some(&reference.plugin_id)) {
-                problems.push(format!("could not load {}: {e}", reference.display_name));
-                continue;
-            }
-            match entry.state_bytes() {
-                Some(bytes) => {
-                    if let Err(e) = self.load_sub_state(entry.instance, &bytes) {
-                        problems.push(format!(
-                            "{} loaded but its settings did not restore: {e}",
-                            reference.display_name
-                        ));
-                    }
-                }
-                None => problems.push(format!(
-                    "{} loaded but no settings were saved",
-                    reference.display_name
-                )),
             }
         }
 

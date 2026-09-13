@@ -115,6 +115,7 @@ pub mod ask {
     pub const REQUEUE_METADATA: f64 = 10.0;
     pub const PROCESS_ERROR: f64 = 11.0;
     pub const REQUEST_FLUSH: f64 = 12.0;
+    pub const FAIL_SAVE: f64 = 13.0;
 }
 
 /// Bit positions in [`PARAM_ACTIVE_PORTS`].
@@ -182,7 +183,7 @@ impl Params {
             PARAM_OFFSET => self.offset = value.clamp(-1.0, 1.0),
             PARAM_MODE => self.mode = value.clamp(0.0, 2.0).round(),
             PARAM_LATENCY => self.latency = value.clamp(0.0, 512.0).round(),
-            PARAM_ASK => self.ask = value.clamp(0.0, ask::REQUEST_FLUSH).round(),
+            PARAM_ASK => self.ask = value.clamp(0.0, ask::FAIL_SAVE).round(),
             _ => {}
         }
     }
@@ -196,6 +197,7 @@ pub(crate) struct Instance {
     pending_metadata: bool,
     metadata_read: u8,
     pending_gui: bool,
+    fail_save: bool,
     /// The struct handed to the host. First field so the pointer the host holds
     /// is also the pointer to this allocation, which `from_host` relies on.
     raw: clap_plugin,
@@ -362,6 +364,7 @@ unsafe extern "C" fn factory_create(
         pending_metadata: false,
         metadata_read: 0,
         pending_gui: false,
+        fail_save: false,
         params: Params::default(),
         held: [false; 128],
         host,
@@ -906,7 +909,7 @@ unsafe extern "C" fn params_get_info(
             "Ask Host",
             "",
             0.0,
-            ask::REQUEST_FLUSH,
+            ask::FAIL_SAVE,
             0.0,
             CLAP_PARAM_IS_STEPPED,
         ),
@@ -1107,6 +1110,7 @@ impl Instance {
             None => return,
         };
         match ask {
+            ask::FAIL_SAVE => self.fail_save = true,
             ask::REQUEST_FLUSH => {
                 self.pending_gui = true;
                 let params = unsafe { get(self.host, CLAP_EXT_PARAMS.as_ptr()) }
@@ -1288,6 +1292,9 @@ unsafe extern "C" fn state_save(plugin: *const clap_plugin, stream: *const clap_
     let (Some(instance), false) = (unsafe { Instance::from_host(plugin) }, stream.is_null()) else {
         return false;
     };
+    if std::mem::take(&mut instance.fail_save) {
+        return false;
+    }
     let Some(write) = (unsafe { (*stream).write }) else {
         return false;
     };
