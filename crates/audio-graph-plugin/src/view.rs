@@ -47,7 +47,6 @@ impl View {
         self.class = host.class(0).map(|c| (c.name.clone(), c.vendor.clone()));
         self.loaded = host.is_loaded(0);
         self.poly_modulation = host.capabilities(0).poly_modulation;
-        self.free_instance = host.free_instance();
 
         // Whether a sub-plugin's window is open changes with nobody asking:
         // the user can close it from its own title bar, and the only thing that

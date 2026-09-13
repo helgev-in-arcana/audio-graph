@@ -24,7 +24,7 @@ pub use config::{LANES, MAX_INSTANCES, SLOT_COUNT, SUB_HOST};
 pub use host_context::WrapperHostContext;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
-pub use shared::{MainState, Shared};
+pub use shared::{GraphEdit, MainState, Shared};
 pub use state::{STATE_VERSION, WrapperState};
 
 /// The effect form: audio in, audio out.

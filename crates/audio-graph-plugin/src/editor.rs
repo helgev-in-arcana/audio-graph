@@ -38,27 +38,14 @@ use nice_plug::editor::dpi::LogicalSize;
 use nice_plug_egui::{EguiEditorState, NiceEguiApp, RepaintNotifier};
 
 use crate::graph_ui::{GraphContext, GraphEditor, PluginKind};
-use crate::shared::Shared;
+use crate::shared::{GraphEdit, Shared};
 use crate::view::View;
 
 /// Action requested by the UI to be executed after the current frame finishes.
 enum Command {
-    /// A plugin node was added: load into `instance` and configure `node` with
-    /// the discovered ports and buses.
-    LoadPlugin {
-        node: audio_graph_engine::NodeId,
-        instance: usize,
-        path: PathBuf,
-    },
-    UnloadInstance(usize),
+    EditGraph(u64, GraphEdit),
     OpenSub(usize),
     CloseSub(usize),
-    /// The graph structure or parameters changed: recompile, publish, and save state.
-    ///
-    /// Graph mutations occur inline on the main thread, while the downstream work
-    /// (recompilation and serialization) is deferred to run once per frame.
-    GraphEdited,
-    NewGraph(u64),
     SetQuantum(u32),
     /// Throw away everything the running graph remembers.
     Reset,
@@ -293,20 +280,21 @@ impl WrapperEditor {
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = self.shared.restore_error() {
+        let mut patch = self.shared.patch();
+        let document = patch.document;
+        if let Some(error) = &patch.restore_error {
             ui.heading("Saved graph could not be opened");
             ui.label(error);
             ui.label("The saved data is preserved. Load a compatible preset or replace it with a new graph.");
             if ui.button("Replace with a new graph").clicked() {
                 self.commands
-                    .push(Command::NewGraph(self.shared.generation()));
+                    .push(Command::EditGraph(document, GraphEdit::Reset));
             }
             return;
         }
         // The canvas edits the graph in place: it is plain data behind a lock
         // and needs no particular thread. What must not happen inline is the
-        // *consequence* of an edit — see `Command::GraphEdited`.
-        let mut patch = self.shared.patch();
+        // *consequence* of an edit — see `GraphEdit::Publish`.
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
@@ -326,16 +314,7 @@ impl WrapperEditor {
         // window. Same reason as everything else here — see the module comment.
         for action in self.graph_ui.take_actions() {
             self.commands.push(match action {
-                crate::graph_ui::GraphAction::LoadPlugin {
-                    node,
-                    instance,
-                    path,
-                } => Command::LoadPlugin {
-                    node,
-                    instance,
-                    path,
-                },
-                crate::graph_ui::GraphAction::UnloadInstance(i) => Command::UnloadInstance(i),
+                crate::graph_ui::GraphAction::Edit(edit) => Command::EditGraph(document, edit),
                 crate::graph_ui::GraphAction::OpenSubEditor(i) => Command::OpenSub(i),
                 crate::graph_ui::GraphAction::CloseSubEditor(i) => Command::CloseSub(i),
                 // Not a command: writing the config touches no window and
@@ -357,7 +336,8 @@ impl WrapperEditor {
         }
 
         if changed {
-            self.commands.push(Command::GraphEdited);
+            self.commands
+                .push(Command::EditGraph(document, GraphEdit::Publish));
         }
     }
 
@@ -585,27 +565,15 @@ impl WrapperEditor {
 /// comment for why that distinction is fatal rather than stylistic.
 fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Command>) {
     for command in commands {
-        if let Command::NewGraph(generation) = &command
-            && *generation != shared.generation()
-        {
-            continue;
-        }
         // Anything below can change what the editor should be showing, and it
         // draws from a snapshot rather than from the lock.
         shared.changed();
         match command {
-            Command::NewGraph(_) => match shared.start_new_graph() {
-                Ok(()) => status.set("new graph started"),
-                Err(error) => status.set(error),
+            Command::EditGraph(document, edit) => match shared.edit_graph(document, edit) {
+                Ok(true) => status.set("graph applied"),
+                Ok(false) => {}
+                Err(error) => status.set(format!("graph edit: {error}")),
             },
-            Command::GraphEdited => {
-                shared.publish_graph();
-                shared.store_state();
-                match shared.patch().compile_error.clone() {
-                    Some(e) => status.set(format!("graph not applied: {e}")),
-                    None => status.set("graph applied"),
-                }
-            }
             Command::Reset => {
                 // Not carried out here: the state belongs to the engine, which
                 // only the audio thread may touch. This leaves a note for the
@@ -617,27 +585,6 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 shared.set_quantum(quantum);
                 shared.store_state();
                 status.set(format!("modulation rate {quantum} samples"));
-            }
-            Command::LoadPlugin {
-                node,
-                instance,
-                path,
-            } => {
-                match shared.load_into(instance, &path) {
-                    Ok(()) => status.set(format!("loaded {}", path.display())),
-                    // Failure is not fatal: the node remains with no sockets and an error state,
-                    // preserving graph connectivity.
-                    Err(e) => status.set(format!("load failed: {e}")),
-                }
-                // Either way — a plugin that failed to load has no buses, and
-                // the node has to stop showing the ones it used to have.
-                shared.discover_ports(node);
-                shared.store_state();
-            }
-            Command::UnloadInstance(instance) => {
-                shared.unload_instance(instance);
-                shared.store_state();
-                status.set(format!("instance {} unloaded", instance + 1));
             }
             Command::OpenSub(instance) => {
                 let result = shared
@@ -864,21 +811,21 @@ mod command_tests {
         let wrapper = crate::Wrapper::default();
         let shared = wrapper.shared();
         shared.retain_state("first", "first error".into());
-        let first = shared.generation();
+        let first = shared.document_generation();
         shared.retain_state("second", "second error".into());
         run(
             shared,
             &Status::default(),
             0,
-            vec![Command::NewGraph(first)],
+            vec![Command::EditGraph(first, GraphEdit::Reset)],
         );
         assert_eq!(shared.restore_error().as_deref(), Some("second error"));
-        let current = shared.generation();
+        let current = shared.document_generation();
         run(
             shared,
             &Status::default(),
             0,
-            vec![Command::NewGraph(current)],
+            vec![Command::EditGraph(current, GraphEdit::Reset)],
         );
         assert!(shared.restore_error().is_none());
     }

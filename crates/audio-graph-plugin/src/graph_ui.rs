@@ -7,22 +7,18 @@
 //! stack back a release. A canvas is a few hundred lines; that trade is not
 //! close.
 //!
-//! Everything here runs on the main thread and edits [`Graph`] in place. That
-//! is safe in a way the rest of the editor is not (see [`crate::editor`]):
-//! moving a node or changing a number touches no window and dispatches no
-//! platform message, so there is no reentrancy to defer around. Only the
-//! *result* — recompiling and publishing — is worth doing once at the end of
-//! the frame rather than on every mutation, and that is what the returned
-//! `changed` flag is for.
+//! Values and wires can be edited inline because they touch no native object.
+//! Adding plugins, removing nodes, and replacing the document are deferred so
+//! the main thread can update the graph and its native children together.
 
 use std::path::PathBuf;
 
 use audio_graph_engine::{
-    Graph, NODE_WIDTH, NodeAction, NodeGroup, NodeId, NodeKind, NodeUi, Plugin, PluginPorts,
-    PortType, Remove, catalogue,
+    Graph, NODE_WIDTH, NodeAction, NodeGroup, NodeId, NodeUi, PortType, Remove, catalogue,
 };
 
 use crate::config::SLOT_COUNT;
+use crate::shared::GraphEdit;
 /// Re-exported so the wrapper fills one in without naming two crates. It is
 /// the engine's type: what a plugin node draws is the engine's business now.
 pub use audio_graph_engine::InstanceView;
@@ -131,14 +127,7 @@ impl PluginTab {
 /// a window — see the module comment on [`crate::editor`] for why that must not
 /// happen inside a draw callback.
 pub enum GraphAction {
-    /// Load `path` into `instance` and configure `node` with the discovered
-    /// ports and buses.
-    LoadPlugin {
-        node: NodeId,
-        instance: usize,
-        path: PathBuf,
-    },
-    UnloadInstance(usize),
+    Edit(GraphEdit),
     OpenSubEditor(usize),
     CloseSubEditor(usize),
     /// Pin or unpin a module in the add-node menu. The canvas cannot do it
@@ -156,8 +145,7 @@ pub struct GraphContext<'a> {
     pub plugins: &'a [PluginEntry],
     /// Indexed by instance number, so a plugin node can look itself up.
     pub instances: &'a [InstanceView],
-    /// The lowest instance number nothing is loaded into, or `None` when the
-    /// wrapper is full.
+    /// Availability hint; the main thread assigns the instance when it executes the edit.
     pub free_instance: Option<usize>,
     /// Slot index → the sub-plugin parameter it drives, for the ones that have
     /// one. Shown on slot nodes so the graph reads as "drive the filter cutoff"
@@ -232,7 +220,7 @@ impl GraphEditor {
     pub fn ui(&mut self, ui: &mut egui::Ui, graph: &mut Graph, ctx: &GraphContext<'_>) -> bool {
         let mut changed = false;
 
-        self.toolbar(ui, graph, ctx, &mut changed);
+        self.toolbar(ui, graph, ctx);
 
         let available = ui.available_size();
         let (canvas, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
@@ -352,15 +340,8 @@ impl GraphEditor {
         painter.set(link_layer, egui::Shape::Vec(shapes));
 
         if let Some(id) = to_remove {
-            // Deleting the node is what unloads the plugin. There is no
-            // separate "unload" anywhere, because a node with no plugin in it
-            // is not a thing the user asked for.
-            if let Some(NodeKind::Plugin(Plugin { instance, .. })) = graph.node(id).map(|n| &n.kind)
-            {
-                self.actions.push(GraphAction::UnloadInstance(*instance));
-            }
-            graph.remove(id);
-            changed = true;
+            self.actions
+                .push(GraphAction::Edit(GraphEdit::RemoveNode(id)));
         }
         if let Some((from, from_port, to, input)) = to_connect {
             graph.connect(from, from_port, to, input);
@@ -393,13 +374,7 @@ impl GraphEditor {
         changed
     }
 
-    fn toolbar(
-        &mut self,
-        ui: &mut egui::Ui,
-        graph: &mut Graph,
-        ctx: &GraphContext<'_>,
-        changed: &mut bool,
-    ) {
+    fn toolbar(&mut self, ui: &mut egui::Ui, graph: &mut Graph, ctx: &GraphContext<'_>) {
         ui.horizontal(|ui| {
             ui.heading("Graph");
             ui.weak(format!("{} nodes", graph.nodes.len()));
@@ -431,8 +406,7 @@ impl GraphEditor {
                 .on_hover_text("back to audio in -> audio out")
                 .clicked()
             {
-                *graph = Graph::default_patch();
-                *changed = true;
+                self.actions.push(GraphAction::Edit(GraphEdit::Reset));
             }
             if !graph.is_empty()
                 && ui
@@ -440,8 +414,7 @@ impl GraphEditor {
                     .on_hover_text("delete every node — nothing drawn means silence")
                     .clicked()
             {
-                *graph = Graph::new();
-                *changed = true;
+                self.actions.push(GraphAction::Edit(GraphEdit::Clear));
             }
         });
         ui.weak(
@@ -1079,23 +1052,11 @@ impl GraphEditor {
                         }
                     });
 
-                    if let (Some(path), Some(instance)) = (chosen, ctx.free_instance) {
-                        // The node appears now and its sockets arrive when the
-                        // plugin has finished loading, which takes hundreds of
-                        // milliseconds.
-                        let node = graph.add(
-                            NodeKind::Plugin(Plugin {
-                                instance,
-                                ports: PluginPorts::default(),
-                            }),
-                            [at.x, at.y],
-                        );
-                        self.actions.push(GraphAction::LoadPlugin {
-                            node,
-                            instance,
+                    if let Some(path) = chosen {
+                        self.actions.push(GraphAction::Edit(GraphEdit::AddPlugin {
                             path,
-                        });
-                        added = true;
+                            pos: [at.x, at.y],
+                        }));
                         close = true;
                     }
 
@@ -1346,6 +1307,7 @@ fn link_shape(from: Pos2, to: Pos2, colour: Color32) -> egui::Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_graph_engine::NodeKind;
 
     /// One egui context, one canvas, and a clock — a canvas that can be driven
     /// without a window.
