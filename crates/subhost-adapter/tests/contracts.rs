@@ -516,8 +516,46 @@ fn duplicate_parameter_sources_have_stable_priority() {
         host.bind_slot(0, slot, ParamId(0)).unwrap();
     }
     assert!(host.activate(audio_config(), &[], &[]).is_err());
-    host.slots_mut().clear(1);
+    host.clear_slot(1);
     host.activate(audio_config(), &[], &[])
         .unwrap()
         .deactivate();
+}
+
+/// Slot edits and restored slot counts preserve the configured position of direct parameter lanes.
+#[test]
+fn slot_edits_preserve_direct_lane_positions() {
+    use subhost_adapter::{ParamTarget, TargetPriority};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("slot-edits");
+    let mut host = SubHost::new(
+        Arc::new(Host),
+        SubHostConfig {
+            target_priority: TargetPriority::PreferSlots,
+            ..host().config()
+        },
+    );
+    host.load(0, &path, None).unwrap();
+    host.bind_slot(0, 0, ParamId(0)).unwrap();
+    host.rename_slot(0, Some("Gain".into()));
+    let direct = [ParamTarget {
+        instance: 0,
+        param: 0,
+    }];
+    let mut processors = host.activate(audio_config(), &[], &direct).unwrap();
+    assert_eq!(run(&mut processors, &[0.25, 0.0, 0.75]), 0.5);
+    processors.deactivate();
+
+    host.clear_slot(0);
+    let mut saved = host.save_state();
+    assert_eq!(saved.slots[0].name.as_deref(), Some("Gain"));
+    assert!(saved.slots[0].binding.is_none());
+    assert!(host.slots().resolved(0).is_none());
+    saved
+        .slots
+        .resize(host.config().slot_count + 1, Default::default());
+    assert!(host.load_state(&saved, &[]).is_empty());
+    assert_eq!(host.slots().count(), host.config().slot_count);
+    let mut processors = host.activate(audio_config(), &[], &direct).unwrap();
+    assert_eq!(run(&mut processors, &[0.25, 0.0, 0.75]), 1.5);
 }
