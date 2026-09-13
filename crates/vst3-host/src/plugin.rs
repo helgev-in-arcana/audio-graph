@@ -55,6 +55,7 @@ use crate::host_app::{ComponentHandler, HostApplication};
 use crate::midi_map::MidiMap;
 use crate::module::{Module, ModuleInner};
 use crate::param_map::ParamMap;
+use crate::param_sync::ParamFeedback;
 use crate::process_io::{EventList, ParameterChanges};
 use crate::stream::MemoryStream;
 use crate::util::{from_char16, to_char16};
@@ -79,7 +80,7 @@ pub struct Vst3Plugin {
     io: plugin_host_api::IoLayout,
     metadata_dirty: bool,
     metadata_structural: bool,
-    /// Main-thread parameter edits waiting to be delivered to the processor.
+    /// Normalized main-thread edits waiting to be delivered to the processor.
     ///
     /// VST3 splits a plugin in two, and `IEditController::setParamNormalized`
     /// only reaches one half. The processor learns values solely through the
@@ -91,6 +92,7 @@ pub struct Vst3Plugin {
     /// *tries* to lock: an edit that loses the race is delivered one block
     /// later rather than blocking the callback.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+    feedback: Arc<ParamFeedback>,
     latency: RefCell<u32>,
     context: Arc<dyn HostContext>,
 }
@@ -103,6 +105,25 @@ impl Vst3Plugin {
             kIoChanged, kIoTitlesChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
         };
         let flags = self.instance.get()._handler.take_restart_requests();
+        if flags & kParamValuesChanged != 0 {
+            // Native value invalidation supersedes feedback collected before the notification.
+            self.feedback.drain(|_, _| {});
+        }
+        if let Some(controller) = self.instance.get().controller.as_ref() {
+            self.feedback.drain(|id, value| {
+                let queued = self
+                    .pending_edits
+                    .lock()
+                    .is_ok_and(|pending| pending.iter().any(|(other, _)| *other == id));
+                if !queued {
+                    unsafe { controller.setParamNormalized(id.0, value) };
+                }
+            });
+            for (id, normalized) in self.instance.get()._handler.take_edits() {
+                let plain = unsafe { controller.normalizedParamToPlain(id.0, normalized) };
+                self.context.param_edited(id, plain);
+            }
+        }
         self.metadata_dirty |=
             flags & (kIoChanged | kIoTitlesChanged | kLatencyChanged | kParamTitlesChanged) != 0;
         self.metadata_structural |= flags & (kIoChanged | kLatencyChanged) != 0;
@@ -140,7 +161,8 @@ impl Vst3Plugin {
                 code: 0,
             })?;
 
-        let handler = ComponentHandler::new(Arc::clone(&context));
+        let pending_edits = Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES)));
+        let handler = ComponentHandler::new(Arc::clone(&pending_edits));
         let (controller, controller_is_separate) =
             Self::create_controller(module, &component, host_unknown, &handler)?;
         // Only meaningful between two distinct objects. A single object
@@ -180,7 +202,8 @@ impl Vst3Plugin {
             io: plugin_host_api::IoLayout::default(),
             metadata_dirty: false,
             metadata_structural: false,
-            pending_edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_PARAM_QUEUES))),
+            pending_edits,
+            feedback: Arc::new(ParamFeedback::new(&[])),
             latency: RefCell::new(0),
             context,
         };
@@ -458,23 +481,18 @@ impl Vst3Plugin {
         &self.params
     }
 
-    /// Creates the plugin's editor view (`IPlugView`), if supported.
-    ///
-    /// Returns the raw `IPlugView`. That is deliberate: everything to do with
-    /// windows lives in `vst3-host-view`, and handing it the interface is the
-    /// whole seam between the two crates. `plugin-host-api` never sees it, so
-    /// the rule about backend types staying out of the shared API surface is
-    /// untouched.
-    ///
-    /// The caller owns the returned view and must tear it down in the required
-    /// order; `vst3_host_view::EditorWindow` does exactly that.
-    pub fn create_view(&self) -> Option<ComPtr<vst3::Steinberg::IPlugView>> {
+    /// Creates a view retaining its native instance and module until the view is released.
+    pub fn create_view(&self) -> Option<Vst3View> {
         let controller = self.instance.get().controller.as_ref()?;
         // "editor" is the only view name VST3 defines.
         let name = c"editor";
         let ptr = unsafe { controller.createView(name.as_ptr()) };
         // createView returns an owned reference.
-        unsafe { ComPtr::from_raw(ptr) }
+        Some(Vst3View {
+            view: unsafe { ComPtr::from_raw(ptr) }?,
+            _instance: Arc::clone(&self.instance),
+            _main_thread: std::marker::PhantomData,
+        })
     }
 
     /// Whether the plugin offers an editor at all.
@@ -600,8 +618,14 @@ impl SubPluginMain for Vst3Plugin {
     }
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
+        if !self.params.iter().any(|param| param.id == id) {
+            return Err(HostError::InvalidState("no such parameter"));
+        }
         let ctrl = self.controller()?;
         let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        if !self.instance.get()._handler.queue_edit(id, normalized) {
+            return Err(HostError::InvalidState("parameter queue unavailable"));
+        }
         // The return value is advisory. Every iZotope plugin here answers
         // kResultFalse and applies the value anyway, and the SDK's own hosts
         // ignore it too. The caller can see what actually happened through
@@ -614,13 +638,6 @@ impl SubPluginMain for Vst3Plugin {
             });
         }
 
-        // The other half of the plugin still has to hear about it.
-        if let Ok(mut pending) = self.pending_edits.lock() {
-            pending.retain(|(existing, _)| *existing != id);
-            if pending.len() < pending.capacity() {
-                pending.push((id, plain));
-            }
-        }
         Ok(())
     }
 
@@ -676,6 +693,11 @@ impl SubPluginMain for Vst3Plugin {
             return Err(HostError::State("state blob is truncated".into()));
         }
         let component_state = data[8..8 + component_len].to_vec();
+        self.pending_edits
+            .lock()
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?
+            .clear();
+        self.feedback.drain(|_, _| {});
         self.metadata_dirty = true;
         self.metadata_structural = true;
         let controller_state = data[8 + component_len..8 + component_len + controller_len].to_vec();
@@ -785,15 +807,30 @@ impl SubPluginMain for Vst3Plugin {
                 .as_ref(),
         );
 
+        self.feedback = Arc::new(ParamFeedback::new(&self.params));
         Ok(Processor::new(Vst3Processor::new(
-            self.instance.get().processor.clone(),
+            Arc::clone(&self.instance),
             config,
             &declared,
             map,
             midi,
             Arc::clone(&self.pending_edits),
-            Arc::clone(&self.instance),
+            Arc::clone(&self.feedback),
         )))
+    }
+}
+
+/// An editor view whose code and controller remain alive until its final release.
+pub struct Vst3View {
+    view: ComPtr<vst3::Steinberg::IPlugView>,
+    _instance: Arc<MainThread<Vst3Instance>>,
+    _main_thread: std::marker::PhantomData<Rc<()>>,
+}
+
+impl Vst3View {
+    /// Borrows the native interface. Any derived interfaces must be released before this handle.
+    pub fn as_ptr(&self) -> *mut vst3::Steinberg::IPlugView {
+        self.view.as_ptr()
     }
 }
 
@@ -872,6 +909,7 @@ pub struct Vst3Processor {
     midi_map: MidiMap,
     /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
+    feedback: Arc<ParamFeedback>,
     instance: Arc<MainThread<Vst3Instance>>,
 }
 
@@ -882,16 +920,16 @@ unsafe impl Send for Vst3Processor {}
 
 impl Vst3Processor {
     fn new(
-        processor: ComPtr<IAudioProcessor>,
+        instance: Arc<MainThread<Vst3Instance>>,
         config: AudioConfig,
         declared: &DeclaredBuses,
         param_map: ParamMap,
         midi_map: MidiMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
-        instance: Arc<MainThread<Vst3Instance>>,
+        feedback: Arc<ParamFeedback>,
     ) -> Vst3Processor {
         Vst3Processor {
-            processor,
+            processor: instance.get().processor.clone(),
             config,
             input_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
             output_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
@@ -904,6 +942,7 @@ impl Vst3Processor {
             param_map,
             midi_map,
             pending_edits,
+            feedback,
             instance,
         }
     }
@@ -939,11 +978,10 @@ impl SubPluginProcessor for Vst3Processor {
 
         // Main-thread edits go in first, at offset 0, so an event stream for
         // this block still overrides them.
-        if let Ok(mut pending) = self.pending_edits.try_lock() {
-            for (id, plain) in pending.drain(..) {
-                if let Some(normalized) = self.param_map.normalize(id, plain) {
-                    self.input_changes.add_point(id.0, 0, normalized);
-                }
+        let mut pending = self.pending_edits.try_lock().ok();
+        if let Some(pending) = pending.as_ref() {
+            for &(id, normalized) in pending.iter() {
+                self.input_changes.add_point(id.0, 0, normalized);
             }
         }
 
@@ -954,6 +992,18 @@ impl SubPluginProcessor for Vst3Processor {
             &self.input_changes,
             &self.input_events,
         );
+        if self.input_changes.overflowed()
+            || self.input_events.overflowed()
+            || !events.is_sorted_by_key(Event::sample_offset)
+            || events.iter().any(|event| event.sample_offset() >= frames)
+        {
+            buffers.clear_output();
+            return ProcessStatus::Error;
+        }
+        if let Some(pending) = pending.as_mut() {
+            pending.clear();
+        }
+        drop(pending);
         // Channel pointers into the caller's flat planar storage.
         let frame_len = frames as usize;
         let input_raw = buffers.raw_input().as_ptr();
@@ -1016,6 +1066,21 @@ impl SubPluginProcessor for Vst3Processor {
             return ProcessStatus::Error;
         }
 
+        self.input_changes
+            .for_each_last(|id, value| self.feedback.publish(id, value));
+        self.output_changes
+            .for_each_last(|id, value| self.feedback.publish(id, value));
+        self.output_changes
+            .for_each_point(|id, offset, normalized| {
+                if let Some(value) = self.param_map.denormalize(ParamId(id), normalized) {
+                    out_events.push(Event::Param(plugin_host_api::ParamEvent::SetValue {
+                        id: ParamId(id),
+                        target: plugin_host_api::Target::Global,
+                        value,
+                        sample_offset: offset.max(0) as u32,
+                    }));
+                }
+            });
         vst_events::drain_outputs(&self.output_events, out_events);
         if self.output_changes.overflowed() {
             out_events.mark_overflow();
@@ -1081,123 +1146,100 @@ fn setup_buses(
 ) -> Result<DeclaredBuses> {
     use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_, SpeakerArr};
 
-    let arrangement = |channels: u32| -> SpeakerArrangement {
-        match channels {
-            0 => 0,
-            1 => SpeakerArr::kMono,
-            // Channel counts above 1 are negotiated as stereo.
-            _ => SpeakerArr::kStereo,
-        }
-    };
-
-    // Negotiate all main and auxiliary input arrangements in a single pass.
-    let mut inputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_inputs.len());
-    if config.input_channels > 0 {
-        inputs.push(arrangement(config.input_channels));
-    }
-    for width in config.aux_inputs.iter() {
-        inputs.push(arrangement(u32::from(width)));
-    }
-    // Negotiate main and auxiliary output arrangements.
-    let mut outputs: Vec<SpeakerArrangement> = Vec::with_capacity(1 + config.aux_outputs.len());
-    if config.output_channels > 0 {
-        outputs.push(arrangement(config.output_channels));
-        for width in config.aux_outputs.iter() {
-            outputs.push(arrangement(u32::from(width)));
-        }
-    }
-    let num_in = inputs.len() as i32;
-    let num_out = outputs.len() as i32;
-
-    let res = unsafe {
-        processor.setBusArrangements(inputs.as_mut_ptr(), num_in, outputs.as_mut_ptr(), num_out)
-    };
-    // kResultFalse means "I chose something else", not failure. Verify rather
-    // than trust: a plugin that quietly picked mono would otherwise corrupt
-    // the second channel's memory.
-    if res != kResultOk {
-        for (index, wanted) in outputs.iter().enumerate() {
-            let mut actual: SpeakerArrangement = 0;
-            if unsafe {
-                processor.getBusArrangement(
-                    BusDirections_::kOutput as i32,
-                    index as i32,
-                    &mut actual,
-                )
-            } == kResultOk
-                && actual != *wanted
-            {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "plugin refused the arrangement asked for on output bus {index}"
-                )));
+    let arrangements =
+        |main: u32, aux: plugin_host_api::AuxBuses| -> Result<Vec<SpeakerArrangement>> {
+            if main == 0 && !aux.is_empty() {
+                return Err(HostError::UnsupportedBusConfig(
+                    "aux buses require a connected main bus".into(),
+                ));
             }
-        }
-        // An aux bus that came back different matters just as much: the buffer
-        // handed to it is sized from what was asked for, and a plugin that
-        // settled on mono would read past the end of its sidechain.
-        for (index, wanted) in inputs.iter().enumerate() {
-            let mut actual: SpeakerArrangement = 0;
-            if unsafe {
-                processor.getBusArrangement(
-                    BusDirections_::kInput as i32,
-                    index as i32,
-                    &mut actual,
-                )
-            } == kResultOk
-                && actual != *wanted
-            {
-                return Err(HostError::UnsupportedBusConfig(format!(
-                    "plugin refused the arrangement asked for on input bus {index}"
-                )));
-            }
-        }
+            std::iter::once(main)
+                .filter(|&n| n != 0)
+                .chain(aux.iter().map(u32::from))
+                .map(|channels| match channels {
+                    1 => Ok(SpeakerArr::kMono),
+                    2 => Ok(SpeakerArr::kStereo),
+                    _ => Err(HostError::UnsupportedBusConfig(
+                        "only mono and stereo arrangements are supported".into(),
+                    )),
+                })
+                .collect()
+        };
+    let mut inputs = arrangements(config.input_channels, config.aux_inputs)?;
+    let mut outputs = arrangements(config.output_channels, config.aux_outputs)?;
+    // Native negotiation is advisory; the resulting buses are the authority even on success.
+    unsafe {
+        processor.setBusArrangements(
+            inputs.as_mut_ptr(),
+            inputs.len() as i32,
+            outputs.as_mut_ptr(),
+            outputs.len() as i32,
+        );
     }
 
-    // Buses default to inactive; a plugin with an inactive output bus writes
-    // nothing at all. Only as many input buses as were negotiated are switched
-    // on: an active sidechain that never receives audio is worse than an
-    // inactive one, because a compressor will duck to silence against it.
     let mut declared = DeclaredBuses {
         inputs: Vec::new(),
         outputs: Vec::new(),
     };
-    for (media, dir, active) in [
-        (MediaTypes_::kAudio, BusDirections_::kInput, num_in as usize),
+    for (dir, wanted, buses) in [
+        (BusDirections_::kInput as i32, &inputs, &mut declared.inputs),
         (
-            MediaTypes_::kAudio,
-            BusDirections_::kOutput,
-            num_out as usize,
+            BusDirections_::kOutput as i32,
+            &outputs,
+            &mut declared.outputs,
         ),
+    ] {
+        let count = unsafe { component.getBusCount(MediaTypes_::kAudio as i32, dir) };
+        if count < 0 || (count as usize) < wanted.len() {
+            return Err(HostError::UnsupportedBusConfig(
+                "requested audio buses are missing".into(),
+            ));
+        }
+        for index in 0..count {
+            let arrangement = wanted.get(index as usize);
+            let channels = if let Some(&wanted) = arrangement {
+                let mut actual = 0;
+                let mut info = unsafe { std::mem::zeroed() };
+                if unsafe { processor.getBusArrangement(dir, index, &mut actual) } != kResultOk
+                    || unsafe {
+                        component.getBusInfo(MediaTypes_::kAudio as i32, dir, index, &mut info)
+                    } != kResultOk
+                    || actual != wanted
+                    || info.channelCount != channel_count(wanted) as i32
+                {
+                    return Err(HostError::UnsupportedBusConfig(format!(
+                        "audio bus {dir}:{index} differs from its requested arrangement"
+                    )));
+                }
+                channel_count(actual)
+            } else {
+                0
+            };
+            buses.push(DeclaredBus { channels });
+        }
+    }
+    // Validate both directions before changing which buses are active.
+    for (media, dir, active) in [
+        (MediaTypes_::kAudio, BusDirections_::kInput, inputs.len()),
+        (MediaTypes_::kAudio, BusDirections_::kOutput, outputs.len()),
         (MediaTypes_::kEvent, BusDirections_::kInput, 1),
         (MediaTypes_::kEvent, BusDirections_::kOutput, 0),
     ] {
         let count = unsafe { component.getBusCount(media as i32, dir as i32) };
         for index in 0..count {
-            let on = (index as usize) < active;
-            unsafe { component.activateBus(media as i32, dir as i32, index, u8::from(on)) };
-            if media as i32 != MediaTypes_::kAudio as i32 {
-                continue;
-            }
-            let width = if dir as i32 == BusDirections_::kInput as i32 {
-                inputs.get(index as usize).copied()
-            } else {
-                outputs.get(index as usize).copied()
-            };
-            let bus = DeclaredBus {
-                channels: if on {
-                    width.map_or(0, channel_count)
-                } else {
-                    0
+            check(
+                unsafe {
+                    component.activateBus(
+                        media as i32,
+                        dir as i32,
+                        index,
+                        u8::from((index as usize) < active),
+                    )
                 },
-            };
-            if dir as i32 == BusDirections_::kInput as i32 {
-                declared.inputs.push(bus);
-            } else {
-                declared.outputs.push(bus);
-            }
+                "IComponent::activateBus",
+            )?;
         }
     }
-
     Ok(declared)
 }
 

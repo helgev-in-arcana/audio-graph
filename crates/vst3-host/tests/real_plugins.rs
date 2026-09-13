@@ -7,8 +7,6 @@
 use vst3_host::{Module, default_plugin_directories, find_modules};
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
-    // Initialize COM STA apartment on test runner thread because plugins assume one exists.
-    vst3_host::init_apartment();
     default_plugin_directories()
         .iter()
         .flat_map(|d| find_modules(d))
@@ -17,6 +15,7 @@ fn installed_modules() -> Vec<std::path::PathBuf> {
 
 #[test]
 fn every_installed_module_loads_and_enumerates() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let modules = installed_modules();
     if modules.is_empty() {
         eprintln!("no VST3 plugins installed; skipping");
@@ -63,6 +62,7 @@ fn every_installed_module_loads_and_enumerates() {
 
 #[test]
 fn repeated_load_unload_is_stable() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let Some(path) = installed_modules().into_iter().next() else {
         eprintln!("no VST3 plugins installed; skipping");
         return;
@@ -90,6 +90,7 @@ fn repeated_load_unload_is_stable() {
 
 #[test]
 fn a_missing_path_is_an_error_not_a_panic() {
+    let _thread = vst3_host::init_apartment().unwrap();
     let err = Module::open("does-not-exist.vst3").unwrap_err();
     assert!(matches!(err, plugin_host_api::HostError::ModuleLoad(_)));
 }

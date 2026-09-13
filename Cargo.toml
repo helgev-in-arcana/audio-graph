@@ -8,6 +8,7 @@ members = [
     "crates/vst3-host-view",
     "crates/clap-host",
     "crates/clap-test-plugin",
+    "crates/vst3-test-plugin",
     "crates/plugin-host",
     "crates/subhost-adapter",
     "crates/audio-graph-engine",

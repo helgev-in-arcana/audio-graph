@@ -7,6 +7,7 @@ readme = "README.md"
 
 [dependencies]
 vst3.workspace = true
+vst3-host.workspace = true
 host-window.workspace = true
 log.workspace = true
 

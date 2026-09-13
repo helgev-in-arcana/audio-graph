@@ -36,7 +36,13 @@ const SUB_HOST: SubHostConfig = SubHostConfig {
 
 fn main() -> ExitCode {
     fault::install_crash_handler();
-    plugin_host::init_thread();
+    let _thread = match plugin_host::init_thread() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
@@ -750,7 +756,10 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         BufferLayout::Planar,
     );
     let mut sink = EventSink::with_capacity(256);
-    processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+    let status = processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink);
+    if status == plugin_host::ProcessStatus::Error {
+        return Err("plugin processing failed".into());
+    }
     if sink.overflowed() {
         return Err("plugin event output overflow".into());
     }

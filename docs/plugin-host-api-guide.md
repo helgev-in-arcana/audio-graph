@@ -95,12 +95,12 @@ main側の制御窓口。`Plugin`、`Vst3Plugin`、`ClapPlugin` が実装する�
 | `voice_info(&self) -> Option<VoiceInfo>` | デフォルト`None`。CLAPはactive時に取得したキャッシュ | CLAP `voice-info.get` はactive mainで問い合わせる。未有効化時は`None` |
 | `note_dialects(&self) -> Vec<&'static str>` | 診断用のノート方言名。デフォルト空、VST3も空 | 表示用。ポート別の交渉・配送に使える型ではない |
 | `io_layout(&self) -> IoLayout` | キャッシュされた音声・note I/Oの読み取り | getterは交渉しない。希望するmain幅はinactive中の`request_main_bus_channels`で明示する |
-| `snapshot(&self) -> ParamSnapshot` | 全parameterの現在値。VST3はcontrollerのnormalized値をplainへ変換。CLAPは`get_value`成功項目を収集 | 一括読み取り。native DSPのある一時点と原子的に一致するsnapshotを保証するものではない |
+| `snapshot(&self) -> ParamSnapshot` | 全parameterの現在値。VST3はcontrollerのnormalized値をplainへ変換。CLAPは`get_value`成功項目を収集 | 先に`tick`でDSPからの反映を進める。native DSPのある一時点と原子的に一致するsnapshotを保証するものではない |
 | `param_to_text(id, plain) -> Option<String>` | plugin独自の表示文字列 | 単位・enum名・丸めはpluginが所有。VST3はplain→native normalized→文字列、CLAPは`value_to_text` |
 | `param_from_text(id, text) -> Option<f64>` | pluginの構文で文字列をplain値に変換 | 上位がHz/dB等の構文を再実装しない。失敗は`None` |
 | `set_param(&mut self, id, plain) -> Result<()>` | main側から値を設定。VST3はcontroller更新とprocessor向けqueue。CLAPはqueueへ入れ、inactive時にはflush | CLAPに直接setterはない。active時のDSP更新は次回processへ送る。成功は「その時点でDSPまで同期済み」を意味しない |
 | `save_state(&self) -> Result<Vec<u8>>` | plugin固有stateを保存 | native stateが保存内容の権威。VST3はcomponent/controllerの2領域に各u32 little-endian長を前置、CLAPはstate extensionのbyte列。CLAPにstate extensionがなければ空 |
-| `load_state(&mut self, data) -> Result<()>` | opaque stateを復元 | 現両バックエンドはactive時に拒否。VST3はcomponent stateをcontrollerにも知らせる。CLAPは復元前のpending editsも消す |
+| `load_state(&mut self, data) -> Result<()>` | opaque stateを復元 | 両バックエンドはactive時に拒否し、復元前のpending editsを消す。VST3はcomponent stateをcontrollerにも知らせ、古いDSP feedbackも破棄する |
 | `latency_samples(&self) -> u32` | 保持している報告遅延、sample単位 | activate後の値を使う。グラフの総遅延や親DAWへの報告値を計算するAPIではない |
 | `activate(&mut self, AudioConfig) -> Result<Processor>` | 構成を交渉・準備し、そのactivationを所有する処理ハンドルを返す | main側に任意のprocessorを返すAPIを置かず、誤ったinstanceへのdeactivateを防ぐ。既存activationがあれば`InvalidState` |
 
@@ -122,6 +122,8 @@ main側の制御窓口。`Plugin`、`Vst3Plugin`、`ClapPlugin` が実装する�
 | --- | --- | --- |
 | `process(&mut self, &mut AudioBuffers, &[Event], &TimeContext, &mut EventSink) -> ProcessStatus` | 一ブロックの音声・parameter・noteを処理し、音声とイベントを出力 | 排他的に呼ぶ。blockはactivate時の構成に一致させる。入力eventsはsample offset順。音声処理経路で確保・待機を避ける |
 | `reset(&mut self)` | 尾音・内部処理状態のリセット要求 | processと同時実行しない。パラメーターや保存済みpresetの初期化とは別 |
+
+両backendはnative変換用の固定容量を超える入力、順序違反、block外の時刻をnative処理前に拒否し、音声を消音して`ProcessStatus::Error`を返す。配送待ちのmain側parameter編集はこの拒否では消費しない。呼び出し側はErrorを処理失敗として扱う。AudioGraphでは既存の出力超過時と同じreset・親voice終了の経路に接続している。
 
 `&mut self` が同時のsafe呼び出しを防ぐ。traitが `Sync` を要求しないことは、任意の実装が `Sync` を持つこと自体を禁止するものではない。公開 `Processor` は `Send` で、`Sync` ではない。
 
@@ -146,7 +148,7 @@ main側の制御窓口。`Plugin`、`Vst3Plugin`、`ClapPlugin` が実装する�
 | `host_name(&self) -> &str` | pluginへ見せるhost名。実装必須 | nativeにはbackendがコピー/変換する。DAW名を自動で引き継がない |
 | `request_restart(&self, RestartReason)` | 変更通知を受け、hostが再構成を予定する | native要求はcoalesceし、main側の`tick`で配送する。callback中の同期再構成は禁止 |
 | `latency_changed(&self, samples: u32)` | デフォルトはsample値を使わず`request_restart(Latency)` | 通知値はそのinstanceの値。総遅延の合算は上位の仕事 |
-| `param_edited(&self, id, plain)` | GUI等からのparameter編集通知。デフォルト何もしない | VST3実装は現在normalized値を渡す。CLAPのprocess出力は`EventSink`に入り、このmethodへ統一されていない |
+| `param_edited(&self, id, plain)` | main側で受け取ったGUI等のparameter編集をplain値で通知。デフォルト何もしない | VST3は`tick`でnative normalized値をplainへ変換して通知。CLAPのinactive flush出力も通知する。process出力は`EventSink`へ配送する |
 
 `Send + Sync` はRT安全性、main thread配送、コールバック非再入を保証しない。受信したその場でplugin再構成を始める設計は避け、通知記録と適切なスレッドでの適用を分ける必要がある。AudioGraphがGUI編集を採用しないのは製品側の方針であり、汎用hostの必須規則ではない。[CLAP host][C7]、[VST3 IComponentHandler][V3]
 
@@ -327,6 +329,8 @@ activateへ渡す固定構成。
 
 `validate() -> Result<()>` は正の有限sample rate、正かつnativeで表現できる最大frame数、加算・sample領域の表現可能性、aux幅を検証し、両backendのactivateで使用する。`total_input_channels()` と `total_output_channels()` はmainとauxの合計を返す。`AudioBuffers`のchannel数はこの**合計**である。公開fieldを持つため、sample rateの妥当性等を構築時に検証する型ではない。config変更は停止→activateを使う。[VST3 ProcessSetup][V4]、[CLAP plugin][C1]、[CLAP render][C11]
 
+activate成功にはnative側の実構成が要求と一致することも必要。VST3 backendはmono/stereoを扱い、幅が3以上のbusやmainが0でauxだけある構成を拒否する。nativeの実arrangementとchannel countを検査してからbusを有効化する。この制限はVST3 backendの対応範囲であり、共通`AudioConfig`全体やCLAPを同じ範囲に制限しない。
+
 ### `AudioBuffers<'a>`
 
 音声を所有しない、一ブロック分の借用view。入力は`&[f32]`、出力は`&mut [f32]`。safeな構築では同じ領域を入出力として重ねられず、in-place処理は公開モデルに含まれない。
@@ -480,6 +484,7 @@ loop以外のtempo/拍子/位置には「不明」を表すfieldがない。Defa
 | variant | 意味 |
 | --- | --- |
 | `ModuleLoad(String)` | file/bundle/libraryを読み込めない |
+| `ModuleBusy(String)` | 同じbackendで、そのbinaryが別の所有threadに使用されている。所有者が解放した後に再試行できる |
 | `NoFactory(String)` | moduleに使えるfactoryがない |
 | `ClassNotFound(String)` | 指定plugin/classがない |
 | `Backend { context: String, code: i32 }` | native操作名等と形式固有結果値。VST3のresultを表しやすい形 |

@@ -6,18 +6,22 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::rc::Rc;
+use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    GetModuleHandleExW,
+};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DestroyWindow, DispatchMessageW, GA_ROOT, GWLP_USERDATA, GetAncestor, GetSystemMetrics,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, RegisterClassExW,
     SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_CLOSE, WM_NCCREATE, WM_SIZE, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    ShowWindow, TranslateMessage, UnregisterClassW, WM_CLOSE, WM_NCCREATE, WM_SIZE, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::window::{Size, WindowState};
@@ -43,31 +47,70 @@ const CLASS_NAME: &[u16] = &[
     0,
 ];
 
-/// Registering the same class twice fails, and a plugin may be instantiated
-/// many times in one process, so it is registered once per module.
-fn ensure_class_registered() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| unsafe {
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            // Not CS_OWNDC or CS_HREDRAW: the plugin's own child window
-            // does all the drawing, and repainting the container behind it
-            // only causes flicker.
-            style: 0,
-            lpfnWndProc: Some(wnd_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: GetModuleHandleW(std::ptr::null()),
-            hIcon: std::ptr::null_mut(),
-            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: COLOR_WINDOW as HBRUSH,
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: CLASS_NAME.as_ptr(),
-            hIconSm: std::ptr::null_mut(),
-        };
-        RegisterClassExW(&class);
-    });
+static CLASS_USERS: Mutex<usize> = Mutex::new(0);
+
+struct WindowClass(HMODULE);
+
+impl WindowClass {
+    fn acquire() -> Result<Self, String> {
+        let mut module = std::ptr::null_mut();
+        // The class belongs to the DLL containing its procedure, not to the host executable.
+        if unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                wnd_proc as *const () as *const u16,
+                &mut module,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "locating window module: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut users = CLASS_USERS.lock().unwrap();
+        if *users == 0 {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                // Not CS_OWNDC or CS_HREDRAW: the plugin's own child window
+                // does all the drawing, and repainting the container behind it
+                // only causes flicker.
+                style: 0,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: module,
+                hIcon: std::ptr::null_mut(),
+                hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
+                hbrBackground: COLOR_WINDOW as HBRUSH,
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: CLASS_NAME.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            if unsafe { RegisterClassExW(&class) } == 0 {
+                return Err(format!(
+                    "registering window class: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        *users += 1;
+        Ok(Self(module))
+    }
+}
+
+impl Drop for WindowClass {
+    fn drop(&mut self) {
+        let mut users = CLASS_USERS.lock().unwrap();
+        *users -= 1;
+        if *users == 0 && unsafe { UnregisterClassW(CLASS_NAME.as_ptr(), self.0) } == 0 {
+            log::error!(
+                "unregistering window class: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 pub(crate) struct Window {
@@ -75,6 +118,7 @@ pub(crate) struct Window {
     /// Kept alive for as long as the window can still receive messages: the
     /// window procedure holds a raw pointer into it.
     _state: Rc<WindowState>,
+    _class: WindowClass,
 }
 
 impl Window {
@@ -84,7 +128,7 @@ impl Window {
         owner: HWND,
         state: Rc<WindowState>,
     ) -> Result<Window, String> {
-        ensure_class_registered();
+        let class = WindowClass::acquire()?;
 
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         wide.push(0);
@@ -137,7 +181,7 @@ impl Window {
                 // this has to be.
                 owner,
                 std::ptr::null_mut(),
-                GetModuleHandleW(std::ptr::null()),
+                class.0,
                 state_ptr as *mut c_void,
             )
         };
@@ -152,6 +196,7 @@ impl Window {
         Ok(Window {
             hwnd: Cell::new(hwnd),
             _state: state,
+            _class: class,
         })
     }
 

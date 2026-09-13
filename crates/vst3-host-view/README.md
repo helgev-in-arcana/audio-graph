@@ -15,7 +15,7 @@ The window half of VST3 editor hosting: everything that happens between an
 ## Not this crate's job
 
 - **Creating the plugin instance or the view.** `vst3-host` does that and hands
-  the `IPlugView` over; that handover is the whole seam between the two crates.
+  an owning `Vst3View` over. This crate depends on `vst3-host` for that lifetime contract.
 - **The window itself.** `ContainerWindow`, the deferred queue and key
   forwarding are format-agnostic and live in `host-window`, so the CLAP backend
   can reach them without depending on VST3. They are re-exported here only so
@@ -29,5 +29,8 @@ The window half of VST3 editor hosting: everything that happens between an
   the view and the window separately could drop them in either order; here it
   cannot.
 - **All access is on the UI thread**, which is where VST3 confines `IPlugFrame`
-  calls. The `unsafe impl Send`/`Sync` on the frame rests on that, plus the
-  frame outliving the pointer to it.
+  calls. The frame and run loop are neither `Send` nor `Sync`.
+- **Callbacks belong to a registration generation.** Replacing or retiming a
+  registration invalidates callbacks collected for its previous generation.
+  Linux native handlers are temporarily retained while their callback runs, so
+  self-unregistration cannot release the object before the call returns.

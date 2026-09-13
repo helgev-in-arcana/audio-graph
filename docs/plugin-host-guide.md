@@ -196,13 +196,15 @@ mtime秒+byte数は安い変更検出のheuristicであり、内容hashではな
 
 `refresh`は第三者コードを同期的に同一process内でロードする。「UI以外のthreadで呼ぶ」は画面を止めにくくするが、process crashやnative hangから隔離するものではない。`Module.error`へ記録できるのはRustのResultとして戻った失敗であり、crash/hangしたmoduleの失敗を現実装が回収して記録するわけではない。
 
+同じbackend内でnative binaryが別の所有threadに使用されている場合は、ロードを`HostError::ModuleBusy`で拒否する。`refresh`はこれを故障としてcacheに保存せず、既存entryがあれば古いstampのまま保持し、なければその回の結果から除外する。所有者が解放した後のscanで再試行できる。同じ所有threadからのロードは既存moduleを共有する。
+
 安全なpath列挙、cache保存、native scan実行は概念として区別できている。任意のinstalled pluginを扱うscannerとして頑健にする場合は、module単位のworker process、timeout、途中結果保存を別の実行責務として導入する余地がある。これは全面的なaudio processingのIPC化とは別の変更単位。[監査の条件付き設計課題](audits/plugin-host-review-2026-09-11.md#scanner)
 
 ## 7. スレッド初期化と共通API再export
 
-`init_thread()` は最初に `reclaim_main_thread()`、続いてVST3 backendの `init_apartment()` を呼ぶ。WindowsではCOM apartment準備が目的。他OSではCOM部分は不要。戻り値がなく、OS main-threadの発行tokenや失敗結果を返すAPIではない。
+`init_thread() -> Result<ThreadGuard>` はVST3 backendの `init_apartment()` を呼び、成功後に `reclaim_main_thread()` を実行する。`ThreadGuard`は`vst3_host::ApartmentGuard`の別名で、Send/Syncではない。Windowsでは成功した`OleInitialize`一回分を所有し、Dropで返却済みprocessorを回収してから`OleUninitialize`を一回呼ぶ。既存STA上の複数guardもそれぞれの参照を解放する。既存MTAは初期化エラーになり、そのapartmentを解除しない。他OSではCOM操作をせず、Drop時の回収だけ行う。
 
-現backendは呼ぶたびに`OleInitialize`を実行し、一度だけ実行するguardや対応する`OleUninitialize`を持たない。facade docの「idempotent」と、backend docの「standalone向け、DAW内では呼ばない」には整理が必要。したがって、既存hostのCOM apartmentに影響しない完全な冪等初期化APIと解釈しない。
+呼び出し側は `let _thread = plugin_host::init_thread()?;` として、plugin・editor・processorより先にguardを作り、それらの解放と所有threadへの返却完了まで保持する。初期化helper内だけで保持しても、helperのreturn時に解除されるため不十分。guardは任意のロードAPIに必須のtokenではなく、OSのmain threadであることや全資源の先行破棄を型で証明するものではない。
 
 `plugin-host`から利用可能な共通APIは以下。定義・理由・全メソッドは[plugin-host-api解説](plugin-host-api-guide.md)で一度説明している。
 
@@ -211,8 +213,8 @@ mtime秒+byte数は安い変更検出のheuristicであり、内容hashではな
 | 音声 | `AudioBuffers`, `AudioConfig`, `AuxBuses`, `BufferLayout`, `MAX_AUX_BUSES` |
 | 記述 | `BusInfo`, `IoLayout`, `Capabilities`, `VoiceInfo`, `ParamId`, `ParamFlags`, `ParamInfo`, `ParamSnapshot`, `ParamValue` |
 | イベント・時間 | `Event`, `EventSink`, `NoteEvent`, `NoteExpression`, `NoteId`, `ParamEvent`, `Target`, `TimeContext` |
-| 契約 | `HostContext`, `SubPluginMain`, `SubPluginProcessor`, `ProcessStatus`, `RestartReason` |
-| 寿命 | `MainThread`, `Processor`, `reclaim_main_thread` |
+| 契約 | `HostContext`, `SubPluginMain`, `SubPluginProcessor`, `ProcessStatus`, `RestartReason`, `MetadataUpdate` |
+| 寿命 | `MainThread`, `Processor`, `reclaim_main_thread`, `ThreadGuard` |
 | エラー | `HostError`, `Result` |
 
 「全て再export」という既存説明には例外がある。`note_id_from_wire`、`note_id_to_wire`、doc-hiddenな`bitflags_lite!`はこのfacadeからexportされない。内部module名もexportしない。
@@ -284,7 +286,7 @@ Debug/Clone/Copy/PartialEq/Eq。直接variantを作れば上記範囲外値も�
 
 典型的なstandalone処理の順序は次のとおり。
 
-1. host側の `HostContext` を作り、所有threadで`init_thread()`。
+1. 所有threadで`init_thread()?`のguardを保持し、host側の `HostContext` を作る。guardは全plugin資源の解放・回収後まで保持する。
 2. 必要ならpath候補だけ列挙。classを知る必要がある候補だけ`scan_module`。
 3. `Plugin::load`へpath/ID/contextを渡す。
 4. 必要なstate復元をinactiveで行い、記述情報を確認する。

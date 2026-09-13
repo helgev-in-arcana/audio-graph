@@ -154,15 +154,27 @@ impl ParameterChanges {
     }
 
     /// Read back what the plugin wrote into an output change list.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn points(&self) -> Vec<(ParamID, int32, ParamValue)> {
         let mut out = Vec::new();
+        self.for_each_point(|id, offset, value| out.push((id, offset, value)));
+        out
+    }
+
+    pub fn for_each_last(&self, mut apply: impl FnMut(ParamID, ParamValue)) {
         for queue in &self.pool[..self.used.get()] {
-            for &(offset, value) in queue.points.borrow().iter() {
-                out.push((queue.id.get(), offset, value));
+            if let Some(&(_, value)) = queue.points.borrow().last() {
+                apply(queue.id.get(), value);
             }
         }
-        out
+    }
+
+    pub fn for_each_point(&self, mut apply: impl FnMut(ParamID, int32, ParamValue)) {
+        for queue in &self.pool[..self.used.get()] {
+            for &(offset, value) in queue.points.borrow().iter() {
+                apply(queue.id.get(), offset, value);
+            }
+        }
     }
 }
 

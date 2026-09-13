@@ -94,7 +94,7 @@ pub struct WrapperEditor {
     scanned: bool,
     /// A scan running on its own thread, if one is. Never more than one: a
     /// second would open the same modules again for the same answer.
-    scan: Option<std::sync::mpsc::Receiver<Vec<plugin_host::catalogue::Module>>>,
+    scan: Option<std::sync::mpsc::Receiver<Result<Vec<plugin_host::catalogue::Module>, String>>>,
 
     /// Whether the plugin-folders window is showing.
     folders_open: bool,
@@ -239,11 +239,14 @@ impl WrapperEditor {
         match std::thread::Builder::new()
             .name("audio-graph plugin scan".into())
             .spawn(move || {
-                // Initialize COM/threading prerequisites for loading plugins on this thread.
-                plugin_host::init_thread();
-                let dirs = audio_graph_settings::directories();
-                let cache = audio_graph_settings::catalogue_path();
-                let _ = tx.send(plugin_host::catalogue::refresh(&dirs, cache.as_deref()));
+                let result = plugin_host::init_thread()
+                    .map(|_thread| {
+                        let dirs = audio_graph_settings::directories();
+                        let cache = audio_graph_settings::catalogue_path();
+                        plugin_host::catalogue::refresh(&dirs, cache.as_deref())
+                    })
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(result);
             }) {
             Ok(_) => self.scan = Some(rx),
             Err(e) => self.status.set(format!("scan not started: {e}")),
@@ -259,7 +262,7 @@ impl WrapperEditor {
     fn collect_scan(&mut self) {
         let Some(rx) = &self.scan else { return };
         match rx.try_recv() {
-            Ok(modules) => {
+            Ok(Ok(modules)) => {
                 self.fill_entries(&modules);
                 self.scan = None;
                 let unknown = self
@@ -275,6 +278,10 @@ impl WrapperEditor {
                         self.entries.len()
                     )
                 });
+            }
+            Ok(Err(error)) => {
+                self.scan = None;
+                self.status.set(format!("scan could not start: {error}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {

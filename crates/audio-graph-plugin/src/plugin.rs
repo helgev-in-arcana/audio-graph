@@ -509,7 +509,12 @@ impl Wrapper {
             &mut self.output_scratch[..(out_channels * frames) as usize],
             nodes,
         );
-        if self.out_events.overflowed() {
+        if self.out_events.overflowed()
+            || state
+                .processor
+                .as_ref()
+                .is_some_and(|processor| processor.failed())
+        {
             self.ended_notes.clear();
             self.engine.reset_notes(&mut self.ended_notes);
             if let Some(processor) = state.processor.as_mut() {

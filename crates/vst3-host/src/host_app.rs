@@ -11,8 +11,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use plugin_host_api::HostContext;
 use vst3::Steinberg::Vst::{
@@ -336,20 +336,40 @@ impl IMessageTrait for HostMessage {
 /// Providing a concrete component handler is essential, as many plugins
 /// disable their UI controls when given a null handler.
 pub struct ComponentHandler {
-    context: Arc<dyn HostContext>,
+    pending: Arc<Mutex<Vec<(plugin_host_api::ParamId, f64)>>>,
+    edits: RefCell<Vec<(plugin_host_api::ParamId, f64)>>,
     restart: AtomicI32,
 }
 
 impl ComponentHandler {
-    pub fn new(context: Arc<dyn HostContext>) -> ComWrapper<ComponentHandler> {
+    pub fn new(
+        pending: Arc<Mutex<Vec<(plugin_host_api::ParamId, f64)>>>,
+    ) -> ComWrapper<ComponentHandler> {
         ComWrapper::new(ComponentHandler {
-            context,
+            pending,
+            edits: RefCell::new(Vec::new()),
             restart: AtomicI32::new(0),
         })
     }
 
     pub fn take_restart_requests(&self) -> i32 {
         self.restart.swap(0, Ordering::AcqRel)
+    }
+
+    pub fn queue_edit(&self, id: plugin_host_api::ParamId, normalized: f64) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        if pending.len() == pending.capacity() && !pending.iter().any(|(other, _)| *other == id) {
+            return false;
+        }
+        pending.retain(|(other, _)| *other != id);
+        pending.push((id, normalized));
+        true
+    }
+
+    pub fn take_edits(&self) -> Vec<(plugin_host_api::ParamId, f64)> {
+        std::mem::take(&mut *self.edits.borrow_mut())
     }
 }
 
@@ -363,10 +383,13 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn performEdit(&self, id: ParamID, value_normalized: ParamValue) -> tresult {
-        // Normalised here; the caller cannot denormalise without the parameter
-        // list, so that translation happens in the plugin wrapper which owns it.
-        self.context
-            .param_edited(plugin_host_api::ParamId(id), value_normalized);
+        let id = plugin_host_api::ParamId(id);
+        if !self.queue_edit(id, value_normalized) {
+            return kResultFalse;
+        }
+        let mut edits = self.edits.borrow_mut();
+        edits.retain(|(other, _)| *other != id);
+        edits.push((id, value_normalized));
         kResultOk
     }
 
@@ -402,20 +425,10 @@ impl IComponentHandler2Trait for ComponentHandler {
 mod notification_tests {
     use super::*;
 
-    struct Host;
-    impl HostContext for Host {
-        fn host_name(&self) -> &str {
-            "test"
-        }
-        fn request_restart(&self, _: plugin_host_api::RestartReason) {
-            panic!("native callbacks must not deliver notifications");
-        }
-    }
-
     /// Taking one batch does not erase requests recorded afterwards.
     #[test]
     fn native_requests_are_coalesced_until_main_takes_them() {
-        let handler = ComponentHandler::new(Arc::new(Host));
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::with_capacity(4))));
         unsafe {
             handler.restartComponent(1);
             handler.restartComponent(2);

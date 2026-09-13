@@ -1,39 +1,96 @@
-//! COM apartment initialization for standalone host processes.
-//!
-//! Plugins that draw with Direct2D, use the Windows shell, or interact with COM
-//! objects assume the thread creating them is an initialized Single-Threaded
-//! Apartment (STA). DAW main threads typically initialize COM, but standalone
-//! host executables and test harnesses must initialize it explicitly.
-//!
-//! This is deliberately not called automatically inside the library. Calling
-//! `OleInitialize` on a thread already initialized by a host DAW can modify the
-//! apartment configuration. Therefore, initialization is left to the process owner.
+//! Explicit ownership of the calling thread's COM initialization.
 
-/// Initializes the calling thread into a Single-Threaded Apartment (STA).
-///
-/// Call once on the main thread from a standalone host binary or test harness.
-/// Do not call this when running as a plugin inside a host DAW.
-/// Calling this multiple times is safe: if the thread is already in an STA,
-/// it succeeds; if it is in a different apartment mode, `RPC_E_CHANGED_MODE`
-/// is returned and treated as non-fatal.
-///
-/// No matching `OleUninitialize` is provided, as the apartment is intended
-/// to persist for the lifetime of the process.
+use std::marker::PhantomData;
+use std::rc::Rc;
+
 #[cfg(windows)]
-pub fn init_apartment() {
-    #[link(name = "ole32")]
-    unsafe extern "system" {
-        fn OleInitialize(reserved: *const std::ffi::c_void) -> i32;
-    }
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn OleInitialize(reserved: *const std::ffi::c_void) -> i32;
+    fn OleUninitialize();
+}
 
-    const S_FALSE: i32 = 1;
-    const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+/// Keeps the calling thread prepared until every hosted plugin and returned processor is released.
+///
+/// Each successful initialization, including an existing STA, owns one matching uninitialization.
+/// A DAW-provided thread must already support STA; an incompatible MTA is an error.
+/// Other platforms require no apartment initialization.
+///
+/// ```compile_fail
+/// let guard = vst3_host::init_apartment().unwrap();
+/// std::thread::spawn(move || drop(guard));
+/// ```
+#[must_use = "hold the guard until plugins and returned processors have been released"]
+pub struct ApartmentGuard(PhantomData<Rc<()>>);
 
-    let hr = unsafe { OleInitialize(std::ptr::null()) };
-    if hr != 0 && hr != S_FALSE && hr != RPC_E_CHANGED_MODE {
-        log::warn!("OleInitialize failed: 0x{hr:08X}; COM-using plugins may fault");
+impl Drop for ApartmentGuard {
+    fn drop(&mut self) {
+        plugin_host_api::reclaim_main_thread();
+        #[cfg(windows)]
+        unsafe {
+            OleUninitialize();
+        }
     }
 }
 
-#[cfg(not(windows))]
-pub fn init_apartment() {}
+/// Prepares this thread for plugin hosting. The guard must outlive all native resources it uses.
+pub fn init_apartment() -> plugin_host_api::Result<ApartmentGuard> {
+    #[cfg(windows)]
+    {
+        let result = unsafe { OleInitialize(std::ptr::null()) };
+        if result < 0 {
+            return Err(plugin_host_api::HostError::Backend {
+                context: "OleInitialize".into(),
+                code: result,
+            });
+        }
+    }
+    Ok(ApartmentGuard(PhantomData))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *const std::ffi::c_void, flags: u32) -> i32;
+        fn CoUninitialize();
+        fn CoGetApartmentType(kind: *mut i32, qualifier: *mut i32) -> i32;
+    }
+    fn initialized() -> bool {
+        let (mut kind, mut qualifier) = (0, 0);
+        unsafe { CoGetApartmentType(&mut kind, &mut qualifier) >= 0 }
+    }
+
+    /// Every guard releases exactly its own initialization reference.
+    #[test]
+    fn nested_guards_balance_initialization() {
+        std::thread::spawn(|| {
+            assert!(!initialized());
+            let first = init_apartment().unwrap();
+            let second = init_apartment().unwrap();
+            drop(first);
+            assert!(initialized());
+            drop(second);
+            assert!(!initialized());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Refusing MTA does not uninitialize the apartment owned by the caller.
+    #[test]
+    fn an_incompatible_apartment_is_an_error() {
+        std::thread::spawn(|| {
+            assert_eq!(unsafe { CoInitializeEx(std::ptr::null(), 0) }, 0);
+            assert!(init_apartment().is_err());
+            assert!(initialized());
+            unsafe {
+                CoUninitialize();
+            }
+            assert!(!initialized());
+        })
+        .join()
+        .unwrap();
+    }
+}

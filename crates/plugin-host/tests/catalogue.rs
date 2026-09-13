@@ -12,6 +12,59 @@ use std::path::PathBuf;
 
 use plugin_host::catalogue;
 
+/// A busy native module retains old metadata and remains eligible for a later scan.
+#[test]
+fn busy_modules_are_not_cached_as_broken() {
+    let profile = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let source = profile.join(format!(
+        "{}clap_test_plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = profile.join(format!("catalogue-busy-{}-{unique}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("fixture.clap");
+    std::fs::copy(source, &binary).unwrap();
+    let cache = dir.join("cache.json");
+    let scan = || {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| catalogue::refresh(std::slice::from_ref(&dir), Some(&cache)))
+                .join()
+                .unwrap()
+        })
+    };
+    let owner = clap_host::Module::open(&binary).unwrap();
+    assert!(scan().is_empty());
+    assert!(catalogue::cached(&cache).is_empty());
+    drop(owner);
+    assert_eq!(scan().len(), 1);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    saved["modules"][0]["stamp"]["size"] = 0.into();
+    std::fs::write(&cache, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let owner = clap_host::Module::open(&binary).unwrap();
+    let deferred = scan();
+    assert_eq!(deferred.len(), 1);
+    assert!(deferred[0].error.is_none());
+    assert_eq!(deferred[0].stamp.size, 0);
+    drop(owner);
+    assert!(scan()[0].stamp.size > 0);
+    std::fs::remove_file(binary).unwrap();
+    std::fs::remove_file(cache).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
 /// Cache persistence and invalidation do not depend on a product settings location.
 #[test]
 fn the_cache_is_stamped_stored_at_the_chosen_path_and_survives_being_lost() {

@@ -21,7 +21,6 @@ const LEVEL: f32 = 0.5;
 
 /// A wrapper with the fixture wired between input and output, running.
 fn playing(name: &str) -> Wrapper {
-    plugin_host::init_thread();
     let mut wrapper = Wrapper::default();
     wrapper
         .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
@@ -37,6 +36,7 @@ fn playing(name: &str) -> Wrapper {
 /// Main-thread refresh preserves running notes for labels, and rebuilds routing and slots for structural changes.
 #[test]
 fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
+    let _thread = plugin_host::init_thread().unwrap();
     use audio_graph_engine::NodeKind;
     use plugin_host::ParamId;
     let mut wrapper = playing("metadata-refresh");
@@ -168,6 +168,7 @@ fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
 /// and stays silent on the desk afterwards.
 #[test]
 fn a_bounce_renders_the_audio_and_gives_it_back_afterwards() {
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = playing("audio-path-bounce");
     let mut daw = Daw::playing();
 
@@ -202,6 +203,7 @@ fn a_bounce_renders_the_audio_and_gives_it_back_afterwards() {
 /// Changing parameter-lane order during playback never pairs a plan with another activation's map.
 #[test]
 fn changing_parameter_bindings_keeps_each_block_consistent() {
+    let _thread = plugin_host::init_thread().unwrap();
     use audio_graph_engine::{
         AudioIn, AudioOut, Constant, Graph, NodeKind, ParamPort, Plugin, PluginPorts,
     };
@@ -298,6 +300,7 @@ fn changing_parameter_bindings_keeps_each_block_consistent() {
 /// Failed bus reconfiguration cannot reuse the old processor and can recover.
 #[test]
 fn a_failed_configuration_is_silent_and_can_be_rebuilt() {
+    let _thread = plugin_host::init_thread().unwrap();
     use audio_graph_engine::{AudioIn, AudioOut, Graph, NodeKind, Plugin, PluginPorts};
     let mut wrapper = playing("audio-path-failed-configuration");
     let shared = wrapper.shared().clone();
@@ -358,7 +361,7 @@ fn a_failed_configuration_is_silent_and_can_be_rebuilt() {
 /// track running late until the DAW next restarts it.
 #[test]
 fn a_latency_that_appears_mid_session_reaches_the_daw() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = Wrapper::default();
     wrapper
         .activate(WrapperKind::Effect, &fx_layout(), &LIVE)

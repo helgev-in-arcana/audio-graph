@@ -84,6 +84,7 @@ pub struct PendingRequests {
     pub restart: bool,
     /// The plugin wants `on_main_thread` called.
     pub callback: bool,
+    pub flush: bool,
     /// The plugin wants processing started again after a `Sleep`.
     pub process: bool,
     /// Its parameter list or values changed; the raw CLAP rescan flags.
@@ -124,6 +125,7 @@ pub(crate) struct HostShim {
 
     restart: AtomicBool,
     callback: AtomicBool,
+    flush: AtomicBool,
     process: AtomicBool,
     param_rescan: AtomicU32,
     latency: AtomicBool,
@@ -201,6 +203,7 @@ impl HostShim {
             main_thread: std::thread::current().id(),
             restart: AtomicBool::new(false),
             callback: AtomicBool::new(false),
+            flush: AtomicBool::new(false),
             process: AtomicBool::new(false),
             param_rescan: AtomicU32::new(0),
             latency: AtomicBool::new(false),
@@ -239,6 +242,7 @@ impl HostShim {
         PendingRequests {
             restart: self.restart.swap(false, Ordering::AcqRel),
             callback: self.callback.swap(false, Ordering::AcqRel),
+            flush: self.flush.swap(false, Ordering::AcqRel),
             process: self.process.swap(false, Ordering::AcqRel),
             param_rescan: self.param_rescan.swap(0, Ordering::AcqRel),
             latency: self.latency.swap(false, Ordering::AcqRel),
@@ -475,11 +479,8 @@ unsafe extern "C" fn params_clear(
 }
 
 unsafe extern "C" fn params_request_flush(host: *const clap_host) {
-    // Recorded as a callback request rather than flushing here: flush is
-    // `[main-thread]` when the plugin is inactive, and this call may arrive
-    // from anywhere.
     if let Some(shim) = unsafe { shim(host) } {
-        shim.callback.store(true, Ordering::Release);
+        shim.flush.store(true, Ordering::Release);
     }
 }
 

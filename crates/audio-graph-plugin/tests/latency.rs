@@ -96,7 +96,7 @@ fn claims(shared: &Shared, instance: usize, samples: f64) {
 /// single plugin wired straight through — and wrong for every other.
 #[test]
 fn the_daw_is_told_what_the_graph_costs() {
-    plugin_host::init_thread();
+    let _thread = plugin_host::init_thread().unwrap();
     let mut wrapper = Wrapper::default();
     let layout = fx_layout();
 
