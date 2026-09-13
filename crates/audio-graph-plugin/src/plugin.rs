@@ -180,7 +180,7 @@ impl Wrapper {
                 }
                 for problem in self.shared.main().host.load_state(
                     &state.sub_host_state(),
-                    &audio_graph_settings::directories(),
+                    &plugin_host::plugin_directories(&audio_graph_settings::directories()),
                 ) {
                     // Not fatal by design: a sub-plugin that cannot be found
                     // must not stop the project from opening, and the bindings
