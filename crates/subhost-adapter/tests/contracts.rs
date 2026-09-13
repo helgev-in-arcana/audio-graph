@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use plugin_host::{Format, HostContext, ParamId, RestartReason};
+use plugin_host::{Format, ParamId, RestartReason};
 use subhost_adapter::{InstanceState, SubHost, SubHostConfig, SubHostState, SubPluginRef};
 
 struct Host;
-impl HostContext for Host {
+impl subhost_adapter::SubHostContext for Host {
     fn host_name(&self) -> &str {
         "adapter contract test"
     }
-    fn request_restart(&self, _: RestartReason) {}
+    fn request_restart(&self, _source: subhost_adapter::InstanceId, _: RestartReason) {}
 }
 
 fn host() -> SubHost {
@@ -186,6 +186,96 @@ fn activation_validates_lanes_and_instance_io() {
         plugin_host::ProcessStatus::Error
     );
     assert_eq!(output, [0.0; 64]);
+}
+
+/// Instance-local IDs remain distinguishable after merging and after a slot is replaced.
+#[test]
+fn notifications_and_outputs_keep_the_native_occupant_identity() {
+    use std::sync::Mutex;
+    use subhost_adapter::{InstanceEventSink, InstanceId, SubHostContext};
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(InstanceId, ParamId, f64)>>);
+    impl SubHostContext for Recording {
+        fn host_name(&self) -> &str {
+            "source test"
+        }
+        fn request_restart(&self, _: InstanceId, _: RestartReason) {}
+        fn param_edited(&self, source: InstanceId, id: ParamId, value: f64) {
+            self.0.lock().unwrap().push((source, id, value));
+        }
+    }
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("source-identity");
+    let context = Arc::new(Recording::default());
+    let mut host = SubHost::new(context.clone(), host().config());
+    for index in 0..2 {
+        host.load(index, &path, None).unwrap();
+    }
+    let sources = [host.source(0).unwrap(), host.source(1).unwrap()];
+    for index in 0..2 {
+        host.set_sub_param(index, ParamId(5), 12.0).unwrap();
+        host.tick_editors();
+    }
+    assert_eq!(
+        *context.0.lock().unwrap(),
+        [
+            (sources[0], ParamId(0), 0.375),
+            (sources[1], ParamId(0), 0.375)
+        ]
+    );
+    let mut old = host.activate(audio_config(), &[], &[]).unwrap();
+    let mut sink = InstanceEventSink::with_capacity(8);
+    for index in 0..2 {
+        host.set_sub_param(index, ParamId(5), 12.0).unwrap();
+        run_bound(&mut old, index as u32, &mut sink);
+    }
+    host.tick_editors();
+    host.tick_editors();
+    for index in 0..2 {
+        run_bound(&mut old, index, &mut sink);
+    }
+    assert_eq!(
+        sink.events().iter().map(|e| e.source).collect::<Vec<_>>(),
+        sources
+    );
+    assert_eq!(sink.events()[0].event, sink.events()[1].event);
+
+    host.set_sub_param(0, ParamId(5), 12.0).unwrap();
+    run_bound(&mut old, 0, &mut sink);
+    host.tick_editors();
+    host.tick_editors();
+    host.load(0, &path, None).unwrap();
+    assert_ne!(host.source(0), Some(sources[0]));
+    sink.clear();
+    run_bound(&mut old, 0, &mut sink);
+    assert_eq!(sink.events()[0].source, sources[0]);
+}
+
+fn run_bound(
+    processors: &mut subhost_adapter::SubHostProcessors,
+    instance: u32,
+    sink: &mut subhost_adapter::InstanceEventSink,
+) {
+    use subhost_adapter::AudioInstances;
+    let mut schedule = subhost_adapter::SlotSchedule::new(4, 64, 32).unwrap();
+    schedule.begin(32).unwrap();
+    let time = plugin_host::TimeContext::default();
+    processors.bind(&time, sink).process(
+        instance,
+        &[],
+        &[1.0; 64],
+        &mut [0.0; 64],
+        subhost_adapter::AudioChunk {
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+            frames: 32,
+            offset: 0,
+        },
+        schedule.view(),
+    );
+    assert!(!processors.failed());
 }
 
 fn audio_config() -> plugin_host::AudioConfig {

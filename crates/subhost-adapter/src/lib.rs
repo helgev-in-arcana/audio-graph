@@ -20,12 +20,16 @@
 //!
 //! See `README.md` in this crate for the invariants that boundary depends on.
 
+mod context;
+mod events;
 mod host;
 mod instances;
 mod schedule;
 mod slots;
 mod state;
 
+pub use context::{InstanceId, SubHostContext};
+pub use events::{InstanceEvent, InstanceEventSink};
 pub use host::{
     BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };

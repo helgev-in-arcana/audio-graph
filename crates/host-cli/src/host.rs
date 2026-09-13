@@ -44,3 +44,21 @@ impl HostContext for CliHost {
         self.record(format!("plugin edited param {} to {plain}", id.0));
     }
 }
+
+impl subhost_adapter::SubHostContext for CliHost {
+    fn host_name(&self) -> &str {
+        HostContext::host_name(self)
+    }
+    fn request_restart(&self, source: subhost_adapter::InstanceId, reason: RestartReason) {
+        self.record(format!("{source:?}: restart requested: {reason:?}"));
+    }
+    fn latency_changed(&self, source: subhost_adapter::InstanceId, samples: u32) {
+        self.record(format!("{source:?}: latency: {samples} samples"));
+    }
+    fn param_edited(&self, source: subhost_adapter::InstanceId, id: ParamId, plain: f64) {
+        self.record(format!(
+            "{source:?}: plugin edited param {} to {plain}",
+            id.0
+        ));
+    }
+}

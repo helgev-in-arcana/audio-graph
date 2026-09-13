@@ -7,9 +7,9 @@ use crate::state::WrapperState;
 use audio_graph_engine::{Ended, Engine, Graph, MAX_LIVE_NOTES};
 use nice_plug::prelude::*;
 use plugin_host::{
-    AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
+    AudioConfig, Event, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SlotSchedule, SubHost};
+use subhost_adapter::{InstanceEventSink, SlotSchedule, SubHost};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -44,7 +44,7 @@ pub struct Wrapper {
     /// The DAW's automation, before the graph has had a say.
     daw_slots: Vec<f64>,
     events: Vec<Event>,
-    out_events: EventSink,
+    out_events: InstanceEventSink,
     /// Notes the graph has finished with, to be handed back to the DAW.
     ///
     /// Owned and sized at activate: the audio thread may not allocate, and the
@@ -85,7 +85,7 @@ impl Default for Wrapper {
             schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM).unwrap(),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
-            out_events: EventSink::new(),
+            out_events: InstanceEventSink::new(),
             ended_notes: Vec::new(),
             input_scratch: Vec::new(),
             daw_inputs: Vec::new(),
@@ -306,7 +306,7 @@ impl Wrapper {
         self.output_scratch = vec![0.0; (self.channels * max_block) as usize];
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
-        self.out_events = EventSink::with_capacity(256);
+        self.out_events = InstanceEventSink::with_capacity(256);
         self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
@@ -609,12 +609,15 @@ impl Wrapper {
 /// of the shared audio state for the whole block.
 fn settle_notes<P: Plugin>(
     engine: &mut Engine,
-    from_plugins: &EventSink,
+    from_plugins: &InstanceEventSink,
     ended: &mut Vec<Ended>,
     context: &mut impl ProcessContext<P>,
 ) {
     ended.clear();
-    engine.end_block(from_plugins.events(), ended);
+    engine.end_block(
+        from_plugins.events().iter().map(|output| &output.event),
+        ended,
+    );
     report_ended(ended, context);
 }
 

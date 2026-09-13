@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use crate::schedule::ScheduleView;
 use plugin_host::{
-    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, HostContext, MainThread,
-    ParamEvent, ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain,
-    SubPluginProcessor, Target, TimeContext,
+    AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, MainThread, ParamEvent,
+    ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain, SubPluginProcessor,
+    Target, TimeContext,
 };
 
+use crate::InstanceEventSink;
+use crate::context::{InstanceContext, InstanceId, SubHostContext};
 use crate::instances::{InstanceIo, ParamTarget};
 use crate::slots::{ResolvedTarget, SlotTable, TargetPriority};
 use crate::state::{InstanceState, SubHostState};
@@ -33,7 +35,7 @@ pub struct SubHost {
     /// Document entries survive unavailable modules and failed native state operations.
     saved: Vec<InstanceState>,
     slots: SlotTable,
-    context: Arc<dyn HostContext>,
+    context: Arc<dyn SubHostContext>,
     /// Latency in samples for each instance, cached so the DAW can be answered
     /// without touching a plugin. Filled at activate and brought up to date by
     /// [`SubHost::reread_latencies`]. Callers that run instances in parallel
@@ -64,12 +66,13 @@ pub struct SubHostConfig {
 /// inside `plugin_host::Plugin`, which owns all three, so dropping this struct
 /// is enough to get it right.
 struct Loaded {
+    source: InstanceId,
     plugin: Plugin,
     reference: SubPluginRef,
 }
 
 impl SubHost {
-    pub fn new(context: Arc<dyn HostContext>, config: SubHostConfig) -> SubHost {
+    pub fn new(context: Arc<dyn SubHostContext>, config: SubHostConfig) -> SubHost {
         SubHost {
             instances: Vec::new(),
             saved: Vec::new(),
@@ -183,6 +186,10 @@ impl SubHost {
             .map(|e| &e.reference)
     }
 
+    pub fn source(&self, instance: usize) -> Option<InstanceId> {
+        self.at(instance).map(|loaded| loaded.source)
+    }
+
     /// Returns the capabilities of the loaded sub-plugin at `instance`.
     ///
     /// Defaults to all-false when nothing is loaded, which is also the honest
@@ -273,8 +280,13 @@ impl SubHost {
         class_id: Option<&str>,
     ) -> Result<(), String> {
         self.reserve(instance)?;
-        let mut plugin =
-            Plugin::load(path, class_id, Arc::clone(&self.context)).map_err(|e| e.to_string())?;
+        let source =
+            InstanceId::new(u32::try_from(instance).map_err(|_| "instance index overflow")?);
+        let context = Arc::new(InstanceContext {
+            source,
+            parent: Arc::clone(&self.context),
+        });
+        let mut plugin = Plugin::load(path, class_id, context).map_err(|e| e.to_string())?;
         plugin.refresh_metadata().map_err(|e| e.to_string())?;
 
         let class = plugin.class();
@@ -298,7 +310,11 @@ impl SubHost {
             reference: reference.clone(),
             state: None,
         });
-        self.instances[instance] = Some(MainThread::new(Loaded { plugin, reference }));
+        self.instances[instance] = Some(MainThread::new(Loaded {
+            source,
+            plugin,
+            reference,
+        }));
         Ok(())
     }
 
@@ -619,8 +635,10 @@ impl SubHost {
                 Ok(processor) => {
                     let latency = loaded.plugin.latency_samples();
                     let note_end_ports = loaded.plugin.note_end_ports();
+                    let source = loaded.source;
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
+                        source,
                         config,
                         lanes: self.config.lanes,
                         processor,
@@ -736,6 +754,7 @@ const INCOMING_EVENT_CAPACITY: usize = 1024;
 
 /// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
+    source: InstanceId,
     config: AudioConfig,
     lanes: usize,
     note_end_ports: Vec<i16>,
@@ -751,6 +770,9 @@ pub struct SubHostProcessor {
 }
 
 impl SubHostProcessor {
+    pub fn source(&self) -> InstanceId {
+        self.source
+    }
     /// Processes an audio buffer through the sub-plugin for the specified sample chunk.
     ///
     /// Merges incoming host events and parameter automation values from
@@ -916,7 +938,7 @@ impl SubHostProcessors {
     pub fn bind<'a>(
         &'a mut self,
         context: &'a TimeContext,
-        out_events: &'a mut EventSink,
+        out_events: &'a mut InstanceEventSink,
     ) -> BoundInstances<'a> {
         self.failed = false;
         BoundInstances {
@@ -931,7 +953,7 @@ impl SubHostProcessors {
 pub struct BoundInstances<'a> {
     processors: &'a mut SubHostProcessors,
     context: &'a TimeContext,
-    out_events: &'a mut EventSink,
+    out_events: &'a mut InstanceEventSink,
 }
 
 impl crate::instances::AudioInstances for BoundInstances<'_> {
@@ -979,19 +1001,17 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
         )
         .with_aux_inputs(chunk.aux_inputs)
         .with_aux_outputs(chunk.aux_outputs);
-        let first_output = self.out_events.events().len();
+        self.out_events.native.clear();
         let status = processor.process(
             &mut buffers,
             schedule,
             notes,
             chunk.offset..chunk.offset.saturating_add(chunk.frames),
             self.context,
-            self.out_events,
+            &mut self.out_events.native,
         );
         self.processors.failed |= status == ProcessStatus::Error;
-        for event in &mut self.out_events.events_mut()[first_output..] {
-            *event = event.at_offset(event.sample_offset() + chunk.offset);
-        }
+        self.out_events.collect(processor.source, chunk.offset);
     }
 }
 
@@ -1048,7 +1068,7 @@ mod tests {
         let mut schedule = SlotSchedule::new(LANES, 4, 32).unwrap();
         schedule.begin(4).unwrap();
         let mut output = [9.0; 8];
-        let mut sink = EventSink::with_capacity(8);
+        let mut sink = InstanceEventSink::with_capacity(8);
         let time = TimeContext::default();
         let chunk = AudioChunk {
             input_channels: 2,
@@ -1134,6 +1154,7 @@ mod tests {
             entries: (0..2)
                 .map(|_| {
                     Some(SubHostProcessor {
+                        source: InstanceId::new(0),
                         config: config(),
                         lanes: LANES,
                         note_end_ports: Vec::new(),
@@ -1145,7 +1166,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let mut sink = EventSink::with_capacity(2);
+        let mut sink = InstanceEventSink::with_capacity(2);
         let context = TimeContext::default();
         let mut schedule = SlotSchedule::new(LANES, 8, 4).unwrap();
         schedule.begin(8).unwrap();
@@ -1178,7 +1199,7 @@ mod tests {
         assert_eq!(
             sink.events()
                 .iter()
-                .map(Event::sample_offset)
+                .map(|output| output.event.sample_offset())
                 .collect::<Vec<_>>(),
             [1, 5]
         );
@@ -1193,6 +1214,7 @@ mod tests {
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
+            source: InstanceId::new(0),
             config: config(),
             lanes: LANES,
             note_end_ports: Vec::new(),
@@ -1531,7 +1553,7 @@ mod tests {
             sample_offset: 0,
         });
         let schedule = SlotSchedule::new(LANES, 4, 32).unwrap();
-        let mut sink = EventSink::new();
+        let mut sink = InstanceEventSink::new();
         let context = TimeContext::default();
         let mut schedule = schedule;
         schedule.begin(4).unwrap();

@@ -1009,7 +1009,11 @@ impl Engine {
     /// `from_plugins` is what the sub-plugins emitted; a `NoteEnd` in it is one
     /// of them saying it is done with a note. `ended` comes back holding the
     /// notes to report to the DAW, addressed the way the DAW will recognise.
-    pub fn end_block(&mut self, from_plugins: &[Event], ended: &mut Vec<Ended>) {
+    pub fn end_block<'a>(
+        &mut self,
+        from_plugins: impl IntoIterator<Item = &'a Event>,
+        ended: &mut Vec<Ended>,
+    ) {
         for event in from_plugins {
             if let Event::Note(NoteEvent::NoteEnd {
                 note_id: Some(id), ..

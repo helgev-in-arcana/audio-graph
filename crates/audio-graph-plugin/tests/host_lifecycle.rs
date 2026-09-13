@@ -3,17 +3,17 @@ mod harness;
 use std::sync::{Arc, Mutex};
 
 use audio_graph_plugin::{SUB_HOST, Shared, WrapperParams};
-use plugin_host::{AudioConfig, HostContext, RestartReason};
+use plugin_host::{AudioConfig, RestartReason};
 use subhost_adapter::{InstanceIo, SubHost};
 
 struct Context(Arc<Mutex<Vec<std::thread::ThreadId>>>);
 
-impl HostContext for Context {
+impl subhost_adapter::SubHostContext for Context {
     fn host_name(&self) -> &str {
         "lifecycle test"
     }
 
-    fn request_restart(&self, _reason: RestartReason) {}
+    fn request_restart(&self, _source: subhost_adapter::InstanceId, _reason: RestartReason) {}
 }
 
 impl Drop for Context {
