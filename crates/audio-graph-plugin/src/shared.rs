@@ -32,7 +32,7 @@
 
 use std::array;
 use std::cell::{RefCell, RefMut};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -70,13 +70,27 @@ pub struct MainState {
 /// The graph being edited, reachable from whichever thread the editor is on.
 pub struct Patch {
     pub graph: Graph,
-    restore_error: Option<String>,
+    pub(crate) document: u64,
+    pub(crate) restore_error: Option<String>,
     /// Why the graph on screen is not the graph being heard.
     ///
     /// A cycle or a duplicate output is an ordinary thing to have halfway
     /// through an edit; the last program that compiled keeps running and the
     /// editor says why.
     pub compile_error: Option<String>,
+}
+
+/// Edits whose publication must agree with the lifetime of hosted children.
+pub enum GraphEdit {
+    AddPlugin {
+        path: PathBuf,
+        pos: [f32; 2],
+    },
+    RemoveNode(NodeId),
+    Clear,
+    Reset,
+    /// Commit inline canvas edits that do not create or destroy native children.
+    Publish,
 }
 
 /// The processor configuration and the earliest publication it can execute.
@@ -182,6 +196,7 @@ impl Shared {
             })),
             patch: Mutex::new(Patch {
                 graph: Graph::default_patch(),
+                document: 0,
                 compile_error: None,
                 restore_error: None,
             }),
@@ -277,6 +292,7 @@ impl Shared {
             return;
         };
         view.rebuild(&state.host, self.generation());
+        view.free_instance = Self::free_graph_instance(&state.host, &self.patch().graph);
     }
 
     /// Hand `task` to the main thread, to run on its next tick.
@@ -421,6 +437,106 @@ impl Shared {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn document_generation(&self) -> u64 {
+        self.patch().document
+    }
+
+    fn free_graph_instance(host: &SubHost, graph: &Graph) -> Option<usize> {
+        (0..host.config().max_instances).find(|&instance| {
+            host.reference(instance).is_none()
+                && !graph.nodes.iter().any(|node| {
+                    matches!(&node.kind, NodeKind::Plugin(plugin) if plugin.instance == instance)
+                })
+        })
+    }
+
+    /// Main-thread edit boundary. A stale request cannot modify a newer document.
+    /// A failed load reserves its node's instance until that node is deleted.
+    /// Returns `false` when the request no longer applies.
+    pub fn edit_graph(&self, document: u64, edit: GraphEdit) -> Result<bool, String> {
+        assert!(
+            self.on_main_thread(),
+            "graph lifecycle edits require the main thread"
+        );
+        {
+            let patch = self.patch();
+            if patch.document != document
+                || (patch.restore_error.is_some()
+                    && !matches!(edit, GraphEdit::Clear | GraphEdit::Reset))
+            {
+                return Ok(false);
+            }
+        }
+        let result = match edit {
+            GraphEdit::AddPlugin { path, pos } => {
+                let instance = Self::free_graph_instance(&self.main().host, &self.patch().graph)
+                    .ok_or("no free plugin instance")?;
+                self.suspend();
+                self.patch().graph.add(
+                    NodeKind::Plugin(Plugin {
+                        instance,
+                        ports: PluginPorts::default(),
+                    }),
+                    pos,
+                );
+                let loaded = self.main().host.load(instance, &path, None);
+                loaded.and_then(|_| self.prepare_host_metadata())
+            }
+            GraphEdit::RemoveNode(id) => {
+                let instance = match self.patch().graph.node(id) {
+                    Some(node) => match &node.kind {
+                        NodeKind::Plugin(plugin) => Some(plugin.instance),
+                        _ => None,
+                    },
+                    None => return Ok(false),
+                };
+                if instance.is_some() {
+                    self.suspend();
+                }
+                self.patch().graph.remove(id);
+                if instance.is_some() {
+                    self.remove_unowned_children();
+                }
+                Ok(())
+            }
+            GraphEdit::Clear | GraphEdit::Reset => {
+                self.suspend();
+                self.main().host.unload_all();
+                self.restore_graph(if matches!(edit, GraphEdit::Clear) {
+                    Graph::new()
+                } else {
+                    Graph::default_patch()
+                });
+                Ok(())
+            }
+            GraphEdit::Publish => Ok(()),
+        };
+        let published = self.publish(false);
+        self.changed();
+        self.store_state();
+        result.and(published).map(|_| true)
+    }
+
+    /// Requires stopped processors: document restoration also owns native child cleanup.
+    pub(crate) fn remove_unowned_children(&self) {
+        let owned: Vec<_> = self
+            .patch()
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Plugin(plugin) => Some(plugin.instance),
+                _ => None,
+            })
+            .collect();
+        let mut main = self.main();
+        for instance in 0..main.host.config().max_instances {
+            if !owned.contains(&instance) {
+                main.host.unload(instance);
+            }
+        }
     }
 
     /// Tell the editor its cached view of the sub-plugin is out of date.
@@ -768,8 +884,10 @@ impl Shared {
 
     pub(crate) fn restore_graph(&self, mut graph: Graph) {
         graph.prune();
-        *self.patch() = Patch {
+        let mut patch = self.patch();
+        *patch = Patch {
             graph,
+            document: patch.document + 1,
             compile_error: None,
             restore_error: None,
         };
@@ -778,8 +896,10 @@ impl Shared {
 
     pub(crate) fn retain_state(&self, json: &str, error: String) {
         self.main().host.unload_all();
-        *self.patch() = Patch {
+        let mut patch = self.patch();
+        *patch = Patch {
             graph: Graph::new(),
+            document: patch.document + 1,
             compile_error: None,
             restore_error: Some(error),
         };
@@ -790,13 +910,8 @@ impl Shared {
 
     /// Explicitly replaces the document, including any retained unreadable input.
     pub fn start_new_graph(&self) -> Result<(), String> {
-        self.suspend();
-        self.main().host.unload_all();
-        self.restore_graph(Graph::default_patch());
-        let result = self.resume();
-        self.changed();
-        self.store_state();
-        result
+        self.edit_graph(self.document_generation(), GraphEdit::Reset)
+            .map(|_| ())
     }
 
     /// Serialise the sub-plugin, the slot table and the graph into the

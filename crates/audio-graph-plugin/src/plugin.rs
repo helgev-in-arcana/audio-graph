@@ -167,6 +167,7 @@ impl Wrapper {
             }
         };
         self.shared.set_quantum(state.sub_block);
+        let needs_default_patch = graph.is_none();
         self.shared.restore_graph(graph.unwrap_or_else(Graph::new));
         for problem in self.shared.main().host.load_state(
             &state.sub_host_state(),
@@ -174,7 +175,10 @@ impl Wrapper {
         ) {
             log::warn!("audio-graph: {problem}");
         }
-        self.shared.adopt_default_patch();
+        if needs_default_patch {
+            self.shared.adopt_default_patch();
+        }
+        self.shared.remove_unowned_children();
         if let Err(error) = self.shared.prepare_host_metadata() {
             self.shared.patch().compile_error = Some(error);
             return false;
