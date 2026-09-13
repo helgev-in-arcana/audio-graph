@@ -871,8 +871,9 @@ impl SubHostProcessor {
         }
 
         let status = if complete {
+            let context = chunk_context(*context, chunk.start, self.config.sample_rate);
             self.processor
-                .process(buffers, &self.scratch, context, out_events)
+                .process(buffers, &self.scratch, &context, out_events)
         } else {
             buffers.clear_output();
             ProcessStatus::Error
@@ -1025,6 +1026,40 @@ fn slice<'a>(events: &'a [Event], chunk: &Range<u32>) -> &'a [Event] {
     let start = events.partition_point(|e| e.sample_offset() < chunk.start);
     let end = events.partition_point(|e| e.sample_offset() < chunk.end);
     &events[start..end.max(start)]
+}
+
+fn chunk_context(mut context: TimeContext, offset: u32, sample_rate: f64) -> TimeContext {
+    if !context.playing || offset == 0 {
+        return context;
+    }
+    fn wrap(position: f64, bounds: Option<(f64, f64)>) -> f64 {
+        if let Some((start, end)) = bounds
+            && start.is_finite()
+            && end.is_finite()
+            && end > start
+            && position >= end
+        {
+            start + (position - start).rem_euclid(end - start)
+        } else {
+            position
+        }
+    }
+    context.project_time_samples = context.project_time_samples.saturating_add(offset.into());
+    context.project_time_music += f64::from(offset) / sample_rate * context.tempo_bpm / 60.0;
+    if context.loop_active {
+        let seconds = context.project_time_samples as f64 / sample_rate;
+        let wrapped = wrap(seconds, context.loop_range_seconds);
+        if wrapped != seconds {
+            context.project_time_samples = (wrapped * sample_rate).round() as i64;
+        }
+        context.project_time_music = wrap(context.project_time_music, context.loop_range_music);
+    }
+    let bar = f64::from(context.time_sig_numerator) * 4.0 / f64::from(context.time_sig_denominator);
+    if bar.is_finite() && bar > 0.0 && context.project_time_music.is_finite() {
+        context.bar_position_music +=
+            ((context.project_time_music - context.bar_position_music) / bar).floor() * bar;
+    }
+    context
 }
 
 /// Appends an event to the scratch buffer unless it is full.

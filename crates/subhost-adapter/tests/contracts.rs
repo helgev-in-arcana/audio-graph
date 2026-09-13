@@ -278,6 +278,87 @@ fn run_bound(
     assert!(!processors.failed());
 }
 
+/// Native transport describes each chunk's first sample, including stopped and looping playback.
+#[test]
+fn subblocks_advance_transport_without_moving_stopped_playback() {
+    use plugin_host::{Event, ParamEvent, Target, TimeContext};
+    use subhost_adapter::{AudioChunk, AudioInstances, InstanceEventSink, SlotSchedule};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("transport");
+    let mut host = host();
+    host.load(0, &path, None).unwrap();
+    let mut processors = host.activate(audio_config(), &[], &[]).unwrap();
+    let mut schedule = SlotSchedule::new(4, 64, 32).unwrap();
+    schedule.begin(64).unwrap();
+    let time = TimeContext {
+        playing: true,
+        project_time_samples: 48000,
+        project_time_music: 2.0,
+        ..Default::default()
+    };
+    let crossing = TimeContext {
+        project_time_samples: 95984,
+        project_time_music: 4.0 - 32.0 / 48000.0,
+        ..time
+    };
+    let cases = [
+        (time, [48032.0 / 48000.0, 2.0 + 64.0 / 48000.0, 0.0]),
+        (
+            TimeContext {
+                playing: false,
+                ..time
+            },
+            [1.0, 2.0, 0.0],
+        ),
+        (crossing, [96016.0 / 48000.0, 4.0 + 32.0 / 48000.0, 4.0]),
+        (
+            TimeContext {
+                loop_active: true,
+                loop_range_seconds: Some((0.0, 2.0)),
+                loop_range_music: Some((0.0, 4.0)),
+                ..crossing
+            },
+            [16.0 / 48000.0, 32.0 / 48000.0, 0.0],
+        ),
+    ];
+    let events = [0, 32].map(|sample_offset| {
+        Event::Param(ParamEvent::SetValue {
+            id: ParamId(5),
+            target: Target::Global,
+            value: 14.0,
+            sample_offset,
+        })
+    });
+    for (time, expected) in cases {
+        let mut sink = InstanceEventSink::with_capacity(8);
+        let mut bound = processors.bind(&time, &mut sink);
+        for offset in [0, 32] {
+            let mut output = [0.0; 64];
+            bound.process(
+                0,
+                &events,
+                &[0.0; 64],
+                &mut output,
+                AudioChunk {
+                    input_channels: 2,
+                    output_channels: 2,
+                    frames: 32,
+                    offset,
+                    aux_inputs: Default::default(),
+                    aux_outputs: Default::default(),
+                },
+                schedule.view(),
+            );
+            if offset == 32 {
+                for (actual, expected) in output.iter().zip(expected) {
+                    assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+                }
+            }
+        }
+        assert!(!processors.failed());
+    }
+}
+
 fn audio_config() -> plugin_host::AudioConfig {
     plugin_host::AudioConfig {
         sample_rate: 48000.0,
