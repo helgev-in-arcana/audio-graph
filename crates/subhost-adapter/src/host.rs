@@ -622,15 +622,18 @@ impl SubHost {
     ///
     /// Returns a list of diagnostic messages rather than an error: a missing
     /// sub-plugin must not stop the rest of the patch from loading.
-    pub fn load_state(&mut self, state: &SubHostState) -> Vec<String> {
+    pub fn load_state(
+        &mut self,
+        state: &SubHostState,
+        search_directories: &[(Format, PathBuf)],
+    ) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
         self.unload_all();
 
         for entry in &state.instances {
             let reference = &entry.reference;
-            let defaults = plugin_host::default_plugin_directories();
-            let Some(path) = Self::resolve_reference(reference, &defaults) else {
+            let Some(path) = Self::resolve_reference(reference, search_directories) else {
                 problems.push(format!(
                     "{} could not be found; its slot bindings are kept and will \
                      resolve if it is reinstalled",

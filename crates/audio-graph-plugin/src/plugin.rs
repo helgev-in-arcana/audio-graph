@@ -178,7 +178,10 @@ impl Wrapper {
                     Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
                     None => {}
                 }
-                for problem in self.shared.main().host.load_state(&state.sub_host_state()) {
+                for problem in self.shared.main().host.load_state(
+                    &state.sub_host_state(),
+                    &audio_graph_settings::directories(),
+                ) {
                     // Not fatal by design: a sub-plugin that cannot be found
                     // must not stop the project from opening, and the bindings
                     // are kept so reinstalling it brings them back.
