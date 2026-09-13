@@ -19,6 +19,7 @@ fn host() -> SubHost {
             max_instances: 4,
             slot_count: 2,
             lanes: 4,
+            target_priority: subhost_adapter::TargetPriority::PreferDirect,
         },
     )
 }
@@ -120,4 +121,95 @@ fn failed_saves_keep_the_last_successful_blob() {
     host.set_sub_param(0, ParamId(5), 13.0).unwrap();
     assert_eq!(host.save_state(), good);
     assert_ne!(host.save_state(), good);
+}
+
+fn audio_config() -> plugin_host::AudioConfig {
+    plugin_host::AudioConfig {
+        sample_rate: 48000.0,
+        max_block_size: 64,
+        input_channels: 2,
+        output_channels: 2,
+        aux_inputs: Default::default(),
+        aux_outputs: Default::default(),
+        offline: true,
+    }
+}
+
+fn run(processors: &mut subhost_adapter::SubHostProcessors, values: &[f64]) -> f32 {
+    let mut schedule = subhost_adapter::SlotSchedule::new(4, 64, 32);
+    schedule.begin(32);
+    schedule.fill(values);
+    let input = [1.0; 64];
+    let mut output = [0.0; 64];
+    let mut buffers = plugin_host::AudioBuffers::new(
+        &input,
+        &mut output,
+        2,
+        2,
+        32,
+        plugin_host::BufferLayout::Planar,
+    );
+    let status = processors.get_mut(0).unwrap().process(
+        &mut buffers,
+        schedule.view(),
+        &[],
+        0..32,
+        &plugin_host::TimeContext::default(),
+        &mut plugin_host::EventSink::with_capacity(64),
+    );
+    assert_eq!(status, plugin_host::ProcessStatus::Continue);
+    output[0]
+}
+
+/// Priority depends on the selected source, not on which competing lane most recently changed.
+#[test]
+fn duplicate_parameter_sources_have_stable_priority() {
+    use subhost_adapter::{ParamTarget, TargetPriority};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("target-priority");
+    for (priority, expected) in [
+        (TargetPriority::PreferDirect, [1.6, 1.6]),
+        (TargetPriority::PreferSlots, [0.4, 0.6]),
+    ] {
+        let mut host = SubHost::new(
+            Arc::new(Host),
+            SubHostConfig {
+                target_priority: priority,
+                ..host().config()
+            },
+        );
+        host.load(0, &path, None).unwrap();
+        for slot in [0, 1] {
+            host.bind_slot(0, slot, ParamId(0)).unwrap();
+        }
+        let mut processors = host
+            .activate(
+                audio_config(),
+                &[],
+                &[ParamTarget {
+                    instance: 0,
+                    param: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(run(&mut processors, &[0.1, 0.2, 0.8]), expected[0]);
+        assert_eq!(run(&mut processors, &[0.5, 0.3, 0.8]), expected[1]);
+        assert_eq!(run(&mut processors, &[0.5, 0.3, 0.8]), expected[1]);
+    }
+    let mut host = SubHost::new(
+        Arc::new(Host),
+        SubHostConfig {
+            target_priority: TargetPriority::RejectConflicts,
+            ..host().config()
+        },
+    );
+    host.load(0, &path, None).unwrap();
+    for slot in [0, 1] {
+        host.bind_slot(0, slot, ParamId(0)).unwrap();
+    }
+    assert!(host.activate(audio_config(), &[], &[]).is_err());
+    host.slots_mut().clear(1);
+    host.activate(audio_config(), &[], &[])
+        .unwrap()
+        .deactivate();
 }

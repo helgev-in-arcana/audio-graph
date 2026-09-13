@@ -16,7 +16,7 @@ use plugin_host::{
 };
 
 use crate::instances::{InstanceIo, ParamTarget};
-use crate::slots::{ResolvedTarget, SlotTable};
+use crate::slots::{ResolvedTarget, SlotTable, TargetPriority};
 use crate::state::{InstanceState, SubHostState};
 
 pub use crate::state::SubPluginRef;
@@ -55,6 +55,7 @@ pub struct SubHostConfig {
     /// Number of values carried per sub-block in the [`SlotSchedule`][crate::SlotSchedule]: the
     /// slots plus whatever else the caller packs alongside them.
     pub lanes: usize,
+    pub target_priority: TargetPriority,
 }
 
 /// A loaded sub-plugin instance and its reference metadata.
@@ -491,11 +492,16 @@ impl SubHost {
     /// Two sources, one shape: the slot table is the DAW's automation lanes,
     /// and the lanes past it are whatever else the caller drives directly. The
     /// merge in `SubHostProcessor::process` does not care which is which.
-    fn targets_for(&self, instance: usize, direct: &[ParamTarget]) -> Vec<(usize, ResolvedTarget)> {
+    fn targets_for(
+        &self,
+        instance: usize,
+        direct: &[ParamTarget],
+    ) -> Result<Vec<(usize, ResolvedTarget)>, String> {
         // Only the slots bound against *this* instance. Handing every
         // instance the whole table would make one slot drive the same
         // parameter on every copy.
         let mut targets = self.slots.active_targets(instance as u32);
+        let slots = targets.len();
         let params = self.params(instance);
         for (lane, target) in direct.iter().enumerate() {
             if target.instance as usize != instance {
@@ -517,7 +523,24 @@ impl SubHost {
                 },
             ));
         }
-        targets
+        if self.config.target_priority == TargetPriority::PreferSlots {
+            targets.rotate_left(slots);
+        }
+        let mut resolved: Vec<(usize, ResolvedTarget)> = Vec::new();
+        for candidate in targets {
+            if let Some(previous) = resolved.iter_mut().find(|(_, t)| t.id == candidate.1.id) {
+                if self.config.target_priority == TargetPriority::RejectConflicts {
+                    return Err(format!(
+                        "multiple lanes target parameter {} on instance {instance}",
+                        candidate.1.id.0
+                    ));
+                }
+                *previous = candidate;
+            } else {
+                resolved.push(candidate);
+            }
+        }
+        Ok(resolved)
     }
 
     /// Activates all loaded sub-plugins for audio processing.
@@ -554,7 +577,7 @@ impl SubHost {
             }
             // Before the plugin is borrowed for activation, because this
             // reads both the slot table and the plugin's parameter list.
-            let targets = self.targets_for(instance, direct);
+            let targets = self.targets_for(instance, direct)?;
             let Some(loaded) = self.at_mut(instance) else {
                 unreachable!("checked just above")
             };
@@ -577,8 +600,8 @@ impl SubHost {
                     processors.push(Some(SubHostProcessor {
                         processor,
                         note_end_ports,
+                        last_sent: vec![f64::NAN; targets.len()],
                         targets,
-                        last_sent: vec![f64::NAN; self.config.lanes],
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }
@@ -757,17 +780,17 @@ impl SubHostProcessor {
             }
 
             let values = slots.block(index);
-            for &(slot, target) in &self.targets {
+            for (target_index, &(slot, target)) in self.targets.iter().enumerate() {
                 let Some(&normalized) = values.get(slot) else {
                     continue;
                 };
                 // Resending would waste the sub-plugin's parameter queue
                 // and, worse, retrigger smoothing on plugins that ramp
                 // towards every incoming point.
-                if self.last_sent[slot] == normalized {
+                if self.last_sent[target_index] == normalized {
                     continue;
                 }
-                self.last_sent[slot] = normalized;
+                self.last_sent[target_index] = normalized;
                 complete &= push(
                     &mut self.scratch,
                     Event::Param(ParamEvent::SetValue {
