@@ -22,6 +22,7 @@ Program {
     audio_ops: [],
     note_ops: [],
     note_bufs: 0,
+    note_streams: [],
     param_targets: [],
     audio_lane_base: 96,
     instances: [],

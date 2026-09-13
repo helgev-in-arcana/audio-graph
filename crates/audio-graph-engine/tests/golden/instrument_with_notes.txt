@@ -35,6 +35,16 @@ Program {
         },
     ],
     note_bufs: 1,
+    note_streams: [
+        NoteStream {
+            node: 0,
+            port: 0,
+            source: None,
+            kind: Input(
+                0,
+            ),
+        },
+    ],
     param_targets: [],
     audio_lane_base: 96,
     instances: [

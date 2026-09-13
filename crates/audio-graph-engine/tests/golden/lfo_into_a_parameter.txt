@@ -27,6 +27,7 @@ Program {
     audio_ops: [],
     note_ops: [],
     note_bufs: 0,
+    note_streams: [],
     param_targets: [
         ParamTarget {
             instance: 0,

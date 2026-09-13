@@ -21,6 +21,8 @@ mod audio_op;
 mod note_op;
 mod op;
 
+pub(crate) use note_op::{NoteStream, NoteStreamKind};
+
 pub use audio_op::{AudioOp, Buf, Chunking, MixIn, Span, Stage};
 pub use note_op::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NoteBuf,
@@ -172,6 +174,7 @@ pub struct Program {
     pub(crate) note_ops: Vec<NoteOp>,
     /// How many note buffers this program uses.
     pub(crate) note_bufs: u16,
+    pub(crate) note_streams: Vec<NoteStream>,
     /// Which sub-plugin parameter each graph-driven lane drives.
     ///
     /// Entry `k` is the lane `slot_count + k` in [`Program::outputs`], so the
@@ -365,6 +368,7 @@ impl Program {
             audio_ops: Vec::new(),
             note_ops: Vec::new(),
             note_bufs: 0,
+            note_streams: Vec::new(),
             param_targets: Vec::new(),
             audio_lane_base: 0,
             instances: Vec::new(),

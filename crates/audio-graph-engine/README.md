@@ -79,6 +79,12 @@ current note expression values — is carried across the swap rather than reset.
 oscillator that restarted on every recompile would make the editor unusable for
 exactly the thing an LFO is for.
 
+Note buffers are matched by their producer, upstream stream, and static filter
+conditions. Matching streams retain held notes and the previous block's event
+tail; new or changed buffers start empty. Buffer storage and boundary indices
+move together without resizing. Controller emitters resend their current value
+after adoption. This matching runs only when a new program is adopted.
+
 ### The dependency on `subhost-adapter` points this way on purpose
 
 A plugin node has something behind it, but this crate only ever sees it through

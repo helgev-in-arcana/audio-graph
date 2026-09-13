@@ -25,7 +25,7 @@ use crate::ir::{
     AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
     MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
     MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
-    NoteOp, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
+    NoteOp, NoteStream, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -246,6 +246,7 @@ struct NoteState {
     /// and refilled after that. A program swap happens on the audio thread, so
     /// nothing here may be sized from the program.
     bufs: Vec<NoteBuf>,
+    streams: [Option<NoteStream>; MAX_NOTE_BUFS],
     /// Last value each controller-generating op sent, or NaN before its first.
     /// Forgotten on a program swap; see [`NoteOp::Emit`].
     emitted: Vec<f64>,
@@ -260,9 +261,47 @@ impl NoteState {
     fn new() -> NoteState {
         NoteState {
             bufs: (0..MAX_NOTE_BUFS).map(|_| NoteBuf::new()).collect(),
+            streams: [None; MAX_NOTE_BUFS],
             emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             dropped: 0,
         }
+    }
+
+    /// Upstream buffers precede their readers, so each match can validate its source's match.
+    fn adopt(&mut self, streams: &[NoteStream]) -> [Option<usize>; MAX_NOTE_BUFS] {
+        let mut remap = [None; MAX_NOTE_BUFS];
+        for (to, next) in streams.iter().enumerate() {
+            remap[to] = self.streams.iter().position(|old| {
+                let Some(old) = old else { return false };
+                old.node == next.node
+                    && old.port == next.port
+                    && old.kind == next.kind
+                    && match (old.source, next.source) {
+                        (None, None) => true,
+                        (Some(old), Some(next)) => {
+                            remap[usize::from(next)] == Some(usize::from(old))
+                        }
+                        _ => false,
+                    }
+            });
+        }
+        let mut order: [usize; MAX_NOTE_BUFS] = std::array::from_fn(|i| i);
+        for (to, from) in remap.iter().enumerate() {
+            if let Some(from) = from {
+                let at = order.iter().position(|slot| slot == from).unwrap();
+                self.bufs.swap(to, at);
+                order.swap(to, at);
+            }
+        }
+        for (index, buf) in self.bufs.iter_mut().enumerate() {
+            if remap[index].is_none() {
+                buf.events.clear();
+                buf.silence();
+            }
+            self.streams[index] = streams.get(index).copied();
+        }
+        self.emitted.fill(f64::NAN);
+        remap
     }
 
     /// Appends unless the buffer is full. Dropping an event is bad; growing a
@@ -737,6 +776,12 @@ impl Engine {
                 .fallback_destinations,
         );
         let next = self.program.as_ref().expect("take reported a swap");
+
+        let remap = self.notes.adopt(&next.note_streams);
+        for marks in self.note_marks.iter_mut().take(self.note_rows) {
+            let previous = *marks;
+            *marks = remap.map(|from| from.map_or(0, |index| previous[index]));
+        }
 
         for (i, &node) in next.lfo_nodes.iter().take(MAX_LFOS).enumerate() {
             // Linear over at most MAX_LFOS entries.
@@ -3140,6 +3185,113 @@ mod tests {
         assert_eq!(heard.0[&0].len(), 1, "and holding it is not");
         block(&mut engine, 0.0, &mut heard);
         assert_eq!(heard.0[&0].len(), 2, "letting go is");
+
+        load(&mut engine, &graph);
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 3, "adoption resends the current value");
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(heard.0[&0].len(), 3);
+        let NodeKind::ParamToCc(emitter) = &mut graph.node_mut(pedal).unwrap().kind else {
+            unreachable!()
+        };
+        emitter.cc = 1;
+        load(&mut engine, &graph);
+        block(&mut engine, 0.0, &mut heard);
+        assert!(matches!(
+            heard.0[&0].last(),
+            Some(Event::Note(NoteEvent::Cc { cc: 1, .. }))
+        ));
+        assert_eq!(heard.0[&0].len(), 4);
+        graph.remove(pedal);
+        load(&mut engine, &graph);
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(
+            heard.0[&0].len(),
+            4,
+            "a removed emitter cannot replay its old buffer"
+        );
+        let replacement = graph.add(NodeKind::ParamToCc(ParamToCc::default()), [0.0; 2]);
+        graph.connect(control, 0, replacement, 0);
+        graph.connect(replacement, 0, synth, 0);
+        load(&mut engine, &graph);
+        block(&mut engine, 0.0, &mut heard);
+        assert_eq!(
+            heard.0[&0].len(),
+            5,
+            "a reused emitter slot must send its first value"
+        );
+    }
+
+    /// Events, boundary indices, and held state move together without replacing buffer storage.
+    #[test]
+    fn note_buffer_handoff_preserves_storage_and_the_previous_block_tail() {
+        use crate::ir::NoteStreamKind;
+        let stream = |node| NoteStream {
+            node,
+            port: 0,
+            source: None,
+            kind: NoteStreamKind::Input(0),
+        };
+        let program = |streams: Vec<NoteStream>| {
+            let mut program = Program::empty();
+            program.note_bufs = streams.len() as u16;
+            program.note_streams = streams;
+            program
+        };
+        let publisher = crate::ProgramPublisher::default();
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        publisher.publish(program(vec![stream(11), stream(22)]), RATE);
+        engine.adopt(&publisher);
+        engine.notes.bufs[0]
+            .events
+            .extend([note_on(60, 1), note_on(61, 40)]);
+        engine.notes.bufs[1]
+            .events
+            .extend([note_on(70, 1), note_on(71, 2), note_on(72, 50)]);
+        engine.notes.bufs[0].held = 1 << 61;
+        engine.notes.bufs[0].struck = 1 << 61;
+        engine.notes.bufs[0].count = 2;
+        engine.notes.bufs[0].velocity = 0.75;
+        engine.notes.bufs[0].key = 61.0 / 127.0;
+        engine.notes.bufs[1].count = 3;
+        engine.note_rows = 2;
+        engine.note_marks[1][0] = 1;
+        engine.note_marks[1][1] = 2;
+        let storage = |engine: &Engine| {
+            let mut storage: [_; MAX_NOTE_BUFS] = std::array::from_fn(|i| {
+                (
+                    engine.notes.bufs[i].events.as_ptr() as usize,
+                    engine.notes.bufs[i].events.capacity(),
+                )
+            });
+            storage.sort_unstable();
+            storage
+        };
+        let before = storage(&engine);
+        publisher.publish(program(vec![stream(22), stream(11), stream(33)]), RATE);
+        assert!(engine.adopt(&publisher));
+        assert_eq!(storage(&engine), before);
+        assert_eq!(engine.note_marks[1][..3], [2, 1, 0]);
+        let carried = &engine.notes.bufs[1];
+        assert_eq!(
+            (carried.held, carried.struck, carried.count),
+            (1 << 61, 1 << 61, 2)
+        );
+        assert_eq!((carried.velocity, carried.key), (0.75, 61.0 / 127.0));
+        assert_eq!(engine.notes.bufs[2].count, 0);
+        assert!(engine.notes.bufs[2].events.is_empty());
+        engine.begin_block(&[]);
+        assert_eq!(engine.notes.bufs[0].events, [note_on(72, 50)]);
+        assert_eq!(engine.notes.bufs[1].events, [note_on(61, 40)]);
+        assert_eq!(engine.notes.bufs[0].count, 3);
+        publisher.publish(program(vec![stream(44), stream(11)]), RATE);
+        engine.adopt(&publisher);
+        assert_eq!(storage(&engine), before);
+        assert_eq!(engine.notes.bufs[0].count, 0);
+        assert_eq!(engine.notes.bufs[0].key, 0.5);
+        assert!(engine.notes.bufs[0].events.is_empty());
+        assert_eq!(engine.notes.bufs[1].count, 2);
     }
 
     /// A generator follows its parameter at sub-block resolution even when the
