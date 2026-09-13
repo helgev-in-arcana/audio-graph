@@ -58,6 +58,7 @@ enum Command {
     /// Graph mutations occur inline on the main thread, while the downstream work
     /// (recompilation and serialization) is deferred to run once per frame.
     GraphEdited,
+    NewGraph(u64),
     SetQuantum(u32),
     /// Throw away everything the running graph remembers.
     Reset,
@@ -292,6 +293,16 @@ impl WrapperEditor {
     }
 
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
+        if let Some(error) = self.shared.restore_error() {
+            ui.heading("Saved graph could not be opened");
+            ui.label(error);
+            ui.label("The saved data is preserved. Load a compatible preset or replace it with a new graph.");
+            if ui.button("Replace with a new graph").clicked() {
+                self.commands
+                    .push(Command::NewGraph(self.shared.generation()));
+            }
+            return;
+        }
         // The canvas edits the graph in place: it is plain data behind a lock
         // and needs no particular thread. What must not happen inline is the
         // *consequence* of an edit — see `Command::GraphEdited`.
@@ -574,10 +585,19 @@ impl WrapperEditor {
 /// comment for why that distinction is fatal rather than stylistic.
 fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Command>) {
     for command in commands {
+        if let Command::NewGraph(generation) = &command
+            && *generation != shared.generation()
+        {
+            continue;
+        }
         // Anything below can change what the editor should be showing, and it
         // draws from a snapshot rather than from the lock.
         shared.changed();
         match command {
+            Command::NewGraph(_) => match shared.start_new_graph() {
+                Ok(()) => status.set("new graph started"),
+                Err(error) => status.set(error),
+            },
             Command::GraphEdited => {
                 shared.publish_graph();
                 shared.store_state();
@@ -832,6 +852,36 @@ pub fn create(shared: Arc<Shared>) -> Option<nice_plug_egui::EguiEditor<WrapperE
             ),
         app,
     )
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    /// A queued replacement cannot discard a document loaded after the user made that choice.
+    #[test]
+    fn replacement_is_bound_to_the_displayed_document() {
+        let wrapper = crate::Wrapper::default();
+        let shared = wrapper.shared();
+        shared.retain_state("first", "first error".into());
+        let first = shared.generation();
+        shared.retain_state("second", "second error".into());
+        run(
+            shared,
+            &Status::default(),
+            0,
+            vec![Command::NewGraph(first)],
+        );
+        assert_eq!(shared.restore_error().as_deref(), Some("second error"));
+        let current = shared.generation();
+        run(
+            shared,
+            &Status::default(),
+            0,
+            vec![Command::NewGraph(current)],
+        );
+        assert!(shared.restore_error().is_none());
+    }
 }
 
 #[cfg(test)]

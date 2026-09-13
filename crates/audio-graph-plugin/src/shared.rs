@@ -70,6 +70,7 @@ pub struct MainState {
 /// The graph being edited, reachable from whichever thread the editor is on.
 pub struct Patch {
     pub graph: Graph,
+    restore_error: Option<String>,
     /// Why the graph on screen is not the graph being heard.
     ///
     /// A cycle or a duplicate output is an ordinary thing to have halfway
@@ -121,11 +122,9 @@ pub struct Shared {
     /// is driving the slot.
     live: [AtomicU32; SLOT_COUNT],
     params: Arc<WrapperParams>,
-    /// The blob this instance last wrote into the persisted field.
+    /// The last document this instance saved or retained without interpreting.
     ///
-    /// `None` until it has written one. It is what tells the wrapper's own
-    /// bookkeeping apart from a project or a preset the DAW has put there,
-    /// which is the only kind that has to be read back in.
+    /// Distinguishes reactivation from a new project or preset supplied by the DAW.
     last_written: Mutex<Option<String>>,
     /// Bumped whenever something the editor displays has changed shape — a
     /// different sub-plugin, a different set of bindings.
@@ -184,6 +183,7 @@ impl Shared {
             patch: Mutex::new(Patch {
                 graph: Graph::default_patch(),
                 compile_error: None,
+                restore_error: None,
             }),
             audio: Mutex::new(AudioState {
                 processor: None,
@@ -447,7 +447,13 @@ impl Shared {
     }
 
     fn compile_program(&self) -> Result<audio_graph_engine::Program, String> {
-        let graph = self.patch().graph.clone();
+        let graph = {
+            let patch = self.patch();
+            if patch.restore_error.is_some() {
+                return Ok(audio_graph_engine::Program::empty());
+            }
+            patch.graph.clone()
+        };
         let compiled = compile(&graph, SLOT_COUNT).map_err(|error| error.to_string());
         self.patch().compile_error = compiled.as_ref().err().cloned();
         compiled
@@ -778,12 +784,52 @@ impl Shared {
         self.publish(true)
     }
 
+    pub fn restore_error(&self) -> Option<String> {
+        self.patch().restore_error.clone()
+    }
+
+    pub(crate) fn restore_graph(&self, mut graph: Graph) {
+        graph.prune();
+        *self.patch() = Patch {
+            graph,
+            compile_error: None,
+            restore_error: None,
+        };
+        self.changed();
+    }
+
+    pub(crate) fn retain_state(&self, json: &str, error: String) {
+        self.main().host.unload_all();
+        *self.patch() = Patch {
+            graph: Graph::new(),
+            compile_error: None,
+            restore_error: Some(error),
+        };
+        // Re-activation of the same input must not replace or repeatedly load it.
+        *self.last_written.lock() = Some(json.to_owned());
+        self.changed();
+    }
+
+    /// Explicitly replaces the document, including any retained unreadable input.
+    pub fn start_new_graph(&self) -> Result<(), String> {
+        self.suspend();
+        self.main().host.unload_all();
+        self.restore_graph(Graph::default_patch());
+        let result = self.resume();
+        self.changed();
+        self.store_state();
+        result
+    }
+
     /// Serialise the sub-plugin, the slot table and the graph into the
     /// persisted field.
     ///
     /// Called after every edit made from the editor, so whenever the DAW
     /// decides to save the project there is something current waiting for it.
     pub fn store_state(&self) {
+        if self.restore_error().is_some() {
+            return;
+        }
         let graph = serde_json::to_value(&self.patch().graph).ok();
         let mut state = self.main();
         let mut blob = WrapperState::default();
@@ -809,15 +855,14 @@ impl Shared {
         }
     }
 
-    /// Whether the persisted blob is one this instance did not write.
+    /// Whether the persisted blob differs from the last saved or retained document.
     ///
     /// A DAW hands a project or a preset over by writing that field, which it
     /// may do before the first activation or in the middle of a session —
     /// nice-plug answers the second by activating again rather than
     /// deactivating first, so an activation is where both of them arrive.
-    /// Everything the wrapper stores goes through `write_state`, so a blob
-    /// that is not the one recorded there came from outside and is the user's
-    /// project rather than our own last word on it.
+    /// Saved and unreadable documents are both recorded, so reactivation alone
+    /// does not reload either. A different input must be interpreted again.
     pub(crate) fn state_is_unseen(&self) -> bool {
         let json = self.params.state.0.read().unwrap().clone();
         self.last_written.lock().as_deref() != Some(json.as_str())

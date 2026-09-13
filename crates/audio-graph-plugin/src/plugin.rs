@@ -150,50 +150,34 @@ impl Wrapper {
     /// Called at activate rather than eagerly, because nice-plug restores
     /// persisted fields before activate and the sub-plugin has to be loaded
     /// with the sample rate the DAW is about to give us.
-    fn restore_state(&mut self) {
+    fn restore_state(&mut self) -> bool {
         let json = self.params.state.0.read().unwrap().clone();
         if json.is_empty() {
-            // A fresh instance, or a project saved before the wrapper ever
-            // wrote anything. Publish the defaults rather than leaving the
-            // field empty: what we are running under should be in the file.
-            self.shared.publish_graph();
-            self.shared.store_state();
-            return;
+            return self.shared.start_new_graph().is_ok();
         }
-        match serde_json::from_str::<WrapperState>(&json) {
-            Ok(state) => {
-                self.shared.set_quantum(state.sub_block);
-                match state
-                    .graph
-                    .as_ref()
-                    .map(|g| serde_json::from_value::<Graph>(g.clone()))
-                {
-                    Some(Ok(mut graph)) => {
-                        // A graph saved against a different slot count, or by a
-                        // version whose node kinds have since changed, can hold
-                        // links that no longer mean anything.
-                        graph.prune();
-                        self.shared.patch().graph = graph;
-                    }
-                    Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
-                    None => {}
-                }
-                for problem in self.shared.main().host.load_state(
-                    &state.sub_host_state(),
-                    &plugin_host::plugin_directories(&audio_graph_settings::directories()),
-                ) {
-                    // Not fatal by design: a sub-plugin that cannot be found
-                    // must not stop the project from opening, and the bindings
-                    // are kept so reinstalling it brings them back.
-                    log::warn!("audio-graph: {problem}");
-                }
+        let decoded = serde_json::from_str::<WrapperState>(&json)
+            .map_err(|error| format!("wrapper state unreadable: {error}"))
+            .and_then(|state| state.decode_graph().map(|graph| (state, graph)));
+        let (state, graph) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                log::warn!("audio-graph: {error}; saved data is retained");
+                self.shared.retain_state(&json, error);
+                return false;
             }
-            Err(e) => log::warn!("audio-graph: wrapper state unreadable: {e}"),
+        };
+        self.shared.set_quantum(state.sub_block);
+        self.shared.restore_graph(graph.unwrap_or_else(Graph::new));
+        for problem in self.shared.main().host.load_state(
+            &state.sub_host_state(),
+            &plugin_host::plugin_directories(&audio_graph_settings::directories()),
+        ) {
+            log::warn!("audio-graph: {problem}");
         }
         self.shared.adopt_default_patch();
         if let Err(error) = self.shared.prepare_host_metadata() {
             self.shared.patch().compile_error = Some(error);
-            return;
+            return false;
         }
         self.shared.publish_graph();
         // Publish it back even when nothing was restored. A project saved
@@ -201,6 +185,7 @@ impl Wrapper {
         // string, and then the defaults it was running under — the sub-block
         // size among them — would not be in the file at all.
         self.shared.store_state();
+        true
     }
 
     /// Load a sub-plugin specified via environment variables, used for headless development and testing.
@@ -283,8 +268,9 @@ impl Wrapper {
             // and starting them here as well would leave a processor that
             // never gets handed back.
             self.shared.main().config = None;
-            self.restore_state();
-            self.load_development_override();
+            if self.restore_state() {
+                self.load_development_override();
+            }
         }
 
         let max_block = config.max_buffer_size;

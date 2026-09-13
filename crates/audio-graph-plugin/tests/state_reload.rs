@@ -173,3 +173,91 @@ fn unavailable_plugins_keep_their_wiring_through_save_and_recovery() {
     }
     wrapper.deactivate();
 }
+
+/// Unreadable documents remain byte-for-byte intact, silent and replaceable by a valid preset.
+#[test]
+fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement() {
+    use audio_graph_engine::Graph;
+    use audio_graph_plugin::{STATE_VERSION, WrapperState};
+    use harness::{Block, Daw};
+
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper
+        .shared()
+        .load(&fixture_as_clap("unreadable-document"))
+        .unwrap();
+    wrapper.shared().adopt_default_patch();
+    wrapper.store_state();
+    let valid = wrapper.wrapper_params().state.0.read().unwrap().clone();
+    let mut future: WrapperState = serde_json::from_str(&valid).unwrap();
+    future.version = STATE_VERSION + 1;
+    let mut unknown = future.clone();
+    unknown.version = STATE_VERSION;
+    unknown.graph = Some(serde_json::json!({
+        "nodes": [{"id": 0, "kind": {"UnrecognizedNode": {"value": 0.5}}}],
+        "links": [], "next_id": 1,
+    }));
+
+    for unreadable in [
+        " { not valid JSON\n".to_owned(),
+        serde_json::to_string_pretty(&future).unwrap(),
+        serde_json::to_string_pretty(&unknown).unwrap(),
+    ] {
+        *wrapper.wrapper_params().state.0.write().unwrap() = unreadable.clone();
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        assert!(wrapper.shared().restore_error().is_some());
+        assert!(!wrapper.shared().main().host.any_loaded());
+        wrapper.shared().patch().graph = Graph::default_patch();
+        wrapper.shared().publish_graph();
+        let mut block = Block::silent(64);
+        block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+        assert_eq!(block.peak(), 0.0);
+        wrapper.store_state();
+        assert_eq!(
+            *wrapper.wrapper_params().state.0.read().unwrap(),
+            unreadable
+        );
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        wrapper.store_state();
+        assert!(wrapper.shared().restore_error().is_some());
+        assert_eq!(
+            *wrapper.wrapper_params().state.0.read().unwrap(),
+            unreadable
+        );
+
+        *wrapper.wrapper_params().state.0.write().unwrap() = valid.clone();
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        assert!(wrapper.shared().restore_error().is_none());
+        assert!(wrapper.shared().main().host.is_loaded(0));
+        block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+        assert_eq!(block.peak(), 0.25);
+    }
+
+    *wrapper.wrapper_params().state.0.write().unwrap() = "unreadable".into();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper.shared().start_new_graph().unwrap();
+    assert!(wrapper.shared().restore_error().is_none());
+    let fresh: WrapperState =
+        serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+    assert!(fresh.sub_plugins.is_empty());
+    assert_eq!(
+        fresh.graph,
+        Some(serde_json::to_value(Graph::default_patch()).unwrap())
+    );
+    let mut block = Block::silent(64);
+    block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+    assert_eq!(block.peak(), 0.25);
+    wrapper.deactivate();
+}

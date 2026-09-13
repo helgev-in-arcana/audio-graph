@@ -48,3 +48,7 @@ the only crate in the workspace that knows AudioGraph is a product.
   DAW's message loop, once the frame is over.
 - **A missing sub-plugin must not stop a project from opening.** It is reported,
   the bindings are kept, and reinstalling the plugin brings them back.
+- **An unreadable document remains intact.** Unsupported document versions,
+  malformed state and unknown graph nodes are retained without automatic saves
+  replacing them. Playback is silent and the editor offers an explicit new
+  graph action; loading a readable preset also resumes normal operation.
