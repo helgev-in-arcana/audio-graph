@@ -17,6 +17,60 @@ fn wires(wrapper: &Wrapper) -> usize {
     wrapper.shared().patch().graph.links.len()
 }
 
+/// Native rediscovery preserves the parameter selected before an auxiliary input disappeared.
+#[test]
+fn native_port_refresh_preserves_parameter_targets() {
+    use audio_graph_engine::{
+        AudioOut, Constant, Graph, NodeKind, ParamPort, Plugin, PluginPorts, compile,
+    };
+    use audio_graph_plugin::SLOT_COUNT;
+
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper
+        .shared()
+        .load_into(0, &fixture_as_clap("port-refresh"))
+        .unwrap();
+    let mut ports = PluginPorts::from_layout(&wrapper.shared().main().host.io_layout(0), 0);
+    ports.audio_in.push(2);
+    ports.params = vec![
+        ParamPort {
+            id: 0,
+            name: "Gain".into(),
+        },
+        ParamPort {
+            id: 1,
+            name: "Offset".into(),
+        },
+    ];
+    let param = (ports.audio_in.len() + usize::from(ports.accepts_notes)) as u8;
+    let mut graph = Graph::new();
+    let value = graph.add(NodeKind::Constant(Constant { value: 0.75 }), [0.0; 2]);
+    let child = graph.add(NodeKind::Plugin(Plugin { instance: 0, ports }), [0.0; 2]);
+    let output = graph.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0; 2],
+    );
+    graph.connect(value, 0, child, param);
+    graph.connect(child, 0, output, 0);
+    let before = compile(&graph, SLOT_COUNT)
+        .unwrap()
+        .param_targets()
+        .to_vec();
+    wrapper.shared().patch().graph = graph;
+    wrapper.shared().discover_ports(child);
+    let after = compile(&wrapper.shared().patch().graph, SLOT_COUNT).unwrap();
+    assert_eq!(after.param_targets(), before);
+    assert_eq!(after.param_targets()[0].param, 0);
+    wrapper.deactivate();
+}
+
 /// A project the DAW loads over a patch that is already playing is read in.
 ///
 /// The DAW writes the blob and activates again, without deactivating first, and

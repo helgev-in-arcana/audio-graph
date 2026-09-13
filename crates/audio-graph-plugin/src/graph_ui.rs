@@ -639,6 +639,14 @@ impl GraphEditor {
             // down as sockets are added is a control you have to find again
             // every time.
             let body = ui.scope(|ui| {
+                let pending = graph.pending_link_count(id);
+                if pending > 0 {
+                    ui.label(format!("{pending} connection(s) awaiting ports"));
+                    if ui.small_button("Discard unavailable connections").clicked() {
+                        graph.discard_pending_links(id);
+                        outcome.changed = true;
+                    }
+                }
                 let mut cx = node_ui(ctx);
                 let changed = graph.nodes[index].kind.controls(ui, &mut cx);
                 actions.append(&mut cx.actions);
