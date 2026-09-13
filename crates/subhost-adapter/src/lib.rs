@@ -3,7 +3,7 @@
 //! Provides the sub-hosting adapter layer: forwarding transport, combining
 //! latency, publishing automatable parameter slots and binding them to
 //! sub-plugin parameters, managing nested sub-plugin state, and scheduling
-//! audio processing across multiple sub-plugin instances.
+//! audio processing inputs across multiple sub-plugin instances.
 //!
 //! The scope is defined by subtraction in both directions.
 //!

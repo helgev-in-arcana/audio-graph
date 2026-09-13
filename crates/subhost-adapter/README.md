@@ -26,7 +26,7 @@ makes different choices and gets the same crate.
 - Forwarding the DAW's transport down and combining latency on the way up.
 - Turning slot and lane values into sample-accurate parameter events, merged in
   order with the DAW's own, per chunk.
-- Note routing at the point where a stream's *name* becomes events.
+- Preserving each child's identity in notifications and output events.
 - Nesting one plugin's opaque state inside another's.
 
 ## Not this crate's job
@@ -55,16 +55,22 @@ parameters.
 
 ### The instance table is sparse, and stays sparse
 
-Callers name an instance by index. An entry whose plugin has gone stays empty
-rather than being closed up, because renumbering would repoint every binding
-after it. This holds for `SubHost::instances`, `SubHostProcessors::entries`, and
-the saved `InstanceState` list alike.
+Callers name an instance by index. Missing plugins retain their document entry
+and opaque state; only their native handle is absent. Such a slot is reserved
+until explicitly removed with `unload`. Entries are never renumbered. A state
+entry beyond this build's instance limit is retained without allocating a sparse
+native table up to its index.
 
 The index identifies a slot, not the lifetime of its current occupant.
 Each processor retains its own activation. `SubHostProcessors::deactivate`
 returns those activations directly, so unloading or replacing a slot cannot
 redirect an outstanding processor's return into another instance. A failed group
 activation also returns all processors created before the failure.
+
+`load_state` takes caller-selected search folders. Failed restoration retains
+the original state and leaves the native plugin unloaded, so a default preset
+cannot overwrite it. A failed save retains the last successful blob. The saved
+document format is independent of whether a native instance is available today.
 
 ### A binding outlives what it points at
 
@@ -80,3 +86,39 @@ versions, and `instance` is what keeps two copies of one plugin apart.
 `SubHostConfig`'s three numbers are ceilings, not guidance. Instance tables,
 event scratch buffers and the slot schedule are all sized at activate, and
 `process` may not grow any of them.
+
+`activate` validates lane and instance dimensions before preparing native
+processors. `SlotSchedule::new`, `begin`, and `ScheduleView::from_parts` return
+errors for unrepresentable capacities or inconsistent shapes. A block beyond
+the schedule's capacity is rejected instead of partially covered. Zero lanes
+are valid for a host that supplies only incoming events.
+Changing quantum updates the row count without reallocating; callers fill the
+new grid before processing. Existing values are not automatically resampled.
+
+### One parameter has one effective scheduled input
+
+`SubHostConfig::target_priority` selects `PreferDirect`, `PreferSlots`, or
+`RejectConflicts`. Within the preferred source, the last lane wins. Arbitration
+happens during preparation, before deduplication, so an unchanged preferred
+value cannot be overridden by a changing lower-priority lane. The caller selects
+the policy; the adapter does not decide whether a graph or a DAW should win.
+
+### Child output retains its identity
+
+`SubHostContext` receives an `InstanceId` with each notification. Native backends
+still receive their single-plugin `HostContext`, wrapped by the adapter.
+`InstanceId` includes the slot index and a runtime generation. `SubHost::source`
+identifies its current occupant; `SubHostProcessor::source` identifies the one
+retained by that processor, even after replacement.
+
+`SubHostProcessors::bind` takes an `InstanceEventSink` containing tagged events
+from every child and chunk. Native output uses preallocated scratch before it
+is copied into tagged storage. Capacity loss remains visible through the sink's
+overflow flag. Callers choose how to route or combine the outputs. Callers using
+`get_mut` and the single-processor API keep the native `EventSink` and can attach
+the processor's source themselves.
+
+Transport supplied to `bind` or `SubHostProcessor::process` describes the start
+of the parent block. The adapter advances it to each chunk's start using the
+activation's sample rate, preserving stopped positions and wrapping known loop
+bounds. Tempo and meter are treated as constant within that parent block.

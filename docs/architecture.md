@@ -38,6 +38,8 @@ VST3とCLAPを共通化します。
 
 - [subhost-adapter](../crates/subhost-adapter/README.md)
 
+保存・通知発生元・入力競合・schedule寸法・transportについての契約とAPI移行は、[adapter契約の修正記録](audits/subhost-adapter-contract-fixes.md)を参照。
+
 入れ子プラグインのための機能群です。
 
 ### audio-graph実装
