@@ -47,6 +47,17 @@ fn default_sub_block() -> u32 {
 pub const STATE_VERSION: u32 = 1;
 
 impl WrapperState {
+    pub(crate) fn decode_graph(&self) -> Result<Option<audio_graph_engine::Graph>, String> {
+        if self.version > STATE_VERSION {
+            return Err(format!("unsupported document version {}", self.version));
+        }
+        self.graph
+            .as_ref()
+            .map(|graph| serde_json::from_value(graph.clone()))
+            .transpose()
+            .map_err(|error| format!("node graph unreadable: {error}"))
+    }
+
     pub fn new(slots: Vec<Slot>) -> WrapperState {
         WrapperState {
             version: STATE_VERSION,
