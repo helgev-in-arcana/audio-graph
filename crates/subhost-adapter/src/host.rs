@@ -163,8 +163,12 @@ impl SubHost {
         &self.slots
     }
 
-    pub fn slots_mut(&mut self) -> &mut SlotTable {
-        &mut self.slots
+    pub fn clear_slot(&mut self, slot: usize) {
+        self.slots.clear(slot);
+    }
+
+    pub fn rename_slot(&mut self, slot: usize, name: Option<String>) {
+        self.slots.rename(slot, name);
     }
 
     pub fn is_loaded(&self, instance: usize) -> bool {
@@ -226,11 +230,8 @@ impl SubHost {
 
     /// Sets one parameter on the specified sub-plugin, from the main thread.
     ///
-    /// For a harness that wants a plugin put into a particular state without
-    /// running audio; the graph drives parameters through the slot schedule
-    /// instead, which is where a DAW's automation ends up. Both formats only
-    /// take a value this way while the plugin is inactive — CLAP flushes it,
-    /// and a value for an active plugin has to ride a process block.
+    /// While active, the backend queues the edit for delivery to the processor.
+    /// Use the slot schedule instead when the edit needs a specific sample offset.
     pub fn set_sub_param(
         &mut self,
         instance: usize,

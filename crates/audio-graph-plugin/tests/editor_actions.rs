@@ -169,7 +169,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     // every installed plugin, in both teardown orders, one child process each.
 
     // "x" on a slot row.
-    shared.main().host.slots_mut().clear(0);
+    shared.main().host.clear_slot(0);
     shared.rebind().expect("rebind after clearing");
     assert!(shared.main().host.slots().resolved(0).is_none());
 

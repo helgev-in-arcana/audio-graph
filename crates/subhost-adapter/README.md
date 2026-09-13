@@ -81,6 +81,13 @@ reloading the plugin has to bring the mapping back. Bindings are keyed on
 `(instance, plugin_id, param_id)`: parameter order is not stable across plugin
 versions, and `instance` is what keeps two copies of one plugin apart.
 
+The table owned by `SubHost` keeps the slot count from `SubHostConfig`, because
+direct parameter lanes start immediately after those slots. `slots()` exposes
+a read-only table; `bind_slot`, `clear_slot`, and `rename_slot` edit individual
+entries. Saved slot tables of other lengths are resized to the configured count
+by `load_state`. Binding changes take effect in newly activated processors;
+callers must rebuild their processors to adopt them.
+
 ### The audio side allocates nothing
 
 `SubHostConfig`'s three numbers are ceilings, not guidance. Instance tables,
