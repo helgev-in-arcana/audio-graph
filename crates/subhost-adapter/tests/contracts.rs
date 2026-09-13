@@ -5,6 +5,38 @@ use plugin_host::{Format, ParamId, RestartReason};
 use subhost_adapter::{InstanceState, SubHost, SubHostConfig, SubHostState, SubPluginRef};
 
 struct Host;
+
+mod allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    thread_local! { static COUNTS: Cell<Option<(usize, usize)>> = const { Cell::new(None) }; }
+    struct Allocator;
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a + 1, d)));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            let _ = COUNTS.try_with(|c| {
+                if let Some((a, d)) = c.get() {
+                    c.set(Some((a, d + 1)));
+                }
+            });
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+    pub fn count(run: impl FnOnce()) -> (usize, usize) {
+        COUNTS.with(|c| c.set(Some((0, 0))));
+        run();
+        COUNTS.with(|c| c.replace(None).unwrap())
+    }
+}
 impl subhost_adapter::SubHostContext for Host {
     fn host_name(&self) -> &str {
         "adapter contract test"
@@ -357,6 +389,46 @@ fn subblocks_advance_transport_without_moving_stopped_playback() {
         }
         assert!(!processors.failed());
     }
+}
+
+/// Adding source identity to a real native output performs no host allocation or deallocation.
+#[test]
+fn tagged_audio_output_uses_only_prepared_storage() {
+    use subhost_adapter::{AudioChunk, AudioInstances, InstanceEventSink, SlotSchedule};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("allocation");
+    let mut host = host();
+    host.load(0, &path, None).unwrap();
+    let mut processors = host.activate(audio_config(), &[], &[]).unwrap();
+    let mut sink = InstanceEventSink::with_capacity(8);
+    host.set_sub_param(0, ParamId(5), 12.0).unwrap();
+    run_bound(&mut processors, 0, &mut sink);
+    host.tick_editors();
+    host.tick_editors();
+    let mut schedule = SlotSchedule::new(4, 64, 32).unwrap();
+    schedule.begin(32).unwrap();
+    let time = plugin_host::TimeContext::default();
+    let mut output = [0.0; 64];
+    let counts = allocations::count(|| {
+        processors.bind(&time, &mut sink).process(
+            0,
+            &[],
+            &[1.0; 64],
+            &mut output,
+            AudioChunk {
+                input_channels: 2,
+                output_channels: 2,
+                aux_inputs: Default::default(),
+                aux_outputs: Default::default(),
+                frames: 32,
+                offset: 0,
+            },
+            schedule.view(),
+        )
+    });
+    assert_eq!(counts, (0, 0));
+    assert_eq!(sink.events().len(), 1);
+    assert_eq!(Some(sink.events()[0].source), host.source(0));
 }
 
 fn audio_config() -> plugin_host::AudioConfig {
