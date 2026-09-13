@@ -65,7 +65,9 @@ impl View {
         self.instances = (0..crate::config::MAX_INSTANCES)
             .map(|i| InstanceView {
                 loaded: host.is_loaded(i),
-                name: host.class(i).map_or_else(String::new, |c| c.name.clone()),
+                name: host
+                    .reference(i)
+                    .map_or_else(String::new, |r| r.display_name.clone()),
                 editor_open: host.editor_is_open(i),
                 params: host
                     .params(i)

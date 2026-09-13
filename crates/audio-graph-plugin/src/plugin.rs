@@ -7,9 +7,9 @@ use crate::state::WrapperState;
 use audio_graph_engine::{Ended, Engine, Graph, MAX_LIVE_NOTES};
 use nice_plug::prelude::*;
 use plugin_host::{
-    AudioConfig, Event, EventSink, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
+    AudioConfig, Event, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
 };
-use subhost_adapter::{SlotSchedule, SubHost};
+use subhost_adapter::{InstanceEventSink, SlotSchedule, SubHost};
 
 use crate::host_context::WrapperHostContext;
 use crate::params::WrapperParams;
@@ -44,7 +44,7 @@ pub struct Wrapper {
     /// The DAW's automation, before the graph has had a say.
     daw_slots: Vec<f64>,
     events: Vec<Event>,
-    out_events: EventSink,
+    out_events: InstanceEventSink,
     /// Notes the graph has finished with, to be handed back to the DAW.
     ///
     /// Owned and sized at activate: the audio thread may not allocate, and the
@@ -82,10 +82,10 @@ impl Default for Wrapper {
             context,
             shared,
             engine: Engine::new(),
-            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM),
+            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM).unwrap(),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
-            out_events: EventSink::new(),
+            out_events: InstanceEventSink::new(),
             ended_notes: Vec::new(),
             input_scratch: Vec::new(),
             daw_inputs: Vec::new(),
@@ -178,7 +178,10 @@ impl Wrapper {
                     Some(Err(e)) => log::warn!("audio-graph: node graph unreadable: {e}"),
                     None => {}
                 }
-                for problem in self.shared.main().host.load_state(&state.sub_host_state()) {
+                for problem in self.shared.main().host.load_state(
+                    &state.sub_host_state(),
+                    &plugin_host::plugin_directories(&audio_graph_settings::directories()),
+                ) {
                     // Not fatal by design: a sub-plugin that cannot be found
                     // must not stop the project from opening, and the bindings
                     // are kept so reinstalling it brings them back.
@@ -303,12 +306,12 @@ impl Wrapper {
         self.output_scratch = vec![0.0; (self.channels * max_block) as usize];
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
-        self.out_events = EventSink::with_capacity(256);
+        self.out_events = InstanceEventSink::with_capacity(256);
         self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
-        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum());
+        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum()).ok()?;
         // The graph's audio buffers, sized for the ceilings rather than for the
         // current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
@@ -362,6 +365,12 @@ impl Wrapper {
         context: &mut impl ProcessContext<P>,
     ) -> ProcessStatus {
         let frames = buffer.samples() as u32;
+        if frames > self.schedule.max_frames() {
+            for channel in buffer.as_slice() {
+                channel.fill(0.0);
+            }
+            return ProcessStatus::Error("block exceeds prepared schedule");
+        }
         let channels = buffer.channels() as u32;
 
         // Collect note input before touching audio: the sub-plugin wants a
@@ -600,12 +609,15 @@ impl Wrapper {
 /// of the shared audio state for the whole block.
 fn settle_notes<P: Plugin>(
     engine: &mut Engine,
-    from_plugins: &EventSink,
+    from_plugins: &InstanceEventSink,
     ended: &mut Vec<Ended>,
     context: &mut impl ProcessContext<P>,
 ) {
     ended.clear();
-    engine.end_block(from_plugins.events(), ended);
+    engine.end_block(
+        from_plugins.events().iter().map(|output| &output.event),
+        ended,
+    );
     report_ended(ended, context);
 }
 
@@ -946,7 +958,7 @@ mod tests {
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
         let mut engine = Engine::new();
-        let mut schedule = SlotSchedule::new(LANES, 512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32).unwrap();
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.

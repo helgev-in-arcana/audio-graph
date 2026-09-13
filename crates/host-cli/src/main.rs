@@ -29,6 +29,7 @@ use subhost_adapter::SubHostConfig;
 /// without linking the wrapper (and so without egui). Keep in step with
 /// `audio_graph_plugin::SUB_HOST`.
 const SUB_HOST: SubHostConfig = SubHostConfig {
+    target_priority: subhost_adapter::TargetPriority::PreferDirect,
     max_instances: 16,
     slot_count: 32,
     lanes: 32 + audio_graph_engine::MAX_GRAPH_PARAMS + audio_graph_engine::MAX_AUDIO_LANES,

@@ -15,17 +15,23 @@ use audio_graph_engine::{
 };
 use audio_graph_plugin::{SLOT_COUNT, SUB_HOST};
 use audio_graph_plugin::{Shared, WrapperParams};
-use plugin_host::{AudioConfig, HostContext, RestartReason};
+use plugin_host::{AudioConfig, RestartReason};
 use subhost_adapter::SubHost;
 
 struct SilentHost;
-impl HostContext for SilentHost {
+impl subhost_adapter::SubHostContext for SilentHost {
     fn host_name(&self) -> &str {
         "audio-thread test"
     }
-    fn request_restart(&self, _reason: RestartReason) {}
-    fn latency_changed(&self, _samples: u32) {}
-    fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
+    fn request_restart(&self, _source: subhost_adapter::InstanceId, _reason: RestartReason) {}
+    fn latency_changed(&self, _source: subhost_adapter::InstanceId, _samples: u32) {}
+    fn param_edited(
+        &self,
+        _source: subhost_adapter::InstanceId,
+        _id: plugin_host::ParamId,
+        _value: f64,
+    ) {
+    }
 }
 
 /// Helper to add a plugin node with a parameter port to the graph.

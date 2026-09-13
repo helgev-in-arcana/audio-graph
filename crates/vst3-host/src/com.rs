@@ -51,44 +51,52 @@ pub fn init_apartment() -> plugin_host_api::Result<ApartmentGuard> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+
     #[link(name = "ole32")]
     unsafe extern "system" {
         fn CoInitializeEx(reserved: *const std::ffi::c_void, flags: u32) -> i32;
         fn CoUninitialize();
-        fn CoGetApartmentType(kind: *mut i32, qualifier: *mut i32) -> i32;
-    }
-    fn initialized() -> bool {
-        let (mut kind, mut qualifier) = (0, 0);
-        unsafe { CoGetApartmentType(&mut kind, &mut qualifier) >= 0 }
     }
 
-    /// Every guard releases exactly its own initialization reference.
+    fn assert_ole_initialization(expected: i32) {
+        // Apartment queries can succeed on an uninitialized thread through the process-wide MTA.
+        let result = unsafe { OleInitialize(std::ptr::null()) };
+        if result >= 0 {
+            unsafe { OleUninitialize() };
+        }
+        assert_eq!(result, expected);
+    }
+
+    /// Every guard releases exactly its own reference even while another thread owns an MTA.
     #[test]
     fn nested_guards_balance_initialization() {
-        std::thread::spawn(|| {
-            assert!(!initialized());
+        assert_eq!(unsafe { CoInitializeEx(std::ptr::null(), 0) }, S_OK);
+        let result = std::thread::spawn(|| {
+            assert_ole_initialization(S_OK);
             let first = init_apartment().unwrap();
             let second = init_apartment().unwrap();
             drop(first);
-            assert!(initialized());
+            assert_ole_initialization(S_FALSE);
             drop(second);
-            assert!(!initialized());
+            assert_ole_initialization(S_OK);
         })
-        .join()
-        .unwrap();
+        .join();
+        unsafe { CoUninitialize() };
+        result.unwrap();
     }
 
     /// Refusing MTA does not uninitialize the apartment owned by the caller.
     #[test]
     fn an_incompatible_apartment_is_an_error() {
         std::thread::spawn(|| {
-            assert_eq!(unsafe { CoInitializeEx(std::ptr::null(), 0) }, 0);
+            assert_eq!(unsafe { CoInitializeEx(std::ptr::null(), 0) }, S_OK);
             assert!(init_apartment().is_err());
-            assert!(initialized());
+            assert_ole_initialization(RPC_E_CHANGED_MODE);
             unsafe {
                 CoUninitialize();
             }
-            assert!(!initialized());
+            assert_ole_initialization(S_OK);
         })
         .join()
         .unwrap();

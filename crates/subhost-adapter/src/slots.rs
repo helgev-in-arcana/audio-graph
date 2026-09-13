@@ -8,6 +8,14 @@
 use plugin_host::{ParamId, ParamInfo};
 use serde::{Deserialize, Serialize};
 
+/// Arbitration before event deduplication; within the preferred source, the last lane wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPriority {
+    PreferSlots,
+    PreferDirect,
+    RejectConflicts,
+}
+
 /// Binding descriptor connecting a parameter slot to a specific sub-plugin parameter.
 ///
 /// Identified by `(instance, plugin_id, param_id)` rather than by index:

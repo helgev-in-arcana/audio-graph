@@ -55,7 +55,7 @@ fn repeated_publications_keep_the_delay_audible() {
     let publisher = ProgramPublisher::default();
     let mut engine = Engine::new();
     engine.prepare(FRAMES, &[2]);
-    let mut schedule = SlotSchedule::new(MAX_GRAPH_PARAMS + MAX_AUDIO_LANES, FRAMES, 32);
+    let mut schedule = SlotSchedule::new(MAX_GRAPH_PARAMS + MAX_AUDIO_LANES, FRAMES, 32).unwrap();
     let mut nodes = NoInstances;
     let mut daw_in = [0.0; 2 * FRAMES as usize];
     let mut daw_out = [0.0; 2 * FRAMES as usize];

@@ -35,4 +35,5 @@ pub const SUB_HOST: SubHostConfig = SubHostConfig {
     max_instances: MAX_INSTANCES,
     slot_count: SLOT_COUNT,
     lanes: LANES,
+    target_priority: subhost_adapter::TargetPriority::PreferDirect,
 };

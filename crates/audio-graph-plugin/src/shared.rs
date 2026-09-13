@@ -824,17 +824,23 @@ impl Shared {
 mod tests {
     use super::*;
     use crate::config::SUB_HOST;
-    use plugin_host::{HostContext, RestartReason};
+    use plugin_host::RestartReason;
 
     struct SilentHost;
 
-    impl HostContext for SilentHost {
+    impl subhost_adapter::SubHostContext for SilentHost {
         fn host_name(&self) -> &str {
             "shared tests"
         }
-        fn request_restart(&self, _reason: RestartReason) {}
-        fn latency_changed(&self, _samples: u32) {}
-        fn param_edited(&self, _id: plugin_host::ParamId, _value: f64) {}
+        fn request_restart(&self, _source: subhost_adapter::InstanceId, _reason: RestartReason) {}
+        fn latency_changed(&self, _source: subhost_adapter::InstanceId, _samples: u32) {}
+        fn param_edited(
+            &self,
+            _source: subhost_adapter::InstanceId,
+            _id: plugin_host::ParamId,
+            _value: f64,
+        ) {
+        }
     }
 
     fn shared() -> Arc<Shared> {

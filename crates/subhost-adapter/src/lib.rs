@@ -3,7 +3,7 @@
 //! Provides the sub-hosting adapter layer: forwarding transport, combining
 //! latency, publishing automatable parameter slots and binding them to
 //! sub-plugin parameters, managing nested sub-plugin state, and scheduling
-//! audio processing across multiple sub-plugin instances.
+//! audio processing inputs across multiple sub-plugin instances.
 //!
 //! The scope is defined by subtraction in both directions.
 //!
@@ -20,18 +20,22 @@
 //!
 //! See `README.md` in this crate for the invariants that boundary depends on.
 
+mod context;
+mod events;
 mod host;
 mod instances;
 mod schedule;
 mod slots;
 mod state;
 
+pub use context::{InstanceId, SubHostContext};
+pub use events::{InstanceEvent, InstanceEventSink};
 pub use host::{
     BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
 pub use instances::{AudioChunk, AudioInstances, InstanceIo, NoInstances, ParamTarget};
 pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, ScheduleView, SlotSchedule};
-pub use slots::{Binding, ResolvedTarget, Slot, SlotTable};
+pub use slots::{Binding, ResolvedTarget, Slot, SlotTable, TargetPriority};
 pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};
 
 /// Latency reported by the wrapper to the host DAW.

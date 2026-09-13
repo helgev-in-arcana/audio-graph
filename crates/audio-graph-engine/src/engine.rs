@@ -1009,7 +1009,11 @@ impl Engine {
     /// `from_plugins` is what the sub-plugins emitted; a `NoteEnd` in it is one
     /// of them saying it is done with a note. `ended` comes back holding the
     /// notes to report to the DAW, addressed the way the DAW will recognise.
-    pub fn end_block(&mut self, from_plugins: &[Event], ended: &mut Vec<Ended>) {
+    pub fn end_block<'a>(
+        &mut self,
+        from_plugins: impl IntoIterator<Item = &'a Event>,
+        ended: &mut Vec<Ended>,
+    ) {
         for event in from_plugins {
             if let Event::Note(NoteEvent::NoteEnd {
                 note_id: Some(id), ..
@@ -1117,7 +1121,10 @@ impl Engine {
         if schedule.quantum() != quantum {
             schedule.set_quantum(quantum);
         }
-        let blocks = schedule.begin(frames);
+        let Ok(blocks) = schedule.begin(frames) else {
+            daw_out.fill(0.0);
+            return false;
+        };
         if !self.has_program() {
             daw_out.fill(0.0);
             schedule.fill(daw_slots);
@@ -1267,13 +1274,16 @@ impl Engine {
         row: usize,
     ) {
         let block = ctx.frames as usize;
-        let schedule = ScheduleView::from_parts(
+        let Ok(schedule) = ScheduleView::from_parts(
             ctx.lanes,
             ctx.lanes_per_row,
             ctx.frames.div_ceil(ctx.quantum.max(1)) as usize,
             ctx.quantum,
             ctx.frames,
-        );
+        ) else {
+            daw_out.fill(0.0);
+            return;
+        };
         let mut tap = 0usize;
         // Which rows of the note buffers this chunk covers. The buffers were
         // filled by the parameter half and hold the whole block; a chunk is a
@@ -3473,7 +3483,7 @@ mod tests {
                 engine.run_audio(
                     &AudioContext {
                         frames: 8,
-                        quantum: 4,
+                        quantum: 8,
                         sample_rate: RATE,
                         lanes: &row,
                         lanes_per_row: width,
@@ -3619,7 +3629,7 @@ mod tests {
             "the follower waits for audio from the instrument"
         );
         let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
-        let mut schedule = SlotSchedule::new(width, 64, 32);
+        let mut schedule = SlotSchedule::new(width, 64, 32).unwrap();
         let mut heard = Heard::default();
         let mut daw_out = [0.0; 2 * 64];
         engine.run_block(
@@ -4969,7 +4979,7 @@ mod tests {
     fn run_block_silences_an_empty_engine() {
         let mut engine = Engine::new();
         engine.prepare(64, &[2]);
-        let mut schedule = SlotSchedule::new(1, 64, 32);
+        let mut schedule = SlotSchedule::new(1, 64, 32).unwrap();
         let mut output = vec![3.0f32; 16];
         let mut nodes = subhost_adapter::NoInstances;
         assert!(!engine.run_block(
@@ -5029,7 +5039,7 @@ mod tests {
                 }
             }
             let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
-            let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM);
+            let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM).unwrap();
             let mut nodes = Adders;
             engine.run_block(
                 &mut schedule,
@@ -5155,7 +5165,7 @@ mod tests {
                     lanes_per_row: width,
                 };
                 if staged {
-                    let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM);
+                    let mut schedule = SlotSchedule::new(width, BLOCK, QUANTUM).unwrap();
                     engine.run_block(
                         &mut schedule,
                         &[],
