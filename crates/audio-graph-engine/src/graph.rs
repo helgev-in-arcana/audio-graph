@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::nodes::{AudioIn, AudioOut, DelayRead, DelayWrite, NodeKind};
+use crate::nodes::{AudioIn, AudioOut, DelayRead, DelayWrite, NodeKind, PluginPorts};
 use crate::port::PortType;
 
 pub use crate::ir::NodeId;
@@ -61,9 +61,51 @@ pub struct Link {
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_links: Vec<PendingLink>,
     /// Never reused, so a stale link can always be recognised as stale rather
     /// than silently re-pointing at whatever took the old id.
     next_id: NodeId,
+}
+
+/// Only unavailable endpoints need an identity beyond their current socket index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PendingLink {
+    link: Link,
+    output: Option<u16>,
+    input: Option<PluginInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum PluginInput {
+    Audio(u8),
+    Notes,
+    Parameter(u8),
+}
+
+impl PluginInput {
+    fn at(ports: &PluginPorts, index: u8) -> Option<Self> {
+        let audio = ports.audio_in.len();
+        let first = audio + usize::from(ports.accepts_notes);
+        if usize::from(index) < audio {
+            Some(Self::Audio(index))
+        } else if usize::from(index) < first {
+            Some(Self::Notes)
+        } else {
+            let param = usize::from(index) - first;
+            (param < ports.params.len()).then_some(Self::Parameter(param as u8))
+        }
+    }
+
+    fn index(self, ports: &PluginPorts) -> Option<u8> {
+        let audio = ports.audio_in.len();
+        match self {
+            Self::Audio(bus) => (usize::from(bus) < audio).then_some(bus),
+            Self::Notes => ports.accepts_notes.then_some(audio as u8),
+            Self::Parameter(row) => (usize::from(row) < ports.params.len())
+                .then(|| (audio + usize::from(ports.accepts_notes) + usize::from(row)) as u8),
+        }
+    }
 }
 
 impl Graph {
@@ -200,6 +242,7 @@ impl Graph {
     pub fn remove(&mut self, id: NodeId) {
         self.nodes.retain(|n| n.id != id);
         self.links.retain(|l| l.from != id && l.to != id);
+        self.discard_pending_links(id);
     }
 
     /// Connect two sockets, replacing whatever already fed that input.
@@ -225,6 +268,8 @@ impl Graph {
 
     pub fn disconnect(&mut self, to: NodeId, to_port: u8) {
         self.links.retain(|l| !(l.to == to && l.to_port == to_port));
+        self.pending_links
+            .retain(|p| !(p.input.is_none() && p.link.to == to && p.link.to_port == to_port));
     }
 
     /// A node has lost `count` input sockets starting at `first`: cut what was
@@ -250,6 +295,18 @@ impl Graph {
                 link.to_port -= count;
             }
         }
+        self.pending_links.retain_mut(|p| {
+            if p.link.to != node || p.input.is_some() {
+                return true;
+            }
+            if (first..end).contains(&p.link.to_port) {
+                return false;
+            }
+            if p.link.to_port >= end {
+                p.link.to_port -= count;
+            }
+            true
+        });
     }
 
     /// The mirror of [`Graph::drop_inputs`], for a node that lost an output.
@@ -269,6 +326,105 @@ impl Graph {
                 link.from_port -= count;
             }
         }
+        self.pending_links.retain_mut(|p| {
+            if p.link.from != node || p.output.is_some() {
+                return true;
+            }
+            if (first..end).contains(&p.link.from_port) {
+                return false;
+            }
+            if p.link.from_port >= end {
+                p.link.from_port -= count;
+            }
+            true
+        });
+    }
+
+    /// Refresh native metadata without changing the meaning of existing wires.
+    /// User-selected parameter rows and output buses belong to the patch.
+    pub fn update_plugin_ports(&mut self, id: NodeId, mut discovered: PluginPorts) {
+        self.migrate_plugin_outputs();
+        let Some(Node {
+            kind: NodeKind::Plugin(plugin),
+            ..
+        }) = self.node_mut(id)
+        else {
+            return;
+        };
+        let old = &plugin.ports;
+        discovered.params = old.params.clone();
+        if !old.audio_out_shown.is_empty() {
+            discovered.audio_out_shown = old.audio_out_shown.clone();
+            if discovered.shown_outputs().is_empty() && !discovered.audio_out.is_empty() {
+                discovered.audio_out_shown.insert(0, 0);
+            }
+        }
+        let old = std::mem::replace(&mut plugin.ports, discovered);
+        let new = plugin.ports.clone();
+        let old_outputs = old.shown_outputs();
+        let new_outputs = new.shown_outputs();
+        let mut links = std::mem::take(&mut self.pending_links);
+        links.extend(
+            std::mem::take(&mut self.links)
+                .into_iter()
+                .map(|link| PendingLink {
+                    link,
+                    output: None,
+                    input: None,
+                }),
+        );
+        for mut pending in links {
+            let link = &mut pending.link;
+            if link.from == id {
+                let Some(bus) = pending
+                    .output
+                    .or_else(|| old_outputs.get(usize::from(link.from_port)).copied())
+                else {
+                    continue;
+                };
+                pending.output = match new_outputs.iter().position(|&b| b == bus) {
+                    Some(port) => {
+                        link.from_port = port as u8;
+                        None
+                    }
+                    None => Some(bus),
+                };
+            }
+            if link.to == id {
+                let Some(input) = pending
+                    .input
+                    .or_else(|| PluginInput::at(&old, link.to_port))
+                else {
+                    continue;
+                };
+                pending.input = match input.index(&new) {
+                    Some(port) => {
+                        link.to_port = port;
+                        None
+                    }
+                    None => Some(input),
+                };
+            }
+            if pending.output.is_some() || pending.input.is_some() {
+                self.pending_links.push(pending);
+            } else if self.can_connect(link.from, link.from_port, link.to, link.to_port) {
+                self.links.push(*link);
+            }
+        }
+        self.prune();
+    }
+
+    pub fn pending_link_count(&self, node: NodeId) -> usize {
+        self.pending_links
+            .iter()
+            .filter(|p| p.link.from == node || p.link.to == node)
+            .count()
+    }
+
+    /// An explicit deletion must also cancel restoration when a bus returns.
+    pub fn discard_pending_links(&mut self, node: NodeId) {
+        self.pending_links
+            .retain(|p| p.link.from != node && p.link.to != node);
     }
 
     /// What feeds one of a node's inputs: the source node and its output port.
@@ -290,6 +446,8 @@ impl Graph {
     pub fn prune(&mut self) {
         self.migrate_plugin_outputs();
         let ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
+        self.pending_links
+            .retain(|p| ids.contains(&p.link.from) && ids.contains(&p.link.to));
         let mut keep = Vec::with_capacity(self.links.len());
         for link in &self.links {
             keep.push(

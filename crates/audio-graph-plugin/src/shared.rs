@@ -726,31 +726,9 @@ impl Shared {
                 state.host.sub_latency(instance),
             )
         };
-        let discovered = PluginPorts::from_layout(&layout, latency);
-
-        let mut patch = self.patch();
-        let Some(node) = patch.graph.nodes.iter_mut().find(|n| n.id == node) else {
-            return;
-        };
-        if let NodeKind::Plugin(Plugin { ports, .. }) = &mut node.kind {
-            // Parameter sockets are user-configured: discovery updates audio and note buses
-            // while preserving existing parameter socket bindings. Which output buses have
-            // sockets is also preserved once configured; initial discovery defaults to the main bus.
-            let params = std::mem::take(&mut ports.params);
-            let shown = (!ports.audio_out_shown.is_empty()).then(|| ports.audio_out_shown.clone());
-            *ports = discovered;
-            ports.params = params;
-            if let Some(shown) = shown {
-                ports.audio_out_shown = shown;
-                // Every pick pointed at a bus the reloaded plugin no longer
-                // has. Silently ending up with no way out of the node would be
-                // worse than falling back to the main bus.
-                if ports.shown_outputs().is_empty() && !ports.audio_out.is_empty() {
-                    ports.audio_out_shown = vec![0];
-                }
-            }
-        }
-        patch.graph.prune();
+        self.patch()
+            .graph
+            .update_plugin_ports(node, PluginPorts::from_layout(&layout, latency));
     }
 
     pub fn unload(&self) {

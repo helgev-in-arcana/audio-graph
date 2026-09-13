@@ -556,7 +556,9 @@ impl Node for Plugin {
         let Some(candidate) = picked else {
             return false;
         };
-        self.ports.shown_mut()[usize::from(port)] = candidate;
+        let picks = self.ports.shown_mut();
+        let index = picks.iter().position(|&b| b == bus).unwrap();
+        picks[index] = candidate;
         true
     }
 
@@ -585,7 +587,10 @@ impl Node for Plugin {
         if self.ports.shown_outputs().len() <= 1 || index >= self.ports.shown_outputs().len() {
             return 0;
         }
-        self.ports.shown_mut().remove(index);
+        let bus = self.ports.shown_outputs()[index];
+        let picks = self.ports.shown_mut();
+        let index = picks.iter().position(|&b| b == bus).unwrap();
+        picks.remove(index);
         1
     }
 
