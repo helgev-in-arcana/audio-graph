@@ -123,6 +123,71 @@ fn failed_saves_keep_the_last_successful_blob() {
     assert_ne!(host.save_state(), good);
 }
 
+/// Invalid preparation is rejected before native activation and remains retryable.
+#[test]
+fn activation_validates_lanes_and_instance_io() {
+    use subhost_adapter::{InstanceIo, ParamTarget};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("preparation");
+    let mut host = SubHost::new(
+        Arc::new(Host),
+        SubHostConfig {
+            lanes: 2,
+            ..host().config()
+        },
+    );
+    host.load(0, &path, None).unwrap();
+    assert!(
+        host.activate(
+            audio_config(),
+            &[],
+            &[ParamTarget {
+                instance: 0,
+                param: 0
+            }]
+        )
+        .is_err()
+    );
+    let mut io = InstanceIo {
+        instance: 0,
+        input_channels: 2,
+        output_channels: 2,
+        aux_inputs: vec![],
+        aux_outputs: vec![],
+    };
+    assert!(
+        host.activate(audio_config(), &[io.clone(), io.clone()], &[])
+            .is_err()
+    );
+    io.aux_inputs = vec![2; plugin_host::MAX_AUX_BUSES + 1];
+    assert!(host.activate(audio_config(), &[io], &[]).is_err());
+    let mut processors = host.activate(audio_config(), &[], &[]).unwrap();
+    let mut schedule = subhost_adapter::SlotSchedule::new(1, 64, 32).unwrap();
+    schedule.begin(32).unwrap();
+    let input = [0.0; 64];
+    let mut output = [9.0; 64];
+    let mut buffers = plugin_host::AudioBuffers::new(
+        &input,
+        &mut output,
+        2,
+        2,
+        32,
+        plugin_host::BufferLayout::Planar,
+    );
+    assert_eq!(
+        processors.get_mut(0).unwrap().process(
+            &mut buffers,
+            schedule.view(),
+            &[],
+            0..32,
+            &plugin_host::TimeContext::default(),
+            &mut plugin_host::EventSink::with_capacity(64)
+        ),
+        plugin_host::ProcessStatus::Error
+    );
+    assert_eq!(output, [0.0; 64]);
+}
+
 fn audio_config() -> plugin_host::AudioConfig {
     plugin_host::AudioConfig {
         sample_rate: 48000.0,
@@ -136,8 +201,8 @@ fn audio_config() -> plugin_host::AudioConfig {
 }
 
 fn run(processors: &mut subhost_adapter::SubHostProcessors, values: &[f64]) -> f32 {
-    let mut schedule = subhost_adapter::SlotSchedule::new(4, 64, 32);
-    schedule.begin(32);
+    let mut schedule = subhost_adapter::SlotSchedule::new(4, 64, 32).unwrap();
+    schedule.begin(32).unwrap();
     schedule.fill(values);
     let input = [1.0; 64];
     let mut output = [0.0; 64];

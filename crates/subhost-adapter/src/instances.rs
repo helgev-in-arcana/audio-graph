@@ -110,12 +110,10 @@ impl AudioInstances for NoInstances {
         _notes: &[Event],
         _input: &[f32],
         output: &mut [f32],
-        chunk: AudioChunk,
+        _chunk: AudioChunk,
         _schedule: ScheduleView<'_>,
     ) {
-        for ch in 0..chunk.output_channels {
-            output[chunk.channel(ch)].fill(0.0);
-        }
+        output.fill(0.0);
     }
 }
 
@@ -137,6 +135,33 @@ pub struct InstanceIo {
     /// Aux output buses, in order, and only as far as the caller reads them:
     /// a plugin's third output is absent when only the second is wired.
     pub aux_outputs: Vec<u16>,
+}
+
+impl InstanceIo {
+    pub(crate) fn configure(
+        &self,
+        config: plugin_host::AudioConfig,
+    ) -> Result<plugin_host::AudioConfig, String> {
+        if self.aux_inputs.len() > plugin_host::MAX_AUX_BUSES
+            || self.aux_outputs.len() > plugin_host::MAX_AUX_BUSES
+        {
+            return Err("too many auxiliary buses".into());
+        }
+        let config = plugin_host::AudioConfig {
+            input_channels: self.input_channels.into(),
+            output_channels: self.output_channels.into(),
+            aux_inputs: AuxBuses::new(&self.aux_inputs),
+            aux_outputs: AuxBuses::new(&self.aux_outputs),
+            ..config
+        };
+        config.validate().map_err(|e| e.to_string())?;
+        if config.total_input_channels() > u16::MAX.into()
+            || config.total_output_channels() > u16::MAX.into()
+        {
+            return Err("channel count exceeds chunk representation".into());
+        }
+        Ok(config)
+    }
 }
 
 /// Target identifier for a sub-plugin parameter driven directly by the audio

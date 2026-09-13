@@ -82,7 +82,7 @@ impl Default for Wrapper {
             context,
             shared,
             engine: Engine::new(),
-            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM),
+            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM).unwrap(),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             out_events: EventSink::new(),
@@ -311,7 +311,7 @@ impl Wrapper {
         // Every allocation the audio path needs happens here. `SlotSchedule`
         // is sized for the finest sub-block on offer, so the user can change
         // the modulation rate mid-playback without this being redone.
-        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum());
+        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum()).ok()?;
         // The graph's audio buffers, sized for the ceilings rather than for the
         // current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
@@ -365,6 +365,12 @@ impl Wrapper {
         context: &mut impl ProcessContext<P>,
     ) -> ProcessStatus {
         let frames = buffer.samples() as u32;
+        if frames > self.schedule.max_frames() {
+            for channel in buffer.as_slice() {
+                channel.fill(0.0);
+            }
+            return ProcessStatus::Error("block exceeds prepared schedule");
+        }
         let channels = buffer.channels() as u32;
 
         // Collect note input before touching audio: the sub-plugin wants a
@@ -949,7 +955,7 @@ mod tests {
     fn a_block_is_filled_to_the_schedules_width_whether_or_not_a_graph_runs() {
         let daw_slots = vec![0.42; SLOT_COUNT];
         let mut engine = Engine::new();
-        let mut schedule = SlotSchedule::new(LANES, 512, 32);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32).unwrap();
 
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.

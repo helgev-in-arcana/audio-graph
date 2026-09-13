@@ -47,6 +47,7 @@ pub struct SlotSchedule {
     /// Number of sub-blocks in the current audio block, initialized by [`begin`][Self::begin].
     blocks: usize,
     frames: u32,
+    max_frames: u32,
 }
 
 /// Read-only view of the rows prepared for one audio block.
@@ -99,14 +100,20 @@ impl<'a> ScheduleView<'a> {
         blocks: usize,
         quantum: u32,
         frames: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, &'static str> {
+        if quantum == 0
+            || (blocks != frames.div_ceil(quantum).max(1) as usize && (frames != 0 || blocks != 0))
+            || blocks.checked_mul(lanes) != Some(values.len())
+        {
+            return Err("inconsistent schedule shape");
+        }
+        Ok(Self {
             values,
             lanes,
             blocks,
             quantum,
             frames,
-        }
+        })
     }
 }
 
@@ -116,15 +123,19 @@ impl SlotSchedule {
     ///
     /// Sizing for the finest granularity rather than the current one is what
     /// makes [`set_quantum`][Self::set_quantum] allocation-free.
-    pub fn new(lanes: usize, max_block: u32, quantum: u32) -> SlotSchedule {
-        let capacity = max_block.div_ceil(MIN_QUANTUM).max(1) as usize * lanes;
-        SlotSchedule {
+    pub fn new(lanes: usize, max_block: u32, quantum: u32) -> Result<SlotSchedule, &'static str> {
+        let capacity = (max_block.div_ceil(MIN_QUANTUM).max(1) as usize)
+            .checked_mul(lanes)
+            .filter(|n| *n <= isize::MAX as usize / size_of::<f64>())
+            .ok_or("schedule capacity overflow")?;
+        Ok(SlotSchedule {
             lanes,
             values: vec![0.0; capacity],
             quantum: sanitise(quantum),
             blocks: 0,
             frames: 0,
-        }
+            max_frames: max_block,
+        })
     }
 
     /// Returns the number of parameter lanes per sub-block.
@@ -135,7 +146,11 @@ impl SlotSchedule {
     /// Returns the maximum number of sub-blocks the preallocated buffer can
     /// store, for callers sizing their own buffers.
     pub fn max_blocks(&self) -> usize {
-        self.values.len() / self.lanes
+        self.max_frames.div_ceil(MIN_QUANTUM).max(1) as usize
+    }
+
+    pub fn max_frames(&self) -> u32 {
+        self.max_frames
     }
 
     pub fn quantum(&self) -> u32 {
@@ -149,13 +164,17 @@ impl SlotSchedule {
     }
 
     /// Initializes the schedule for an audio block of `frames` samples and returns the sub-block count.
-    pub fn begin(&mut self, frames: u32) -> usize {
+    pub fn begin(&mut self, frames: u32) -> Result<usize, &'static str> {
+        if frames > self.max_frames {
+            self.frames = 0;
+            self.blocks = 0;
+            return Err("block exceeds schedule capacity");
+        }
         self.frames = frames;
         // Never zero: a block of no samples still wants one boundary, so a
         // caller can write values without special-casing it.
         self.blocks = frames.div_ceil(self.quantum).max(1) as usize;
-        self.blocks = self.blocks.min(self.max_blocks());
-        self.blocks
+        Ok(self.blocks)
     }
 
     pub fn blocks(&self) -> usize {
@@ -231,14 +250,33 @@ fn sanitise(quantum: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// Rejected blocks expose no partial rows, and an empty lane set requires no allocation.
+    #[test]
+    fn capacity_and_view_shape_are_checked() {
+        let mut schedule = SlotSchedule::new(1, 16, 16).unwrap();
+        assert!(schedule.begin(64).is_err());
+        assert_eq!(
+            (schedule.blocks(), schedule.frames(), schedule.rows().len()),
+            (0, 0, 0)
+        );
+        assert_eq!(schedule.begin(16), Ok(1));
+        assert!(SlotSchedule::new(usize::MAX, 16, 16).is_err());
+        assert!(ScheduleView::from_parts(&[], 1, 1, 16, 16).is_err());
+        assert!(ScheduleView::from_parts(&[0.0], 1, 1, 0, 16).is_err());
+        assert!(ScheduleView::from_parts(&[0.0], 1, 1, 16, 64).is_err());
+        let mut empty = SlotSchedule::new(0, 64, 16).unwrap();
+        assert_eq!(empty.begin(64), Ok(4));
+        assert!(empty.view().block(3).is_empty());
+    }
+
     /// Test constants for slot and lane counts.
     const SLOTS: usize = 32;
     const LANES: usize = SLOTS + 64 + 16;
 
     #[test]
     fn a_block_is_cut_into_whole_sub_blocks_plus_a_remainder() {
-        let mut schedule = SlotSchedule::new(LANES, 512, 32);
-        assert_eq!(schedule.begin(100), 4);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32).unwrap();
+        assert_eq!(schedule.begin(100).unwrap(), 4);
         assert_eq!(schedule.offset(0), 0);
         assert_eq!(schedule.offset(3), 96);
         assert_eq!(schedule.frames_of(0), 32);
@@ -256,7 +294,7 @@ mod tests {
 
     #[test]
     fn changing_the_quantum_never_needs_more_memory() {
-        let mut schedule = SlotSchedule::new(LANES, 512, 128);
+        let mut schedule = SlotSchedule::new(LANES, 512, 128).unwrap();
         let capacity = schedule.max_blocks();
         schedule.set_quantum(16);
         assert_eq!(
@@ -264,7 +302,7 @@ mod tests {
             capacity,
             "sized for the finest quantum from the start"
         );
-        assert_eq!(schedule.begin(512), 32);
+        assert_eq!(schedule.begin(512).unwrap(), 32);
     }
 
     #[test]
@@ -272,8 +310,8 @@ mod tests {
         // A host is allowed to give us fewer samples than the maximum, and an
         // event at an offset past the end is a contract violation the
         // sub-plugin would be entitled to crash on.
-        let mut schedule = SlotSchedule::new(LANES, 512, 32);
-        schedule.begin(8);
+        let mut schedule = SlotSchedule::new(LANES, 512, 32).unwrap();
+        schedule.begin(8).unwrap();
         for i in 0..schedule.blocks() {
             assert!(schedule.offset(i) < 8);
         }
@@ -281,8 +319,8 @@ mod tests {
 
     #[test]
     fn filling_gives_every_sub_block_the_same_value() {
-        let mut schedule = SlotSchedule::new(LANES, 256, 32);
-        schedule.begin(256);
+        let mut schedule = SlotSchedule::new(LANES, 256, 32).unwrap();
+        schedule.begin(256).unwrap();
         let mut values = vec![0.0; SLOTS];
         values[3] = 0.75;
         schedule.fill(&values);

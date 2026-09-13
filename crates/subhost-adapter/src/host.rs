@@ -560,6 +560,29 @@ impl SubHost {
         io: &[InstanceIo],
         direct: &[ParamTarget],
     ) -> Result<SubHostProcessors, String> {
+        config.validate().map_err(|e| e.to_string())?;
+        if self
+            .config
+            .slot_count
+            .checked_add(direct.len())
+            .is_none_or(|n| n > self.config.lanes)
+            || self.config.max_instances > u32::MAX as usize
+            || config.total_input_channels() > u16::MAX.into()
+            || config.total_output_channels() > u16::MAX.into()
+            || direct
+                .iter()
+                .any(|t| t.instance as usize >= self.config.max_instances)
+        {
+            return Err("invalid instance or parameter lane configuration".into());
+        }
+        for (index, entry) in io.iter().enumerate() {
+            if entry.instance as usize >= self.config.max_instances
+                || io[..index].iter().any(|e| e.instance == entry.instance)
+            {
+                return Err("invalid or duplicate instance I/O".into());
+            }
+            entry.configure(config)?;
+        }
         // One event per lane per sub-block is the worst a caller can ask for,
         // plus whatever the DAW sends us. Reserved here because `process` is
         // not allowed to grow it.
@@ -567,7 +590,13 @@ impl SubHost {
             .max_block_size
             .div_ceil(crate::schedule::MIN_QUANTUM)
             .max(1) as usize;
-        let capacity = self.config.lanes * sub_blocks + INCOMING_EVENT_CAPACITY;
+        let capacity = self
+            .config
+            .lanes
+            .checked_mul(sub_blocks)
+            .and_then(|n| n.checked_add(INCOMING_EVENT_CAPACITY))
+            .filter(|n| *n <= isize::MAX as usize / size_of::<Event>())
+            .ok_or("event capacity overflow")?;
 
         let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
         for instance in 0..self.instances.len() {
@@ -583,13 +612,7 @@ impl SubHost {
             };
             // Apply per-instance bus configuration overrides if specified.
             let config = match io.iter().find(|e| e.instance as usize == instance) {
-                Some(entry) => AudioConfig {
-                    input_channels: u32::from(entry.input_channels),
-                    output_channels: u32::from(entry.output_channels),
-                    aux_inputs: plugin_host::AuxBuses::new(&entry.aux_inputs),
-                    aux_outputs: plugin_host::AuxBuses::new(&entry.aux_outputs),
-                    ..config
-                },
+                Some(entry) => entry.configure(config)?,
                 None => config,
             };
             match loaded.plugin.activate(config) {
@@ -598,6 +621,8 @@ impl SubHost {
                     let note_end_ports = loaded.plugin.note_end_ports();
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
+                        config,
+                        lanes: self.config.lanes,
                         processor,
                         note_end_ports,
                         last_sent: vec![f64::NAN; targets.len()],
@@ -711,6 +736,8 @@ const INCOMING_EVENT_CAPACITY: usize = 1024;
 
 /// Audio-thread processor for a single sub-plugin instance.
 pub struct SubHostProcessor {
+    config: AudioConfig,
+    lanes: usize,
     note_end_ports: Vec<i16>,
     processor: Processor,
     /// Parameter targets and their schedule lane indices, captured at
@@ -748,6 +775,17 @@ impl SubHostProcessor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
+        if chunk.end.checked_sub(chunk.start) != Some(buffers.frame_count())
+            || chunk.end > slots.frames()
+            || slots.frames() > self.config.max_block_size
+            || slots.lanes() != self.lanes
+            || !events.is_sorted_by_key(Event::sample_offset)
+            || events.iter().any(|e| e.sample_offset() >= slots.frames())
+        {
+            buffers.clear_output();
+            self.last_sent.fill(f64::NAN);
+            return ProcessStatus::Error;
+        }
         self.scratch.clear();
         let mut complete = true;
         // Everything before the chunk was sent on an earlier call;
@@ -761,7 +799,7 @@ impl SubHostProcessor {
             // chunk of a block is short whenever the block is not a multiple
             // of the quantum, so `<` on the end is what keeps the boundary row
             // out of both calls' way rather than in both.
-            if offset < chunk.start || offset >= chunk.end.max(chunk.start + 1) {
+            if offset < chunk.start || offset >= chunk.end.max(chunk.start.saturating_add(1)) {
                 continue;
             }
             let offset = offset - chunk.start;
@@ -924,9 +962,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
             // audio thread held this program. Silence is the only honest
             // answer; passing the input through would let the user hear the
             // graph working when it is not.
-            for ch in 0..chunk.output_channels {
-                output[chunk.channel(ch)].fill(0.0);
-            }
+            output.fill(0.0);
             return;
         };
 
@@ -948,7 +984,7 @@ impl crate::instances::AudioInstances for BoundInstances<'_> {
             &mut buffers,
             schedule,
             notes,
-            chunk.offset..chunk.offset + chunk.frames,
+            chunk.offset..chunk.offset.saturating_add(chunk.frames),
             self.context,
             self.out_events,
         );
@@ -1009,8 +1045,8 @@ mod tests {
             velocity: 0.0,
             sample_offset: 0,
         });
-        let mut schedule = SlotSchedule::new(LANES, 4, 32);
-        schedule.begin(4);
+        let mut schedule = SlotSchedule::new(LANES, 4, 32).unwrap();
+        schedule.begin(4).unwrap();
         let mut output = [9.0; 8];
         let mut sink = EventSink::with_capacity(8);
         let time = TimeContext::default();
@@ -1061,6 +1097,18 @@ mod tests {
     const SLOTS: usize = 32;
     const LANES: usize = SLOTS + 64 + 16;
 
+    fn config() -> AudioConfig {
+        AudioConfig {
+            sample_rate: 48000.0,
+            max_block_size: 128,
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+            offline: true,
+        }
+    }
+
     /// Several instances and chunks append block-relative output without losing overflow.
     #[test]
     fn output_collection_spans_instances_and_chunks() {
@@ -1086,6 +1134,8 @@ mod tests {
             entries: (0..2)
                 .map(|_| {
                     Some(SubHostProcessor {
+                        config: config(),
+                        lanes: LANES,
                         note_end_ports: Vec::new(),
                         processor: Processor::new(Echo),
                         targets: Vec::new(),
@@ -1097,8 +1147,8 @@ mod tests {
         };
         let mut sink = EventSink::with_capacity(2);
         let context = TimeContext::default();
-        let mut schedule = SlotSchedule::new(LANES, 8, 4);
-        schedule.begin(8);
+        let mut schedule = SlotSchedule::new(LANES, 8, 4).unwrap();
+        schedule.begin(8).unwrap();
         schedule.fill(&[0.0; LANES]);
         for (instance, offset) in [(0, 0), (1, 4), (0, 4)] {
             let event = Event::Note(NoteEvent::NoteOn {
@@ -1143,6 +1193,8 @@ mod tests {
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let processor = SubHostProcessor {
+            config: config(),
+            lanes: LANES,
             note_end_ports: Vec::new(),
             processor: Processor::new(Recorder { seen: seen.clone() }),
             targets,
@@ -1153,16 +1205,18 @@ mod tests {
     }
 
     fn run(p: &mut SubHostProcessor, values: &[f64]) {
-        let mut schedule = SlotSchedule::new(LANES, 4, 32);
-        schedule.begin(4);
+        let mut schedule = SlotSchedule::new(LANES, 4, 32).unwrap();
+        schedule.begin(4).unwrap();
         schedule.fill(values);
         run_scheduled(p, &schedule, &[]);
     }
 
     fn run_scheduled(p: &mut SubHostProcessor, schedule: &SlotSchedule, events: &[Event]) {
-        let input = [0.0f32; 8];
-        let mut output = [0.0f32; 8];
-        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        let frames = schedule.frames();
+        let input = vec![0.0f32; frames as usize * 2];
+        let mut output = vec![0.0f32; frames as usize * 2];
+        let mut buffers =
+            AudioBuffers::new(&input, &mut output, 2, 2, frames, BufferLayout::Planar);
         let mut sink = EventSink::new();
         p.process(
             &mut buffers,
@@ -1268,8 +1322,8 @@ mod tests {
             sample_offset: 40,
         });
 
-        let mut schedule = SlotSchedule::new(LANES, 128, 32);
-        schedule.begin(64);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        schedule.begin(64).unwrap();
 
         let input = [0.0f32; 64];
         let mut output = [0.0f32; 64];
@@ -1308,8 +1362,8 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(LANES, 128, 32);
-        let blocks = schedule.begin(128);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        let blocks = schedule.begin(128).unwrap();
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
         }
@@ -1347,8 +1401,8 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(LANES, 128, 32);
-        let blocks = schedule.begin(128);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        let blocks = schedule.begin(128).unwrap();
         assert_eq!(blocks, 4);
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
@@ -1370,8 +1424,8 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(LANES, 128, 32);
-        schedule.begin(128);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        schedule.begin(128).unwrap();
         schedule.fill(&vec![0.5; SLOTS]);
         run_scheduled(&mut p, &schedule, &[]);
 
@@ -1392,8 +1446,8 @@ mod tests {
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
-        let mut schedule = SlotSchedule::new(LANES, 128, 32);
-        let blocks = schedule.begin(128);
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        let blocks = schedule.begin(128).unwrap();
         for i in 0..blocks {
             schedule.block_mut(i)[0] = i as f64 / 4.0;
         }
@@ -1476,11 +1530,11 @@ mod tests {
             velocity: 1.0,
             sample_offset: 0,
         });
-        let schedule = SlotSchedule::new(LANES, 4, 32);
+        let schedule = SlotSchedule::new(LANES, 4, 32).unwrap();
         let mut sink = EventSink::new();
         let context = TimeContext::default();
         let mut schedule = schedule;
-        schedule.begin(4);
+        schedule.begin(4).unwrap();
         let view = schedule.view();
         let mut running = processors.bind(&context, &mut sink);
 
