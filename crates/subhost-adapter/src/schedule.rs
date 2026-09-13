@@ -161,6 +161,9 @@ impl SlotSchedule {
     /// from the audio thread when the user moves the setting mid-playback.
     pub fn set_quantum(&mut self, quantum: u32) {
         self.quantum = sanitise(quantum);
+        if self.blocks != 0 {
+            self.blocks = self.frames.div_ceil(self.quantum).max(1) as usize;
+        }
     }
 
     /// Initializes the schedule for an audio block of `frames` samples and returns the sub-block count.
@@ -303,6 +306,19 @@ mod tests {
             "sized for the finest quantum from the start"
         );
         assert_eq!(schedule.begin(512).unwrap(), 32);
+        schedule.set_quantum(64);
+        assert_eq!(schedule.blocks(), 8);
+        let view = schedule.view();
+        assert!(
+            ScheduleView::from_parts(
+                view.rows(),
+                view.lanes(),
+                view.blocks(),
+                view.quantum(),
+                view.frames()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

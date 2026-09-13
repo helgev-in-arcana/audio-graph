@@ -43,9 +43,9 @@ pub struct SubHost {
     latencies: Vec<u32>,
 }
 
-/// Configuration limits and buffer sizing parameters for a sub-host.
+/// Resource limits and parameter conflict policy for a sub-host.
 ///
-/// These are ceilings rather than guidance: everything below is preallocated.
+/// Resource limits are ceilings rather than guidance: audio storage is preallocated.
 /// The instance table and the event buffers are sized at activate, and
 /// `process` may not grow either, because it runs on the audio thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,9 +109,11 @@ impl SubHost {
 
     /// Expands the instance table if needed to accommodate `instance`.
     fn reserve(&mut self, instance: usize) -> Result<(), String> {
-        if instance >= self.config.max_instances {
+        if instance >= self.config.max_instances || instance > u32::MAX as usize {
             let max = self.config.max_instances;
-            return Err(format!("at most {max} sub-plugins"));
+            return Err(format!(
+                "invalid instance index {instance} (capacity {max})"
+            ));
         }
         if self.instances.len() <= instance {
             self.instances.resize_with(instance + 1, || None);
@@ -318,6 +320,7 @@ impl SubHost {
         Ok(())
     }
 
+    /// Removes both the native plugin and its saved document entry.
     pub fn unload(&mut self, instance: usize) {
         self.detach(instance);
         self.saved.retain(|entry| entry.instance != instance);
@@ -419,10 +422,6 @@ impl SubHost {
     /// `load_sub_state` additionally tick around the plugin themselves, since
     /// a callback missed there costs data rather than responsiveness.
     ///
-    /// One platform is still short: on VST3 under Linux the underlying host
-    /// posts these onto a worker thread rather than a main thread, so the tick
-    /// declines to do anything. CLAP under Linux goes through
-    /// `request_callback()` and is fine.
     pub fn tick_editors(&mut self) {
         for instance in 0..self.instances.len() {
             if let Some(loaded) = self.at_mut(instance) {
@@ -788,6 +787,8 @@ impl SubHostProcessor {
     /// *its own* events, rebased — a note at sample 40 belongs to the chunk
     /// starting at 32, at offset 8, and to no other. Handing every chunk the
     /// whole block would replay every note once per chunk.
+    ///
+    /// `context` describes the parent block's start; transport is advanced to `chunk.start`.
     pub fn process(
         &mut self,
         buffers: &mut AudioBuffers<'_>,
