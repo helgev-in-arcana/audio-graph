@@ -514,6 +514,7 @@ impl Wrapper {
                 .as_ref()
                 .is_some_and(|processor| processor.failed())
         {
+            self.shared.report_processing_error(state.document);
             self.ended_notes.clear();
             self.engine.reset_notes(&mut self.ended_notes);
             if let Some(processor) = state.processor.as_mut() {

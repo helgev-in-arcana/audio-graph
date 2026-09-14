@@ -33,14 +33,16 @@
 use std::array;
 use std::cell::{RefCell, RefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::config::SLOT_COUNT;
+use crate::notification::{ErrorSource, Notifications};
 use crate::state::WrapperState;
 use audio_graph_engine::NodeId;
 use audio_graph_engine::{Graph, ProgramPublisher, compile};
 use audio_graph_engine::{NodeKind, Plugin, PluginPorts};
+use nice_plug::prelude::EditorOpenRequest;
 use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
 use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
@@ -72,6 +74,7 @@ pub struct Patch {
     pub graph: Graph,
     pub(crate) document: u64,
     pub(crate) restore_error: Option<String>,
+    pub(crate) notifications: Notifications,
     /// Why the graph on screen is not the graph being heard.
     ///
     /// A cycle or a duplicate output is an ordinary thing to have halfway
@@ -95,6 +98,7 @@ pub enum GraphEdit {
 
 /// The processor configuration and the earliest publication it can execute.
 pub struct AudioState {
+    pub(crate) document: u64,
     /// Missing or failed hosted processors are represented by silence through NoInstances.
     pub(crate) processor: Option<SubHostProcessors>,
     pub(crate) reset_notes: bool,
@@ -108,6 +112,8 @@ pub struct AudioState {
 /// table. Their return paths survive the last shared handle being released on
 /// an executor or audio thread.
 pub struct Shared {
+    editor_requests: OnceLock<Box<dyn Fn(EditorOpenRequest) + Send + Sync>>,
+    processing_error: AtomicU64,
     main: MainThread<RefCell<MainState>>,
     patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
@@ -187,6 +193,8 @@ impl Drop for Shared {
 impl Shared {
     pub fn new(host: SubHost, params: Arc<WrapperParams>) -> Arc<Shared> {
         Arc::new(Shared {
+            editor_requests: OnceLock::new(),
+            processing_error: AtomicU64::new(0),
             main: MainThread::new(RefCell::new(MainState {
                 host,
                 config: None,
@@ -199,8 +207,10 @@ impl Shared {
                 document: 0,
                 compile_error: None,
                 restore_error: None,
+                notifications: Notifications::default(),
             }),
             audio: Mutex::new(AudioState {
+                document: 0,
                 processor: None,
                 reset_notes: false,
                 required_publication: 0,
@@ -336,6 +346,9 @@ impl Shared {
 
     pub fn set_editor_open(&self, open: bool) {
         self.editor_open.store(open, Ordering::Relaxed);
+        if open {
+            self.patch().notifications.take_request(true);
+        }
     }
 
     /// Observes availability without allowing callers to replace the configuration.
@@ -441,6 +454,55 @@ impl Shared {
 
     pub fn document_generation(&self) -> u64 {
         self.patch().document
+    }
+
+    /// A delayed report cannot attach an error to a replacement document. Non-audio threads only.
+    pub fn report_error(&self, document: u64, source: ErrorSource, message: String) {
+        let mut patch = self.patch();
+        if patch.document == document {
+            patch.notifications.report(source, message);
+        }
+    }
+
+    pub fn clear_error(&self, document: u64, source: ErrorSource) {
+        let mut patch = self.patch();
+        if patch.document == document {
+            patch.notifications.clear(source);
+        }
+    }
+
+    /// Audio thread: zero means no report, so the document is encoded as its generation plus one.
+    pub(crate) fn report_processing_error(&self, document: u64) {
+        self.processing_error.store(document + 1, Ordering::Release);
+    }
+
+    pub(crate) fn set_editor_request_handler(
+        &self,
+        send: impl Fn(EditorOpenRequest) + Send + Sync + 'static,
+    ) {
+        let _ = self.editor_requests.set(Box::new(send));
+    }
+
+    pub(crate) fn take_editor_open_request(&self) -> Option<EditorOpenRequest> {
+        let mut patch = self.patch.try_lock()?;
+        patch.notifications.take_request(self.editor_open())
+    }
+
+    pub(crate) fn flush_error_notifications(&self) {
+        let encoded = self.processing_error.swap(0, Ordering::AcqRel);
+        if encoded != 0 {
+            self.report_error(
+                encoded - 1,
+                ErrorSource::Processing,
+                "Audio processing failed or its event buffer overflowed. Processing was reset."
+                    .into(),
+            );
+        }
+        if let Some(send) = self.editor_requests.get()
+            && let Some(request) = self.take_editor_open_request()
+        {
+            send(request);
+        }
     }
 
     fn free_graph_instance(host: &SubHost, graph: &Graph) -> Option<usize> {
@@ -554,7 +616,12 @@ impl Shared {
     pub(crate) fn activate(&self, config: AudioConfig) -> Result<(), String> {
         self.main().config = Some(config);
         self.programs.reset();
-        self.publish(true)
+        let result = self.publish(true);
+        if result.is_ok() {
+            self.processing_error.store(0, Ordering::Release);
+            self.clear_error(self.document_generation(), ErrorSource::Processing);
+        }
+        result
     }
 
     pub(crate) fn deactivate(&self) {
@@ -571,7 +638,14 @@ impl Shared {
             patch.graph.clone()
         };
         let compiled = compile(&graph, SLOT_COUNT).map_err(|error| error.to_string());
-        self.patch().compile_error = compiled.as_ref().err().cloned();
+        let mut patch = self.patch();
+        patch.compile_error = compiled.as_ref().err().cloned();
+        match &compiled {
+            Ok(_) => patch.notifications.clear(ErrorSource::Graph),
+            Err(error) => patch
+                .notifications
+                .report(ErrorSource::Graph, error.clone()),
+        }
         compiled
     }
 
@@ -618,7 +692,15 @@ impl Shared {
             Err(error) => (None, Err(error)),
         };
         self.main().rebind_required = result.is_err();
+        if let Err(error) = &result {
+            self.report_error(
+                self.document_generation(),
+                ErrorSource::Graph,
+                error.clone(),
+            );
+        }
         *self.audio() = AudioState {
+            document: self.document_generation(),
             processor,
             reset_notes: true,
             required_publication: publication,
@@ -890,6 +972,7 @@ impl Shared {
             document: patch.document + 1,
             compile_error: None,
             restore_error: None,
+            notifications: Notifications::default(),
         };
         self.changed();
     }
@@ -901,8 +984,10 @@ impl Shared {
             graph: Graph::new(),
             document: patch.document + 1,
             compile_error: None,
-            restore_error: Some(error),
+            restore_error: Some(error.clone()),
+            notifications: Notifications::default(),
         };
+        patch.notifications.report(ErrorSource::State, error);
         // Re-activation of the same input must not replace or repeatedly load it.
         *self.last_written.lock() = Some(json.to_owned());
         self.changed();
@@ -990,6 +1075,44 @@ mod tests {
             SubHost::new(Arc::new(SilentHost), SUB_HOST),
             WrapperParams::new(),
         )
+    }
+
+    /// Worker and audio reports reach a closed editor without another audio block or activation.
+    #[test]
+    fn non_activation_errors_flush_without_holding_shared_locks() {
+        let shared = shared();
+        let sent = Arc::new(AtomicU32::new(0));
+        let weak = Arc::downgrade(&shared);
+        let count = sent.clone();
+        shared.set_editor_request_handler(move |request| {
+            let shared = weak.upgrade().unwrap();
+            assert!(shared.try_main().is_some());
+            assert!(shared.patch.try_lock().is_some());
+            assert!(shared.audio.try_lock().is_some());
+            count.fetch_add(1, Ordering::Relaxed);
+            request.dispatch(|| nice_plug::prelude::EditorOpenStatus::Accepted);
+        });
+        let document = shared.document_generation();
+        let worker = shared.clone();
+        std::thread::spawn(move || {
+            worker.report_error(document, ErrorSource::Graph, "worker error".into())
+        })
+        .join()
+        .unwrap();
+        shared.flush_error_notifications();
+        assert_eq!(sent.load(Ordering::Relaxed), 1);
+        shared.report_processing_error(document);
+        shared.flush_error_notifications();
+        assert_eq!(sent.load(Ordering::Relaxed), 2);
+        shared.report_processing_error(document);
+        shared.flush_error_notifications();
+        assert_eq!(sent.load(Ordering::Relaxed), 2);
+        shared.restore_graph(Graph::new());
+        shared.report_processing_error(document);
+        shared.report_error(document, ErrorSource::State, "stale worker error".into());
+        shared.flush_error_notifications();
+        assert_eq!(shared.patch().notifications.messages().count(), 0);
+        assert_eq!(sent.load(Ordering::Relaxed), 2);
     }
 
     /// A replacement configuration cannot run a program left from an older configuration.

@@ -118,6 +118,11 @@ pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &Tick
         main.host.any_loaded()
     };
     if let Err(error) = shared.refresh_metadata() {
+        shared.report_error(
+            shared.document_generation(),
+            crate::ErrorSource::Graph,
+            error.clone(),
+        );
         shared.patch().compile_error = Some(error);
     }
 
@@ -132,6 +137,7 @@ pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &Tick
     // Last, so the snapshot the next frame draws includes everything this tick
     // did.
     shared.publish_view();
+    shared.flush_error_notifications();
 
     // An open editor needs the full rate whether or not anything is loaded: it
     // is the only thing turning our event loop, and off the main thread it is

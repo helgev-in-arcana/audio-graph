@@ -9,6 +9,7 @@ mod config;
 mod editor;
 mod graph_ui;
 mod host_context;
+mod notification;
 mod params;
 mod plugin;
 mod shared;
@@ -22,6 +23,7 @@ use nice_plug::prelude::*;
 
 pub use config::{LANES, MAX_INSTANCES, SLOT_COUNT, SUB_HOST};
 pub use host_context::WrapperHostContext;
+pub use notification::ErrorSource;
 pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
 pub use shared::{GraphEdit, MainState, Shared};
@@ -90,6 +92,10 @@ macro_rules! wrapper_class {
             }
 
             fn editor(&mut self, executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
+                let requests = executor.clone();
+                self.0.shared().set_editor_request_handler(move |request| {
+                    requests.request_editor_open(request);
+                });
                 // Not editor business, but this is the one moment nice-plug
                 // offers a way onto the main thread, and it happens at
                 // instance creation rather than when a window opens.
@@ -106,6 +112,9 @@ macro_rules! wrapper_class {
                 context: &mut impl ActivateContext<Self>,
             ) -> bool {
                 let latency = self.0.activate($kind, audio_io_layout, buffer_config);
+                if let Some(request) = self.0.shared().take_editor_open_request() {
+                    context.request_editor_open(request);
+                }
                 match latency {
                     Some(samples) => {
                         // Report the combined latency (wrapper plus sub-plugins) to the host,
@@ -227,3 +236,82 @@ wrapper_class! {
 // Export both the effect and instrument plugin classes from this binary.
 nice_export_vst3!(WrapperFx, WrapperInstrument);
 nice_export_clap!(WrapperFx, WrapperInstrument);
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Context(RefCell<Vec<EditorOpenRequest>>);
+
+    impl ActivateContext<WrapperFx> for Context {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Clap
+        }
+        fn execute(&self, _: tick::Task) {}
+        fn set_latency_samples(&self, _: u32) {}
+        fn set_current_voice_capacity(&self, _: u32) {}
+        fn request_editor_open(&self, request: EditorOpenRequest) {
+            self.0.borrow_mut().push(request);
+        }
+    }
+
+    fn activate(plugin: &mut WrapperFx, context: &mut Context) {
+        assert!(Plugin::activate(
+            plugin,
+            &FX_LAYOUTS[0],
+            &BufferConfig {
+                sample_rate: 48_000.0,
+                min_buffer_size: None,
+                max_buffer_size: 64,
+                process_mode: ProcessMode::Realtime,
+            },
+            context
+        ));
+    }
+
+    /// Rejecting a G2 display request preserves the original state and does not repeat on reactivation.
+    #[test]
+    fn retained_state_notifies_once_without_changing_the_saved_bytes() {
+        let _thread = plugin_host::init_thread().unwrap();
+        let mut plugin = WrapperFx::default();
+        let mut context = Context::default();
+        let original = "{ unreadable saved state";
+        *plugin.0.wrapper_params().state.0.write().unwrap() = original.into();
+        activate(&mut plugin, &mut context);
+        assert!(plugin.0.shared().restore_error().is_some());
+        assert_eq!(context.0.borrow().len(), 1);
+        context
+            .0
+            .borrow_mut()
+            .pop()
+            .unwrap()
+            .dispatch(|| EditorOpenStatus::Rejected);
+        plugin.0.store_state();
+        activate(&mut plugin, &mut context);
+        assert!(context.0.borrow().is_empty());
+        assert_eq!(
+            &*plugin.0.wrapper_params().state.0.read().unwrap(),
+            original
+        );
+        plugin.0.deactivate();
+    }
+
+    /// Replacing a retained document cancels its queued notification before a host can display it.
+    #[test]
+    fn loading_a_new_document_cancels_the_old_request() {
+        let _thread = plugin_host::init_thread().unwrap();
+        let mut plugin = WrapperFx::default();
+        let mut context = Context::default();
+        *plugin.0.wrapper_params().state.0.write().unwrap() = "unreadable".into();
+        activate(&mut plugin, &mut context);
+        let request = context.0.borrow_mut().pop().unwrap();
+        *plugin.0.wrapper_params().state.0.write().unwrap() = String::new();
+        activate(&mut plugin, &mut context);
+        assert!(!request.is_pending());
+        assert!(plugin.0.shared().restore_error().is_none());
+        assert!(context.0.borrow().is_empty());
+        plugin.0.deactivate();
+    }
+}
