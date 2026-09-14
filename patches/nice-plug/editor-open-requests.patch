@@ -1,0 +1,1434 @@
+From 0eba0e0506bb1eebba7363b3483b4234c9088104 Mon Sep 17 00:00:00 2001
+From: Helgev <113248435+helgev-traP@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 11:54:01 +0900
+Subject: [PATCH] feat: add cancellable deferred editor open requests
+
+---
+ crates/nice-plug-core/src/context.rs          |   2 +
+ crates/nice-plug-core/src/context/activate.rs |   7 +
+ .../src/context/editor_request.rs             | 138 ++++++++++++
+ crates/nice-plug-core/src/context/gui.rs      |  22 ++
+ crates/nice-plug/src/event_loop.rs            |   4 +
+ crates/nice-plug/src/event_loop/linux.rs      |   4 +
+ crates/nice-plug/src/event_loop/macos.rs      |  20 +-
+ crates/nice-plug/src/event_loop/windows.rs    |  29 +--
+ crates/nice-plug/src/prelude.rs               |   2 +
+ crates/nice-plug/src/wrapper.rs               |   3 +
+ crates/nice-plug/src/wrapper/clap/context.rs  |  16 +-
+ crates/nice-plug/src/wrapper/clap/wrapper.rs  | 122 +++++++---
+ .../clap/wrapper/editor_request_tests.rs      | 204 +++++++++++++++++
+ .../src/wrapper/editor_request_tests.rs       |  89 ++++++++
+ crates/nice-plug/src/wrapper/vst3/context.rs  |  16 +-
+ crates/nice-plug/src/wrapper/vst3/inner.rs    | 126 ++++++++---
+ crates/nice-plug/src/wrapper/vst3/wrapper.rs  |  32 +++
+ .../vst3/wrapper/editor_request_tests.rs      | 212 ++++++++++++++++++
+ 18 files changed, 962 insertions(+), 86 deletions(-)
+ create mode 100644 crates/nice-plug-core/src/context/editor_request.rs
+ create mode 100644 crates/nice-plug/src/wrapper/clap/wrapper/editor_request_tests.rs
+ create mode 100644 crates/nice-plug/src/wrapper/editor_request_tests.rs
+ create mode 100644 crates/nice-plug/src/wrapper/vst3/wrapper/editor_request_tests.rs
+
+diff --git a/crates/nice-plug-core/src/context.rs b/crates/nice-plug-core/src/context.rs
+index 37dfc37b..097806c0 100644
+--- a/crates/nice-plug-core/src/context.rs
++++ b/crates/nice-plug-core/src/context.rs
+@@ -3,6 +3,8 @@
+ use std::fmt::Display;
+ 
+ pub mod activate;
++#[cfg(feature = "editor")]
++pub mod editor_request;
+ pub mod process;
+ 
+ // Contexts for more plugin-API specific features
+diff --git a/crates/nice-plug-core/src/context/activate.rs b/crates/nice-plug-core/src/context/activate.rs
+index 5b503b98..b1d966b7 100644
+--- a/crates/nice-plug-core/src/context/activate.rs
++++ b/crates/nice-plug-core/src/context/activate.rs
+@@ -27,6 +27,13 @@ pub trait ActivateContext<P: Plugin> {
+     /// this may cause audio playback to be restarted.
+     fn set_latency_samples(&self, samples: u32);
+ 
++    /// Queue a request to show this plugin's editor after activation releases its locks.
++    /// The host may defer or refuse the request. It does not carry an error message.
++    #[cfg(feature = "editor")]
++    fn request_editor_open(&self, request: super::editor_request::EditorOpenRequest) {
++        request.dispatch(|| super::editor_request::EditorOpenStatus::Unsupported);
++    }
++
+     /// Set the current voice **capacity** for this plugin (so not the number of currently active
+     /// voices). This may only be called if `ClapPlugin::CLAP_POLY_MODULATION_CONFIG` is set.
+     /// `capacity` must be between 1 and the configured maximum capacity. Changing this at runtime
+diff --git a/crates/nice-plug-core/src/context/editor_request.rs b/crates/nice-plug-core/src/context/editor_request.rs
+new file mode 100644
+index 00000000..0fb01eb7
+--- /dev/null
++++ b/crates/nice-plug-core/src/context/editor_request.rs
+@@ -0,0 +1,138 @@
++//! A cancellable request to show the plugin's own editor, independent of any open window.
++
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU8, Ordering};
++
++/// Host acceptance does not mean that a window has finished opening or gained focus.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u8)]
++pub enum EditorOpenStatus {
++    Pending,
++    Dispatching,
++    Accepted,
++    Unsupported,
++    Rejected,
++    Cancelled,
++}
++
++/// The sending half. Dropping an unhandled request cancels it.
++///
++/// Allocate this on a non-audio thread, then keep a [`Self::handle`] to observe or cancel it.
++pub struct EditorOpenRequest(Arc<AtomicU8>);
++
++/// An observer that can cancel a request until the host call begins.
++#[derive(Clone)]
++pub struct EditorOpenHandle(Arc<AtomicU8>);
++
++impl Default for EditorOpenRequest {
++    fn default() -> Self {
++        Self(Arc::new(AtomicU8::new(EditorOpenStatus::Pending as u8)))
++    }
++}
++
++impl EditorOpenRequest {
++    pub fn handle(&self) -> EditorOpenHandle {
++        EditorOpenHandle(self.0.clone())
++    }
++
++    pub fn is_pending(&self) -> bool {
++        self.0.load(Ordering::Acquire) == EditorOpenStatus::Pending as u8
++    }
++
++    /// For wrapper implementations: invoke the host only if the request is still live.
++    /// No plugin, editor, or host-interface lock may be held while running `send`.
++    pub fn dispatch(self, send: impl FnOnce() -> EditorOpenStatus) {
++        if self
++            .0
++            .compare_exchange(
++                EditorOpenStatus::Pending as u8,
++                EditorOpenStatus::Dispatching as u8,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            )
++            .is_ok()
++        {
++            let result = send();
++            assert!(matches!(
++                result,
++                EditorOpenStatus::Accepted
++                    | EditorOpenStatus::Unsupported
++                    | EditorOpenStatus::Rejected
++            ));
++            self.0.store(result as u8, Ordering::Release);
++        }
++    }
++}
++
++impl Drop for EditorOpenRequest {
++    fn drop(&mut self) {
++        let _ = self
++            .0
++            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |status| {
++                (status <= EditorOpenStatus::Dispatching as u8)
++                    .then_some(EditorOpenStatus::Cancelled as u8)
++            });
++    }
++}
++
++impl EditorOpenHandle {
++    pub fn status(&self) -> EditorOpenStatus {
++        match self.0.load(Ordering::Acquire) {
++            0 => EditorOpenStatus::Pending,
++            1 => EditorOpenStatus::Dispatching,
++            2 => EditorOpenStatus::Accepted,
++            3 => EditorOpenStatus::Unsupported,
++            4 => EditorOpenStatus::Rejected,
++            _ => EditorOpenStatus::Cancelled,
++        }
++    }
++
++    /// Returns false if dispatch has already begun or the request has finished.
++    pub fn cancel(&self) -> bool {
++        self.0
++            .compare_exchange(
++                EditorOpenStatus::Pending as u8,
++                EditorOpenStatus::Cancelled as u8,
++                Ordering::AcqRel,
++                Ordering::Acquire,
++            )
++            .is_ok()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Cancelling queued work prevents a stale request from reaching the host.
++    #[test]
++    fn cancellation_prevents_dispatch() {
++        let request = EditorOpenRequest::default();
++        let handle = request.handle();
++        assert!(handle.cancel());
++        request.dispatch(|| panic!("cancelled request reached the host"));
++        assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++    }
++
++    /// Acceptance survives sender destruction and cannot be revoked after dispatch begins.
++    #[test]
++    fn dispatch_has_a_terminal_result() {
++        let request = EditorOpenRequest::default();
++        let handle = request.handle();
++        request.dispatch(|| {
++            assert_eq!(handle.status(), EditorOpenStatus::Dispatching);
++            assert!(!handle.cancel());
++            EditorOpenStatus::Accepted
++        });
++        assert_eq!(handle.status(), EditorOpenStatus::Accepted);
++    }
++
++    /// Destroying a queue or wrapper settles its outstanding requests.
++    #[test]
++    fn dropping_the_sender_cancels_the_request() {
++        let request = EditorOpenRequest::default();
++        let handle = request.handle();
++        drop(request);
++        assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++    }
++}
+diff --git a/crates/nice-plug-core/src/context/gui.rs b/crates/nice-plug-core/src/context/gui.rs
+index 15576f19..c48240b0 100644
+--- a/crates/nice-plug-core/src/context/gui.rs
++++ b/crates/nice-plug-core/src/context/gui.rs
+@@ -159,6 +159,7 @@ pub trait GuiContextInner: Send + Sync + 'static {
+ pub struct AsyncExecutor<P: Plugin> {
+     pub(crate) execute_background: Arc<dyn Fn(P::BackgroundTask) + Send + Sync>,
+     pub(crate) execute_gui: Arc<dyn Fn(P::BackgroundTask) + Send + Sync>,
++    request_editor_open: Arc<dyn Fn(super::editor_request::EditorOpenRequest) + Send + Sync>,
+ }
+ 
+ impl<P: Plugin> AsyncExecutor<P> {
+@@ -169,8 +170,28 @@ impl<P: Plugin> AsyncExecutor<P> {
+         Self {
+             execute_background,
+             execute_gui,
++            request_editor_open: Arc::new(|request| {
++                request.dispatch(|| super::editor_request::EditorOpenStatus::Unsupported);
++            }),
+         }
+     }
++
++    /// For wrapper implementations: install a sender that always defers host calls to the main thread.
++    pub fn with_editor_request_handler(
++        mut self,
++        handler: Arc<dyn Fn(super::editor_request::EditorOpenRequest) + Send + Sync>,
++    ) -> Self {
++        self.request_editor_open = handler;
++        self
++    }
++
++    /// Request this plugin's editor even if no editor window has been opened.
++    /// The host call is deferred; the request's handle distinguishes acceptance from queueing.
++    /// A full queue, destruction, or reentry into a busy plugin cancels the request. Callers may
++    /// retry cancellation later, but should not repeatedly retry host refusal or missing support.
++    pub fn request_editor_open(&self, request: super::editor_request::EditorOpenRequest) {
++        (self.request_editor_open)(request);
++    }
+ }
+ 
+ // Can't derive this since Rust then requires `P` to also be `Clone`able
+@@ -179,6 +200,7 @@ impl<P: Plugin> Clone for AsyncExecutor<P> {
+         Self {
+             execute_background: self.execute_background.clone(),
+             execute_gui: self.execute_gui.clone(),
++            request_editor_open: self.request_editor_open.clone(),
+         }
+     }
+ }
+diff --git a/crates/nice-plug/src/event_loop.rs b/crates/nice-plug/src/event_loop.rs
+index 260080c0..90931d31 100644
+--- a/crates/nice-plug/src/event_loop.rs
++++ b/crates/nice-plug/src/event_loop.rs
+@@ -57,6 +57,10 @@ where
+     #[must_use]
+     fn schedule_gui(&self, task: T) -> bool;
+ 
++    /// Queue without inline execution, so a host callback cannot reenter its sender's locks.
++    #[must_use]
++    fn schedule_gui_deferred(&self, task: T) -> bool;
++
+     /// Post a task to the background task queue so it can be run in a dedicated background thread
+     /// without blocking the plugin's GUI. This function needs to be callable at any time without
+     /// blocking.
+diff --git a/crates/nice-plug/src/event_loop/linux.rs b/crates/nice-plug/src/event_loop/linux.rs
+index ab6e043a..8f6dfdb2 100644
+--- a/crates/nice-plug/src/event_loop/linux.rs
++++ b/crates/nice-plug/src/event_loop/linux.rs
+@@ -59,6 +59,10 @@ where
+         self.background_thread.schedule(task)
+     }
+ 
++    fn schedule_gui_deferred(&self, _task: T) -> bool {
++        false
++    }
++
+     fn is_main_thread(&self) -> bool {
+         // FIXME: `thread::current()` may allocate the first time it's called, is there a safe
+         //        non-allocating version of this without using huge OS-specific libraries?
+diff --git a/crates/nice-plug/src/event_loop/macos.rs b/crates/nice-plug/src/event_loop/macos.rs
+index a9df3295..e6fa8999 100644
+--- a/crates/nice-plug/src/event_loop/macos.rs
++++ b/crates/nice-plug/src/event_loop/macos.rs
+@@ -98,17 +98,19 @@ where
+ 
+             true
+         } else {
+-            // Only signal the main thread callback to be called if the task was added to the queue.
+-            let success = self.main_thread_sender.try_send(task).is_ok();
+-            if success {
+-                unsafe {
+-                    CFRunLoopSourceSignal(self.loop_source.0);
+-                    CFRunLoopWakeUp(CFRunLoopGetMain());
+-                }
+-            }
++            self.schedule_gui_deferred(task)
++        }
++    }
+ 
+-            success
++    fn schedule_gui_deferred(&self, task: T) -> bool {
++        let success = self.main_thread_sender.try_send(task).is_ok();
++        if success {
++            unsafe {
++                CFRunLoopSourceSignal(self.loop_source.0);
++                CFRunLoopWakeUp(CFRunLoopGetMain());
++            }
+         }
++        success
+     }
+ 
+     fn schedule_background(&self, task: T) -> bool {
+diff --git a/crates/nice-plug/src/event_loop/windows.rs b/crates/nice-plug/src/event_loop/windows.rs
+index 2d6df327..aab4e155 100644
+--- a/crates/nice-plug/src/event_loop/windows.rs
++++ b/crates/nice-plug/src/event_loop/windows.rs
+@@ -155,22 +155,23 @@ where
+ 
+             true
+         } else {
+-            let success = self.tasks_sender.try_send(task).is_ok();
+-            if success {
+-                // Instead of polling on a timer, we can just wake up the window whenever there's a
+-                // new message.
+-                unsafe {
+-                    let _ = PostMessageA(
+-                        Some(self.message_window.0),
+-                        NOTIFY_MESSAGE_ID,
+-                        WPARAM(0),
+-                        LPARAM(0),
+-                    );
+-                }
+-            }
++            self.schedule_gui_deferred(task)
++        }
++    }
+ 
+-            success
++    fn schedule_gui_deferred(&self, task: T) -> bool {
++        let success = self.tasks_sender.try_send(task).is_ok();
++        if success {
++            unsafe {
++                let _ = PostMessageA(
++                    Some(self.message_window.0),
++                    NOTIFY_MESSAGE_ID,
++                    WPARAM(0),
++                    LPARAM(0),
++                );
++            }
+         }
++        success
+     }
+ 
+     fn schedule_background(&self, task: T) -> bool {
+diff --git a/crates/nice-plug/src/prelude.rs b/crates/nice-plug/src/prelude.rs
+index bcb3c192..3ebc2152 100644
+--- a/crates/nice-plug/src/prelude.rs
++++ b/crates/nice-plug/src/prelude.rs
+@@ -20,6 +20,8 @@ pub use crate::buffer::Buffer;
+ pub use crate::context::PluginApi;
+ pub use crate::context::activate::ActivateContext;
+ #[cfg(feature = "editor")]
++pub use crate::context::editor_request::{EditorOpenHandle, EditorOpenRequest, EditorOpenStatus};
++#[cfg(feature = "editor")]
+ pub use crate::context::gui::{AsyncExecutor, GuiContextInner, ParamSetter};
+ pub use crate::context::process::{ProcessContext, Transport};
+ pub use crate::context::remote_controls::{
+diff --git a/crates/nice-plug/src/wrapper.rs b/crates/nice-plug/src/wrapper.rs
+index 4e7584a5..2b03b92c 100644
+--- a/crates/nice-plug/src/wrapper.rs
++++ b/crates/nice-plug/src/wrapper.rs
+@@ -12,3 +12,6 @@ pub mod vst3;
+ 
+ // This is used by the wrappers.
+ pub use util::setup_logger;
++
++#[cfg(all(test, feature = "editor"))]
++mod editor_request_tests;
+diff --git a/crates/nice-plug/src/wrapper/clap/context.rs b/crates/nice-plug/src/wrapper/clap/context.rs
+index 0baa8baf..f68e5d59 100644
+--- a/crates/nice-plug/src/wrapper/clap/context.rs
++++ b/crates/nice-plug/src/wrapper/clap/context.rs
+@@ -32,10 +32,12 @@ pub(crate) struct WrapperActivateContext<'a, P: ClapPlugin> {
+ 
+ /// Any requests that should be sent out when the [`WrapperActivateContext`] is dropped. See that
+ /// struct's docstring for mroe information.
+-#[derive(Debug, Default)]
++#[derive(Default)]
+ pub(crate) struct PendingActivateContextRequests {
+     /// The value of the last `.set_latency_samples()` call.
+     latency_changed: Cell<Option<u32>>,
++    #[cfg(feature = "editor")]
++    editor_open: Cell<Option<nice_plug_core::context::editor_request::EditorOpenRequest>>,
+ }
+ 
+ /// A [`ProcessContext`] implementation for the wrapper. This is a separate object so it can hold on
+@@ -74,6 +76,10 @@ impl<P: ClapPlugin> Drop for WrapperActivateContext<'_, P> {
+         if let Some(samples) = self.pending_requests.latency_changed.take() {
+             self.wrapper.set_latency_samples(samples)
+         }
++        #[cfg(feature = "editor")]
++        if let Some(request) = self.pending_requests.editor_open.take() {
++            self.wrapper.request_editor_open(request);
++        }
+     }
+ }
+ 
+@@ -91,6 +97,14 @@ impl<P: ClapPlugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
+         self.pending_requests.latency_changed.set(Some(samples));
+     }
+ 
++    #[cfg(feature = "editor")]
++    fn request_editor_open(
++        &self,
++        request: nice_plug_core::context::editor_request::EditorOpenRequest,
++    ) {
++        self.pending_requests.editor_open.set(Some(request));
++    }
++
+     fn set_current_voice_capacity(&self, capacity: u32) {
+         self.wrapper.set_current_voice_capacity(capacity)
+     }
+diff --git a/crates/nice-plug/src/wrapper/clap/wrapper.rs b/crates/nice-plug/src/wrapper/clap/wrapper.rs
+index d2993894..6236fdd7 100644
+--- a/crates/nice-plug/src/wrapper/clap/wrapper.rs
++++ b/crates/nice-plug/src/wrapper/clap/wrapper.rs
+@@ -1,4 +1,7 @@
+ use atomic_refcell::{AtomicRefCell, AtomicRefMut};
++
++#[cfg(all(test, feature = "editor"))]
++mod editor_request_tests;
+ use clap_sys::events::{
+     CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_IS_LIVE, CLAP_EVENT_MIDI, CLAP_EVENT_MIDI_SYSEX,
+     CLAP_EVENT_NOTE_CHOKE, CLAP_EVENT_NOTE_END, CLAP_EVENT_NOTE_EXPRESSION, CLAP_EVENT_NOTE_OFF,
+@@ -67,6 +70,8 @@ use crossbeam::channel::{self, SendTimeoutError};
+ use crossbeam::queue::ArrayQueue;
+ use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
+ #[cfg(feature = "editor")]
++use nice_plug_core::context::editor_request::{EditorOpenRequest, EditorOpenStatus};
++#[cfg(feature = "editor")]
+ use nice_plug_core::context::gui::GuiContext;
+ use nice_plug_core::context::process::Transport;
+ #[cfg(feature = "editor")]
+@@ -203,6 +208,7 @@ pub struct Wrapper<P: ClapPlugin> {
+     clap_plugin_gui: clap_plugin_gui,
+     #[cfg(feature = "editor")]
+     host_gui: AtomicRefCell<Option<ClapPtr<clap_host_gui>>>,
++    gui_host_initialized: AtomicBool,
+ 
+     clap_plugin_latency: clap_plugin_latency,
+     host_latency: AtomicRefCell<Option<ClapPtr<clap_host_latency>>>,
+@@ -293,6 +299,8 @@ pub struct Wrapper<P: ClapPlugin> {
+ /// implementation, this uses [`clap_host::request_callback()`] instead.
+ #[allow(clippy::enum_variant_names)]
+ pub enum Task<P: Plugin> {
++    #[cfg(feature = "editor")]
++    RequestEditorOpen(EditorOpenRequest),
+     /// Execute one of the plugin's background tasks.
+     PluginTask(P::BackgroundTask),
+     /// Inform the plugin that one parameter's value has changed. This uses the parameter hashes
+@@ -375,6 +383,14 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
+             .schedule(task)
+     }
+ 
++    fn schedule_gui_deferred(&self, task: Task<P>) -> bool {
++        let success = self.tasks.push(task).is_ok();
++        if success && self.gui_host_initialized.load(Ordering::Acquire) {
++            unsafe_clap_call! { &*self.host_callback=>request_callback(&*self.host_callback) };
++        }
++        success
++    }
++
+     fn is_main_thread(&self) -> bool {
+         // If the host supports the thread check interface then we'll use that, otherwise we'll
+         // check if this is the same thread as the one that created the plugin instance.
+@@ -393,6 +409,26 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
+     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
+         // This function is always called from the main thread, from [Self::on_main_thread].
+         match task {
++            #[cfg(feature = "editor")]
++            Task::RequestEditorOpen(request) => {
++                if self.plugin.try_lock().is_none() || self.task_executor.try_lock().is_none() {
++                    return;
++                }
++                let host_gui = self.host_gui.borrow().clone();
++                let has_editor = self.editor.borrow().is_some();
++                request.dispatch(|| {
++                    if !is_gui_thread || !self.is_main_thread() || !has_editor {
++                        return EditorOpenStatus::Unsupported;
++                    }
++                    match host_gui.and_then(|gui| gui.request_show) {
++                        Some(show) if unsafe { show(&*self.host_callback) } => {
++                            EditorOpenStatus::Accepted
++                        }
++                        Some(_) => EditorOpenStatus::Rejected,
++                        None => EditorOpenStatus::Unsupported,
++                    }
++                });
++            }
+             Task::PluginTask(task) => (self.task_executor.lock())(task),
+             #[cfg(feature = "editor")]
+             Task::ParameterValueChanged(param_hash, normalized_value) => {
+@@ -668,6 +704,7 @@ impl<P: ClapPlugin> Wrapper<P> {
+             },
+             #[cfg(feature = "editor")]
+             host_gui: AtomicRefCell::new(None),
++            gui_host_initialized: AtomicBool::new(false),
+ 
+             clap_plugin_latency: clap_plugin_latency {
+                 get: Some(Self::ext_latency_get),
+@@ -766,38 +803,49 @@ impl<P: ClapPlugin> Wrapper<P> {
+             *wrapper.editor.borrow_mut() = wrapper
+                 .plugin
+                 .lock()
+-                .editor(nice_plug_core::context::gui::AsyncExecutor::new(
+-                    Arc::new({
+-                        let wrapper = Arc::downgrade(&wrapper);
+-                        move |task| {
+-                            let wrapper = match wrapper.upgrade() {
+-                                Some(wrapper) => wrapper,
+-                                None => return,
+-                            };
+-
+-                            let task_posted = wrapper.schedule_background(Task::PluginTask(task));
+-                            crate::nice_debug_assert!(
+-                                task_posted,
+-                                "The task queue is full, dropping task..."
+-                            );
+-                        }
+-                    }),
+-                    Arc::new({
++                .editor(
++                    nice_plug_core::context::gui::AsyncExecutor::new(
++                        Arc::new({
++                            let wrapper = Arc::downgrade(&wrapper);
++                            move |task| {
++                                let wrapper = match wrapper.upgrade() {
++                                    Some(wrapper) => wrapper,
++                                    None => return,
++                                };
++
++                                let task_posted =
++                                    wrapper.schedule_background(Task::PluginTask(task));
++                                crate::nice_debug_assert!(
++                                    task_posted,
++                                    "The task queue is full, dropping task..."
++                                );
++                            }
++                        }),
++                        Arc::new({
++                            let wrapper = Arc::downgrade(&wrapper);
++                            move |task| {
++                                let wrapper = match wrapper.upgrade() {
++                                    Some(wrapper) => wrapper,
++                                    None => return,
++                                };
++
++                                let task_posted = wrapper.schedule_gui(Task::PluginTask(task));
++                                crate::nice_debug_assert!(
++                                    task_posted,
++                                    "The task queue is full, dropping task..."
++                                );
++                            }
++                        }),
++                    )
++                    .with_editor_request_handler(Arc::new({
+                         let wrapper = Arc::downgrade(&wrapper);
+-                        move |task| {
+-                            let wrapper = match wrapper.upgrade() {
+-                                Some(wrapper) => wrapper,
+-                                None => return,
+-                            };
+-
+-                            let task_posted = wrapper.schedule_gui(Task::PluginTask(task));
+-                            crate::nice_debug_assert!(
+-                                task_posted,
+-                                "The task queue is full, dropping task..."
+-                            );
++                        move |request| {
++                            if let Some(wrapper) = wrapper.upgrade() {
++                                wrapper.request_editor_open(request);
++                            }
+                         }
+-                    }),
+-                ))
++                    })),
++                )
+                 .map(Mutex::new);
+         }
+ 
+@@ -824,6 +872,11 @@ impl<P: ClapPlugin> Wrapper<P> {
+         }
+     }
+ 
++    #[cfg(feature = "editor")]
++    pub(super) fn request_editor_open(&self, request: EditorOpenRequest) {
++        let _ = self.schedule_gui_deferred(Task::RequestEditorOpen(request));
++    }
++
+     fn make_process_context(&self, transport: Transport) -> WrapperProcessContext<'_, P> {
+         WrapperProcessContext {
+             wrapper: self,
+@@ -1974,8 +2027,8 @@ impl<P: ClapPlugin> Wrapper<P> {
+             }
+ 
+             // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
+-            drop(activate_context);
+             drop(plugin);
++            drop(activate_context);
+         }
+ 
+         crate::nice_debug_assert!(
+@@ -2027,6 +2080,13 @@ impl<P: ClapPlugin> Wrapper<P> {
+ 
+         wrapper.update_track_info_from_host();
+ 
++        {
++            wrapper.gui_host_initialized.store(true, Ordering::Release);
++            if !wrapper.tasks.is_empty() {
++                unsafe_clap_call! { &*wrapper.host_callback=>request_callback(&*wrapper.host_callback) };
++            }
++        }
++
+         true
+     }
+ 
+diff --git a/crates/nice-plug/src/wrapper/clap/wrapper/editor_request_tests.rs b/crates/nice-plug/src/wrapper/clap/wrapper/editor_request_tests.rs
+new file mode 100644
+index 00000000..3df4bbf3
+--- /dev/null
++++ b/crates/nice-plug/src/wrapper/clap/wrapper/editor_request_tests.rs
+@@ -0,0 +1,204 @@
++use super::*;
++use crate::wrapper::editor_request_tests::{RequestPlugin, empty_state};
++use std::sync::OnceLock;
++use std::sync::atomic::AtomicUsize;
++
++struct Host {
++    wrapper: OnceLock<Weak<Wrapper<RequestPlugin>>>,
++    callbacks: AtomicUsize,
++    shows: AtomicUsize,
++    locks_free: AtomicBool,
++    accept: bool,
++    supports_gui: bool,
++}
++
++impl Host {
++    fn check_locks(&self) {
++        let wrapper = self.wrapper.get().unwrap().upgrade().unwrap();
++        let free = wrapper.is_main_thread()
++            && wrapper.plugin.try_lock().is_some()
++            && wrapper.task_executor.try_lock().is_some()
++            && wrapper.host_gui.try_borrow_mut().is_ok();
++        self.locks_free.fetch_and(free, Ordering::Relaxed);
++    }
++}
++
++unsafe fn host_data<'a>(host: *const clap_host) -> &'a Host {
++    unsafe { &*((*host).host_data as *const Host) }
++}
++
++unsafe extern "C" fn show(host: *const clap_host) -> bool {
++    let data = unsafe { host_data(host) };
++    data.check_locks();
++    data.shows.fetch_add(1, Ordering::Relaxed);
++    data.accept
++}
++
++unsafe extern "C" fn restart(host: *const clap_host) {
++    unsafe { host_data(host) }.check_locks();
++}
++unsafe extern "C" fn callback(host: *const clap_host) {
++    unsafe { host_data(host) }
++        .callbacks
++        .fetch_add(1, Ordering::Relaxed);
++}
++
++unsafe extern "C" fn extension(
++    host: *const clap_host,
++    id: *const std::ffi::c_char,
++) -> *const c_void {
++    static GUI: clap_host_gui = clap_host_gui {
++        resize_hints_changed: None,
++        request_resize: None,
++        request_show: Some(show),
++        request_hide: None,
++        closed: None,
++    };
++    static LATENCY: clap_host_latency = clap_host_latency {
++        changed: Some(restart),
++    };
++    match unsafe { CStr::from_ptr(id) } {
++        id if id == CLAP_EXT_GUI && unsafe { host_data(host) }.supports_gui => {
++            &GUI as *const _ as *const c_void
++        }
++        id if id == CLAP_EXT_LATENCY => &LATENCY as *const _ as *const c_void,
++        _ => std::ptr::null(),
++    }
++}
++
++fn fixture(
++    accept: bool,
++    supports_gui: bool,
++) -> (Arc<Wrapper<RequestPlugin>>, Box<clap_host>, Box<Host>) {
++    let mut data = Box::new(Host {
++        wrapper: OnceLock::new(),
++        callbacks: AtomicUsize::new(0),
++        shows: AtomicUsize::new(0),
++        locks_free: AtomicBool::new(true),
++        accept,
++        supports_gui,
++    });
++    let host = Box::new(clap_host {
++        clap_version: clap_sys::version::CLAP_VERSION,
++        host_data: &mut *data as *mut _ as *mut c_void,
++        name: c"request test".as_ptr(),
++        vendor: c"nice-plug".as_ptr(),
++        url: c"".as_ptr(),
++        version: c"1".as_ptr(),
++        get_extension: Some(extension),
++        request_restart: Some(restart),
++        request_process: None,
++        request_callback: Some(callback),
++    });
++    let wrapper = unsafe { Wrapper::<RequestPlugin>::new(&*host) };
++    data.wrapper.set(Arc::downgrade(&wrapper)).ok().unwrap();
++    (wrapper, host, data)
++}
++
++/// Activation and preset reload release their plugin locks before host callbacks can reenter.
++#[test]
++fn activation_and_reload_notify_after_unlocking() {
++    let (wrapper, _host, data) = fixture(true, true);
++    let plugin = wrapper.clap_plugin.as_ptr();
++    unsafe {
++        assert!(Wrapper::<RequestPlugin>::init(plugin));
++        assert!(Wrapper::<RequestPlugin>::activate(plugin, 48_000.0, 1, 64));
++    }
++    assert_eq!(data.shows.load(Ordering::Relaxed), 0);
++    assert_eq!(
++        wrapper.plugin.lock().requests[0].status(),
++        EditorOpenStatus::Pending
++    );
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(plugin);
++    }
++    assert_eq!(
++        wrapper.plugin.lock().requests[0].status(),
++        EditorOpenStatus::Accepted
++    );
++    assert!(wrapper.set_state_inner(&mut empty_state()));
++    assert_eq!(data.shows.load(Ordering::Relaxed), 1);
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(plugin);
++    }
++    assert_eq!(data.shows.load(Ordering::Relaxed), 2);
++    assert!(data.locks_free.load(Ordering::Relaxed));
++    drop(wrapper);
++}
++
++/// A closed, inactive editor can be requested from a worker, with cancellation and rejection observable.
++#[test]
++fn requests_work_without_activation_or_an_open_editor() {
++    let (wrapper, _host, data) = fixture(false, true);
++    let executor = wrapper.plugin.lock().executor.get().unwrap().clone();
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    executor.request_editor_open(request);
++    assert_eq!(data.callbacks.load(Ordering::Relaxed), 0);
++    unsafe {
++        assert!(Wrapper::<RequestPlugin>::init(wrapper.clap_plugin.as_ptr()));
++        Wrapper::<RequestPlugin>::on_main_thread(wrapper.clap_plugin.as_ptr());
++    }
++    assert_eq!(handle.status(), EditorOpenStatus::Rejected);
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    std::thread::spawn(move || executor.execute_gui(request))
++        .join()
++        .unwrap();
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(wrapper.clap_plugin.as_ptr());
++    }
++    assert_eq!(handle.status(), EditorOpenStatus::Rejected);
++    assert_eq!(data.shows.load(Ordering::Relaxed), 2);
++    let request = EditorOpenRequest::default();
++    request.handle().cancel();
++    wrapper.request_editor_open(request);
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(wrapper.clap_plugin.as_ptr());
++    }
++    assert_eq!(data.shows.load(Ordering::Relaxed), 2);
++    assert!(data.locks_free.load(Ordering::Relaxed));
++    drop(wrapper);
++}
++
++/// Missing host support and destruction settle requests without native GUI calls.
++#[test]
++fn unsupported_and_destroyed_hosts_do_not_open() {
++    let (wrapper, _host, data) = fixture(true, false);
++    unsafe {
++        assert!(Wrapper::<RequestPlugin>::init(wrapper.clap_plugin.as_ptr()));
++    }
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.request_editor_open(request);
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(wrapper.clap_plugin.as_ptr());
++    }
++    assert_eq!(handle.status(), EditorOpenStatus::Unsupported);
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.request_editor_open(request);
++    drop(wrapper);
++    assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++    assert_eq!(data.shows.load(Ordering::Relaxed), 0);
++}
++
++/// Pumping a nested main loop must not call the host while the plugin or task executor is locked.
++#[test]
++fn reentered_delivery_is_cancelled_without_a_host_call() {
++    let (wrapper, _host, data) = fixture(true, true);
++    unsafe {
++        assert!(Wrapper::<RequestPlugin>::init(wrapper.clap_plugin.as_ptr()));
++    }
++    let plugin = wrapper.plugin.lock();
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.request_editor_open(request);
++    unsafe {
++        Wrapper::<RequestPlugin>::on_main_thread(wrapper.clap_plugin.as_ptr());
++    }
++    assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++    assert_eq!(data.shows.load(Ordering::Relaxed), 0);
++    drop(plugin);
++    drop(wrapper);
++}
+diff --git a/crates/nice-plug/src/wrapper/editor_request_tests.rs b/crates/nice-plug/src/wrapper/editor_request_tests.rs
+new file mode 100644
+index 00000000..a117e589
+--- /dev/null
++++ b/crates/nice-plug/src/wrapper/editor_request_tests.rs
+@@ -0,0 +1,89 @@
++use crate::prelude::*;
++use std::sync::{Arc, OnceLock};
++
++struct EmptyParams;
++
++// There are no parameter pointers to outlive this object.
++unsafe impl Params for EmptyParams {
++    fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
++        Vec::new()
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct RequestPlugin {
++    pub requests: Vec<EditorOpenHandle>,
++    pub executor: Arc<OnceLock<AsyncExecutor<Self>>>,
++    activations: u32,
++}
++
++impl Plugin for RequestPlugin {
++    const NAME: &'static str = "Editor request fixture";
++    const VENDOR: &'static str = "nice-plug";
++    const URL: &'static str = "https://codeberg.org/RustAudio/nice-plug";
++    const EMAIL: &'static str = "";
++    const VERSION: &'static str = "0.0.0";
++    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout::const_default()];
++    type Editor = ();
++    type SysExMessage = ();
++    type BackgroundTask = EditorOpenRequest;
++
++    fn params(&self) -> Arc<dyn Params> {
++        Arc::new(EmptyParams)
++    }
++
++    fn editor(&mut self, executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
++        let _ = self.executor.set(executor);
++        Some(())
++    }
++
++    fn task_executor(&mut self) -> TaskExecutor<Self> {
++        let executor = self.executor.clone();
++        Box::new(move |request| executor.get().unwrap().request_editor_open(request))
++    }
++
++    fn activate(
++        &mut self,
++        _: &AudioIOLayout,
++        _: &BufferConfig,
++        context: &mut impl ActivateContext<Self>,
++    ) -> bool {
++        self.activations += 1;
++        context.set_latency_samples(self.activations);
++        let request = EditorOpenRequest::default();
++        self.requests.push(request.handle());
++        context.request_editor_open(request);
++        true
++    }
++
++    fn process(
++        &mut self,
++        _: &mut Buffer,
++        _: &mut AuxiliaryBuffers,
++        _: &mut impl ProcessContext<Self>,
++    ) -> ProcessStatus {
++        ProcessStatus::Normal
++    }
++}
++
++impl ClapPlugin for RequestPlugin {
++    const CLAP_ID: &'static str = "org.nice-plug.editor-request-test";
++    const CLAP_DESCRIPTION: Option<&'static str> = None;
++    const CLAP_MANUAL_URL: Option<&'static str> = None;
++    const CLAP_SUPPORT_URL: Option<&'static str> = None;
++    const CLAP_FEATURES: &'static [ClapFeature] = &[];
++}
++
++#[cfg(feature = "vst3")]
++impl Vst3Plugin for RequestPlugin {
++    const VST3_CLASS_ID: [u8; 16] = *b"EditorRequestTst";
++    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[];
++}
++
++pub(crate) fn empty_state() -> PluginState {
++    PluginState {
++        version: "0.0.0".into(),
++        params: Default::default(),
++        fields: Default::default(),
++    }
++}
+diff --git a/crates/nice-plug/src/wrapper/vst3/context.rs b/crates/nice-plug/src/wrapper/vst3/context.rs
+index 22e1a096..4b0e2c8d 100644
+--- a/crates/nice-plug/src/wrapper/vst3/context.rs
++++ b/crates/nice-plug/src/wrapper/vst3/context.rs
+@@ -38,10 +38,12 @@ pub(crate) struct WrapperActivateContext<'a, P: Vst3Plugin> {
+ 
+ /// Any requests that should be sent out when the [`WrapperActivateContext`] is dropped. See that
+ /// struct's docstring for mroe information.
+-#[derive(Debug, Default)]
++#[derive(Default)]
+ pub(crate) struct PendingActivateContextRequests {
+     /// The value of the last `.set_latency_samples()` call.
+     latency_changed: Cell<Option<u32>>,
++    #[cfg(feature = "editor")]
++    editor_open: Cell<Option<nice_plug_core::context::editor_request::EditorOpenRequest>>,
+ }
+ 
+ /// A [`ProcessContext`] implementation for the wrapper. This is a separate object so it can hold on
+@@ -70,6 +72,10 @@ impl<P: Vst3Plugin> Drop for WrapperActivateContext<'_, P> {
+         if let Some(samples) = self.pending_requests.latency_changed.take() {
+             self.inner.set_latency_samples(samples)
+         }
++        #[cfg(feature = "editor")]
++        if let Some(request) = self.pending_requests.editor_open.take() {
++            self.inner.request_editor_open(request);
++        }
+     }
+ }
+ 
+@@ -87,6 +93,14 @@ impl<P: Vst3Plugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
+         self.pending_requests.latency_changed.set(Some(samples));
+     }
+ 
++    #[cfg(feature = "editor")]
++    fn request_editor_open(
++        &self,
++        request: nice_plug_core::context::editor_request::EditorOpenRequest,
++    ) {
++        self.pending_requests.editor_open.set(Some(request));
++    }
++
+     fn set_current_voice_capacity(&self, _capacity: u32) {
+         // This is only supported by CLAP
+     }
+diff --git a/crates/nice-plug/src/wrapper/vst3/inner.rs b/crates/nice-plug/src/wrapper/vst3/inner.rs
+index ed351486..54fa7ec9 100644
+--- a/crates/nice-plug/src/wrapper/vst3/inner.rs
++++ b/crates/nice-plug/src/wrapper/vst3/inner.rs
+@@ -3,6 +3,8 @@ use crossbeam::atomic::AtomicCell;
+ use crossbeam::channel;
+ use nice_plug_core::audio_setup::{AudioIOLayout, BufferConfig, ProcessMode};
+ #[cfg(feature = "editor")]
++use nice_plug_core::context::editor_request::{EditorOpenRequest, EditorOpenStatus};
++#[cfg(feature = "editor")]
+ use nice_plug_core::context::gui::GuiContext;
+ use nice_plug_core::context::process::Transport;
+ #[cfg(feature = "editor")]
+@@ -23,6 +25,8 @@ use vst3::ComPtr;
+ #[cfg(feature = "editor")]
+ use vst3::ComWrapper;
+ use vst3::Steinberg::Vst::{IComponentHandler, IComponentHandlerTrait, RestartFlags_};
++#[cfg(feature = "editor")]
++use vst3::Steinberg::Vst::{IComponentHandler2, IComponentHandler2Trait};
+ use vst3::Steinberg::{kInvalidArgument, kResultOk, tresult};
+ 
+ use super::context::{WrapperActivateContext, WrapperProcessContext};
+@@ -67,6 +71,8 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
+     /// The host's [`IComponentHandler`] instance, if passed through
+     /// [`IEditController::set_component_handler`].
+     pub component_handler: AtomicRefCell<Option<ComPtr<IComponentHandler>>>,
++    #[cfg(feature = "editor")]
++    pub pending_editor_open: Mutex<Option<EditorOpenRequest>>,
+ 
+     /// Our own [`IPlugView`] instance.
+     #[cfg(feature = "editor")]
+@@ -176,6 +182,8 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
+ /// Windows and macOS).
+ #[allow(clippy::enum_variant_names)]
+ pub enum Task<P: Plugin> {
++    #[cfg(feature = "editor")]
++    RequestEditorOpen(EditorOpenRequest),
+     /// Execute one of the plugin's background tasks.
+     PluginTask(P::BackgroundTask),
+     /// Inform the plugin that one or more parameter values have changed.
+@@ -322,6 +330,8 @@ impl<P: Vst3Plugin> WrapperInner<P> {
+             editor_window: Arc::new(AtomicRefCell::new(None)),
+ 
+             component_handler: AtomicRefCell::new(None),
++            #[cfg(feature = "editor")]
++            pending_editor_open: Mutex::new(None),
+ 
+             #[cfg(feature = "editor")]
+             plug_view: RwLock::new(None),
+@@ -378,38 +388,49 @@ impl<P: Vst3Plugin> WrapperInner<P> {
+             *wrapper.editor.borrow_mut() = wrapper
+                 .plugin
+                 .lock()
+-                .editor(nice_plug_core::context::gui::AsyncExecutor::new(
+-                    Arc::new({
++                .editor(
++                    nice_plug_core::context::gui::AsyncExecutor::new(
++                        Arc::new({
++                            let wrapper = Arc::downgrade(&wrapper);
++                            move |task| {
++                                let wrapper = match wrapper.upgrade() {
++                                    Some(wrapper) => wrapper,
++                                    None => return,
++                                };
++
++                                let task_posted =
++                                    wrapper.schedule_background(Task::PluginTask(task));
++                                crate::nice_debug_assert!(
++                                    task_posted,
++                                    "The task queue is full, dropping task..."
++                                );
++                            }
++                        }),
++                        Arc::new({
++                            let wrapper = Arc::downgrade(&wrapper);
++                            move |task| {
++                                let wrapper = match wrapper.upgrade() {
++                                    Some(wrapper) => wrapper,
++                                    None => return,
++                                };
++
++                                let task_posted = wrapper.schedule_gui(Task::PluginTask(task));
++                                crate::nice_debug_assert!(
++                                    task_posted,
++                                    "The task queue is full, dropping task..."
++                                );
++                            }
++                        }),
++                    )
++                    .with_editor_request_handler(Arc::new({
+                         let wrapper = Arc::downgrade(&wrapper);
+-                        move |task| {
+-                            let wrapper = match wrapper.upgrade() {
+-                                Some(wrapper) => wrapper,
+-                                None => return,
+-                            };
+-
+-                            let task_posted = wrapper.schedule_background(Task::PluginTask(task));
+-                            crate::nice_debug_assert!(
+-                                task_posted,
+-                                "The task queue is full, dropping task..."
+-                            );
++                        move |request| {
++                            if let Some(wrapper) = wrapper.upgrade() {
++                                wrapper.request_editor_open(request);
++                            }
+                         }
+-                    }),
+-                    Arc::new({
+-                        let wrapper = Arc::downgrade(&wrapper);
+-                        move |task| {
+-                            let wrapper = match wrapper.upgrade() {
+-                                Some(wrapper) => wrapper,
+-                                None => return,
+-                            };
+-
+-                            let task_posted = wrapper.schedule_gui(Task::PluginTask(task));
+-                            crate::nice_debug_assert!(
+-                                task_posted,
+-                                "The task queue is full, dropping task..."
+-                            );
+-                        }
+-                    }),
+-                ))
++                    })),
++                )
+                 .map(|editor| Arc::new(Mutex::new(editor)));
+         }
+ 
+@@ -436,6 +457,20 @@ impl<P: Vst3Plugin> WrapperInner<P> {
+         }
+     }
+ 
++    #[cfg(feature = "editor")]
++    pub fn request_editor_open(&self, request: EditorOpenRequest) {
++        if cfg!(not(any(target_os = "windows", target_os = "macos"))) {
++            request.dispatch(|| EditorOpenStatus::Unsupported);
++            return;
++        }
++        let _ = self
++            .event_loop
++            .borrow()
++            .as_ref()
++            .unwrap()
++            .schedule_gui_deferred(Task::RequestEditorOpen(request));
++    }
++
+     pub fn make_process_context(&self, transport: Transport) -> WrapperProcessContext<'_, P> {
+         WrapperProcessContext {
+             inner: self,
+@@ -689,6 +724,37 @@ impl<P: Vst3Plugin> MainThreadExecutor<Task<P>> for WrapperInner<P> {
+     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
+         // This function is always called from the main thread
+         match task {
++            #[cfg(feature = "editor")]
++            Task::RequestEditorOpen(request) => {
++                if !request.is_pending() {
++                    return;
++                }
++                if self.plugin.try_lock().is_none() || self.task_executor.try_lock().is_none() {
++                    return;
++                }
++                let handler = self.component_handler.borrow().clone();
++                let Some(handler) = handler else {
++                    *self.pending_editor_open.lock() = Some(request);
++                    return;
++                };
++                let has_editor = self.editor.borrow().is_some();
++                request.dispatch(|| {
++                    if !is_gui_thread
++                        || !self.event_loop.borrow().as_ref().unwrap().is_main_thread()
++                        || !has_editor
++                    {
++                        return EditorOpenStatus::Unsupported;
++                    }
++                    let Some(handler) = handler.cast::<IComponentHandler2>() else {
++                        return EditorOpenStatus::Unsupported;
++                    };
++                    if unsafe { handler.requestOpenEditor(c"editor".as_ptr()) } == kResultOk {
++                        EditorOpenStatus::Accepted
++                    } else {
++                        EditorOpenStatus::Rejected
++                    }
++                });
++            }
+             Task::PluginTask(task) => (self.task_executor.lock())(task),
+             #[cfg(feature = "editor")]
+             Task::StateChanged => {
+diff --git a/crates/nice-plug/src/wrapper/vst3/wrapper.rs b/crates/nice-plug/src/wrapper/vst3/wrapper.rs
+index 0f561149..f1290146 100644
+--- a/crates/nice-plug/src/wrapper/vst3/wrapper.rs
++++ b/crates/nice-plug/src/wrapper/vst3/wrapper.rs
+@@ -1,4 +1,28 @@
+ use nice_plug_core::audio_setup::{AuxiliaryBuffers, BufferConfig, ProcessMode};
++
++#[cfg(all(test, feature = "editor", target_os = "windows"))]
++mod editor_request_tests;
++
++#[cfg(all(
++    test,
++    feature = "editor",
++    not(any(target_os = "windows", target_os = "macos"))
++))]
++mod unsupported_editor_request_test {
++    use super::*;
++    use crate::prelude::{EditorOpenRequest, EditorOpenStatus};
++    use crate::wrapper::editor_request_tests::RequestPlugin;
++
++    /// The Linux worker fallback must not invoke a VST3 UI-thread-only host callback.
++    #[test]
++    fn linux_editor_request_is_unsupported() {
++        let wrapper = Wrapper::<RequestPlugin>::new();
++        let request = EditorOpenRequest::default();
++        let handle = request.handle();
++        wrapper.inner.request_editor_open(request);
++        assert_eq!(handle.status(), EditorOpenStatus::Unsupported);
++    }
++}
+ use nice_plug_core::context::process::Transport;
+ use nice_plug_core::midi::sysex::SysExMessage;
+ use nice_plug_core::midi::{MidiConfig, NoteEvent};
+@@ -727,6 +751,14 @@ impl<P: Vst3Plugin> IEditControllerTrait for Wrapper<P> {
+         *self.inner.component_handler.borrow_mut() =
+             unsafe { ComRef::from_raw(handler) }.map(|r| r.to_com_ptr());
+ 
++        #[cfg(feature = "editor")]
++        if !handler.is_null() {
++            let pending = self.inner.pending_editor_open.lock().take();
++            if let Some(request) = pending {
++                self.inner.request_editor_open(request);
++            }
++        }
++
+         kResultOk
+     }
+ 
+diff --git a/crates/nice-plug/src/wrapper/vst3/wrapper/editor_request_tests.rs b/crates/nice-plug/src/wrapper/vst3/wrapper/editor_request_tests.rs
+new file mode 100644
+index 00000000..4553ff4f
+--- /dev/null
++++ b/crates/nice-plug/src/wrapper/vst3/wrapper/editor_request_tests.rs
+@@ -0,0 +1,212 @@
++use super::*;
++use crate::prelude::{EditorOpenRequest, EditorOpenStatus};
++use crate::wrapper::editor_request_tests::{RequestPlugin, empty_state};
++use std::sync::Weak;
++use std::sync::atomic::{AtomicBool, AtomicUsize};
++use vst3::{
++    ComWrapper,
++    Steinberg::Vst::{IComponentHandler2, IComponentHandler2Trait, IComponentHandlerTrait},
++};
++use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PM_REMOVE, PeekMessageW};
++
++struct Handler {
++    wrapper: Weak<WrapperInner<RequestPlugin>>,
++    shows: AtomicUsize,
++    safe: AtomicBool,
++    accept: AtomicBool,
++}
++
++impl Handler {
++    fn check_locks(&self) {
++        let wrapper = self.wrapper.upgrade().unwrap();
++        let free = wrapper.plugin.try_lock().is_some()
++            && wrapper.task_executor.try_lock().is_some()
++            && wrapper.component_handler.try_borrow_mut().is_ok();
++        self.safe.fetch_and(free, Ordering::Relaxed);
++    }
++}
++
++impl Class for Handler {
++    type Interfaces = (IComponentHandler, IComponentHandler2);
++}
++impl IComponentHandlerTrait for Handler {
++    unsafe fn beginEdit(&self, _: u32) -> tresult {
++        kResultOk
++    }
++    unsafe fn performEdit(&self, _: u32, _: f64) -> tresult {
++        kResultOk
++    }
++    unsafe fn endEdit(&self, _: u32) -> tresult {
++        kResultOk
++    }
++    unsafe fn restartComponent(&self, _: i32) -> tresult {
++        let wrapper = self.wrapper.upgrade().unwrap();
++        self.safe
++            .fetch_and(wrapper.plugin.try_lock().is_some(), Ordering::Relaxed);
++        kResultOk
++    }
++}
++impl IComponentHandler2Trait for Handler {
++    unsafe fn setDirty(&self, _: TBool) -> tresult {
++        kResultOk
++    }
++    unsafe fn startGroupEdit(&self) -> tresult {
++        kResultOk
++    }
++    unsafe fn finishGroupEdit(&self) -> tresult {
++        kResultOk
++    }
++    unsafe fn requestOpenEditor(&self, name: FIDString) -> tresult {
++        self.check_locks();
++        self.safe.fetch_and(
++            unsafe { std::ffi::CStr::from_ptr(name) } == c"editor",
++            Ordering::Relaxed,
++        );
++        self.shows.fetch_add(1, Ordering::Relaxed);
++        if self.accept.load(Ordering::Relaxed) {
++            kResultOk
++        } else {
++            kResultFalse
++        }
++    }
++}
++
++struct LegacyHandler;
++impl Class for LegacyHandler {
++    type Interfaces = (IComponentHandler,);
++}
++impl IComponentHandlerTrait for LegacyHandler {
++    unsafe fn beginEdit(&self, _: u32) -> tresult {
++        kResultOk
++    }
++    unsafe fn performEdit(&self, _: u32, _: f64) -> tresult {
++        kResultOk
++    }
++    unsafe fn endEdit(&self, _: u32) -> tresult {
++        kResultOk
++    }
++    unsafe fn restartComponent(&self, _: i32) -> tresult {
++        kResultOk
++    }
++}
++
++fn pump() {
++    let mut message = MSG::default();
++    while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
++        unsafe {
++            DispatchMessageW(&message);
++        }
++    }
++}
++
++/// Disconnected, activation, reload, and worker requests use the OS queue with no held wrapper locks.
++#[test]
++fn requests_defer_and_survive_connection_until_the_main_loop_runs() {
++    let wrapper = Wrapper::<RequestPlugin>::new();
++    let handler = ComWrapper::new(Handler {
++        wrapper: Arc::downgrade(&wrapper.inner),
++        shows: AtomicUsize::new(0),
++        safe: AtomicBool::new(true),
++        accept: AtomicBool::new(true),
++    });
++    let executor = wrapper.inner.plugin.lock().executor.get().unwrap().clone();
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    executor.request_editor_open(request);
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Pending);
++    assert!(wrapper.inner.pending_editor_open.lock().is_some());
++    unsafe {
++        wrapper.setComponentHandler(handler.as_com_ref::<IComponentHandler>().unwrap().as_ptr());
++    }
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 0);
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Accepted);
++    wrapper
++        .inner
++        .current_buffer_config
++        .store(Some(BufferConfig {
++            sample_rate: 48_000.0,
++            min_buffer_size: None,
++            max_buffer_size: 64,
++            process_mode: ProcessMode::Realtime,
++        }));
++    unsafe {
++        assert_eq!(wrapper.setActive(1), kResultOk);
++    }
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 1);
++    pump();
++    assert_eq!(
++        wrapper.inner.plugin.lock().requests[0].status(),
++        EditorOpenStatus::Accepted
++    );
++    assert!(wrapper.inner.set_state_inner(&mut empty_state()));
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 2);
++    pump();
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 3);
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    std::thread::spawn(move || executor.execute_gui(request))
++        .join()
++        .unwrap();
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Accepted);
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 4);
++    assert!(handler.safe.load(Ordering::Relaxed));
++    unsafe {
++        wrapper.setComponentHandler(std::ptr::null_mut());
++    }
++}
++
++/// Refusal, unsupported optional interfaces, and destroyed wrappers have distinct terminal outcomes.
++#[test]
++fn requests_do_not_claim_success_when_the_host_cannot_show() {
++    let wrapper = Wrapper::<RequestPlugin>::new();
++    let handler = ComWrapper::new(Handler {
++        wrapper: Arc::downgrade(&wrapper.inner),
++        shows: AtomicUsize::new(0),
++        safe: AtomicBool::new(true),
++        accept: AtomicBool::new(false),
++    });
++    unsafe {
++        wrapper.setComponentHandler(handler.as_com_ref::<IComponentHandler>().unwrap().as_ptr());
++    }
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.inner.request_editor_open(request);
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Rejected);
++    let request = EditorOpenRequest::default();
++    request.handle().cancel();
++    wrapper.inner.request_editor_open(request);
++    pump();
++    assert_eq!(handler.shows.load(Ordering::Relaxed), 1);
++    let legacy = ComWrapper::new(LegacyHandler);
++    unsafe {
++        wrapper.setComponentHandler(legacy.as_com_ref::<IComponentHandler>().unwrap().as_ptr());
++    }
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.inner.request_editor_open(request);
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Unsupported);
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.inner.request_editor_open(request);
++    drop(wrapper);
++    assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++}
++
++/// A host pumping messages during plugin work cannot reenter the locked plugin through this request.
++#[test]
++fn nested_message_delivery_does_not_call_the_host() {
++    let wrapper = Wrapper::<RequestPlugin>::new();
++    let plugin = wrapper.inner.plugin.lock();
++    let request = EditorOpenRequest::default();
++    let handle = request.handle();
++    wrapper.inner.request_editor_open(request);
++    pump();
++    assert_eq!(handle.status(), EditorOpenStatus::Cancelled);
++    assert!(wrapper.inner.pending_editor_open.lock().is_none());
++    drop(plugin);
++}

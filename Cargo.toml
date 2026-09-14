@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["temp/external/nice-plug"]
 members = [
     "crates/audio-graph-settings",
     "crates/plugin-host-api",
@@ -37,6 +38,12 @@ clap-sys = "0.5.0"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[patch.crates-io]
+nice-plug = { path = "temp/external/nice-plug/crates/nice-plug" }
+nice-plug-core = { path = "temp/external/nice-plug/crates/nice-plug-core" }
+nice-plug-derive = { path = "temp/external/nice-plug/crates/nice-plug-derive" }
+nice-log = { path = "temp/external/nice-plug/crates/nice-log" }
 
 # baseview 0.3.1 の X11 バックエンドは `AncestorVisibilityState` の `Debug` を
 # `debug_assertions` で条件付けしているのに、それを渡す `dbg!` は素で置いている。

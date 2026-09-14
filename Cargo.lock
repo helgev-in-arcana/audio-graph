@@ -1196,8 +1196,6 @@ dependencies = [
 [[package]]
 name = "nice-log"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3921836d433fa74f9df4fbb56bddedb075a7689805135d10b614ffdf631be36c"
 dependencies = [
  "tracing-appender",
  "windows",
@@ -1206,8 +1204,6 @@ dependencies = [
 [[package]]
 name = "nice-plug"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7591aebd56600bede2cf1e4559d16c29309429bb9999511539c39fc830b7e2fe"
 dependencies = [
  "anyhow",
  "anymap3",
@@ -1238,8 +1234,6 @@ dependencies = [
 [[package]]
 name = "nice-plug-core"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3efe28c7689d970d8ebe9afec813895ace1fdb544fb50f79122ccc1ee6dca54b"
 dependencies = [
  "atomic_float",
  "atomic_refcell",
@@ -1259,8 +1253,6 @@ dependencies = [
 [[package]]
 name = "nice-plug-derive"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2952ae91d0701916f887973dd0b84ac70007761872b7689395c7adc0e803b232"
 dependencies = [
  "proc-macro2",
  "quote",

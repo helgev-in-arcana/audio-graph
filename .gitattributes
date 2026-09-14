@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Unified diffs retain a space on empty context lines.
+patches/nice-plug/*.patch -whitespace
