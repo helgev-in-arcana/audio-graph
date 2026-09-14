@@ -282,5 +282,27 @@ fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
         let mut after = Block::silent(FRAMES);
         after.process(&mut wrapper, &mut daw);
         assert_eq!(after.peak(), 0.0, "the native voice must stop too");
+        assert!(
+            wrapper
+                .shared()
+                .error_message(audio_graph_plugin::ErrorSource::Processing)
+                .is_none()
+        );
+        wrapper.tick();
+        assert!(
+            wrapper
+                .shared()
+                .error_message(audio_graph_plugin::ErrorSource::Processing)
+                .is_some()
+        );
+        wrapper
+            .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+            .unwrap();
+        assert!(
+            wrapper
+                .shared()
+                .error_message(audio_graph_plugin::ErrorSource::Processing)
+                .is_none()
+        );
     }
 }
