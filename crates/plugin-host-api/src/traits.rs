@@ -1,9 +1,3 @@
-// ============================================================================
-//
-// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
-//
-// ============================================================================
-
 //! Core traits for plugin hosting backends.
 //!
 //! Two rules drive the shape here:

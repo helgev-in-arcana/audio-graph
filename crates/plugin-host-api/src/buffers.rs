@@ -1,9 +1,3 @@
-// ============================================================================
-//
-// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
-//
-// ============================================================================
-
 //! Audio buffer representation.
 //!
 //! Audio channels are stored in one contiguous, flat buffer rather than as a
