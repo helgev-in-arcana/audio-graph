@@ -266,6 +266,12 @@ fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement(
             .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
             .unwrap();
         assert!(wrapper.shared().restore_error().is_some());
+        assert_eq!(
+            wrapper
+                .shared()
+                .error_message(audio_graph_plugin::ErrorSource::State),
+            wrapper.shared().restore_error()
+        );
         assert!(!wrapper.shared().main().host.any_loaded());
         wrapper.shared().patch().graph = Graph::default_patch();
         wrapper.shared().publish_graph();
@@ -292,6 +298,12 @@ fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement(
             .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
             .unwrap();
         assert!(wrapper.shared().restore_error().is_none());
+        assert!(
+            wrapper
+                .shared()
+                .error_message(audio_graph_plugin::ErrorSource::State)
+                .is_none()
+        );
         assert!(wrapper.shared().main().host.is_loaded(0));
         block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
         assert_eq!(block.peak(), 0.25);

@@ -282,6 +282,12 @@ impl WrapperEditor {
     fn graph_panel(&mut self, ui: &mut egui::Ui) {
         let mut patch = self.shared.patch();
         let document = patch.document;
+        for message in patch.notifications.messages().filter(|message| {
+            patch.restore_error.as_deref() != Some(*message)
+                && patch.compile_error.as_deref() != Some(*message)
+        }) {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+        }
         if let Some(error) = &patch.restore_error {
             ui.heading("Saved graph could not be opened");
             ui.label(error);
