@@ -19,14 +19,6 @@
 
 VST3とCLAPを共通化します。
 
-構造と公開APIを詳しく読むための資料:
-
-- [plugin-host-api の構造・全公開API・VST3/CLAP対応](plugin-host-api-guide.md)
-- [plugin-host の構造・全公開API・探索とeditor](plugin-host-guide.md)
-- [2026-09-11 構造監査](audits/plugin-host-review-2026-09-11.md)
-- [plugin-host契約の修正と検証](audits/plugin-host-contract-fixes.md)
-- [上流native host契約9件の修正と検証](audits/upstream-host-contract-fixes.md)
-
 `vst3-host-view`は`vst3-host`へ依存し、instanceとmoduleの寿命を保持する`Vst3View`を受け取ります。windowを所有する層はこのhandleを通じてnative viewを操作します。
 
 `plugin-host-api` の `Processor` は、稼働に必要な実体・モジュール・コールバックの寿命を保持します。停止はprocessor自身を消費して行い、返却先として別のmain側インスタンスを受け取りません。`MainThread<T>` とprocessorは生成元スレッドで破棄され、他スレッドからの返却は事前確保した記録に保存されます。ホストのmainスレッドは `reclaim_main_thread()` で回収します。所有スレッドが未返却の資源を残して終了した場合は、別スレッドで破棄せず保持するため、通常終了ではprocessorの返却と回収を先に完了させます。
@@ -37,8 +29,6 @@ VST3とCLAPを共通化します。
 ### 入れ子プラグイン汎用
 
 - [subhost-adapter](../crates/subhost-adapter/README.md)
-
-保存・通知発生元・入力競合・schedule寸法・transportについての契約とAPI移行は、[adapter契約の修正記録](audits/subhost-adapter-contract-fixes.md)を参照。
 
 入れ子プラグインのための機能群です。
 

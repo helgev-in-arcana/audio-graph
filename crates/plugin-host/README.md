@@ -51,3 +51,21 @@ If it only makes sense because a DAW is above us, it belongs in
 - **Enumerating a module means loading third-party code.** `installed_modules`
   returns paths only; anything that opens a module says so and expects to be
   called off the UI thread.
+
+## Host lifecycle
+
+Create `let _thread = plugin_host::init_thread()?;` on the owning thread before
+loading plugins. Keep this guard alive until all plugins, editors, and processors
+have been released and returned resources reclaimed.
+
+The main loop services three separate responsibilities:
+
+- `poll()` advances this library's window events inside a DAW. Standalone hosts
+  can use `pump_events()` to dispatch their own message queue.
+- Call each `Plugin::tick()` even without an open editor, to deliver main-thread
+  callbacks and service plugin timers and editor changes.
+- Call `reclaim_main_thread()` to destroy resources returned from other threads,
+  including during shutdown before releasing the thread guard.
+
+Processing, metadata refresh, and processor return follow the
+[shared API contracts](../plugin-host-api/README.md#processing-and-metadata-contracts).
