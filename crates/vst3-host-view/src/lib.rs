@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! VST3 plugin editor window hosting and frame management.
 //!
 //! Provides top-level window embedding for VST3 `IPlugView` instances, `IPlugFrame`

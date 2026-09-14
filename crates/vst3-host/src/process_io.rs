@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Host-side containers passed into `IAudioProcessor::process`.
 //!
 //! Buffers are pre-sized during activation and reused during processing to ensure

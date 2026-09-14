@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Host context implementation provided by the wrapper to hosted sub-plugins.
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Keyboard event forwarding to host windows.
 //!
 //! A plugin editor is a child window, and child windows are the end of the line

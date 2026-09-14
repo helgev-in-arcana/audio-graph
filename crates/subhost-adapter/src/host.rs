@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Sub-plugin lifecycle and hosting abstraction.
 //!
 //! Separates main-thread operations ([`SubHost`] for loading, parameter binding,

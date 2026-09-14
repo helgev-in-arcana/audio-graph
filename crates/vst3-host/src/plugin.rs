@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Instantiating and driving a VST3 plugin instance.
 //!
 //! The VST3 lifecycle is sequence-sensitive:

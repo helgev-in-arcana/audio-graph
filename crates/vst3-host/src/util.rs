@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Conversions between VST3's fixed-size C string fields and Rust strings.
 
 use vst3::Steinberg::{char8, char16};

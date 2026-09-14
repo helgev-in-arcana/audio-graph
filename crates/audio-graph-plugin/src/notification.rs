@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 /// Independent error conditions in the current document, each retaining only its latest message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorSource {

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Platform dynamic-library loading and VST3 bundle layout.
 //!
 //! Handles loading `.vst3` binaries, whether laid out as a standalone shared

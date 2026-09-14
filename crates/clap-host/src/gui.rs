@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Container and lifecycle management for CLAP plugin GUI editors.
 //!
 //! Handles creating, attaching, resizing, and cleanly destroying embedded plugin

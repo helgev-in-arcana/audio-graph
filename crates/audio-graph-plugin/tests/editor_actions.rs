@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Everything the editor's buttons do, without the editor.
 //!
 //! The egui layer is a thin shell over [`Shared`]: each control resolves to one

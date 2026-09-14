@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Instantiating a CLAP plugin and driving it.
 //!
 //! The lifecycle is short next to VST3's, and the format states it plainly:

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! In-memory stream adaptors for CLAP `clap_istream` and `clap_ostream`.
 //!
 //! Converts between opaque binary state buffers and CLAP's stream interfaces.

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Compiled intermediate representation: a flat sequence of instructions over register files and audio buffers.
 //!
 //! A [`Program`] is what crosses to the audio thread. It holds no `Rc`, no

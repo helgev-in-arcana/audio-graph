@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Implementation of [`HostContext`] for the CLI harness.
 //!
 //! Provides a host context that records notifications (such as restart requests,

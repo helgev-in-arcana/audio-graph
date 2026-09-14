@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Graph node definitions and common trait interface.
 //!
 //! One file per node. Everything a node *is* — its settings, its sockets, its

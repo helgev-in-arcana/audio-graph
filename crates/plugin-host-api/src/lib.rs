@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Format-agnostic plugin hosting API.
 //!
 //! Provides a unified data model and trait definitions for hosting audio

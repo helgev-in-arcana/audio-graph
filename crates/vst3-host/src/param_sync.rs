@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 use plugin_host_api::{ParamId, ParamInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
 

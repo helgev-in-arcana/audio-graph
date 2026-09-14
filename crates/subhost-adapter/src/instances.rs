@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Audio processing interfaces and types for sub-plugin instances.
 //!
 //! Defines the audio processing trait [`AudioInstances`], channel chunk

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Format-agnostic window management and event plumbing for hosting plugin editors.
 //!
 //! Three concerns, and none of them is VST3's or CLAP's:

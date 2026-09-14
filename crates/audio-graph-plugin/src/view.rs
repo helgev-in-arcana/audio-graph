@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The snapshot the editor draws from.
 //!
 //! Everything the editor shows about a sub-plugin comes from the sub-plugin

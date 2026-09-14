@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The wrapper's host-visible parameters.
 //!
 //! The sub-plugin's parameters are not published directly to the DAW. Instead,

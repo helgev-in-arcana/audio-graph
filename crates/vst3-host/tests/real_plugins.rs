@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Tests that need an actual VST3 plugin on the machine.
 //!
 //! They discover plugins through the OS-conventional directories and skip

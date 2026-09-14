@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! X11 side of key forwarding.
 //!
 //! X has no virtual key codes. A key is a *keysym*, which the keyboard mapping

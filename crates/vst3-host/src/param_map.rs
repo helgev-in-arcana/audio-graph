@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Plain ↔ normalized conversion for the audio thread.
 //!
 //! Host audio engines typically use plain (unnormalized) values with domain ranges,

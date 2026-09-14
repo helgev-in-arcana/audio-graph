@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Standing in for the DAW: what a test needs to drive the wrapper.
 //!
 //! `Wrapper::activate` takes plain structs, but `Wrapper::process` wants

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Sub-block parameter scheduling and value buffer management.
 //!
 //! Parameter automation is quantized into sub-blocks (default 32 samples).

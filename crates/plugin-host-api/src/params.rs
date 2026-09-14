@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Parameter model — plain values with an explicit range.
 //!
 //! Normalising to 0..1 in the core would bake VST3's poverty in: CLAP's stepped

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! An `IBStream` implementation backed by an in-memory byte vector.
 //!
 //! VST3 passes component and controller state via stream interfaces (`IBStream`).

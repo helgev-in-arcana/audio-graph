@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{ALL_CHANNELS, ALL_CONTROLLERS};

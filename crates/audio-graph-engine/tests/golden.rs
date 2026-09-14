@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Golden snapshots of compiled programs for regression testing.
 //!
 //! Snapshot tests compare compiled [`Program`] outputs (including instruction order,

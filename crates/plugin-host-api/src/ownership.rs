@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Destruction on the thread that owns a plugin's control and OS resources.
 
 use std::cell::{RefCell, UnsafeCell};

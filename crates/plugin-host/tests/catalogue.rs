@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Tests for the plugin catalogue cache storage, stamping, and invalidation.
 //!
 //! Verifies timestamp and size calculation for files and directory bundles,

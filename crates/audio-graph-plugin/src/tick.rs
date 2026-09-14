@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The wrapper's background heartbeat: provides periodic calls onto the host's main thread.
 //!
 //! Hosted plugins may request periodic timer ticks or schedule main-thread callbacks

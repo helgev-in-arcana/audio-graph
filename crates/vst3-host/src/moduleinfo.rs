@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! `moduleinfo.json` — the bundle's self-description.
 //!
 //! VST3 3.7.5 onwards lets a bundle declare its classes in a JSON file under

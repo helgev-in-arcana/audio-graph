@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Native fault diagnostics handler for host-cli.
 //!
 //! A plugin crash is not a Rust panic: an access violation does not unwind and

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! VST3 plugin editor window hosting and lifecycle management.
 //!
 //! Enforces proper attachment and teardown sequencing for hosted `IPlugView` instances:

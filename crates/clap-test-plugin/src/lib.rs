@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! A deterministic CLAP test plugin implementation for integration testing `clap-host`.
 //!
 //! Exposes standard CLAP entry points and extensions (parameters, audio/note ports,

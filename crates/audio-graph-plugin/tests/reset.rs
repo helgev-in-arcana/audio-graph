@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Throwing away what the running graph is holding.
 //!
 //! The engine's own tests say what a reset empties. These say the request gets

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! What the wrapper tells the DAW to align the track by.
 //!
 //! The number belongs to the graph, not to any one plugin: a plugin's own

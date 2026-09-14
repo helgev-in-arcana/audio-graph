@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Translation between host engine event types and VST3 event representations.
 //!
 //! Parameter updates and note events are converted into VST3 parameter change queues

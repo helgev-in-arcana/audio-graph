@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Concurrency and real-time invariants for the audio thread.
 //!
 //! Routine main-thread operations (drawing the editor, ticking sub-plugin windows,

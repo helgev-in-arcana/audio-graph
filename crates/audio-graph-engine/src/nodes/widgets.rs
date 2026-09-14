@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Shared UI widgets and context structures for rendering graph nodes with egui.
 //!
 //! Only compiled with the `ui` feature, which only the wrapper turns on. The CLI

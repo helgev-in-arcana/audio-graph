@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Where a program has to be cut, and what each piece runs at.
 //!
 //! A stage is a run of ops that execute together over the whole DAW block:

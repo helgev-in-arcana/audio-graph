@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Plugin discovery and module inspection.
 //!
 //! Everything here is format-agnostic on the outside: one list of directories,

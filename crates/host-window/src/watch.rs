@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Watching a plugin's timers and file descriptors on its behalf.
 //!
 //! A plugin cannot wait on anything itself: the host owns the loop. So whatever

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Lock-free and allocation-free communication channel for passing compiled programs to the audio thread.
 //!
 //! Provides a single-producer single-consumer channel where the audio thread can

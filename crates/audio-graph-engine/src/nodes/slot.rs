@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Wrapper slot automation input node.
 //!
 //! Reads normalized [0.0, 1.0] automation values from the host DAW's automation slots.

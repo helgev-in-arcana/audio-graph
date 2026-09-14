@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Lifecycle and state checks against real installed plugins.
 //!
 //! Skips itself when no plugins are present, so this stays green on a bare CI

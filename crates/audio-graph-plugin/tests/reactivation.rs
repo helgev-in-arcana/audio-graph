@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! What the DAW does around a bounce, and what the wrapper has to survive.
 //!
 //! A fast export is not a special process call: the host switches the render

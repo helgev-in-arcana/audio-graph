@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Event model for parameter changes, MIDI, and note expressions.
 //!
 //! `SetValue` and `Modulate` are separate variants on purpose: CLAP keeps

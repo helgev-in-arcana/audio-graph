@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Loaded plugin instance abstraction over format-specific backends.
 //!
 //! [`Plugin`] implements [`SubPluginMain`] by delegating calls to the underlying

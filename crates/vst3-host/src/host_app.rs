@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The COM objects a plugin expects its host to provide.
 //!
 //! `IHostApplication` is the context handed to `IPluginBase::initialize`; many

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! State serialization types and helpers for hosted sub-plugins.
 //!
 //! What a wrapper saves is its own business — which slots it publishes, what

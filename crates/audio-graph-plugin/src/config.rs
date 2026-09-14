@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Capacity limits and configuration constants for the wrapper plugin.
 //!
 //! These constants define AudioGraph's limits and are passed to

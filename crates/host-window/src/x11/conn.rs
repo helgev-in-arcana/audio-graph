@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The X connection our windows live on, and the loop that drains it.
 //!
 //! One connection per thread, opened the first time something needs it. It is

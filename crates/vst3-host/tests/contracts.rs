@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 use plugin_host_api::{AudioConfig, AuxBuses, HostContext, RestartReason, SubPluginMain};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

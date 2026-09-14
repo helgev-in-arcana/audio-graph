@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 use audio_graph_engine::{
     AudioIn, AudioOut, Constant, Graph, NodeId, NodeKind, ParamPort, Plugin, PluginPorts,
 };

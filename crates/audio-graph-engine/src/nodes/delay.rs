@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Delay line read and write nodes.
 //!
 //! Delay lines are split into write and read endpoints paired by a shared line ID

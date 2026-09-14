@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Win32 side of key forwarding.
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};

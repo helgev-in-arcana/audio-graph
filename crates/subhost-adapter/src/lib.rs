@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Hosting sub-plugins inside another plugin.
 //!
 //! Provides the sub-hosting adapter layer: forwarding transport, combining

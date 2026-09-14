@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! X11 backend.
 //!
 //! X11 rather than Wayland, and not because Wayland is unspoken. VST3 has a

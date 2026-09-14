@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The wrapping plugin itself: one plugin to the DAW, a host on the inside.
 //!
 //! Two plugin classes are exported from this single binary. The sub-plugin's kind

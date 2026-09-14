@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The wrapper's GUI editor: hosts the node graph canvas and plugin management.
 //!
 //! The editor provides a visual graph interface where users can load sub-plugins,

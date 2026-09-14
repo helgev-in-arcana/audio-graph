@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Audio instruction set and audio buffer operations.
 //!
 //! Kept apart from [`Op`][crate::Op] because the two halves run at different

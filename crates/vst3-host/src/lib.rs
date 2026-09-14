@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! A VST3 host backend implementation in pure Rust.
 //!
 //! This crate handles loading, introspecting, and executing VST3 plugins.

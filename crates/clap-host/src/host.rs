@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Host implementation and extension vtables provided to hosted CLAP plugins.
 //!
 //! Provides the `clap_host` struct and static extension tables (`clap_host_params`,

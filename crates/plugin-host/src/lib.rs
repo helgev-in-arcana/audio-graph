@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Unified plugin hosting facade supporting VST3 and CLAP formats.
 //!
 //! One facade over both backends. A caller here says "load this path", "give

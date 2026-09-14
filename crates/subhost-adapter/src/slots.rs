@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Automatable parameter slots and sub-plugin parameter bindings.
 //!
 //! The sub-plugin's parameters are deliberately *not* exposed to the DAW. The

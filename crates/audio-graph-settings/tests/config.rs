@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Tests for plugin directory and pinning configuration management.
 //!
 //! Verifies default directory seeding, persistence, modification timestamp reload,

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Minimal test GUI implementation for the fixture plugin.
 //!
 //! Provides a plain embedded child window implementation used to verify host GUI

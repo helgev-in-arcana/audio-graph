@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! A project or a preset the DAW hands over while the wrapper is running.
 //!
 //! nice-plug answers a state load by calling `activate` again rather than

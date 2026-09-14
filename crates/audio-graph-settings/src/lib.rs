@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! AudioGraph product settings and plugin discovery preferences.
 //!
 //! Nothing in either format lets a plugin discover where the DAW looks:

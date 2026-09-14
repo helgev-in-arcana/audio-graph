@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Note pipeline compilation pass.
 //!
 //! Runs *before* the parameter and audio halves, because both of them need to

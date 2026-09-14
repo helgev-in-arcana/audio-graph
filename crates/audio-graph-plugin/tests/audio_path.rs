@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The wrapper's own `process`, driven the way a DAW drives it.
 //!
 //! Everything else about the audio path is checked through the bundled binary

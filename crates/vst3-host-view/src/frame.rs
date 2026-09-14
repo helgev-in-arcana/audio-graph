@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Host-side `IPlugFrame` implementation.
 //!
 //! Receives plugin-initiated resize requests via `IPlugFrame::resizeView` and records

@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Container window implementation for hosting plugin editors.
 //!
 //! This window draws nothing. It is a titled, resizable frame to embed a

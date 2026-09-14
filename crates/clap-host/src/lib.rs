@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! CLAP plugin hosting implementation in pure Rust.
 //!
 //! Provides discovery, loading, instantiation, parameter management, audio/event

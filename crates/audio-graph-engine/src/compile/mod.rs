@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Graph compilation: transforms an editable [`Graph`] into an executable [`Program`].
 //!
 //! Runs on the UI thread, as often as the user edits.

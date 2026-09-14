@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Loading a `.clap` module and enumerating the plugins it offers.
 //!
 //! Provides a reference-counted handle onto a loaded CLAP library module, cached by path

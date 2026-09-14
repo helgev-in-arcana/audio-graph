@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Node compilation contexts for parameter and audio execution pipelines.
 //!
 //! Provides [`ParamCx`], [`AudioCx`], and [`DeclareCx`], handed to nodes during

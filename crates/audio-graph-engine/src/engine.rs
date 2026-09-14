@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Realtime audio engine execution runtime.
 //!
 //! Executes compiled [`Program`] instructions on the audio thread.

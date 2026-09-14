@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! The CLAP backend, driven end to end against `clap-test-plugin`.
 //!
 //! Unlike the VST3 backend's tests, this one does not need a plugin to be

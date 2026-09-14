@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Serialized state representation stored in DAW project files and presets.
 //!
 //! Sub-plugin state chunks are nested opaquely. Wrapper-owned data structures

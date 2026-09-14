@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Audio graph engine crate for evaluating node graphs.
 //!
 //! Modulation sources (constants, LFOs, note expressions) and audio routing

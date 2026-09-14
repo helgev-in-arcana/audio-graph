@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Which parameter a MIDI controller drives, for the audio thread.
 //!
 //! VST3 never delivers a control change to a plugin as a MIDI message. The

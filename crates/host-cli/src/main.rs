@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Development harness and diagnostic CLI for the plugin host.
 //!
 //! Stands in for a DAW during development: everything worth proving about the

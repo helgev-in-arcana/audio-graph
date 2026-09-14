@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Shared state accessible by both the editor UI and the audio processing thread.
 //!
 //! The arrangement here is the answer to one question: what may the audio

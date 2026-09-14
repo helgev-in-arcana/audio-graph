@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Platform dynamic-library loading and CLAP bundle layout.
 
 use std::ffi::{CString, OsStr};

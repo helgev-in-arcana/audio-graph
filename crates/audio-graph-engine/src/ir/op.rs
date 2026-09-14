@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Parameter instruction set and evaluation primitives.
 //!
 //! Contains the scalar operations the parameter engine executes each sub-block.
