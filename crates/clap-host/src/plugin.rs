@@ -1324,7 +1324,8 @@ impl SubPluginProcessor for ClapProcessor {
             let _guard = AudioThreadGuard::enter();
             unsafe { reset(self.plugin) };
         }
-        self.steady_time = 0;
+        // `steady_time` keeps counting: CLAP requires it to advance by at
+        // least the frames of every call, reset or not.
     }
 }
 
