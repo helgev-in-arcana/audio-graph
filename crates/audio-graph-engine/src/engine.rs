@@ -628,20 +628,22 @@ fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, x: f32) -> f32 {
     ((c3 * x + c2) * x + c1) * x + y1
 }
 
-/// Move each ring to the index the new program gave its node, contents intact.
+/// One step of [`reorder`], applied by the caller to every per-line table it keeps.
+enum Move {
+    Swap(usize, usize),
+    /// The slot's line is gone.
+    Clear(usize),
+}
+
+/// Move each line to the index the new program gave its node, contents intact.
 ///
-/// Work out the permutation first, then apply it by swapping the outer `Vec`
-/// entries — no allocation, and no copying of ring contents, which for an audio
-/// line is 96 000 samples a channel.
-fn reorder<T: Copy>(
-    rings: &mut [Vec<T>],
-    heads: &mut [usize],
-    nodes: &mut [u32],
-    order: &mut [usize],
-    want: &[u32],
-    zero: T,
-) {
-    let lines = want.len().min(rings.len());
+/// Work out the permutation first, then hand it to `apply` a step at a time.
+/// The caller moves the outer `Vec` of a ring rather than its contents, which
+/// for an audio line is 96 000 samples a channel, and moves every other
+/// per-line table with it. A table left out would describe the ring that used
+/// to sit at an index rather than the one sitting there now.
+fn reorder(nodes: &mut [u32], order: &mut [usize], want: &[u32], mut apply: impl FnMut(Move)) {
+    let lines = want.len().min(nodes.len());
     for (i, slot) in order[..lines].iter_mut().enumerate() {
         *slot = nodes
             .iter()
@@ -658,8 +660,7 @@ fn reorder<T: Copy>(
         if from == NOT_PRESENT || from == i {
             continue;
         }
-        rings.swap(i, from);
-        heads.swap(i, from);
+        apply(Move::Swap(i, from));
         // Whatever was at `i` now sits at `from`; a line still pointing at `i`
         // has to follow it there.
         for slot in order[i + 1..lines].iter_mut() {
@@ -672,8 +673,7 @@ fn reorder<T: Copy>(
     // Whatever is left in a new line's slot belonged to a line that is gone.
     for i in 0..lines {
         if order[i] == NOT_PRESENT {
-            rings[i].fill(zero);
-            heads[i] = 0;
+            apply(Move::Clear(i));
         }
         nodes[i] = want[i];
     }
@@ -823,21 +823,44 @@ impl Engine {
         }
 
         // Delay line ring buffers retain their contents across program swaps.
+        let (rings, heads) = (&mut self.rings, &mut self.ring_heads);
         reorder(
-            &mut self.rings,
-            &mut self.ring_heads,
             &mut self.ring_nodes,
             &mut self.ring_order,
             &next.delay_nodes,
-            0.0,
+            |step| match step {
+                Move::Swap(a, b) => {
+                    rings.swap(a, b);
+                    heads.swap(a, b);
+                }
+                Move::Clear(i) => {
+                    rings[i].fill(0.0);
+                    heads[i] = 0;
+                }
+            },
         );
-        reorder(
+        // An audio ring's length travels with it: the length decides whether
+        // a ring handed over with the program replaces this one below.
+        let (rings, heads, lens) = (
             &mut self.audio_rings,
             &mut self.audio_ring_heads,
+            &mut self.audio_ring_len,
+        );
+        reorder(
             &mut self.audio_ring_nodes,
             &mut self.audio_ring_order,
             &next.audio_delay_nodes,
-            0.0,
+            |step| match step {
+                Move::Swap(a, b) => {
+                    rings.swap(a, b);
+                    heads.swap(a, b);
+                    lens.swap(a, b);
+                }
+                Move::Clear(i) => {
+                    rings[i].fill(0.0);
+                    heads[i] = 0;
+                }
+            },
         );
         // When ring lengths change, new buffers provided by the main thread are swapped in.
         let next = self
