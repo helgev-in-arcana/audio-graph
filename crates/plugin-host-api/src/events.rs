@@ -40,11 +40,15 @@ pub enum ParamEvent {
         amount: f64,
         sample_offset: u32,
     },
+    /// A gesture has a time like any other event: it sits in the same ordered
+    /// stream, and one reported as offset 0 would break that order.
     GestureBegin {
         id: ParamId,
+        sample_offset: u32,
     },
     GestureEnd {
         id: ParamId,
+        sample_offset: u32,
     },
 }
 
@@ -53,30 +57,27 @@ impl ParamEvent {
         match *self {
             ParamEvent::SetValue { id, .. }
             | ParamEvent::Modulate { id, .. }
-            | ParamEvent::GestureBegin { id }
-            | ParamEvent::GestureEnd { id } => id,
+            | ParamEvent::GestureBegin { id, .. }
+            | ParamEvent::GestureEnd { id, .. } => id,
         }
     }
 
     pub fn sample_offset(&self) -> u32 {
         match *self {
             ParamEvent::SetValue { sample_offset, .. }
-            | ParamEvent::Modulate { sample_offset, .. } => sample_offset,
-            _ => 0,
+            | ParamEvent::Modulate { sample_offset, .. }
+            | ParamEvent::GestureBegin { sample_offset, .. }
+            | ParamEvent::GestureEnd { sample_offset, .. } => sample_offset,
         }
     }
 
     /// Returns a copy of the event with its sample offset updated to `offset`.
-    ///
-    /// A gesture has no offset to move; it is returned unchanged rather than
-    /// refused, so a caller rebasing a whole stream does not have to know which
-    /// events carry a time.
     pub fn at_offset(mut self, offset: u32) -> ParamEvent {
-        if let ParamEvent::SetValue { sample_offset, .. }
-        | ParamEvent::Modulate { sample_offset, .. } = &mut self
-        {
-            *sample_offset = offset;
-        }
+        let (ParamEvent::SetValue { sample_offset, .. }
+        | ParamEvent::Modulate { sample_offset, .. }
+        | ParamEvent::GestureBegin { sample_offset, .. }
+        | ParamEvent::GestureEnd { sample_offset, .. }) = &mut self;
+        *sample_offset = offset;
         self
     }
 }
@@ -528,7 +529,10 @@ mod sink_tests {
     /// Capacity and overflow survive cloning and repeated appends until the caller clears.
     #[test]
     fn capacity_is_a_limit_and_loss_is_sticky() {
-        let event = Event::Param(ParamEvent::GestureBegin { id: ParamId(0) });
+        let event = Event::Param(ParamEvent::GestureBegin {
+            id: ParamId(0),
+            sample_offset: 0,
+        });
         assert!(!EventSink::new().push(event));
         let mut sink = EventSink::with_capacity(2).clone();
         assert!(sink.push(event));
@@ -614,6 +618,17 @@ mod tests {
             assert_eq!(event.sample_offset(), 7, "{data:02x?}");
             assert_eq!(event.to_midi(), Some(data), "{data:02x?}");
         }
+    }
+
+    /// A gesture keeps its own time and is rebased like every other event.
+    #[test]
+    fn gestures_carry_and_move_their_time() {
+        let end = ParamEvent::GestureEnd {
+            id: ParamId(3),
+            sample_offset: 40,
+        };
+        assert_eq!(Event::Param(end).sample_offset(), 40);
+        assert_eq!(Event::Param(end).at_offset(8).sample_offset(), 8);
     }
 
     #[test]

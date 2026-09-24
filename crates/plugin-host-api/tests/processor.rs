@@ -56,6 +56,7 @@ impl SubPluginProcessor for Counter {
         self.calls += 1;
         sink.push(Event::Param(plugin_host_api::ParamEvent::GestureBegin {
             id: plugin_host_api::ParamId(0),
+            sample_offset: 0,
         }));
         ProcessStatus::Continue
     }
