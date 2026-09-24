@@ -246,8 +246,7 @@ pub fn to_process_context(context: &TimeContext, sample_rate: f64) -> ProcessCon
     let mut state = StatesAndFlags_::kTempoValid
         | StatesAndFlags_::kTimeSigValid
         | StatesAndFlags_::kProjectTimeMusicValid
-        | StatesAndFlags_::kBarPositionValid
-        | StatesAndFlags_::kSystemTimeValid;
+        | StatesAndFlags_::kBarPositionValid;
     if context.playing {
         state |= StatesAndFlags_::kPlaying;
     }
@@ -488,6 +487,14 @@ mod tests {
         assert!(out.state & StatesAndFlags_::kPlaying as u32 != 0);
         assert!(out.state & StatesAndFlags_::kTempoValid as u32 != 0);
         assert_eq!(out.state & StatesAndFlags_::kRecording as u32, 0);
+    }
+
+    /// The system time is never filled in, so it is never claimed valid.
+    #[test]
+    fn the_system_time_is_not_claimed() {
+        let out = to_process_context(&TimeContext::default(), 48_000.0);
+        assert_eq!(out.systemTime, 0);
+        assert_eq!(out.state & StatesAndFlags_::kSystemTimeValid as u32, 0);
     }
 
     #[test]
