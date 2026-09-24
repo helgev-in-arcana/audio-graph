@@ -14,7 +14,6 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use plugin_host_api::HostContext;
 use vst3::Steinberg::Vst::{
     IAttributeList, IAttributeListTrait, IComponentHandler, IComponentHandler2,
     IComponentHandler2Trait, IComponentHandlerTrait, IHostApplication, IHostApplicationTrait,
@@ -40,13 +39,19 @@ fn guid(tuid: &TUID) -> [u8; 16] {
 ///
 /// Deliberately thin: the only genuine service is `createInstance`, which the
 /// SDK's own host classes also implement by hand.
+///
+/// Holds the host's name rather than its [`plugin_host_api::HostContext`]. The object is shared
+/// by every instance of a module and lives as long as the module, so a context
+/// kept here would be the first instance's, kept past that instance's end.
 pub struct HostApplication {
-    context: Arc<dyn HostContext>,
+    name: String,
 }
 
 impl HostApplication {
-    pub fn new(context: Arc<dyn HostContext>) -> ComWrapper<HostApplication> {
-        ComWrapper::new(HostApplication { context })
+    pub fn new(name: &str) -> ComWrapper<HostApplication> {
+        ComWrapper::new(HostApplication {
+            name: name.to_owned(),
+        })
     }
 }
 
@@ -77,7 +82,7 @@ impl IHostApplicationTrait for HostApplication {
             return kInvalidArgument;
         }
         let dst = unsafe { &mut *name };
-        to_char16(self.context.host_name(), dst);
+        to_char16(&self.name, dst);
         kResultOk
     }
 
@@ -332,7 +337,7 @@ impl IMessageTrait for HostMessage {
 /// Host-side `IComponentHandler`: the interface a plugin GUI uses to report
 /// user edits and request host actions.
 ///
-/// Parameter edits are reported through [`HostContext::param_edited`].
+/// Parameter edits are reported through [`plugin_host_api::HostContext::param_edited`].
 /// Providing a concrete component handler is essential, as many plugins
 /// disable their UI controls when given a null handler.
 pub struct ComponentHandler {
