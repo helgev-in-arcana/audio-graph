@@ -1255,7 +1255,7 @@ impl SubPluginProcessor for ClapProcessor {
             // `set_port_activation` is required to be marked constant.
             buffer.constant_mask = match binding {
                 Binding::Caller(_) => 0,
-                Binding::Scratch(_) => (1u64 << width) - 1,
+                Binding::Scratch(_) => every_channel(width),
             };
             at += width;
         }
@@ -1327,6 +1327,17 @@ impl SubPluginProcessor for ClapProcessor {
         // `steady_time` keeps counting: CLAP requires it to advance by at
         // least the frames of every call, reset or not.
     }
+}
+
+/// A `constant_mask` naming every channel of a port `width` wide.
+///
+/// The mask has 64 bits and a port may declare more channels than that; the
+/// ones past bit 63 cannot be marked, and a plain shift would overflow.
+fn every_channel(width: usize) -> u64 {
+    u32::try_from(width)
+        .ok()
+        .and_then(|width| 1u64.checked_shl(width))
+        .map_or(u64::MAX, |bit| bit - 1)
 }
 
 fn empty_buffer(channels: u16) -> clap_audio_buffer {
@@ -1623,6 +1634,15 @@ mod tests {
             inputs: vec![port("Main", 2, true), port("Sidechain", 2, false)],
             outputs: vec![port("Main", 2, true)],
         }
+    }
+
+    /// A port too wide for the mask marks all 64 channels it can name, rather than overflowing.
+    #[test]
+    fn the_constant_mask_saturates_at_its_width() {
+        assert_eq!(every_channel(0), 0);
+        assert_eq!(every_channel(2), 0b11);
+        assert_eq!(every_channel(64), u64::MAX);
+        assert_eq!(every_channel(65), u64::MAX);
     }
 
     #[test]
