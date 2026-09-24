@@ -65,10 +65,11 @@ impl IBStreamTrait for MemoryStream {
             return kInvalidArgument;
         }
         let mut inner = self.inner.borrow_mut();
-        let available = inner.data.len().saturating_sub(inner.pos);
-        let n = available.min(num_bytes as usize);
+        // `pos` may lie past the end after a seek; nothing is left to read there.
+        let rest = inner.data.get(inner.pos..).unwrap_or_default();
+        let n = rest.len().min(num_bytes as usize);
         unsafe {
-            std::ptr::copy_nonoverlapping(inner.data[inner.pos..].as_ptr(), buffer as *mut u8, n);
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), buffer as *mut u8, n);
         }
         inner.pos += n;
         if !num_bytes_read.is_null() {
@@ -195,6 +196,21 @@ mod tests {
         let res = unsafe { stream.read(dst.as_mut_ptr() as *mut c_void, 8, &mut read) };
         assert_eq!(res, kResultOk);
         assert_eq!(read, 2);
+    }
+
+    /// A read after seeking past the end is an empty read, not a panic across the FFI boundary.
+    #[test]
+    fn reading_after_seeking_past_the_end_reads_nothing() {
+        let stream = MemoryStream::from_bytes(b"ab".to_vec());
+        let mut out = 0i64;
+        let mut dst = [0u8; 4];
+        let mut read = -1;
+        unsafe {
+            assert_eq!(stream.seek(8, kIBSeekSet as int32, &mut out), kResultOk);
+            let res = stream.read(dst.as_mut_ptr() as *mut c_void, 4, &mut read);
+            assert_eq!(res, kResultOk);
+        }
+        assert_eq!(read, 0);
     }
 
     #[test]
