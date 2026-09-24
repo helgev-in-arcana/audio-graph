@@ -218,6 +218,10 @@ pub(crate) struct Instance {
     active: bool,
     processing: bool,
     initialised: bool,
+    /// The least `steady_time` the next `process` may carry within this
+    /// activation. CLAP requires the counter to advance by at least the
+    /// frames just processed, so a call below this is refused as an error.
+    steady_floor: i64,
     /// Which ports the host left switched on. Every port starts active, which
     /// is what CLAP says a fresh instance looks like.
     active_ports: u32,
@@ -378,6 +382,7 @@ unsafe extern "C" fn factory_create(
         active: false,
         processing: false,
         initialised: false,
+        steady_floor: 0,
         // CLAP says every port starts active.
         active_ports: u32::MAX,
         render_mode: CLAP_RENDER_REALTIME,
@@ -437,6 +442,7 @@ unsafe extern "C" fn plugin_activate(
         return false;
     }
     instance.active = true;
+    instance.steady_floor = 0;
     true
 }
 
@@ -491,6 +497,13 @@ unsafe extern "C" fn plugin_process(
         return CLAP_PROCESS_ERROR;
     }
     let data = unsafe { &*process };
+    // -1 is how a host says it keeps no counter.
+    if data.steady_time >= 0 {
+        if data.steady_time < instance.steady_floor {
+            return CLAP_PROCESS_ERROR;
+        }
+        instance.steady_floor = data.steady_time + i64::from(data.frames_count);
+    }
     unsafe { instance.emit_gui(data.out_events) };
 
     // Events first, at offset 0 only: a fixture that honoured sample offsets

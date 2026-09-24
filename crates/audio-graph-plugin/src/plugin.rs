@@ -382,7 +382,7 @@ impl Wrapper {
 
         let mut state = match self.shared.begin_block(&mut self.engine) {
             Some(state) => state,
-            None => return pass_through(buffer, self.kind),
+            None => return silence(buffer),
         };
         if std::mem::take(&mut state.reset_notes) {
             self.ended_notes.clear();
@@ -651,17 +651,14 @@ fn all_notes_off(events: &[Event]) -> bool {
         .any(|event| matches!(event, Event::Note(ApiNote::Cc { cc: 120 | 123, .. })))
 }
 
-/// Leave the input alone (an effect) or silence the output (an instrument).
+/// Silence the output of a block the graph cannot run.
 ///
-/// The fallback whenever there is no sub-plugin to run, whether because none is
-/// loaded or because the editor currently holds the lock.
-fn pass_through(buffer: &mut Buffer, kind: WrapperKind) -> ProcessStatus {
-    if kind == WrapperKind::Instrument {
-        for mut ch in buffer.iter_samples() {
-            for sample in ch.iter_mut() {
-                *sample = 0.0;
-            }
-        }
+/// The processors are out of reach while a sub-plugin loads, while the graph
+/// is rebuilt, and for a block that loses the race for their lock. Letting an
+/// effect's input through then would play a route the canvas does not draw.
+fn silence(buffer: &mut Buffer) -> ProcessStatus {
+    for channel in buffer.as_slice() {
+        channel.fill(0.0);
     }
     ProcessStatus::Normal
 }

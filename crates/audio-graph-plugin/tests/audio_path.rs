@@ -279,10 +279,10 @@ fn changing_parameter_bindings_keeps_each_block_consistent() {
             while !stop.load(Ordering::Acquire) || blocks == 0 {
                 block.fill(0.5).process(&mut wrapper, &mut daw);
                 let peak = block.peak();
-                // Gain 1.5 and offset -0.5 render 0.25. A suspended block passes
-                // 0.5 through; swapped parameter targets would instead render 0.75.
+                // Gain 1.5 and offset -0.5 render 0.25. A suspended block is
+                // silent; swapped parameter targets would instead render 0.75.
                 assert!(
-                    (peak - 0.25).abs() < 1e-6 || (peak - 0.5).abs() < 1e-6,
+                    (peak - 0.25).abs() < 1e-6 || peak == 0.0,
                     "inconsistent block: {peak}"
                 );
                 blocks += 1;
@@ -355,6 +355,33 @@ fn a_failed_configuration_is_silent_and_can_be_rebuilt() {
     assert!(shared.has_processors());
     block.fill(0.5).process(&mut wrapper, &mut daw);
     assert!((block.peak() - 0.5).abs() < 1e-6);
+    wrapper.deactivate();
+}
+
+/// A block the graph cannot run is silent, never the dry input.
+///
+/// The processors are out of reach while a sub-plugin loads or the graph is
+/// rebuilt. An effect that let its input through then would play a route the
+/// canvas does not draw.
+#[test]
+fn a_block_the_graph_cannot_run_is_silent() {
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = playing("audio-path-unavailable");
+    let shared = wrapper.shared().clone();
+    let mut block = Block::silent(32);
+    let mut daw = Daw::playing();
+    block.fill(LEVEL).process(&mut wrapper, &mut daw);
+    assert!(
+        (block.peak() - LEVEL).abs() < 1e-6,
+        "the graph carries the input while it runs"
+    );
+    {
+        let _held = shared
+            .try_audio()
+            .expect("nothing else holds the processors");
+        block.fill(LEVEL).process(&mut wrapper, &mut daw);
+    }
+    assert_eq!(block.peak(), 0.0);
     wrapper.deactivate();
 }
 

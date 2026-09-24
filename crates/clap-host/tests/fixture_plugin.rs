@@ -302,6 +302,34 @@ fn mismatched_blocks_never_enter_native_processing() {
     );
 }
 
+/// A reset keeps the steady-time counter moving forward, as CLAP requires.
+#[test]
+fn steady_time_keeps_advancing_across_a_reset() {
+    let _fixture = FIXTURE.lock().unwrap();
+    let module = Module::open(fixture_path()).unwrap();
+    let mut plugin = ClapPlugin::create(
+        &module,
+        "dev.audio-graph.clap-test-plugin",
+        Arc::new(TestHost),
+    )
+    .unwrap();
+    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let mut sink = EventSink::with_capacity(8);
+    let input = [0.5; 8];
+    let mut output = [0.0; 8];
+    let mut run = |processor: &mut plugin_host_api::Processor| {
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink)
+    };
+    assert_eq!(run(&mut processor), ProcessStatus::Continue);
+    processor.reset();
+    assert_eq!(
+        run(&mut processor),
+        ProcessStatus::Continue,
+        "the fixture refuses a steady time that went backwards"
+    );
+}
+
 /// Both native scratch loss and caller capacity loss remain visible across process calls.
 #[test]
 fn output_overflow_is_propagated_and_not_cleared_by_processing() {

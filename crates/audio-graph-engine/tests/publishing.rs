@@ -223,3 +223,100 @@ fn repeated_publications_keep_the_delay_audible() {
         }
     }
 }
+
+/// Deleting one audio delay line leaves every other line, and what it holds, intact.
+///
+/// Removing a line renumbers the ones after it. The survivors keep their rings
+/// across the swap, so each ring's length has to move with it to its new index.
+#[test]
+fn deleting_a_delay_line_keeps_the_others_audible() {
+    use audio_graph_engine::Mix;
+
+    const RATE: f64 = 48_000.0;
+    const FRAMES: u32 = 128;
+    const DELAY: usize = 200;
+    const IMPULSE: usize = 8;
+
+    let mut graph = Graph::new();
+    let input = graph.add(
+        NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0, 0.0],
+    );
+    let output = graph.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0, 0.0],
+    );
+    let mix = graph.add(
+        NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 2,
+            gains: vec![0.0, 0.0],
+        }),
+        [0.0, 0.0],
+    );
+    // Two lines with rings of different lengths, so a length left behind at
+    // the old index cannot pass for the right one.
+    let mut lines = Vec::new();
+    for (port, max_time) in [(0, 0.05), (2, 0.2)] {
+        let (write, read) = graph.add_delay(PortType::STEREO, [0.0, 0.0]);
+        let NodeKind::DelayRead(delay) = &mut graph.node_mut(read).unwrap().kind else {
+            panic!("the delay read node exists");
+        };
+        delay.time = DELAY as f64 / RATE;
+        delay.max_time = max_time;
+        graph.connect(input, 0, write, 0);
+        graph.connect(read, 0, mix, port);
+        lines.push((write, read));
+    }
+    graph.connect(mix, 0, output, 0);
+
+    let publisher = ProgramPublisher::default();
+    let mut engine = Engine::new();
+    engine.prepare(FRAMES, &[2]);
+    let mut schedule = SlotSchedule::new(MAX_GRAPH_PARAMS + MAX_AUDIO_LANES, FRAMES, 32).unwrap();
+    let mut daw_in = [0.0; 2 * FRAMES as usize];
+    let mut daw_out = [0.0; 2 * FRAMES as usize];
+    publisher.publish(compile(&graph, 0).unwrap(), RATE);
+    assert!(engine.adopt(&publisher));
+
+    for block in 0..2 {
+        daw_in.fill(0.0);
+        if block == 0 {
+            daw_in[IMPULSE] = 1.0;
+            daw_in[FRAMES as usize + IMPULSE] = 1.0;
+        } else {
+            // The impulse is inside both rings now. Deleting the first line
+            // moves the second one to index 0.
+            let (write, read) = lines[0];
+            graph.remove(write);
+            graph.remove(read);
+            publisher.publish(compile(&graph, 0).unwrap(), RATE);
+            assert!(engine.adopt(&publisher));
+        }
+        assert!(engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            FRAMES,
+            32,
+            RATE,
+            120.0,
+            &daw_in,
+            &mut daw_out,
+            &mut NoInstances,
+        ));
+    }
+    for channel in daw_out.as_chunks::<{ FRAMES as usize }>().0 {
+        assert_eq!(
+            channel.iter().position(|sample| sample.abs() > 0.9),
+            Some(IMPULSE + DELAY - FRAMES as usize),
+            "the surviving line still returns the impulse"
+        );
+    }
+}
