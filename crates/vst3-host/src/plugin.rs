@@ -145,7 +145,7 @@ impl Vst3Plugin {
         // it is given via setHostContext for the module's whole lifetime. On
         // Linux this is also where a plugin picks up the run loop, which has to
         // outlive any editor.
-        let host_app = module.host_application(Arc::clone(&context));
+        let host_app = module.host_application(context.host_name());
         let host_unknown = com_ref_ptr::<_, FUnknown>(&host_app);
 
         let component = create_instance::<IComponent>(module, cid.to_tuid())?;
