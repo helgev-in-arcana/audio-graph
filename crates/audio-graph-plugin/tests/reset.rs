@@ -306,3 +306,85 @@ fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
         );
     }
 }
+
+/// A running wrapper with the fixture wired in to out and notes wired to it.
+fn playing_with_notes(name: &str) -> Wrapper {
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .expect("the wrapper activates");
+    wrapper
+        .shared()
+        .load(&harness::fixture_as_clap(name))
+        .expect("the fixture loads");
+    wrapper.shared().adopt_default_patch();
+    {
+        let mut patch = wrapper.shared().patch();
+        let (plugin, note_port) = patch
+            .graph
+            .nodes
+            .iter()
+            .find_map(|node| match &node.kind {
+                NodeKind::Plugin(plugin) => Some((node.id, plugin.ports.audio_in.len() as u8)),
+                _ => None,
+            })
+            .expect("the default patch holds the plugin");
+        let notes = patch.graph.add(NodeKind::NoteIn, [0.0; 2]);
+        patch.graph.connect(notes, 0, plugin, note_port);
+    }
+    wrapper
+        .shared()
+        .rebind()
+        .expect("the notes reach the plugin");
+    wrapper
+}
+
+/// The DAW's reset reaches the sub-plugin: a note it was holding is gone in the next block.
+#[test]
+fn a_daw_reset_reaches_the_sub_plugin() {
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = playing_with_notes("reset-reaches-fixture");
+    let mut daw = Daw::playing();
+    daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
+        timing: 0,
+        voice_id: Some(1),
+        channel: 0,
+        note: 60,
+        velocity: 1.0,
+    });
+    let mut block = Block::silent(32);
+    block.fill(LEVEL).process(&mut wrapper, &mut daw);
+    assert!(
+        (block.peak() - (LEVEL + 0.25)).abs() < 1e-6,
+        "the fixture holds the note"
+    );
+    wrapper.reset();
+    block.fill(LEVEL).process(&mut wrapper, &mut daw);
+    assert!((block.peak() - LEVEL).abs() < 1e-6, "and lets it go");
+    wrapper.deactivate();
+}
+
+/// The DAW's reset never waits for the processors' lock.
+///
+/// CLAP calls it on the audio thread, which may not wait on anything the
+/// editor can hold.
+#[test]
+fn a_daw_reset_does_not_wait_for_the_processors() {
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = playing_with_notes("reset-does-not-wait-fixture");
+    let shared = wrapper.shared().clone();
+    let held = shared
+        .try_audio()
+        .expect("nothing else holds the processors");
+    let (done, finished) = std::sync::mpsc::channel();
+    let audio = std::thread::spawn(move || {
+        wrapper.reset();
+        let _ = done.send(());
+        wrapper
+    });
+    let returned = finished.recv_timeout(std::time::Duration::from_secs(5));
+    drop(held);
+    let mut wrapper = audio.join().unwrap();
+    assert!(returned.is_ok(), "reset waited for the processors' lock");
+    wrapper.deactivate();
+}
