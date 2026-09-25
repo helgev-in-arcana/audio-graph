@@ -79,15 +79,6 @@ pub struct ResolvedTarget {
     /// thread so an event is delivered to the plugin it was bound against.
     pub instance: u32,
     pub id: ParamId,
-    pub min: f64,
-    pub max: f64,
-}
-
-impl ResolvedTarget {
-    /// Maps a normalized `0.0..=1.0` slot value to the parameter's native value range `[min, max]`.
-    pub fn to_plain(&self, normalized: f64) -> f64 {
-        self.min + normalized.clamp(0.0, 1.0) * (self.max - self.min)
-    }
 }
 
 impl SlotTable {
@@ -126,8 +117,6 @@ impl SlotTable {
         self.resolved[index] = Some(ResolvedTarget {
             instance,
             id: param.id,
-            min: param.min,
-            max: param.max,
         });
     }
 
@@ -182,12 +171,7 @@ impl SlotTable {
                 params
                     .iter()
                     .find(|p| p.id.0 == binding.param_id)
-                    .map(|p| ResolvedTarget {
-                        instance,
-                        id: p.id,
-                        min: p.min,
-                        max: p.max,
-                    })
+                    .map(|p| ResolvedTarget { instance, id: p.id })
             };
         }
     }
@@ -254,16 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_slot_maps_automation_onto_the_plain_range() {
-        let mut table = SlotTable::new(SLOTS);
-        table.bind(0, 0, "AAAA", &param(7, "Cutoff", 20.0, 20_000.0));
-        let target = table.resolved(0).expect("resolved");
-        assert_eq!(target.to_plain(0.0), 20.0);
-        assert_eq!(target.to_plain(1.0), 20_000.0);
-        assert_eq!(target.to_plain(0.5), 10_010.0);
-    }
-
-    #[test]
     fn a_binding_survives_a_plugin_that_does_not_resolve_it() {
         // A missing plugin must not delete the user's work: reloading it has
         // to bring the mapping back.
@@ -298,7 +272,6 @@ mod tests {
 
         let target = table.resolved(0).expect("resolved");
         assert_eq!(target.id, ParamId(42));
-        assert_eq!(target.max, 10.0);
     }
 
     #[test]

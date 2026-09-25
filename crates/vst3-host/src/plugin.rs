@@ -122,7 +122,7 @@ impl Vst3Plugin {
                 }
             });
             for (id, normalized) in self.instance.get()._handler.take_edits() {
-                let plain = unsafe { controller.normalizedParamToPlain(id.0, normalized) };
+                let plain = self.to_plain(controller, id, normalized);
                 self.context.param_edited(id, plain);
             }
         }
@@ -294,7 +294,7 @@ impl Vst3Plugin {
         // Arrangements may only be set while deactivated.
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState(
-                "bus negotiation requires an inactive plugin",
+                "bus negotiation requires an inactive plugin".into(),
             ));
         }
         if input > 2 || output > 2 {
@@ -373,7 +373,7 @@ impl Vst3Plugin {
                             .getBusInfo(media, dir, index, &mut info)
                     } != kResultOk
                     {
-                        return Err(HostError::InvalidState("bus enumeration failed"));
+                        return Err(HostError::InvalidState("bus enumeration failed".into()));
                     }
                     Ok(plugin_host_api::BusInfo {
                         name: crate::util::from_char16(&info.name),
@@ -513,12 +513,39 @@ impl Vst3Plugin {
         found
     }
 
+    /// A stepped parameter's step count, which is also its largest plain
+    /// value; `None` for a continuous one. See [`crate::param_map::step_to_normalized`].
+    fn steps(&self, id: ParamId) -> Option<f64> {
+        self.params
+            .iter()
+            .find(|p| p.id == id)
+            .filter(|p| p.flags.contains(ParamFlags::STEPPED))
+            .map(|p| p.max)
+    }
+
+    /// Plain to normalized: by the format's formula for a stepped parameter,
+    /// by the plugin's own curve otherwise.
+    fn to_normalized(&self, ctrl: &ComPtr<IEditController>, id: ParamId, plain: f64) -> f64 {
+        match self.steps(id) {
+            Some(steps) => crate::param_map::step_to_normalized(plain, steps),
+            None => unsafe { ctrl.plainParamToNormalized(id.0, plain) },
+        }
+    }
+
+    /// The inverse of [`Vst3Plugin::to_normalized`].
+    fn to_plain(&self, ctrl: &ComPtr<IEditController>, id: ParamId, normalized: f64) -> f64 {
+        match self.steps(id) {
+            Some(steps) => crate::param_map::normalized_to_step(normalized, steps),
+            None => unsafe { ctrl.normalizedParamToPlain(id.0, normalized) },
+        }
+    }
+
     fn controller(&self) -> Result<&ComPtr<IEditController>> {
         self.instance
             .get()
             .controller
             .as_ref()
-            .ok_or(HostError::InvalidState("plugin has no edit controller"))
+            .ok_or_else(|| HostError::InvalidState("plugin has no edit controller".into()))
     }
 }
 
@@ -563,7 +590,7 @@ impl SubPluginMain for Vst3Plugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "metadata changed during refresh; retry",
+                "metadata changed during refresh; retry".into(),
             ));
         }
         self.params = params;
@@ -605,7 +632,7 @@ impl SubPluginMain for Vst3Plugin {
                     let normalized = unsafe { ctrl.getParamNormalized(p.id.0) };
                     ApiParamValue {
                         id: p.id,
-                        plain: unsafe { ctrl.normalizedParamToPlain(p.id.0, normalized) },
+                        plain: self.to_plain(ctrl, p.id, normalized),
                     }
                 })
                 .collect(),
@@ -614,7 +641,7 @@ impl SubPluginMain for Vst3Plugin {
 
     fn param_to_text(&self, id: ParamId, plain: f64) -> Option<String> {
         let ctrl = self.controller().ok()?;
-        let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        let normalized = self.to_normalized(ctrl, id, plain);
         let mut buf: String128 = [0; 128];
         (unsafe { ctrl.getParamStringByValue(id.0, normalized, &mut buf) } == kResultOk)
             .then(|| from_char16(&buf))
@@ -627,17 +654,19 @@ impl SubPluginMain for Vst3Plugin {
         let mut normalized = 0.0;
         (unsafe { ctrl.getParamValueByString(id.0, buf.as_mut_ptr(), &mut normalized) }
             == kResultOk)
-            .then(|| unsafe { ctrl.normalizedParamToPlain(id.0, normalized) })
+            .then(|| self.to_plain(ctrl, id, normalized))
     }
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
         if !self.params.iter().any(|param| param.id == id) {
-            return Err(HostError::InvalidState("no such parameter"));
+            return Err(HostError::InvalidState("no such parameter".into()));
         }
         let ctrl = self.controller()?;
-        let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        let normalized = self.to_normalized(ctrl, id, plain);
         if !self.instance.get()._handler.queue_edit(id, normalized) {
-            return Err(HostError::InvalidState("parameter queue unavailable"));
+            return Err(HostError::InvalidState(
+                "parameter queue unavailable".into(),
+            ));
         }
         // The return value is advisory. Every iZotope plugin here answers
         // kResultFalse and applies the value anyway, and the SDK's own hosts
@@ -693,7 +722,7 @@ impl SubPluginMain for Vst3Plugin {
         reclaim_main_thread();
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState(
-                "state restoration requires an inactive plugin",
+                "state restoration requires an inactive plugin".into(),
             ));
         }
         self.tick();
@@ -708,7 +737,7 @@ impl SubPluginMain for Vst3Plugin {
         let component_state = data[8..8 + component_len].to_vec();
         self.pending_edits
             .lock()
-            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned".into()))?
             .clear();
         self.feedback.drain(|_, _| {});
         self.metadata_dirty = true;
@@ -749,11 +778,11 @@ impl SubPluginMain for Vst3Plugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         if *self.instance.get().active.borrow() {
-            return Err(HostError::InvalidState("plugin is already active"));
+            return Err(HostError::InvalidState("plugin is already active".into()));
         }
 
         let declared = setup_buses(
@@ -1099,20 +1128,10 @@ impl SubPluginProcessor for Vst3Processor {
             out_events.mark_overflow();
         }
 
-        // The plugin sets silence flags on the output bus when it has nothing
-        // to say; honouring that is what lets a chain skip downstream work.
-        // The main bus alone: `output_ptrs` may now span several buses, and a
-        // silent main output says nothing about the aux ones.
-        let main_width = self.config.output_channels as usize;
-        if let Some(main) = self.output_buses.first()
-            && main.silenceFlags != 0
-            && main_width <= 64
-        {
-            let all_silent = (0..main_width).all(|c| main.silenceFlags & (1 << c) != 0);
-            if all_silent {
-                return ProcessStatus::Silent;
-            }
-        }
+        // Never `Silent`: that status promises the output stays silent until new
+        // input arrives, and VST3 has no way to say so. Its silence flags cover
+        // this block alone, and a delay's echo can follow a silent block with no
+        // new input at all.
         ProcessStatus::Continue
     }
 
@@ -1271,7 +1290,9 @@ fn read_params(controller: &ComPtr<IEditController>) -> Result<Vec<ParamInfo>> {
     for index in 0..count {
         let mut raw: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { controller.getParameterInfo(index, &mut raw) } != kResultOk {
-            return Err(HostError::InvalidState("parameter enumeration failed"));
+            return Err(HostError::InvalidState(
+                "parameter enumeration failed".into(),
+            ));
         }
 
         let stepped = raw.stepCount > 0;
@@ -1300,8 +1321,13 @@ fn read_params(controller: &ComPtr<IEditController>) -> Result<Vec<ParamInfo>> {
             module: from_char16(&raw.units),
             min,
             max,
-            default: unsafe {
-                controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue)
+            default: if stepped {
+                crate::param_map::normalized_to_step(
+                    raw.defaultNormalizedValue,
+                    raw.stepCount as f64,
+                )
+            } else {
+                unsafe { controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue) }
             },
             flags,
         });

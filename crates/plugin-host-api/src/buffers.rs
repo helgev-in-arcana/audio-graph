@@ -105,10 +105,12 @@ impl AudioConfig {
     /// Reject dimensions that cannot be represented by the native processing APIs.
     pub fn validate(&self) -> crate::Result<()> {
         if !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
-            return Err(crate::HostError::InvalidState("invalid sample rate"));
+            return Err(crate::HostError::InvalidState("invalid sample rate".into()));
         }
         if self.max_block_size == 0 || self.max_block_size > i32::MAX as u32 {
-            return Err(crate::HostError::InvalidState("invalid maximum block size"));
+            return Err(crate::HostError::InvalidState(
+                "invalid maximum block size".into(),
+            ));
         }
         for (main, aux) in [
             (self.input_channels, self.aux_inputs),
@@ -122,7 +124,7 @@ impl AudioConfig {
                 });
             if !valid || aux.iter().any(|width| width == 0) {
                 return Err(crate::HostError::InvalidState(
-                    "invalid audio bus dimensions",
+                    "invalid audio bus dimensions".into(),
                 ));
             }
         }
