@@ -298,7 +298,12 @@ impl NoteEvent {
                 key,
                 velocity,
                 ..
-            } => [status(0x90, channel), key as u8 & 0x7f, to7(velocity)],
+            } => [
+                status(0x90, channel),
+                key as u8 & 0x7f,
+                // Velocity 0 on a note-on is a note-off to every MIDI receiver.
+                to7(velocity).max(1),
+            ],
             NoteEvent::NoteOff {
                 channel,
                 key,
@@ -628,6 +633,22 @@ mod tests {
             let event = NoteEvent::from_midi(0, data, 7);
             assert_eq!(event.sample_offset(), 7, "{data:02x?}");
             assert_eq!(event.to_midi(), Some(data), "{data:02x?}");
+        }
+    }
+
+    /// A note-on stays a note-on in MIDI, however quiet: velocity 0 would turn it into a note-off.
+    #[test]
+    fn a_quiet_note_on_keeps_a_velocity_of_at_least_one() {
+        for velocity in [0.0, 0.001, 1.0 / 254.0] {
+            let on = NoteEvent::NoteOn {
+                note_id: None,
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity,
+                sample_offset: 0,
+            };
+            assert_eq!(on.to_midi(), Some([0x90, 60, 1]), "velocity {velocity}");
         }
     }
 
