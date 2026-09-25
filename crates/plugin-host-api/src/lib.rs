@@ -9,8 +9,8 @@
 //! * The model is shaped after CLAP, the richer format. VST3 backends
 //!   *degrade* to it; it is never narrowed to the intersection of the two.
 //! * Nothing that cannot cross a process boundary may appear in a public
-//!   signature — no `ComPtr`, no raw pointers, no references or `Arc` in
-//!   payloads, no single-shot getters.
+//!   signature — no `ComPtr`, no raw pointers, no references, `Arc`s or
+//!   callbacks in payloads, and no single-shot getters beyond text conversion.
 
 mod buffers;
 mod events;
