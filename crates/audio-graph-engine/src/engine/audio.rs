@@ -422,7 +422,7 @@ impl Engine {
                     let mut from = self
                         .latches
                         .get(*state as usize)
-                        .copied()
+                        .map(|latch| latch.value)
                         .unwrap_or(f64::NAN);
                     // One segment per sub-block the chunk covers, so a chunk
                     // that spans the whole block still follows the lane.
@@ -479,7 +479,11 @@ impl Engine {
                         from = if ramp < seg { target } else { ramped(ramp - 1) };
                         done += seg;
                     }
-                    if let Some(latch) = self.latches.get_mut(*state as usize) {
+                    if let Some(latch) = self
+                        .latches
+                        .get_mut(*state as usize)
+                        .map(|latch| &mut latch.value)
+                    {
                         *latch = from;
                     }
                 }
@@ -506,7 +510,7 @@ impl Engine {
                         // interpolator needs ahead of the read pointer.
                         let floor = frames as f64 + 2.0;
                         let ceiling = (max_time * ctx.sample_rate)
-                            .min(self.audio_ring_len[*line as usize].saturating_sub(4) as f64)
+                            .min(self.audio_lines[*line as usize].len.saturating_sub(4) as f64)
                             .max(floor);
                         (seconds * ctx.sample_rate).clamp(floor, ceiling)
                     });
@@ -550,8 +554,8 @@ impl Engine {
         distance: f64,
     ) {
         let frames = win.frames;
-        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
-        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
+        let ring_len = self.audio_lines.get(line).map_or(0, |held| held.len);
+        if ring_len == 0 || self.audio_lines[line].ring.len() < MAX_CHANNELS * ring_len {
             self.fill(buf, win, 0.0);
             return;
         }
@@ -560,7 +564,7 @@ impl Engine {
             Some(previous) if previous.is_finite() => previous,
             _ => distance,
         };
-        let head = self.audio_ring_heads[line];
+        let head = self.audio_lines[line].head;
         for ch in 0..width.min(MAX_CHANNELS) {
             let ring = ch * ring_len;
             let to = self.at(buf, ch, win);
@@ -574,7 +578,7 @@ impl Engine {
                 let at = whole as i64;
                 let y = |offset: i64| -> f32 {
                     let index = (at + offset).rem_euclid(ring_len as i64) as usize;
-                    self.audio_rings[line][ring + index]
+                    self.audio_lines[line].ring[ring + index]
                 };
                 self.pool[to + i] = hermite(y(-1), y(0), y(1), y(2), fraction as f32);
             }
@@ -592,11 +596,11 @@ impl Engine {
     /// than itself.
     fn delay_write(&mut self, line: usize, buf: Buf, width: usize, win: Window) {
         let frames = win.frames;
-        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
-        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
+        let ring_len = self.audio_lines.get(line).map_or(0, |held| held.len);
+        if ring_len == 0 || self.audio_lines[line].ring.len() < MAX_CHANNELS * ring_len {
             return;
         }
-        let head = self.audio_ring_heads[line];
+        let head = self.audio_lines[line].head;
         for ch in 0..MAX_CHANNELS {
             let ring = ch * ring_len;
             // A channel the source does not have still has to be written, or
@@ -604,14 +608,14 @@ impl Engine {
             let from = self.at(buf, ch, win);
             for i in 0..frames {
                 let at = (head + i) % ring_len;
-                self.audio_rings[line][ring + at] = if ch < width.min(MAX_CHANNELS) {
+                self.audio_lines[line].ring[ring + at] = if ch < width.min(MAX_CHANNELS) {
                     self.pool[from + i]
                 } else {
                     0.0
                 };
             }
         }
-        self.audio_ring_heads[line] = (head + frames) % ring_len;
+        self.audio_lines[line].head = (head + frames) % ring_len;
     }
 
     /// Advance `line`'s write head over this chunk without a source.
@@ -619,18 +623,18 @@ impl Engine {
     /// The head moves at the rate a connected write would move it, so the line
     /// drains over its delay time rather than holding still.
     fn delay_silence(&mut self, line: usize, frames: usize) {
-        let ring_len = self.audio_ring_len.get(line).copied().unwrap_or(0);
-        if ring_len == 0 || self.audio_rings[line].len() < MAX_CHANNELS * ring_len {
+        let ring_len = self.audio_lines.get(line).map_or(0, |held| held.len);
+        if ring_len == 0 || self.audio_lines[line].ring.len() < MAX_CHANNELS * ring_len {
             return;
         }
-        let head = self.audio_ring_heads[line];
+        let head = self.audio_lines[line].head;
         for ch in 0..MAX_CHANNELS {
             let ring = ch * ring_len;
             for i in 0..frames {
-                self.audio_rings[line][ring + (head + i) % ring_len] = 0.0;
+                self.audio_lines[line].ring[ring + (head + i) % ring_len] = 0.0;
             }
         }
-        self.audio_ring_heads[line] = (head + frames) % ring_len;
+        self.audio_lines[line].head = (head + frames) % ring_len;
     }
 
     /// Delays a buffer in place by a fixed sample count for latency compensation.

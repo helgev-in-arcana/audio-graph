@@ -1,4 +1,9 @@
-//! Carrying delay rings across a program swap.
+//! State that belongs to a node and outlives the program it was compiled into.
+//!
+//! An LFO's phase, a delay line's ring, a latch: each sits at an index the
+//! program chose, and a recompile may choose another. Each kind is one value
+//! per slot, and [`reorder`] moves whole slots, so nothing kept about a slot
+//! can be left behind at the index it used to occupy.
 
 use super::*;
 
@@ -37,45 +42,172 @@ pub(super) fn copy_ring(
     *head = keep % to_len;
 }
 
-/// One step of [`reorder`], applied by the caller to every per-line table it keeps.
-pub(super) enum Move {
-    Swap(usize, usize),
-    /// The slot's line is gone.
-    Clear(usize),
+/// One slot of state that follows its node across a program swap.
+pub(super) trait Slot {
+    fn node(&self) -> u32;
+    fn set_node(&mut self, node: u32);
+    /// Start over, for a node the previous program did not have.
+    fn clear(&mut self);
 }
 
-/// Move each line to the index the new program gave its node, contents intact.
+/// One parameter delay line: `MAX_DELAY_TAPS` sub-blocks of history.
+pub(super) struct ParamLine {
+    pub(super) ring: Vec<f64>,
+    pub(super) head: usize,
+    node: u32,
+}
+
+impl ParamLine {
+    pub(super) fn new() -> ParamLine {
+        ParamLine {
+            ring: vec![0.0; MAX_DELAY_TAPS],
+            head: 0,
+            node: u32::MAX,
+        }
+    }
+}
+
+impl Slot for ParamLine {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    fn clear(&mut self) {
+        self.ring.fill(0.0);
+        self.head = 0;
+    }
+}
+
+/// One audio delay line.
 ///
-/// Work out the permutation first, then hand it to `apply` a step at a time.
-/// The caller moves the outer `Vec` of a ring rather than its contents, which
-/// for an audio line is 96 000 samples a channel, and moves every other
-/// per-line table with it. A table left out would describe the ring that used
-/// to sit at an index rather than the one sitting there now.
-pub(super) fn reorder(
-    nodes: &mut [u32],
-    order: &mut [usize],
-    want: &[u32],
-    mut apply: impl FnMut(Move),
-) {
-    let lines = want.len().min(nodes.len());
+/// The ring is allocated on the main thread and carried in on the program,
+/// because this thread may not allocate and only that side knows both the
+/// graph's `max_time` and the sample rate.
+pub(super) struct AudioLine {
+    pub(super) ring: Vec<f32>,
+    /// Samples per channel in `ring`, or zero while the line has none. It
+    /// decides whether a ring handed over with the program replaces this one.
+    pub(super) len: usize,
+    pub(super) head: usize,
+    node: u32,
+}
+
+impl AudioLine {
+    pub(super) fn new() -> AudioLine {
+        AudioLine {
+            ring: Vec::new(),
+            len: 0,
+            head: 0,
+            node: u32::MAX,
+        }
+    }
+}
+
+impl Slot for AudioLine {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    /// Emptied where it stands. `len` still describes the ring, which a new
+    /// line either reuses or has replaced by one of its own.
+    fn clear(&mut self) {
+        self.ring.fill(0.0);
+        self.head = 0;
+    }
+}
+
+/// One LFO.
+pub(super) struct Lfo {
+    /// 0..1.
+    pub(super) phase: f64,
+    /// The sample-and-hold value.
+    pub(super) hold: f64,
+    node: u32,
+}
+
+impl Lfo {
+    pub(super) fn new() -> Lfo {
+        Lfo {
+            phase: 0.0,
+            hold: 0.0,
+            node: u32::MAX,
+        }
+    }
+}
+
+impl Slot for Lfo {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    fn clear(&mut self) {
+        self.phase = 0.0;
+        self.hold = 0.0;
+    }
+}
+
+/// One latch, and the state of the ops that keep a single value between
+/// blocks the same way (a fade's ramp, a follower's level).
+pub(super) struct Latch {
+    /// NaN for a latch nothing has set yet.
+    pub(super) value: f64,
+    node: u32,
+}
+
+impl Latch {
+    pub(super) fn new() -> Latch {
+        Latch {
+            value: f64::NAN,
+            node: u32::MAX,
+        }
+    }
+}
+
+impl Slot for Latch {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    fn clear(&mut self) {
+        self.value = f64::NAN;
+    }
+}
+
+/// Move each slot to the index the new program gave its node, contents intact.
+///
+/// Work out the permutation first, then apply it by swapping whole slots: for
+/// a ring that moves the outer `Vec` rather than its contents, which for an
+/// audio line is 96 000 samples a channel. A slot whose node is new starts
+/// over; one past the new program's count keeps its memory and forgets its
+/// node, which no program will name.
+pub(super) fn reorder<S: Slot>(slots: &mut [S], order: &mut [usize], want: &[u32]) {
+    let lines = want.len().min(slots.len());
     for (i, slot) in order[..lines].iter_mut().enumerate() {
-        *slot = nodes
+        *slot = slots
             .iter()
-            .position(|&n| n == want[i])
+            .position(|s| s.node() == want[i])
             .unwrap_or(NOT_PRESENT);
     }
 
-    // Move the surviving rings into place first. Clearing as we went would wipe
-    // a ring that is still sitting in a slot some later line wants.
+    // Move the surviving slots into place first. Clearing as we went would
+    // wipe a slot that is still sitting where some later one wants it.
     for i in 0..lines {
         let from = order[i];
-        // `from` is never below `i`: slots below `i` already hold the rings of
-        // earlier lines, whose nodes are all different from this one's.
+        // `from` is never below `i`: slots below `i` already hold earlier
+        // nodes, which are all different from this one.
         if from == NOT_PRESENT || from == i {
             continue;
         }
-        apply(Move::Swap(i, from));
-        // Whatever was at `i` now sits at `from`; a line still pointing at `i`
+        slots.swap(i, from);
+        // Whatever was at `i` now sits at `from`; a slot still pointing at `i`
         // has to follow it there.
         for slot in order[i + 1..lines].iter_mut() {
             if *slot == i {
@@ -84,14 +216,14 @@ pub(super) fn reorder(
         }
         order[i] = i;
     }
-    // Whatever is left in a new line's slot belonged to a line that is gone.
+    // Whatever is left in a new node's slot belonged to a node that is gone.
     for i in 0..lines {
         if order[i] == NOT_PRESENT {
-            apply(Move::Clear(i));
+            slots[i].clear();
         }
-        nodes[i] = want[i];
+        slots[i].set_node(want[i]);
     }
-    for node in nodes[lines..].iter_mut() {
-        *node = u32::MAX;
+    for slot in slots[lines..].iter_mut() {
+        slot.set_node(u32::MAX);
     }
 }

@@ -76,24 +76,24 @@ impl Engine {
                         None => time,
                     };
                     let index = line as usize;
-                    self.registers[out as usize] = if index < self.rings.len() {
+                    self.registers[out as usize] = if index < self.lines.len() {
                         let taps = (time * taps_per_second)
                             .round()
                             .clamp(1.0, (MAX_DELAY_TAPS - 1) as f64)
                             as usize;
-                        let head = self.ring_heads[index];
+                        let head = self.lines[index].head;
                         let at = (head + MAX_DELAY_TAPS - taps) % MAX_DELAY_TAPS;
-                        self.rings[index][at]
+                        self.lines[index].ring[at]
                     } else {
                         0.0
                     };
                 }
                 Op::DelayWrite { line, a } => {
                     let index = line as usize;
-                    if index < self.rings.len() {
-                        let head = self.ring_heads[index];
-                        self.rings[index][head] = self.registers[a as usize];
-                        self.ring_heads[index] = (head + 1) % MAX_DELAY_TAPS;
+                    if index < self.lines.len() {
+                        let head = self.lines[index].head;
+                        self.lines[index].ring[head] = self.registers[a as usize];
+                        self.lines[index].head = (head + 1) % MAX_DELAY_TAPS;
                     }
                 }
                 Op::Const { out, value } => self.registers[out as usize] = value,
@@ -110,7 +110,7 @@ impl Engine {
                     centre,
                 } => {
                     let i = state as usize;
-                    let phase = (self.phases[i] + offset_phase).rem_euclid(1.0);
+                    let phase = (self.lfos[i].phase + offset_phase).rem_euclid(1.0);
                     let shape = match waveform {
                         Waveform::Sine => (phase * std::f64::consts::TAU).sin(),
                         Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
@@ -122,7 +122,7 @@ impl Engine {
                                 1.0
                             }
                         }
-                        Waveform::Random => self.holds[i],
+                        Waveform::Random => self.lfos[i].hold,
                     };
                     self.registers[out as usize] = centre + depth * shape;
 
@@ -130,12 +130,12 @@ impl Engine {
                         RateSpec::Hz(hz) => hz,
                         RateSpec::CyclesPerBeat(cpb) => cpb * ctx.tempo_bpm / 60.0,
                     };
-                    let advanced = self.phases[i] + hz * dt;
+                    let advanced = self.lfos[i].phase + hz * dt;
                     if advanced >= 1.0 && waveform == Waveform::Random {
                         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                        self.holds[i] = f64::from(self.rng >> 8) / f64::from(1u32 << 23) - 1.0;
+                        self.lfos[i].hold = f64::from(self.rng >> 8) / f64::from(1u32 << 23) - 1.0;
                     }
-                    self.phases[i] = advanced.rem_euclid(1.0);
+                    self.lfos[i].phase = advanced.rem_euclid(1.0);
                 }
                 Op::Select {
                     out,
@@ -180,7 +180,11 @@ impl Engine {
                     // the times mean the same thing at any quantum and any
                     // block size. A time of zero is a coefficient of zero,
                     // which is following exactly.
-                    let held = self.latches.get(state as usize).copied().unwrap_or(0.0);
+                    let held = self
+                        .latches
+                        .get(state as usize)
+                        .map(|latch| latch.value)
+                        .unwrap_or(0.0);
                     let held = if held.is_finite() { held } else { 0.0 };
                     let time = if level > held { attack } else { release };
                     let value = if time > 0.0 && dt > 0.0 {
@@ -189,7 +193,11 @@ impl Engine {
                     } else {
                         level
                     };
-                    if let Some(latch) = self.latches.get_mut(state as usize) {
+                    if let Some(latch) = self
+                        .latches
+                        .get_mut(state as usize)
+                        .map(|latch| &mut latch.value)
+                    {
                         *latch = value;
                     }
                     self.registers[out as usize] = value;
@@ -222,7 +230,11 @@ impl Engine {
                     // The latch is not read back — the tables above already
                     // survive a program swap — but keeping the value in it
                     // means the editor can show what the node is reading.
-                    if let Some(latch) = self.latches.get_mut(state as usize) {
+                    if let Some(latch) = self
+                        .latches
+                        .get_mut(state as usize)
+                        .map(|latch| &mut latch.value)
+                    {
                         *latch = self.registers[out as usize];
                     }
                 }
@@ -234,7 +246,10 @@ impl Engine {
                 } => {
                     if self.struck(buf, key)
                         && count > 0
-                        && let Some(latch) = self.latches.get_mut(state as usize)
+                        && let Some(latch) = self
+                            .latches
+                            .get_mut(state as usize)
+                            .map(|latch| &mut latch.value)
                     {
                         let at = if latch.is_nan() { 0.0 } else { *latch };
                         *latch = (at + 1.0).rem_euclid(f64::from(count));
@@ -247,7 +262,10 @@ impl Engine {
                     value,
                 } => {
                     if self.struck(buf, key)
-                        && let Some(latch) = self.latches.get_mut(state as usize)
+                        && let Some(latch) = self
+                            .latches
+                            .get_mut(state as usize)
+                            .map(|latch| &mut latch.value)
                     {
                         *latch = value;
                     }
@@ -261,7 +279,7 @@ impl Engine {
                     let at = self
                         .latches
                         .get(state as usize)
-                        .copied()
+                        .map(|latch| latch.value)
                         .unwrap_or(f64::NAN);
                     let at = if at.is_nan() { initial } else { at };
                     self.registers[out as usize] = f64::from(at == value);
@@ -293,7 +311,7 @@ impl Engine {
                             }) if number == cc && (channel < 0 || channel == on) => Some(value),
                             _ => None,
                         });
-                    let held = &mut self.latches[state as usize];
+                    let held = &mut self.latches[state as usize].value;
                     if let Some(value) = latest {
                         *held = value;
                     }
@@ -307,7 +325,7 @@ impl Engine {
                     let value = self
                         .latches
                         .get(state as usize)
-                        .copied()
+                        .map(|latch| latch.value)
                         .unwrap_or(f64::NAN);
                     self.registers[out as usize] = if value.is_nan() { initial } else { value };
                 }
