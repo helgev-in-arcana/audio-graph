@@ -266,3 +266,35 @@ fn view_retains_its_native_owner() {
     assert_eq!(unsafe { depth() }, 0);
     assert_eq!(unsafe { exit_views() }, 0);
 }
+
+/// A stepped VST3 parameter's plain value is its step, whatever the plugin calls plain.
+///
+/// The fixture's Mode declares four choices and, like the SDK's base
+/// `Parameter`, calls the normalized value plain. Declaring its range as
+/// steps while converting through the plugin's plain would turn step 2 into a
+/// normalized 2, past the last choice.
+#[test]
+fn a_stepped_parameter_is_set_and_read_by_its_step() {
+    let _thread = vst3_host::init_apartment().unwrap();
+    use plugin_host_api::*;
+    let _lock = fixture();
+    let module = Module::open(fixture_path()).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    let mode = plugin
+        .params()
+        .iter()
+        .find(|p| p.id == ParamId(1))
+        .expect("the fixture declares Mode")
+        .clone();
+    assert!(mode.flags.contains(ParamFlags::STEPPED));
+    assert_eq!((mode.min, mode.max, mode.default), (0.0, 3.0, 0.0));
+
+    // The fixture displays the normalized value it is handed.
+    let two_thirds = (2.0f64 / 3.0).to_string();
+    assert_eq!(plugin.param_to_text(ParamId(1), 2.0), Some(two_thirds));
+    plugin.set_param(ParamId(1), 2.0).unwrap();
+    plugin.tick();
+    assert_eq!(plugin.snapshot().get(ParamId(1)), Some(2.0));
+    assert_eq!(plugin.param_from_text(ParamId(1), "1"), Some(3.0));
+}

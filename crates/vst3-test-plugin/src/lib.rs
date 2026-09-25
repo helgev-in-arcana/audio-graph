@@ -343,6 +343,8 @@ impl IProcessContextRequirementsTrait for GainProcessor {
 
 struct GainController {
     gain: Cell<f64>,
+    /// The normalized value of the stepped "Mode" parameter (id 1).
+    mode: Cell<f64>,
 }
 
 impl Class for GainController {
@@ -355,6 +357,7 @@ impl GainController {
     fn new() -> GainController {
         GainController {
             gain: Cell::new(1.0),
+            mode: Cell::new(0.0),
         }
     }
 }
@@ -391,7 +394,7 @@ impl IEditControllerTrait for GainController {
     }
 
     unsafe fn getParameterCount(&self) -> i32 {
-        1
+        2
     }
 
     unsafe fn getParameterInfo(&self, param_index: i32, info: *mut ParameterInfo) -> tresult {
@@ -410,6 +413,23 @@ impl IEditControllerTrait for GainController {
 
                 kResultOk
             }
+            // Four choices, declared the way the SDK's base `Parameter` does
+            // it: a step count, and a plain value that is the normalized one
+            // (see `normalizedParamToPlain`).
+            1 => {
+                let info = &mut *info;
+
+                info.id = 1;
+                copy_wstring("Mode", &mut info.title);
+                copy_wstring("Mode", &mut info.shortTitle);
+                copy_wstring("", &mut info.units);
+                info.stepCount = 3;
+                info.defaultNormalizedValue = 0.0;
+                info.unitId = 0;
+                info.flags = ParameterInfo_::ParameterFlags_::kCanAutomate as i32;
+
+                kResultOk
+            }
             _ => kInvalidArgument,
         }
     }
@@ -423,7 +443,8 @@ impl IEditControllerTrait for GainController {
         let slice = unsafe { &mut *string };
 
         match id {
-            0 => {
+            // The normalized value itself, so a test can see what it was handed.
+            0 | 1 => {
                 let display = value_normalized.to_string();
                 copy_wstring(&display, slice);
                 kResultOk
@@ -439,7 +460,8 @@ impl IEditControllerTrait for GainController {
         value_normalized: *mut f64,
     ) -> tresult {
         match id {
-            0 => {
+            // The text is the normalized value, as `getParamStringByValue` writes it.
+            0 | 1 => {
                 let len = len_wstring(string as *const TChar);
                 if let Ok(string) =
                     String::from_utf16(slice::from_raw_parts(string as *const u16, len))
@@ -457,6 +479,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn normalizedParamToPlain(&self, id: u32, value_normalized: f64) -> f64 {
         match id {
             0 => value_normalized * f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
+            1 => value_normalized,
             _ => 0.0,
         }
     }
@@ -464,6 +487,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn plainParamToNormalized(&self, id: u32, plain_value: f64) -> f64 {
         match id {
             0 => plain_value / f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
+            1 => plain_value,
             _ => 0.0,
         }
     }
@@ -471,6 +495,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
         match id {
             0 => self.gain.get(),
+            1 => self.mode.get(),
             _ => 0.0,
         }
     }
@@ -479,6 +504,10 @@ impl IEditControllerTrait for GainController {
         match id {
             0 => {
                 self.gain.set(value);
+                kResultOk
+            }
+            1 => {
+                self.mode.set(value);
                 kResultOk
             }
             _ => kInvalidArgument,

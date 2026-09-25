@@ -10,7 +10,29 @@
 //! and stepped parameters use closed-form conversions, while non-linear curves
 //! use a sampled lookup table.
 
-use plugin_host_api::{ParamId, ParamInfo};
+use plugin_host_api::{ParamFlags, ParamId, ParamInfo};
+
+/// A discrete parameter's normalized value for `step`, by VST3's own formula.
+///
+/// The steps are a stepped parameter's plain values. Deliberately not the
+/// plugin's `plainParamToNormalized`: what a plugin calls plain for a stepped
+/// parameter varies (the SDK's base `Parameter` and JUCE call the normalized
+/// value plain), while this formula is the format's and every plugin rounds
+/// its result to the same step.
+pub fn step_to_normalized(step: f64, steps: f64) -> f64 {
+    if steps <= 0.0 {
+        return 0.0;
+    }
+    step.round().clamp(0.0, steps) / steps
+}
+
+/// The step a normalized value selects, by VST3's own formula; see
+/// [`step_to_normalized`].
+pub fn normalized_to_step(normalized: f64, steps: f64) -> f64 {
+    (normalized.clamp(0.0, 1.0) * (steps + 1.0))
+        .floor()
+        .min(steps)
+}
 
 /// How many samples define a non-linear curve. 257 points gives a worst-case
 /// interpolation error well below what a 16-bit control surface can express,
@@ -31,6 +53,8 @@ enum Curve {
     Sampled(Box<[f64; TABLE_SIZE]>),
     /// Range is degenerate; every plain value maps to 0.
     Constant(f64),
+    /// A discrete parameter, whose plain values are its steps `0..=steps`.
+    Stepped(f64),
 }
 
 struct Entry {
@@ -81,6 +105,7 @@ impl ParamMap {
         let entry = self.entry(id)?;
         Some(match &entry.curve {
             Curve::Constant(_) => 0.0,
+            Curve::Stepped(steps) => step_to_normalized(plain, *steps),
             Curve::Linear { min, span } => ((plain - min) / span).clamp(0.0, 1.0),
             Curve::Sampled(table) => invert_table(table, plain),
         })
@@ -93,6 +118,7 @@ impl ParamMap {
         }
         Some(match &entry.curve {
             Curve::Constant(value) => *value,
+            Curve::Stepped(steps) => normalized_to_step(n, *steps),
             Curve::Linear { min, span } => min + n * span,
             Curve::Sampled(table) => {
                 let position = n * (TABLE_SIZE - 1) as f64;
@@ -104,6 +130,9 @@ impl ParamMap {
 }
 
 fn build_curve(param: &ParamInfo, sample: &mut impl FnMut(ParamId, f64) -> f64) -> Curve {
+    if param.flags.contains(ParamFlags::STEPPED) {
+        return Curve::Stepped(param.max);
+    }
     let min = sample(param.id, 0.0);
     let max = sample(param.id, 1.0);
     let span = max - min;
@@ -257,6 +286,23 @@ mod tests {
             assert_eq!(map.denormalize(ParamId(id), 1.0), Some(f64::from(id)));
         }
         assert_eq!(map.normalize(ParamId(3), 1.0), None);
+    }
+
+    /// Steps convert by the format's formula, whatever the plugin's own plain curve says.
+    #[test]
+    fn stepped_parameters_convert_by_their_steps() {
+        let mut mode = info(6, 0.0, 3.0);
+        mode.flags = ParamFlags::STEPPED;
+        // The plugin calls the normalized value plain, as the SDK's base
+        // `Parameter` does; the map must not follow it.
+        let map = ParamMap::build(&[mode], |_, n| n);
+        for step in 0..=3 {
+            let n = map.normalize(ParamId(6), f64::from(step)).unwrap();
+            assert_eq!(n, f64::from(step) / 3.0);
+            assert_eq!(map.denormalize(ParamId(6), n), Some(f64::from(step)));
+        }
+        assert_eq!(map.normalize(ParamId(6), 9.0), Some(1.0));
+        assert_eq!(map.denormalize(ParamId(6), 0.49), Some(1.0));
     }
 
     #[test]
