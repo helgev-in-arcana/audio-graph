@@ -603,6 +603,17 @@ impl Default for TimeContext {
 mod tests {
     use super::*;
 
+    /// A gesture keeps its own time and is rebased like every other event.
+    #[test]
+    fn gestures_carry_and_move_their_time() {
+        let end = ParamEvent::GestureEnd {
+            id: ParamId(3),
+            sample_offset: 40,
+        };
+        assert_eq!(Event::Param(end).sample_offset(), 40);
+        assert_eq!(Event::Param(end).at_offset(8).sample_offset(), 8);
+    }
+
     #[test]
     fn midi_classification_round_trips() {
         let cases: [[u8; 3]; 6] = [
@@ -618,17 +629,6 @@ mod tests {
             assert_eq!(event.sample_offset(), 7, "{data:02x?}");
             assert_eq!(event.to_midi(), Some(data), "{data:02x?}");
         }
-    }
-
-    /// A gesture keeps its own time and is rebased like every other event.
-    #[test]
-    fn gestures_carry_and_move_their_time() {
-        let end = ParamEvent::GestureEnd {
-            id: ParamId(3),
-            sample_offset: 40,
-        };
-        assert_eq!(Event::Param(end).sample_offset(), 40);
-        assert_eq!(Event::Param(end).at_offset(8).sample_offset(), 8);
     }
 
     #[test]
