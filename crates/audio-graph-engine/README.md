@@ -47,12 +47,13 @@ The crate is split along the one line that matters, the thread boundary:
 
 ### The thread boundary is a module boundary
 
-What reaches the audio side is a `PreparedProgram` and nothing else. `engine.rs` must
-not mention `graph` or a node kind outside of its own tests.
+What reaches the audio side is a `PreparedProgram` and nothing else. The
+`engine` module must not mention `graph` or a node kind outside of its tests,
+which live in `engine/tests.rs`.
 
-**A `use crate::graph::…` appearing above the `#[cfg(test)]` line in `engine.rs`
-is the signal that something has leaked across.** That is the cheapest way to
-check the invariant by eye, and it is worth checking in review.
+**A `use crate::graph::…` in any other file under `engine/` is the signal that
+something has leaked across.** That is the cheapest way to check the invariant
+by eye, and it is worth checking in review.
 
 ### The audio side allocates nothing
 
