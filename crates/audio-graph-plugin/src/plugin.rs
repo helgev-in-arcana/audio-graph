@@ -99,6 +99,14 @@ impl Default for Wrapper {
     }
 }
 
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        // The ticker first, so no tick lands in the middle of the teardown.
+        self.ticker = None;
+        self.shared.shut_down();
+    }
+}
+
 impl Wrapper {
     pub fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
