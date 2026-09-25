@@ -122,7 +122,7 @@ impl Vst3Plugin {
                 }
             });
             for (id, normalized) in self.instance.get()._handler.take_edits() {
-                let plain = unsafe { controller.normalizedParamToPlain(id.0, normalized) };
+                let plain = self.to_plain(controller, id, normalized);
                 self.context.param_edited(id, plain);
             }
         }
@@ -513,6 +513,33 @@ impl Vst3Plugin {
         found
     }
 
+    /// A stepped parameter's step count, which is also its largest plain
+    /// value; `None` for a continuous one. See [`crate::param_map::step_to_normalized`].
+    fn steps(&self, id: ParamId) -> Option<f64> {
+        self.params
+            .iter()
+            .find(|p| p.id == id)
+            .filter(|p| p.flags.contains(ParamFlags::STEPPED))
+            .map(|p| p.max)
+    }
+
+    /// Plain to normalized: by the format's formula for a stepped parameter,
+    /// by the plugin's own curve otherwise.
+    fn to_normalized(&self, ctrl: &ComPtr<IEditController>, id: ParamId, plain: f64) -> f64 {
+        match self.steps(id) {
+            Some(steps) => crate::param_map::step_to_normalized(plain, steps),
+            None => unsafe { ctrl.plainParamToNormalized(id.0, plain) },
+        }
+    }
+
+    /// The inverse of [`Vst3Plugin::to_normalized`].
+    fn to_plain(&self, ctrl: &ComPtr<IEditController>, id: ParamId, normalized: f64) -> f64 {
+        match self.steps(id) {
+            Some(steps) => crate::param_map::normalized_to_step(normalized, steps),
+            None => unsafe { ctrl.normalizedParamToPlain(id.0, normalized) },
+        }
+    }
+
     fn controller(&self) -> Result<&ComPtr<IEditController>> {
         self.instance
             .get()
@@ -605,7 +632,7 @@ impl SubPluginMain for Vst3Plugin {
                     let normalized = unsafe { ctrl.getParamNormalized(p.id.0) };
                     ApiParamValue {
                         id: p.id,
-                        plain: unsafe { ctrl.normalizedParamToPlain(p.id.0, normalized) },
+                        plain: self.to_plain(ctrl, p.id, normalized),
                     }
                 })
                 .collect(),
@@ -614,7 +641,7 @@ impl SubPluginMain for Vst3Plugin {
 
     fn param_to_text(&self, id: ParamId, plain: f64) -> Option<String> {
         let ctrl = self.controller().ok()?;
-        let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        let normalized = self.to_normalized(ctrl, id, plain);
         let mut buf: String128 = [0; 128];
         (unsafe { ctrl.getParamStringByValue(id.0, normalized, &mut buf) } == kResultOk)
             .then(|| from_char16(&buf))
@@ -627,7 +654,7 @@ impl SubPluginMain for Vst3Plugin {
         let mut normalized = 0.0;
         (unsafe { ctrl.getParamValueByString(id.0, buf.as_mut_ptr(), &mut normalized) }
             == kResultOk)
-            .then(|| unsafe { ctrl.normalizedParamToPlain(id.0, normalized) })
+            .then(|| self.to_plain(ctrl, id, normalized))
     }
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
@@ -635,7 +662,7 @@ impl SubPluginMain for Vst3Plugin {
             return Err(HostError::InvalidState("no such parameter".into()));
         }
         let ctrl = self.controller()?;
-        let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
+        let normalized = self.to_normalized(ctrl, id, plain);
         if !self.instance.get()._handler.queue_edit(id, normalized) {
             return Err(HostError::InvalidState(
                 "parameter queue unavailable".into(),
@@ -1294,8 +1321,13 @@ fn read_params(controller: &ComPtr<IEditController>) -> Result<Vec<ParamInfo>> {
             module: from_char16(&raw.units),
             min,
             max,
-            default: unsafe {
-                controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue)
+            default: if stepped {
+                crate::param_map::normalized_to_step(
+                    raw.defaultNormalizedValue,
+                    raw.stepCount as f64,
+                )
+            } else {
+                unsafe { controller.normalizedParamToPlain(raw.id, raw.defaultNormalizedValue) }
             },
             flags,
         });
