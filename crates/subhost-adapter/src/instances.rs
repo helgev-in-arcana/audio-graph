@@ -64,11 +64,12 @@ impl AudioChunk {
 /// about the plugin format crosses back.
 pub trait AudioInstances {
     /// Whether an input port supplies explicit voice completion events.
-    /// Implementations providing completion themselves can keep this default;
-    /// hosts of formats without it must report false for the affected ports.
-    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
-        true
-    }
+    ///
+    /// No default: answering `true` for a port that never reports completion
+    /// leaves its notes waiting for an end that never comes, and answering
+    /// `false` for one that does throws its reports away. Only the
+    /// implementation knows which it is.
+    fn reports_note_end(&self, instance: u32, port: i16) -> bool;
 
     /// Processes audio and events for the specified sub-plugin instance.
     ///
