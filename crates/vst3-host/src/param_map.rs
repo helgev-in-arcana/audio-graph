@@ -40,6 +40,8 @@ struct Entry {
 
 /// Plain→normalised conversion for one plugin's whole parameter list.
 pub struct ParamMap {
+    /// Sorted by id. Looked up once per parameter event on the audio thread,
+    /// and a plugin may declare thousands of parameters.
     entries: Vec<Entry>,
 }
 
@@ -49,14 +51,20 @@ impl ParamMap {
     ///
     /// Called on the main thread during activate.
     pub fn build(params: &[ParamInfo], mut sample: impl FnMut(ParamId, f64) -> f64) -> ParamMap {
-        let entries = params
+        let mut entries: Vec<Entry> = params
             .iter()
             .map(|p| Entry {
                 id: p.id,
                 curve: build_curve(p, &mut sample),
             })
             .collect();
+        entries.sort_unstable_by_key(|e| e.id);
         ParamMap { entries }
+    }
+
+    fn entry(&self, id: ParamId) -> Option<&Entry> {
+        let index = self.entries.binary_search_by_key(&id, |e| e.id).ok()?;
+        Some(&self.entries[index])
     }
 
     /// Convert a plain value to normalised. Audio-thread safe.
@@ -65,7 +73,7 @@ impl ParamMap {
     /// normalised value to a parameter that is not there would be a silent
     /// wrong answer.
     pub fn normalize(&self, id: ParamId, plain: f64) -> Option<f64> {
-        let entry = self.entries.iter().find(|e| e.id == id)?;
+        let entry = self.entry(id)?;
         Some(match &entry.curve {
             Curve::Constant(_) => 0.0,
             Curve::Linear { min, span } => ((plain - min) / span).clamp(0.0, 1.0),
@@ -73,7 +81,7 @@ impl ParamMap {
         })
     }
     pub fn denormalize(&self, id: ParamId, normalized: f64) -> Option<f64> {
-        let entry = self.entries.iter().find(|e| e.id == id)?;
+        let entry = self.entry(id)?;
         let n = normalized.clamp(0.0, 1.0);
         if !n.is_finite() {
             return None;
@@ -232,6 +240,18 @@ mod tests {
         let map = ParamMap::build(&params, |_, _| 1.0);
         assert_eq!(map.normalize(ParamId(5), 1.0), Some(0.0));
         assert_eq!(map.denormalize(ParamId(5), 0.5), Some(1.0));
+    }
+
+    /// Lookup does not depend on the order the plugin declared its parameters in.
+    #[test]
+    fn parameters_declared_out_of_order_are_found() {
+        let params = [info(9, 0.0, 9.0), info(2, 0.0, 2.0), info(5, 0.0, 5.0)];
+        let map = ParamMap::build(&params, |id, n| n * f64::from(id.0));
+        for id in [9, 2, 5] {
+            assert_eq!(map.normalize(ParamId(id), f64::from(id)), Some(1.0));
+            assert_eq!(map.denormalize(ParamId(id), 1.0), Some(f64::from(id)));
+        }
+        assert_eq!(map.normalize(ParamId(3), 1.0), None);
     }
 
     #[test]
