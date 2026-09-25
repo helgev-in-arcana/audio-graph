@@ -4,7 +4,19 @@
 //! themselves when there are none, so `cargo test` stays green on a bare CI
 //! box while still doing real work on a developer machine.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use vst3_host::{Module, default_plugin_directories, find_modules};
+
+/// Serialises the tests that open installed modules.
+///
+/// A module belongs to one thread at a time, and the harness runs each test on
+/// a thread of its own: two tests opening the same module at once would see
+/// `ModuleBusy`, which is the host working as designed rather than a failure.
+fn installed() -> MutexGuard<'static, ()> {
+    static INSTALLED: Mutex<()> = Mutex::new(());
+    INSTALLED.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn installed_modules() -> Vec<std::path::PathBuf> {
     default_plugin_directories()
@@ -15,6 +27,7 @@ fn installed_modules() -> Vec<std::path::PathBuf> {
 
 #[test]
 fn every_installed_module_loads_and_enumerates() {
+    let _installed = installed();
     let _thread = vst3_host::init_apartment().unwrap();
     let modules = installed_modules();
     if modules.is_empty() {
@@ -62,6 +75,7 @@ fn every_installed_module_loads_and_enumerates() {
 
 #[test]
 fn repeated_load_unload_is_stable() {
+    let _installed = installed();
     let _thread = vst3_host::init_apartment().unwrap();
     let Some(path) = installed_modules().into_iter().next() else {
         eprintln!("no VST3 plugins installed; skipping");
