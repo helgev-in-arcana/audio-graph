@@ -459,6 +459,10 @@ fn note_plugin(graph: &mut Graph, instance: usize) -> NodeId {
 struct Heard(std::collections::BTreeMap<u32, Vec<Event>>);
 
 impl AudioInstances for Heard {
+    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         instance: u32,
@@ -1760,6 +1764,10 @@ fn a_controller_holds_its_position() {
 struct Adders;
 
 impl AudioInstances for Adders {
+    fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+        true
+    }
+
     fn process(
         &mut self,
         instance: u32,
@@ -3371,6 +3379,10 @@ fn a_plugin_called_for_a_sub_block_is_handed_that_sub_block() {
         heard: Vec<Vec<f32>>,
     }
     impl AudioInstances for Records {
+        fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+            true
+        }
+
         fn process(
             &mut self,
             _instance: u32,
@@ -3458,6 +3470,10 @@ fn a_plugin_called_for_a_sub_block_is_handed_that_sub_block() {
 fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
     struct Counting(usize);
     impl AudioInstances for Counting {
+        fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+            true
+        }
+
         fn process(
             &mut self,
             _instance: u32,

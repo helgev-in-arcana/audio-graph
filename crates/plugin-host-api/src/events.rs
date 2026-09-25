@@ -33,6 +33,19 @@ pub enum ParamEvent {
         value: f64,
         sample_offset: u32,
     },
+    /// Set the parameter to `value` in its normalized `0.0..=1.0` range.
+    ///
+    /// What a DAW's automation lane holds. The backend maps it the way the
+    /// format itself does, VST3 through the plugin's own normalized value and
+    /// CLAP linearly across the declared range, so a value driven through a
+    /// wrapper lands where the same automation would land on the plugin
+    /// directly, taper and steps included.
+    SetNormalized {
+        id: ParamId,
+        target: Target,
+        value: f64,
+        sample_offset: u32,
+    },
     /// Add `amount` (plain units) on top of the parameter's own value.
     Modulate {
         id: ParamId,
@@ -56,6 +69,7 @@ impl ParamEvent {
     pub fn id(&self) -> ParamId {
         match *self {
             ParamEvent::SetValue { id, .. }
+            | ParamEvent::SetNormalized { id, .. }
             | ParamEvent::Modulate { id, .. }
             | ParamEvent::GestureBegin { id, .. }
             | ParamEvent::GestureEnd { id, .. } => id,
@@ -65,6 +79,7 @@ impl ParamEvent {
     pub fn sample_offset(&self) -> u32 {
         match *self {
             ParamEvent::SetValue { sample_offset, .. }
+            | ParamEvent::SetNormalized { sample_offset, .. }
             | ParamEvent::Modulate { sample_offset, .. }
             | ParamEvent::GestureBegin { sample_offset, .. }
             | ParamEvent::GestureEnd { sample_offset, .. } => sample_offset,
@@ -74,6 +89,7 @@ impl ParamEvent {
     /// Returns a copy of the event with its sample offset updated to `offset`.
     pub fn at_offset(mut self, offset: u32) -> ParamEvent {
         let (ParamEvent::SetValue { sample_offset, .. }
+        | ParamEvent::SetNormalized { sample_offset, .. }
         | ParamEvent::Modulate { sample_offset, .. }
         | ParamEvent::GestureBegin { sample_offset, .. }
         | ParamEvent::GestureEnd { sample_offset, .. }) = &mut self;

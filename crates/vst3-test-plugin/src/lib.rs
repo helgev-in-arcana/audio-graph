@@ -302,7 +302,7 @@ impl IAudioProcessorTrait for GainProcessor {
         let input_buses =
             slice::from_raw_parts(process_data.inputs, process_data.numInputs as usize);
         let output_buses =
-            slice::from_raw_parts(process_data.outputs, process_data.numOutputs as usize);
+            slice::from_raw_parts_mut(process_data.outputs, process_data.numOutputs as usize);
 
         if input_buses[0].numChannels != 2 || output_buses[0].numChannels != 2 {
             return kResultOk;
@@ -326,6 +326,9 @@ impl IAudioProcessorTrait for GainProcessor {
             output_l[i] = gain * input_l[i];
             output_r[i] = gain * input_r[i];
         }
+        if AUDIT_SILENT.load(Ordering::SeqCst) {
+            output_buses[0].silenceFlags = 0b11;
+        }
 
         kResultOk
     }
@@ -343,6 +346,8 @@ impl IProcessContextRequirementsTrait for GainProcessor {
 
 struct GainController {
     gain: Cell<f64>,
+    /// The normalized value of the stepped "Mode" parameter (id 1).
+    mode: Cell<f64>,
 }
 
 impl Class for GainController {
@@ -355,6 +360,7 @@ impl GainController {
     fn new() -> GainController {
         GainController {
             gain: Cell::new(1.0),
+            mode: Cell::new(0.0),
         }
     }
 }
@@ -391,7 +397,7 @@ impl IEditControllerTrait for GainController {
     }
 
     unsafe fn getParameterCount(&self) -> i32 {
-        1
+        2
     }
 
     unsafe fn getParameterInfo(&self, param_index: i32, info: *mut ParameterInfo) -> tresult {
@@ -410,6 +416,23 @@ impl IEditControllerTrait for GainController {
 
                 kResultOk
             }
+            // Four choices, declared the way the SDK's base `Parameter` does
+            // it: a step count, and a plain value that is the normalized one
+            // (see `normalizedParamToPlain`).
+            1 => {
+                let info = &mut *info;
+
+                info.id = 1;
+                copy_wstring("Mode", &mut info.title);
+                copy_wstring("Mode", &mut info.shortTitle);
+                copy_wstring("", &mut info.units);
+                info.stepCount = 3;
+                info.defaultNormalizedValue = 0.0;
+                info.unitId = 0;
+                info.flags = ParameterInfo_::ParameterFlags_::kCanAutomate as i32;
+
+                kResultOk
+            }
             _ => kInvalidArgument,
         }
     }
@@ -423,7 +446,8 @@ impl IEditControllerTrait for GainController {
         let slice = unsafe { &mut *string };
 
         match id {
-            0 => {
+            // The normalized value itself, so a test can see what it was handed.
+            0 | 1 => {
                 let display = value_normalized.to_string();
                 copy_wstring(&display, slice);
                 kResultOk
@@ -439,7 +463,8 @@ impl IEditControllerTrait for GainController {
         value_normalized: *mut f64,
     ) -> tresult {
         match id {
-            0 => {
+            // The text is the normalized value, as `getParamStringByValue` writes it.
+            0 | 1 => {
                 let len = len_wstring(string as *const TChar);
                 if let Ok(string) =
                     String::from_utf16(slice::from_raw_parts(string as *const u16, len))
@@ -457,6 +482,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn normalizedParamToPlain(&self, id: u32, value_normalized: f64) -> f64 {
         match id {
             0 => value_normalized * f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
+            1 => value_normalized,
             _ => 0.0,
         }
     }
@@ -464,6 +490,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn plainParamToNormalized(&self, id: u32, plain_value: f64) -> f64 {
         match id {
             0 => plain_value / f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
+            1 => plain_value,
             _ => 0.0,
         }
     }
@@ -471,6 +498,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
         match id {
             0 => self.gain.get(),
+            1 => self.mode.get(),
             _ => 0.0,
         }
     }
@@ -479,6 +507,10 @@ impl IEditControllerTrait for GainController {
         match id {
             0 => {
                 self.gain.set(value);
+                kResultOk
+            }
+            1 => {
+                self.mode.set(value);
                 kResultOk
             }
             _ => kInvalidArgument,
@@ -661,6 +693,12 @@ pub extern "C" fn audit_vst_gui_edit(value: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn audit_vst_emit() {
     AUDIT_EMIT.store(true, Ordering::SeqCst);
+}
+/// Mark both main output channels silent in every block while set.
+static AUDIT_SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_silent(on: bool) {
+    AUDIT_SILENT.store(on, Ordering::SeqCst);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn audit_vst_depth() -> u32 {

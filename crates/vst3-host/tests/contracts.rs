@@ -266,3 +266,71 @@ fn view_retains_its_native_owner() {
     assert_eq!(unsafe { depth() }, 0);
     assert_eq!(unsafe { exit_views() }, 0);
 }
+
+/// A silent VST3 block is only that block: it is not reported as the sleep a `Silent` status promises.
+///
+/// VST3 silence flags describe one block's output and say nothing about the
+/// next, where a delay's echo may still arrive without any new input.
+#[test]
+fn silence_flags_do_not_claim_lasting_silence() {
+    let _thread = vst3_host::init_apartment().unwrap();
+    use plugin_host_api::*;
+    let _lock = fixture();
+    let path = fixture_path();
+    let observer = unsafe { libloading::Library::new(&path) }.unwrap();
+    let silent =
+        unsafe { observer.get::<unsafe extern "C" fn(bool)>(b"audit_vst_silent") }.unwrap();
+    struct Silenced<'a>(libloading::Symbol<'a, unsafe extern "C" fn(bool)>);
+    impl Drop for Silenced<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.0)(false) };
+        }
+    }
+    unsafe { silent(true) };
+    let _silenced = Silenced(silent);
+
+    let module = Module::open(&path).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    let mut processor = plugin.activate(AudioConfig::default()).unwrap();
+    let input = [0.0; 8];
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    let mut sink = EventSink::with_capacity(8);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+}
+
+/// A stepped VST3 parameter's plain value is its step, whatever the plugin calls plain.
+///
+/// The fixture's Mode declares four choices and, like the SDK's base
+/// `Parameter`, calls the normalized value plain. Declaring its range as
+/// steps while converting through the plugin's plain would turn step 2 into a
+/// normalized 2, past the last choice.
+#[test]
+fn a_stepped_parameter_is_set_and_read_by_its_step() {
+    let _thread = vst3_host::init_apartment().unwrap();
+    use plugin_host_api::*;
+    let _lock = fixture();
+    let module = Module::open(fixture_path()).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    let mode = plugin
+        .params()
+        .iter()
+        .find(|p| p.id == ParamId(1))
+        .expect("the fixture declares Mode")
+        .clone();
+    assert!(mode.flags.contains(ParamFlags::STEPPED));
+    assert_eq!((mode.min, mode.max, mode.default), (0.0, 3.0, 0.0));
+
+    // The fixture displays the normalized value it is handed.
+    let two_thirds = (2.0f64 / 3.0).to_string();
+    assert_eq!(plugin.param_to_text(ParamId(1), 2.0), Some(two_thirds));
+    plugin.set_param(ParamId(1), 2.0).unwrap();
+    plugin.tick();
+    assert_eq!(plugin.snapshot().get(ParamId(1)), Some(2.0));
+    assert_eq!(plugin.param_from_text(ParamId(1), "1"), Some(3.0));
+}

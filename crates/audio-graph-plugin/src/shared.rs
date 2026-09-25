@@ -925,6 +925,30 @@ impl Shared {
         self.publish(true)
     }
 
+    /// Destroy every hosted child now, on the thread that owns them.
+    ///
+    /// Called when the plugin instance is destroyed, which both formats do on
+    /// the main thread. The editor and the task executor also hold this state,
+    /// and whichever of them lets go last may be another thread, where the
+    /// children could only be marked for an owner that will never pump again.
+    /// Their host callbacks point into this module's code, so they must not
+    /// outlive it.
+    pub fn shut_down(&self) {
+        if !self.on_main_thread() {
+            log::warn!(
+                "audio-graph: the plugin was destroyed off its main thread;                  its sub-plugins cannot be torn down"
+            );
+            return;
+        }
+        let processor = self.audio().processor.take();
+        drop(processor);
+        if let Some(mut main) = self.try_main() {
+            main.host.unload_all();
+            main.config = None;
+        }
+        plugin_host::reclaim_main_thread();
+    }
+
     fn suspend(&self) {
         self.main().rebind_required = true;
         let processor = {

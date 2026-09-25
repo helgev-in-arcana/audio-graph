@@ -40,15 +40,27 @@ than normalised to `0..1`. Normalising in the core would bake VST3's poverty in:
 CLAP's stepped and enum semantics do not survive that round trip. Backends
 normalise on the way out instead.
 
+A value that is already normalized, the way a DAW's automation lane holds it,
+travels as `SetNormalized` rather than being turned into a plain value first.
+Only the backend knows how its format normalizes: VST3 through the plugin's own
+curve, CLAP linearly across the declared range. Mapping it anywhere else would
+lose the plugin's taper and steps.
+
 Where a format genuinely has nothing to offer, the answer is `None`, never a
 guess — `VoiceInfo` comes from CLAP's `voice-info` and a VST3 sub-plugin reports
 `None`.
 
 ### Nothing that cannot cross a process boundary appears in a public signature
 
-No `ComPtr`, no raw pointers, no references or `Arc` in payloads, no callbacks.
-`HostError` is a flat owned enum for the same reason. This is what keeps an
-out-of-process backend a drop-in substitution rather than a rewrite.
+No `ComPtr`, no raw pointers, no references, `Arc`s or callbacks in payloads.
+The host's services reach a backend through one injected trait, `HostContext`,
+which an out-of-process backend forwards as messages. `HostError` is a flat
+owned enum for the same reason, down to the message of `InvalidState`. This is
+what keeps an out-of-process backend a drop-in substitution rather than a
+rewrite.
+
+A borrowed return — `params()`, `host_name()` — is a view of state the calling
+side keeps; an out-of-process backend answers it from its own copy.
 
 Two consequences worth stating outright:
 
@@ -64,6 +76,10 @@ Reads are batched by construction: `params()`, `snapshot()`, `io_layout()` each
 return everything in one round trip, and there is no `param(id)` or per-bus
 accessor anywhere in the API. This is not a convenience — it is what stops the
 boundary from becoming chatty enough that IPC stops being viable.
+
+The one exception is text conversion, `param_to_text` and `param_from_text`. It
+is asked for one value at a time, at the pace a user moves a control, so there
+is nothing to batch.
 
 ### Main-thread and audio-thread surfaces are different traits
 

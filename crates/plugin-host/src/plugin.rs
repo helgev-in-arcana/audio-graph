@@ -291,7 +291,7 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::voice_info(p))
     }
 
-    fn note_dialects(&self) -> Vec<&'static str> {
+    fn note_dialects(&self) -> plugin_host_api::NoteDialects {
         delegate!(self, p => SubPluginMain::note_dialects(p))
     }
 

@@ -534,8 +534,6 @@ impl SubHost {
                 ResolvedTarget {
                     instance: target.instance,
                     id: info.id,
-                    min: info.min,
-                    max: info.max,
                 },
             ));
         }
@@ -853,12 +851,15 @@ impl SubHostProcessor {
                     continue;
                 }
                 self.last_sent[target_index] = normalized;
+                // Normalized, as the lane holds it: the backend maps it the
+                // way the format does, so a slot drives the plugin exactly as
+                // the DAW's own automation of that parameter would.
                 complete &= push(
                     &mut self.scratch,
-                    Event::Param(ParamEvent::SetValue {
+                    Event::Param(ParamEvent::SetNormalized {
                         id: target.id,
                         target: Target::Global,
-                        value: target.to_plain(normalized),
+                        value: normalized,
                         sample_offset: offset,
                     }),
                 );
@@ -1287,13 +1288,15 @@ mod tests {
         );
     }
 
+    /// A slot's value reaches the sub-plugin normalized, as the DAW's automation holds it.
+    ///
+    /// Mapping it to plain units here, linearly, would lose the plugin's own
+    /// taper and steps, which only the backend knows.
     #[test]
-    fn slot_values_reach_the_sub_plugin_in_plain_units() {
+    fn slot_values_reach_the_sub_plugin_normalized() {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(9),
-            min: 20.0,
-            max: 20_000.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
         let mut values = vec![0.0; SLOTS];
@@ -1303,9 +1306,9 @@ mod tests {
         let events = seen.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
         match events[0] {
-            Event::Param(ParamEvent::SetValue { id, value, .. }) => {
+            Event::Param(ParamEvent::SetNormalized { id, value, .. }) => {
                 assert_eq!(id, ParamId(9));
-                assert_eq!(value, 10_010.0);
+                assert_eq!(value, 0.5);
             }
             other => panic!("unexpected event {other:?}"),
         }
@@ -1317,8 +1320,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(1),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
         let values = vec![0.25; SLOTS];
@@ -1344,8 +1345,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(1),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
         let values = vec![0.25; SLOTS];
@@ -1416,8 +1415,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
@@ -1455,8 +1452,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
@@ -1478,8 +1473,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
@@ -1500,8 +1493,6 @@ mod tests {
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
-            min: 0.0,
-            max: 1.0,
         };
         let (mut p, seen) = harness(vec![(0, target)]);
 
@@ -1558,8 +1549,6 @@ mod tests {
                 ResolvedTarget {
                     instance: 0,
                     id: ParamId(42),
-                    min: 0.0,
-                    max: 10.0
                 }
             )]
         );

@@ -1473,6 +1473,10 @@ mod tests {
     struct PassThrough;
 
     impl AudioInstances for PassThrough {
+        fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+            true
+        }
+
         fn process(
             &mut self,
             _instance: u32,
@@ -1501,6 +1505,10 @@ mod tests {
     }
 
     impl AudioInstances for RecordInput {
+        fn reports_note_end(&self, _instance: u32, _port: i16) -> bool {
+            true
+        }
+
         fn process(
             &mut self,
             _instance: u32,
