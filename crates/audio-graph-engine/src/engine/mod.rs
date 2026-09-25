@@ -40,7 +40,7 @@ mod params;
 mod tests;
 
 use audio::Window;
-use lines::{Move, copy_ring, reorder};
+use lines::{AudioLine, Latch, Lfo, ParamLine, Slot, copy_ring, reorder};
 use notes::{NoteState, key_bit};
 
 /// Maximum number of `DelayRead` taps supported in a single program.
@@ -115,30 +115,12 @@ const MAX_BLOCK_EVENTS: usize = 1024;
 pub struct Engine {
     program: Option<Box<PreparedProgram>>,
     registers: Vec<f64>,
-    /// LFO phase, 0..1, per state index of the current program.
-    phases: Vec<f64>,
-    /// Sample-and-hold values, per state index.
-    holds: Vec<f64>,
-    /// Scratch for carrying phases across a program swap. Sized once so the
-    /// swap itself allocates nothing.
-    carry: Vec<(u32, f64, f64)>,
-    /// Which node each phase belongs to, mirrored from the program so the swap
-    /// can match old state to new without touching the old program again.
-    phase_nodes: Vec<u32>,
-    /// One ring per parameter delay line, each `MAX_DELAY_TAPS` sub-blocks long.
-    ///
-    /// A `Vec<Vec<f64>>` rather than one flat buffer specifically so that a
-    /// program swap can reorder the lines by swapping the outer entries, which
-    /// moves pointers instead of 32 kB of samples.
-    rings: Vec<Vec<f64>>,
-    /// Current write head position per parameter delay line.
-    ring_heads: Vec<usize>,
-    /// Which `DelayWrite` node each ring belongs to. Same role as
-    /// `phase_nodes`.
-    ring_nodes: Vec<u32>,
-    /// Scratch for reordering `rings` on a swap, so the swap allocates
-    /// nothing.
-    ring_order: Vec<usize>,
+    /// One per LFO state index of the current program. See [`Slot`] for how
+    /// each follows its node across a program swap, which is what keeps an
+    /// oscillator from restarting every time an unrelated control is dragged.
+    lfos: Vec<Lfo>,
+    /// One per parameter delay line.
+    lines: Vec<ParamLine>,
     /// The audio buffer pool, one `MAX_CHANNELS * max_frames` region per buffer
     /// index. Sized by [`prepare`][Engine::prepare], which is the only place in
     /// this type that allocates.
@@ -176,19 +158,8 @@ pub struct Engine {
     /// by `prepare`, because it is fixed for as long as the DAW keeps us
     /// activated.
     daw_inputs: Vec<u16>,
-    /// One ring per audio delay line, as long as the node asked for.
-    ///
-    /// Allocated on the main thread and carried in on the program, because this
-    /// thread may not allocate and only that side knows both the graph's
-    /// `max_time` and the sample rate. Split per line for the same reason the
-    /// param rings are: a program swap reorders them by moving pointers.
-    audio_rings: Vec<Vec<f32>>,
-    /// Samples per channel in each of those, mirrored so the ops do not have to
-    /// reach into the program for it.
-    audio_ring_len: Vec<usize>,
-    audio_ring_heads: Vec<usize>,
-    audio_ring_nodes: Vec<u32>,
-    audio_ring_order: Vec<usize>,
+    /// One per audio delay line, each ring as long as its node asked for.
+    audio_lines: Vec<AudioLine>,
     /// Where each tap's read pointer stood at the end of the last chunk, in
     /// samples. NaN means "no previous", which is what a fresh program leaves
     /// behind and what makes the first chunk after a swap jump rather than sweep
@@ -197,13 +168,12 @@ pub struct Engine {
     /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
-    /// One value per latch, or NaN for a latch nothing has set yet.
-    latches: Vec<f64>,
-    /// Which node each latch belongs to, so a program swap can carry it over.
-    latch_nodes: Vec<u32>,
-    /// Scratch for that swap, sized once so the swap itself allocates
-    /// nothing.
-    latch_carry: Vec<(u32, f64)>,
+    /// One per latch index of the current program. Carried across a swap so a
+    /// key switch does not forget which way it was thrown.
+    latches: Vec<Latch>,
+    /// Scratch for [`reorder`], as long as the longest of the slot tables, so a
+    /// swap allocates nothing.
+    order: Vec<usize>,
     rng: u32,
 }
 
@@ -218,23 +188,13 @@ impl Engine {
         Engine {
             program: None,
             registers: vec![0.0; MAX_REGISTERS],
-            phases: vec![0.0; MAX_LFOS],
-            holds: vec![0.0; MAX_LFOS],
-            carry: vec![(0, 0.0, 0.0); MAX_LFOS],
-            phase_nodes: vec![u32::MAX; MAX_LFOS],
-            rings: (0..MAX_DELAY_LINES)
-                .map(|_| vec![0.0; MAX_DELAY_TAPS])
-                .collect(),
-            ring_heads: vec![0; MAX_DELAY_LINES],
-            ring_nodes: vec![u32::MAX; MAX_DELAY_LINES],
-            ring_order: vec![0; MAX_DELAY_LINES],
+            lfos: (0..MAX_LFOS).map(|_| Lfo::new()).collect(),
+            lines: (0..MAX_DELAY_LINES).map(|_| ParamLine::new()).collect(),
             // Empty until a program with a delay line in it arrives, and then
             // only as long as that line asked for.
-            audio_rings: (0..MAX_AUDIO_DELAY_LINES).map(|_| Vec::new()).collect(),
-            audio_ring_len: vec![0; MAX_AUDIO_DELAY_LINES],
-            audio_ring_heads: vec![0; MAX_AUDIO_DELAY_LINES],
-            audio_ring_nodes: vec![u32::MAX; MAX_AUDIO_DELAY_LINES],
-            audio_ring_order: vec![0; MAX_AUDIO_DELAY_LINES],
+            audio_lines: (0..MAX_AUDIO_DELAY_LINES)
+                .map(|_| AudioLine::new())
+                .collect(),
             tap_distance: vec![f64::NAN; MAX_AUDIO_TAPS],
             pool: Vec::new(),
             daw_inputs: Vec::new(),
@@ -251,9 +211,14 @@ impl Engine {
             note_rows: 0,
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
-            latches: vec![f64::NAN; MAX_LATCHES],
-            latch_nodes: vec![u32::MAX; MAX_LATCHES],
-            latch_carry: vec![(u32::MAX, f64::NAN); MAX_LATCHES],
+            latches: (0..MAX_LATCHES).map(|_| Latch::new()).collect(),
+            order: vec![
+                0;
+                MAX_LFOS
+                    .max(MAX_LATCHES)
+                    .max(MAX_DELAY_LINES)
+                    .max(MAX_AUDIO_DELAY_LINES)
+            ],
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
             rng: 0x2545_F491,
@@ -285,17 +250,6 @@ impl Engine {
     }
 
     pub(crate) fn adopt_handoff(&mut self, handoff: &Handoff<PreparedProgram>) -> bool {
-        // Remember which node each running phase belongs to *before* the swap;
-        // afterwards the old program is gone.
-        let live = self.phase_nodes.len().min(self.phases.len());
-        for i in 0..live {
-            self.carry[i] = (self.phase_nodes[i], self.phases[i], self.holds[i]);
-        }
-        let carried = self
-            .program
-            .as_ref()
-            .map_or(0, |p| p.lfo_nodes.len().min(MAX_LFOS));
-
         if !handoff.take(&mut self.program) {
             return false;
         }
@@ -314,84 +268,14 @@ impl Engine {
             *marks = remap.map(|from| from.map_or(0, |index| previous[index]));
         }
 
-        for (i, &node) in next.lfo_nodes.iter().take(MAX_LFOS).enumerate() {
-            // Linear over at most MAX_LFOS entries.
-            match self.carry[..carried].iter().find(|&&(id, _, _)| id == node) {
-                Some(&(_, phase, hold)) => {
-                    self.phases[i] = phase;
-                    self.holds[i] = hold;
-                }
-                None => {
-                    self.phases[i] = 0.0;
-                    self.holds[i] = 0.0;
-                }
-            }
-            self.phase_nodes[i] = node;
-        }
-        for i in next.lfo_nodes.len()..MAX_LFOS {
-            self.phase_nodes[i] = u32::MAX;
-        }
-
-        // Latches keep their values across the swap so user switch settings persist.
-        let latched = self
-            .latch_carry
-            .len()
-            .min(self.latch_nodes.len())
-            .min(self.latches.len());
-        for i in 0..latched {
-            self.latch_carry[i] = (self.latch_nodes[i], self.latches[i]);
-        }
-        for (i, &node) in next.latch_nodes.iter().take(MAX_LATCHES).enumerate() {
-            self.latches[i] = self.latch_carry[..latched]
-                .iter()
-                .find(|&&(id, _)| id == node)
-                .map_or(f64::NAN, |&(_, value)| value);
-            self.latch_nodes[i] = node;
-        }
-        for i in next.latch_nodes.len()..MAX_LATCHES {
-            self.latch_nodes[i] = u32::MAX;
-            self.latches[i] = f64::NAN;
-        }
-
-        // Delay line ring buffers retain their contents across program swaps.
-        let (rings, heads) = (&mut self.rings, &mut self.ring_heads);
+        // Everything a node owns follows it to wherever the new program put it.
+        reorder(&mut self.lfos, &mut self.order, &next.lfo_nodes);
+        reorder(&mut self.latches, &mut self.order, &next.latch_nodes);
+        reorder(&mut self.lines, &mut self.order, &next.delay_nodes);
         reorder(
-            &mut self.ring_nodes,
-            &mut self.ring_order,
-            &next.delay_nodes,
-            |step| match step {
-                Move::Swap(a, b) => {
-                    rings.swap(a, b);
-                    heads.swap(a, b);
-                }
-                Move::Clear(i) => {
-                    rings[i].fill(0.0);
-                    heads[i] = 0;
-                }
-            },
-        );
-        // An audio ring's length travels with it: the length decides whether
-        // a ring handed over with the program replaces this one below.
-        let (rings, heads, lens) = (
-            &mut self.audio_rings,
-            &mut self.audio_ring_heads,
-            &mut self.audio_ring_len,
-        );
-        reorder(
-            &mut self.audio_ring_nodes,
-            &mut self.audio_ring_order,
+            &mut self.audio_lines,
+            &mut self.order,
             &next.audio_delay_nodes,
-            |step| match step {
-                Move::Swap(a, b) => {
-                    rings.swap(a, b);
-                    heads.swap(a, b);
-                    lens.swap(a, b);
-                }
-                Move::Clear(i) => {
-                    rings[i].fill(0.0);
-                    heads[i] = 0;
-                }
-            },
         );
         // When ring lengths change, new buffers provided by the main thread are swapped in.
         let next = self
@@ -401,24 +285,19 @@ impl Engine {
             .program_mut();
         for line in 0..next.audio_delay_nodes.len().min(MAX_AUDIO_DELAY_LINES) {
             let len = next.audio_ring_len.get(line).copied().unwrap_or(0);
+            let held = &mut self.audio_lines[line];
             if next.audio_rings.get(line).is_some_and(|r| !r.is_empty()) {
-                std::mem::swap(&mut self.audio_rings[line], &mut next.audio_rings[line]);
+                std::mem::swap(&mut held.ring, &mut next.audio_rings[line]);
                 // Carry over what will still fit, most recent samples last.
                 let from = &next.audio_rings[line];
-                copy_ring(
-                    from,
-                    self.audio_ring_len[line],
-                    &mut self.audio_rings[line],
-                    len,
-                    &mut self.audio_ring_heads[line],
-                );
-                self.audio_ring_len[line] = len;
-            } else if self.audio_ring_len[line] != len {
-                self.audio_ring_len[line] = 0;
+                copy_ring(from, held.len, &mut held.ring, len, &mut held.head);
+                held.len = len;
+            } else if held.len != len {
+                held.len = 0;
             }
         }
         for line in next.audio_delay_nodes.len()..MAX_AUDIO_DELAY_LINES {
-            self.audio_ring_len[line] = 0;
+            self.audio_lines[line].len = 0;
         }
         self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
         true
@@ -466,7 +345,7 @@ impl Engine {
         self.forget_params();
         // A latch nothing has set reads as NaN, which is what a fresh program
         // leaves behind; see `adopt`.
-        self.latches.iter_mut().for_each(|v| *v = f64::NAN);
+        self.latches.iter_mut().for_each(Slot::clear);
         self.forget_audio();
     }
 
@@ -499,10 +378,8 @@ impl Engine {
     /// The parameter half: what a modulator has been carrying between blocks.
     /// Latches are not in it — see the two callers that differ over them.
     fn forget_params(&mut self) {
-        self.phases.iter_mut().for_each(|p| *p = 0.0);
-        self.holds.iter_mut().for_each(|h| *h = 0.0);
-        self.rings.iter_mut().for_each(|r| r.fill(0.0));
-        self.ring_heads.iter_mut().for_each(|h| *h = 0);
+        self.lfos.iter_mut().for_each(Slot::clear);
+        self.lines.iter_mut().for_each(Slot::clear);
     }
 
     /// The audio half: every sample still on its way somewhere.
@@ -518,8 +395,7 @@ impl Engine {
         // Emptied where they stand. An audio delay's ring is sized and
         // allocated on the main thread and rides in on the program, so there
         // is nothing to hand back and nothing to resize.
-        self.audio_rings.iter_mut().for_each(|r| r.fill(0.0));
-        self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
+        self.audio_lines.iter_mut().for_each(Slot::clear);
         // No previous position, so the first chunk after this jumps to where
         // its tap says rather than sweeping from where the old one left off.
         self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
@@ -554,7 +430,7 @@ impl Engine {
             .resize(MAX_COMPENSATORS * MAX_CHANNELS * MAX_COMPENSATION, 0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
         // Audio delay rings are sized and allocated by the main thread via Program::size_rings.
-        self.audio_ring_heads.iter_mut().for_each(|h| *h = 0);
+        self.audio_lines.iter_mut().for_each(|line| line.head = 0);
     }
 
     /// Take in the DAW's note stream for one block.
