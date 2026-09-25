@@ -224,6 +224,33 @@ pub fn load() -> Config {
     seeded
 }
 
+/// Moves a config file that does not parse out of the way of a save.
+///
+/// Reading such a file gives the default rather than re-seeding over it (see
+/// [`read_file`]), but a save would still replace it, and the list the user
+/// kept in it with it. Renamed rather than deleted, with the time in the name so
+/// a second failure does not replace the first one's copy.
+fn keep_unreadable(path: &Path) -> Result<(), String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(());
+    };
+    if serde_json::from_slice::<Config>(&bytes).is_ok() {
+        return Ok(());
+    }
+    let seconds = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let kept = path.with_extension(format!("json.unreadable-{seconds}"));
+    std::fs::rename(path, &kept)
+        .map_err(|e| format!("keeping unreadable {}: {e}", path.display()))?;
+    log::warn!(
+        "audio-graph: {} could not be read; kept as {}",
+        path.display(),
+        kept.display()
+    );
+    Ok(())
+}
+
 /// Updates configuration in memory and writes it to disk.
 ///
 /// The in-memory copy is updated whether or not the write succeeds, so a user
@@ -243,6 +270,7 @@ pub fn store(config: &Config) -> Result<(), String> {
             .map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(config).map_err(|e| format!("encoding config: {e}"))?;
+    keep_unreadable(&path)?;
 
     // Written beside the target and renamed over it, so that a crash halfway
     // through leaves the previous settings rather than half of the new ones.
