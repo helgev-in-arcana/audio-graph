@@ -41,12 +41,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::format::Format;
 
-/// High-level classification of a plugin module.
-///
-/// One answer per module rather than per class, because that is the question
-/// the browser asks. A module exporting both — rare, but a synth shipped with
-/// its own effect does it — counts as an instrument: that is the part the user
-/// went looking for.
 /// One class a module exports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Class {

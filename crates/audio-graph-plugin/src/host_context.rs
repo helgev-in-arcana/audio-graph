@@ -12,9 +12,6 @@ use subhost_adapter::{InstanceId, SubHostContext};
 /// upward at points the DAW allows (activate, or the next process block).
 #[derive(Default)]
 pub struct WrapperHostContext {
-    /// Set when the sub-plugin asked for anything that needs the DAW's
-    /// attention, so the wrapper can check cheaply once per block.
-    restart_pending: AtomicBool,
     latency_changed: AtomicBool,
 }
 
@@ -29,10 +26,6 @@ impl WrapperHostContext {
     pub fn take_latency_change(&self) -> bool {
         self.latency_changed.swap(false, Ordering::AcqRel)
     }
-
-    pub fn take_restart_request(&self) -> bool {
-        self.restart_pending.swap(false, Ordering::AcqRel)
-    }
 }
 
 impl SubHostContext for WrapperHostContext {
@@ -44,8 +37,9 @@ impl SubHostContext for WrapperHostContext {
     }
 
     fn request_restart(&self, source: InstanceId, reason: RestartReason) {
+        // Nothing to record: the backend marks the child's metadata as stale,
+        // and the tick's `refresh_metadata` is what acts on it.
         log::debug!("sub-plugin {source:?} requested restart: {reason:?}");
-        self.restart_pending.store(true, Ordering::Release);
     }
 
     fn latency_changed(&self, _source: InstanceId, _samples: u32) {
@@ -81,14 +75,5 @@ mod tests {
         // Taken means taken: recompiling the graph and telling the DAW again
         // for a change already acted on would restart processing for nothing.
         assert!(!ctx.take_latency_change());
-    }
-
-    #[test]
-    fn restart_requests_collapse_until_taken() {
-        let ctx = WrapperHostContext::new();
-        ctx.request_restart(SOURCE, RestartReason::ParamValues);
-        ctx.request_restart(SOURCE, RestartReason::ParamTitles);
-        assert!(ctx.take_restart_request());
-        assert!(!ctx.take_restart_request());
     }
 }
