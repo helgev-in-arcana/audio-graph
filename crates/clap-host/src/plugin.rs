@@ -658,7 +658,7 @@ impl SubPluginMain for ClapPlugin {
         self.apply(requests);
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "metadata changed during refresh; retry",
+                "metadata changed during refresh; retry".into(),
             ));
         }
         self.params = params;
@@ -769,18 +769,18 @@ impl SubPluginMain for ClapPlugin {
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
         if !self.params.iter().any(|p| p.id == id) {
-            return Err(HostError::InvalidState("no such parameter"));
+            return Err(HostError::InvalidState("no such parameter".into()));
         }
         // CLAP has no setter: a value reaches the plugin only as an event, and
         // the only question is whether it rides a `flush` or the next block.
         let mut pending = self
             .pending_edits
             .lock()
-            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?;
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned".into()))?;
         if pending.len() == pending.capacity()
             && !pending.iter().any(|(existing, _)| *existing == id)
         {
-            return Err(HostError::InvalidState("parameter queue full"));
+            return Err(HostError::InvalidState("parameter queue full".into()));
         }
         pending.retain(|(existing, _)| *existing != id);
         pending.push((id, plain));
@@ -809,7 +809,7 @@ impl SubPluginMain for ClapPlugin {
         reclaim_main_thread();
         if self.instance.get().active.get() {
             return Err(HostError::InvalidState(
-                "state restoration requires an inactive plugin",
+                "state restoration requires an inactive plugin".into(),
             ));
         }
         self.tick();
@@ -851,11 +851,11 @@ impl SubPluginMain for ClapPlugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         if self.instance.get().active.get() {
-            return Err(HostError::InvalidState("plugin is already active"));
+            return Err(HostError::InvalidState("plugin is already active".into()));
         }
         // Anything queued while inactive has to reach the plugin before it
         // starts, or the first block renders with the old values.
@@ -876,7 +876,9 @@ impl SubPluginMain for ClapPlugin {
                     .filter(|(id, _)| !pending.iter().any(|(queued, _)| queued == id))
                     .count();
                 if additional > pending.capacity() - pending.len() {
-                    return Err(HostError::InvalidState("activation parameter queue full"));
+                    return Err(HostError::InvalidState(
+                        "activation parameter queue full".into(),
+                    ));
                 }
                 for (id, plain) in flushed.drain(..) {
                     pending.retain(|(existing, _)| *existing != id);
@@ -891,7 +893,7 @@ impl SubPluginMain for ClapPlugin {
         self.apply(requests);
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         let plan = bind_ports(&self.ports, &config)?;
@@ -1473,7 +1475,9 @@ unsafe fn read_params(
         return Ok(Vec::new());
     }
     let (Some(count), Some(get_info)) = (unsafe { ((*ext).count, (*ext).get_info) }) else {
-        return Err(HostError::InvalidState("incomplete parameter extension"));
+        return Err(HostError::InvalidState(
+            "incomplete parameter extension".into(),
+        ));
     };
 
     let total = unsafe { count(plugin) };
@@ -1481,7 +1485,9 @@ unsafe fn read_params(
     for index in 0..total {
         let mut raw: clap_param_info = unsafe { std::mem::zeroed() };
         if !unsafe { get_info(plugin, index, &mut raw) } {
-            return Err(HostError::InvalidState("parameter enumeration failed"));
+            return Err(HostError::InvalidState(
+                "parameter enumeration failed".into(),
+            ));
         }
 
         let mut flags = ParamFlags::NONE;
@@ -1537,7 +1543,9 @@ unsafe fn read_ports(
         return Ok(PortLayout::default());
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return Err(HostError::InvalidState("incomplete audio port extension"));
+        return Err(HostError::InvalidState(
+            "incomplete audio port extension".into(),
+        ));
     };
 
     let side = |is_input: bool| -> Result<Vec<Port>> {
@@ -1546,7 +1554,9 @@ unsafe fn read_ports(
             .map(|index| {
                 let mut raw: clap_audio_port_info = unsafe { std::mem::zeroed() };
                 if !unsafe { get(plugin, index, is_input, &mut raw) } {
-                    return Err(HostError::InvalidState("audio port enumeration failed"));
+                    return Err(HostError::InvalidState(
+                        "audio port enumeration failed".into(),
+                    ));
                 }
                 Ok(Port {
                     name: from_char_array(&raw.name[..CLAP_NAME_SIZE]),
@@ -1578,7 +1588,9 @@ unsafe fn read_note_ports(
         return Ok((0, 0, Vec::new(), Vec::new()));
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return Err(HostError::InvalidState("incomplete note port extension"));
+        return Err(HostError::InvalidState(
+            "incomplete note port extension".into(),
+        ));
     };
 
     let inputs = unsafe { count(plugin, true) } as usize;
@@ -1591,7 +1603,9 @@ unsafe fn read_note_ports(
     for index in 0..inputs as u32 {
         let mut raw: clap_note_port_info = unsafe { std::mem::zeroed() };
         if !unsafe { get(plugin, index, true, &mut raw) } {
-            return Err(HostError::InvalidState("note port enumeration failed"));
+            return Err(HostError::InvalidState(
+                "note port enumeration failed".into(),
+            ));
         }
         dialects |= raw.supported_dialects;
         if raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0

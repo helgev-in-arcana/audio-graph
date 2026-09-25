@@ -53,7 +53,7 @@ pub enum HostError {
     /// State blob could not be read or written.
     State(String),
     /// A call was made in the wrong lifecycle phase.
-    InvalidState(&'static str),
+    InvalidState(String),
 }
 
 impl std::fmt::Display for HostError {
