@@ -40,6 +40,12 @@ than normalised to `0..1`. Normalising in the core would bake VST3's poverty in:
 CLAP's stepped and enum semantics do not survive that round trip. Backends
 normalise on the way out instead.
 
+A value that is already normalized, the way a DAW's automation lane holds it,
+travels as `SetNormalized` rather than being turned into a plain value first.
+Only the backend knows how its format normalizes: VST3 through the plugin's own
+curve, CLAP linearly across the declared range. Mapping it anywhere else would
+lose the plugin's taper and steps.
+
 Where a format genuinely has nothing to offer, the answer is `None`, never a
 guess — `VoiceInfo` comes from CLAP's `voice-info` and a VST3 sub-plugin reports
 `None`.

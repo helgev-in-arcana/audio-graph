@@ -131,6 +131,9 @@ fn encode(event: &Event) -> Option<RawEvent> {
                 value,
             };
         }
+        // Mapped to a plain value by the processor, which holds the ranges.
+        // A list with no range to map by drops it rather than guessing one.
+        Event::Param(ParamEvent::SetNormalized { .. }) => return None,
         Event::Param(ParamEvent::Modulate {
             id,
             target,
