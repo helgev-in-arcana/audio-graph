@@ -5,6 +5,16 @@ use vst3_host::{Module, Vst3Plugin};
 
 static FIXTURE: Mutex<()> = Mutex::new(());
 
+/// Serialises the tests that share the fixture's process-wide state.
+///
+/// A test that panics while holding the lock poisons it; taking the guard
+/// anyway keeps that one failure from being reported again by every test after it.
+fn fixture() -> std::sync::MutexGuard<'static, ()> {
+    FIXTURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// GUI edits, automation and native output converge in plain units without overriding newer edits.
 #[test]
 fn parameter_values_cross_both_native_threads() {
@@ -38,15 +48,24 @@ fn parameter_values_cross_both_native_threads() {
                 .unwrap()
         })
     }
-    let _lock = FIXTURE.lock().unwrap();
+    let _lock = fixture();
     let path = fixture_path();
     let observer = unsafe { libloading::Library::new(&path) }.unwrap();
     let edit = unsafe { observer.get::<unsafe extern "C" fn(f64)>(b"audit_vst_gui_edit") }.unwrap();
     let scale = unsafe { observer.get::<unsafe extern "C" fn(f64)>(b"audit_vst_scale") }.unwrap();
     let emit = unsafe { observer.get::<unsafe extern "C" fn()>(b"audit_vst_emit") }.unwrap();
+    // The scale is a static inside the fixture, shared with every later test in
+    // this process, so it goes back to 1 however this test ends.
+    struct Scaled<'a>(libloading::Symbol<'a, unsafe extern "C" fn(f64)>);
+    impl Drop for Scaled<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.0)(1.0) };
+        }
+    }
     unsafe {
         scale(10.0);
     }
+    let _scaled = Scaled(scale);
     let module = Module::open(&path).unwrap();
     let cid = module.audio_modules().unwrap()[0].cid;
     let context = Arc::new(Edits(Mutex::new(Vec::new())));
@@ -105,7 +124,7 @@ fn parameter_values_cross_both_native_threads() {
 fn input_overflow_preserves_pending_main_edits() {
     let _thread = vst3_host::init_apartment().unwrap();
     use plugin_host_api::*;
-    let _lock = FIXTURE.lock().unwrap();
+    let _lock = fixture();
     let module = Module::open(fixture_path()).unwrap();
     let cid = module.audio_modules().unwrap()[0].cid;
     let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
@@ -141,7 +160,7 @@ fn input_overflow_preserves_pending_main_edits() {
 #[test]
 fn activation_requires_the_actual_requested_bus_layout() {
     let _thread = vst3_host::init_apartment().unwrap();
-    let _lock = FIXTURE.lock().unwrap();
+    let _lock = fixture();
     let module = Module::open(fixture_path()).unwrap();
     let cid = module.audio_modules().unwrap()[0].cid;
     let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
@@ -202,7 +221,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn module_ownership_is_shared_locally_and_exclusive_across_threads() {
     let _thread = vst3_host::init_apartment().unwrap();
-    let _lock = FIXTURE.lock().unwrap();
+    let _lock = fixture();
     let path = fixture_path();
     let first = Module::open(&path).unwrap();
     let second = Module::open(&path).unwrap();
@@ -228,7 +247,7 @@ fn module_ownership_is_shared_locally_and_exclusive_across_threads() {
 #[test]
 fn view_retains_its_native_owner() {
     let _thread = vst3_host::init_apartment().unwrap();
-    let _lock = FIXTURE.lock().unwrap();
+    let _lock = fixture();
     let path = fixture_path();
     // The observer keeps code mapped even if an ownership regression ends the module too early.
     let observer = unsafe { libloading::Library::new(&path) }.unwrap();

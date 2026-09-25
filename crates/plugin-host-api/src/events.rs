@@ -40,11 +40,15 @@ pub enum ParamEvent {
         amount: f64,
         sample_offset: u32,
     },
+    /// A gesture has a time like any other event: it sits in the same ordered
+    /// stream, and one reported as offset 0 would break that order.
     GestureBegin {
         id: ParamId,
+        sample_offset: u32,
     },
     GestureEnd {
         id: ParamId,
+        sample_offset: u32,
     },
 }
 
@@ -53,30 +57,27 @@ impl ParamEvent {
         match *self {
             ParamEvent::SetValue { id, .. }
             | ParamEvent::Modulate { id, .. }
-            | ParamEvent::GestureBegin { id }
-            | ParamEvent::GestureEnd { id } => id,
+            | ParamEvent::GestureBegin { id, .. }
+            | ParamEvent::GestureEnd { id, .. } => id,
         }
     }
 
     pub fn sample_offset(&self) -> u32 {
         match *self {
             ParamEvent::SetValue { sample_offset, .. }
-            | ParamEvent::Modulate { sample_offset, .. } => sample_offset,
-            _ => 0,
+            | ParamEvent::Modulate { sample_offset, .. }
+            | ParamEvent::GestureBegin { sample_offset, .. }
+            | ParamEvent::GestureEnd { sample_offset, .. } => sample_offset,
         }
     }
 
     /// Returns a copy of the event with its sample offset updated to `offset`.
-    ///
-    /// A gesture has no offset to move; it is returned unchanged rather than
-    /// refused, so a caller rebasing a whole stream does not have to know which
-    /// events carry a time.
     pub fn at_offset(mut self, offset: u32) -> ParamEvent {
-        if let ParamEvent::SetValue { sample_offset, .. }
-        | ParamEvent::Modulate { sample_offset, .. } = &mut self
-        {
-            *sample_offset = offset;
-        }
+        let (ParamEvent::SetValue { sample_offset, .. }
+        | ParamEvent::Modulate { sample_offset, .. }
+        | ParamEvent::GestureBegin { sample_offset, .. }
+        | ParamEvent::GestureEnd { sample_offset, .. }) = &mut self;
+        *sample_offset = offset;
         self
     }
 }
@@ -297,7 +298,12 @@ impl NoteEvent {
                 key,
                 velocity,
                 ..
-            } => [status(0x90, channel), key as u8 & 0x7f, to7(velocity)],
+            } => [
+                status(0x90, channel),
+                key as u8 & 0x7f,
+                // Velocity 0 on a note-on is a note-off to every MIDI receiver.
+                to7(velocity).max(1),
+            ],
             NoteEvent::NoteOff {
                 channel,
                 key,
@@ -528,7 +534,10 @@ mod sink_tests {
     /// Capacity and overflow survive cloning and repeated appends until the caller clears.
     #[test]
     fn capacity_is_a_limit_and_loss_is_sticky() {
-        let event = Event::Param(ParamEvent::GestureBegin { id: ParamId(0) });
+        let event = Event::Param(ParamEvent::GestureBegin {
+            id: ParamId(0),
+            sample_offset: 0,
+        });
         assert!(!EventSink::new().push(event));
         let mut sink = EventSink::with_capacity(2).clone();
         assert!(sink.push(event));
@@ -599,6 +608,17 @@ impl Default for TimeContext {
 mod tests {
     use super::*;
 
+    /// A gesture keeps its own time and is rebased like every other event.
+    #[test]
+    fn gestures_carry_and_move_their_time() {
+        let end = ParamEvent::GestureEnd {
+            id: ParamId(3),
+            sample_offset: 40,
+        };
+        assert_eq!(Event::Param(end).sample_offset(), 40);
+        assert_eq!(Event::Param(end).at_offset(8).sample_offset(), 8);
+    }
+
     #[test]
     fn midi_classification_round_trips() {
         let cases: [[u8; 3]; 6] = [
@@ -613,6 +633,22 @@ mod tests {
             let event = NoteEvent::from_midi(0, data, 7);
             assert_eq!(event.sample_offset(), 7, "{data:02x?}");
             assert_eq!(event.to_midi(), Some(data), "{data:02x?}");
+        }
+    }
+
+    /// A note-on stays a note-on in MIDI, however quiet: velocity 0 would turn it into a note-off.
+    #[test]
+    fn a_quiet_note_on_keeps_a_velocity_of_at_least_one() {
+        for velocity in [0.0, 0.001, 1.0 / 254.0] {
+            let on = NoteEvent::NoteOn {
+                note_id: None,
+                port: 0,
+                channel: 0,
+                key: 60,
+                velocity,
+                sample_offset: 0,
+            };
+            assert_eq!(on.to_midi(), Some([0x90, 60, 1]), "velocity {velocity}");
         }
     }
 
