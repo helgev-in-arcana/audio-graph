@@ -57,9 +57,9 @@ use clap_sys::process::{
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
-    IoLayout, MainThread, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
-    Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
-    reclaim_main_thread,
+    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
+    ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor,
+    TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -124,7 +124,7 @@ pub struct ClapPlugin {
     note_outputs: usize,
     note_end_ports: Vec<i16>,
     /// Diagnostic only; see `SubPluginMain::note_dialects`.
-    note_dialects: Vec<&'static str>,
+    note_dialects: NoteDialects,
 
     ext_params: *const clap_plugin_params,
     ext_state: *const clap_plugin_state,
@@ -684,8 +684,8 @@ impl SubPluginMain for ClapPlugin {
         self.voices.get()
     }
 
-    fn note_dialects(&self) -> Vec<&'static str> {
-        self.note_dialects.clone()
+    fn note_dialects(&self) -> NoteDialects {
+        self.note_dialects
     }
 
     fn note_end_ports(&self) -> Vec<i16> {
@@ -1583,9 +1583,9 @@ unsafe fn read_ports(
 unsafe fn read_note_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_note_ports,
-) -> Result<(usize, usize, Vec<i16>, Vec<&'static str>)> {
+) -> Result<(usize, usize, Vec<i16>, NoteDialects)> {
     if ext.is_null() {
-        return Ok((0, 0, Vec::new(), Vec::new()));
+        return Ok((0, 0, Vec::new(), NoteDialects::NONE));
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
         return Err(HostError::InvalidState(
@@ -1615,17 +1615,15 @@ unsafe fn read_note_ports(
         }
     }
 
-    let names = [
-        (CLAP_NOTE_DIALECT_CLAP, "clap"),
-        (CLAP_NOTE_DIALECT_MIDI, "midi"),
-        (CLAP_NOTE_DIALECT_MIDI_MPE, "midi-mpe"),
-        (CLAP_NOTE_DIALECT_MIDI2, "midi2"),
-    ];
-    let supported = names
-        .iter()
-        .filter(|(bit, _)| dialects & bit != 0)
-        .map(|(_, name)| *name)
-        .collect();
+    let mut supported = NoteDialects::NONE;
+    for (bit, dialect) in [
+        (CLAP_NOTE_DIALECT_CLAP, NoteDialects::CLAP),
+        (CLAP_NOTE_DIALECT_MIDI, NoteDialects::MIDI),
+        (CLAP_NOTE_DIALECT_MIDI_MPE, NoteDialects::MIDI_MPE),
+        (CLAP_NOTE_DIALECT_MIDI2, NoteDialects::MIDI2),
+    ] {
+        supported.set(dialect, dialects & bit != 0);
+    }
 
     Ok((inputs, outputs, note_end_ports, supported))
 }
