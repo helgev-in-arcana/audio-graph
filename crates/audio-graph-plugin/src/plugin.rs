@@ -68,6 +68,8 @@ pub struct Wrapper {
     /// The latency last reported to the DAW, so a block that has nothing new
     /// to say does not say it. Audio thread only.
     reported_latency: u32,
+    /// The DAW asked for a reset the processors have not had yet; see `reset`.
+    reset_processors: bool,
 
     /// The periodic main-thread tick CLAP requires of us (see [`crate::tick`]).
     ///
@@ -99,9 +101,18 @@ impl Default for Wrapper {
             kind: WrapperKind::Effect,
             channels: 2,
             reported_latency: 0,
+            reset_processors: false,
             tick_state: TickState::new(),
             ticker: None,
         }
+    }
+}
+
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        // The ticker first, so no tick lands in the middle of the teardown.
+        self.ticker = None;
+        self.shared.shut_down();
     }
 }
 
@@ -346,12 +357,10 @@ impl Wrapper {
 
     pub fn reset(&mut self) {
         self.engine.reset();
-        // Blocking, not `try_lock`: a skipped reset leaves the sub-plugin with
-        // stale parameter state and hanging notes, and this is called when the
-        // transport jumps rather than while audio is flowing.
-        if let Some(processor) = &mut self.shared.audio().processor {
-            processor.reset();
-        }
+        // The processors are reset by the next block, which holds their lock
+        // anyway. Taking it here would make the audio thread, where CLAP calls
+        // this, wait for whatever the editor is doing with them.
+        self.reset_processors = true;
     }
 
     pub fn process<P: Plugin>(
@@ -384,6 +393,11 @@ impl Wrapper {
             Some(state) => state,
             None => return silence(buffer),
         };
+        if std::mem::take(&mut self.reset_processors)
+            && let Some(processor) = state.processor.as_mut()
+        {
+            processor.reset();
+        }
         if std::mem::take(&mut state.reset_notes) {
             self.ended_notes.clear();
             self.engine.reset_notes(&mut self.ended_notes);

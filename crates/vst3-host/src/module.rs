@@ -10,7 +10,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use plugin_host_api::{HostError, Result};
@@ -202,18 +201,15 @@ impl Module {
     ///
     /// One per module rather than one per instance, because
     /// `setHostContext` is a module-level registration the factory retains.
-    /// The `context` argument is only honoured the first time; subsequent
+    /// The `name` argument is only honoured the first time; subsequent
     /// instances share the object the factory was already given.
-    pub(crate) fn host_application(
-        &self,
-        context: Arc<dyn plugin_host_api::HostContext>,
-    ) -> ComWrapper<HostApplication> {
+    pub(crate) fn host_application(&self, name: &str) -> ComWrapper<HostApplication> {
         let mut slot = self.inner.host_app.borrow_mut();
         if let Some(existing) = slot.as_ref() {
             return existing.clone();
         }
 
-        let app = HostApplication::new(context);
+        let app = HostApplication::new(name);
         if let Some(factory3) = self
             .inner
             .factory

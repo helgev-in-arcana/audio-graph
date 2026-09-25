@@ -107,6 +107,18 @@ fn fill_param(event: &ParamEvent, map: &ParamMap, changes: &ComWrapper<Parameter
                 changes.add_point(id.0, sample_offset as i32, normalized);
             }
         }
+        // VST3's own normalized value, handed over untouched: no curve of
+        // ours stands between a DAW-shaped value and the plugin's taper.
+        ParamEvent::SetNormalized {
+            id,
+            value,
+            sample_offset,
+            ..
+        } => {
+            if map.contains(id) && value.is_finite() {
+                changes.add_point(id.0, sample_offset as i32, value.clamp(0.0, 1.0));
+            }
+        }
         // See the module comment: dropped, not approximated.
         ParamEvent::Modulate { .. } => {}
         // Gestures exist only to bracket a user's edit for the host's undo
@@ -347,6 +359,40 @@ mod tests {
             &list,
         );
         assert_eq!(changes.points(), vec![(3, 16, 0.5)]);
+    }
+
+    /// A normalized value reaches the plugin untouched by any curve, and an undeclared id reaches it not at all.
+    #[test]
+    fn a_normalized_value_is_the_plugins_own() {
+        let params = [ParamInfo {
+            id: ParamId(3),
+            name: String::new(),
+            module: String::new(),
+            min: 20.0,
+            max: 20_000.0,
+            default: 20.0,
+            flags: ParamFlags::NONE,
+        }];
+        // A cutoff whose plain range is logarithmic in its normalized one.
+        let map = ParamMap::build(&params, |_, n| 20.0 * 1000f64.powf(n));
+        let changes = ParameterChanges::new(4, 4);
+        let list = EventList::new(4);
+        let set = |id, value| {
+            ApiEvent::Param(ParamEvent::SetNormalized {
+                id: ParamId(id),
+                target: Default::default(),
+                value,
+                sample_offset: 8,
+            })
+        };
+        fill_inputs(
+            &[set(3, 0.5), set(4, 0.5)],
+            &map,
+            &MidiMap::empty(),
+            &changes,
+            &list,
+        );
+        assert_eq!(changes.points(), vec![(3, 8, 0.5)]);
     }
 
     /// The sustain pedal is the reason this route exists: without it, CC64

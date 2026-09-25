@@ -101,3 +101,34 @@ fn shared_shutdown_returns_its_active_instances_to_main() {
     assert!(weak.upgrade().is_none());
     assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
 }
+
+/// Destroying the wrapper destroys its hosted children then and there, on its own thread.
+///
+/// The editor and the task executor hold the shared state too, and whichever
+/// lets go last may not be the thread that owns the children. Left to that
+/// moment, nothing would ever reclaim them, and they would outlive the code
+/// their host callbacks point into.
+#[test]
+fn destroying_the_wrapper_releases_its_children() {
+    use audio_graph_plugin::{Wrapper, WrapperKind};
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = harness::fixture_as_clap("teardown-fixture");
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &harness::fx_layout(), &harness::LIVE)
+        .expect("the first activation");
+    wrapper.shared().load(&path).expect("the fixture loads");
+    let editor = wrapper.shared().clone();
+    drop(wrapper);
+
+    // A module stays claimed by its owner thread for as long as anything of it
+    // is alive, so another thread can open it only once the children are gone.
+    let busy = std::thread::spawn(move || {
+        let _thread = plugin_host::init_thread().unwrap();
+        plugin_host::scan_module(&path).err()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(busy, None, "the children outlived the wrapper");
+    drop(editor);
+}

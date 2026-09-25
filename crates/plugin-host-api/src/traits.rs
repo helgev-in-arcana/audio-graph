@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Core traits for plugin hosting backends.
 //!
 //! Two rules drive the shape here:
@@ -13,7 +19,9 @@
 
 use crate::buffers::{AudioBuffers, AudioConfig};
 use crate::events::{Event, EventSink, TimeContext};
-use crate::params::{Capabilities, IoLayout, ParamId, ParamInfo, ParamSnapshot, VoiceInfo};
+use crate::params::{
+    Capabilities, IoLayout, NoteDialects, ParamId, ParamInfo, ParamSnapshot, VoiceInfo,
+};
 use crate::{Processor, Result};
 
 /// What the sub-plugin reported about its output for this block.
@@ -140,8 +148,8 @@ pub trait SubPluginMain {
     /// VST3 does not, having exactly one way to deliver a note. The question
     /// this answers is whether any plugin here would actually benefit from us
     /// speaking MIDI 2.0, which is otherwise easy to guess at and hard to know.
-    fn note_dialects(&self) -> Vec<&'static str> {
-        Vec::new()
+    fn note_dialects(&self) -> NoteDialects {
+        NoteDialects::NONE
     }
 
     /// Input ports whose native note dialect reports voice completion with `NoteEnd`.

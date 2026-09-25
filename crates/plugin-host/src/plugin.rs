@@ -163,7 +163,8 @@ impl Plugin {
 
     pub fn has_editor(&self) -> bool {
         match &self.inner {
-            Backend::Vst3 { plugin, .. } => plugin.has_editor(),
+            // An open editor answers without probing for a second view.
+            Backend::Vst3 { plugin, editor, .. } => editor.is_some() || plugin.has_editor(),
             Backend::Clap { plugin, .. } => plugin.has_editor(),
         }
     }
@@ -298,7 +299,7 @@ impl SubPluginMain for Plugin {
         delegate!(self, p => SubPluginMain::voice_info(p))
     }
 
-    fn note_dialects(&self) -> Vec<&'static str> {
+    fn note_dialects(&self) -> plugin_host_api::NoteDialects {
         delegate!(self, p => SubPluginMain::note_dialects(p))
     }
 

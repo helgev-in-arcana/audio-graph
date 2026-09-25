@@ -137,6 +137,9 @@ fn encode(event: &Event) -> Option<RawEvent> {
                 value,
             };
         }
+        // Mapped to a plain value by the processor, which holds the ranges.
+        // A list with no range to map by drops it rather than guessing one.
+        Event::Param(ParamEvent::SetNormalized { .. }) => return None,
         Event::Param(ParamEvent::Modulate {
             id,
             target,
@@ -159,21 +162,21 @@ fn encode(event: &Event) -> Option<RawEvent> {
                 amount,
             };
         }
-        Event::Param(ParamEvent::GestureBegin { id }) => {
+        Event::Param(ParamEvent::GestureBegin { id, sample_offset }) => {
             raw.gesture = clap_event_param_gesture {
                 header: header(
                     size_of::<clap_event_param_gesture>(),
-                    0,
+                    sample_offset,
                     CLAP_EVENT_PARAM_GESTURE_BEGIN,
                 ),
                 param_id: id.0,
             };
         }
-        Event::Param(ParamEvent::GestureEnd { id }) => {
+        Event::Param(ParamEvent::GestureEnd { id, sample_offset }) => {
             raw.gesture = clap_event_param_gesture {
                 header: header(
                     size_of::<clap_event_param_gesture>(),
-                    0,
+                    sample_offset,
                     CLAP_EVENT_PARAM_GESTURE_END,
                 ),
                 param_id: id.0,
@@ -322,9 +325,11 @@ unsafe fn decode(raw: &RawEvent) -> Option<Event> {
         }
         CLAP_EVENT_PARAM_GESTURE_BEGIN => Event::Param(ParamEvent::GestureBegin {
             id: ParamId(unsafe { raw.gesture }.param_id),
+            sample_offset: header.time,
         }),
         CLAP_EVENT_PARAM_GESTURE_END => Event::Param(ParamEvent::GestureEnd {
             id: ParamId(unsafe { raw.gesture }.param_id),
+            sample_offset: header.time,
         }),
         CLAP_EVENT_NOTE_ON => {
             let e = unsafe { raw.note };
@@ -817,11 +822,34 @@ mod tests {
         }
     }
 
+    /// A gesture reaches the plugin at its own time and comes back at it.
+    #[test]
+    fn gestures_round_trip_with_their_time() {
+        for event in [
+            ParamEvent::GestureBegin {
+                id: ParamId(4),
+                sample_offset: 12,
+            },
+            ParamEvent::GestureEnd {
+                id: ParamId(4),
+                sample_offset: 30,
+            },
+        ] {
+            let event = Event::Param(event);
+            let raw = encode(&event).expect("encodable");
+            assert_eq!(unsafe { raw.header.time }, event.sample_offset());
+            assert_eq!(unsafe { decode(&raw) }, Some(event));
+        }
+    }
+
     #[test]
     fn every_event_declares_its_own_size_not_the_unions() {
         // A plugin reads `size` to step through the list; declaring the union's
         // size would make it walk past events it has not seen.
-        let event = Event::Param(ParamEvent::GestureBegin { id: ParamId(1) });
+        let event = Event::Param(ParamEvent::GestureBegin {
+            id: ParamId(1),
+            sample_offset: 0,
+        });
         let raw = encode(&event).expect("encodable");
         assert_eq!(
             unsafe { raw.header.size } as usize,

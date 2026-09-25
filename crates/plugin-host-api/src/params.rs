@@ -1,3 +1,9 @@
+// ============================================================================
+//
+// HUMAN REVIEW REQUIRED: THIS FILE HAS NOT BEEN REVIEWED BY A HUMAN.
+//
+// ============================================================================
+
 //! Parameter model — plain values with an explicit range.
 //!
 //! Normalising to 0..1 in the core would bake VST3's poverty in: CLAP's stepped
@@ -106,6 +112,36 @@ pub struct Capabilities {
     pub dynamic_params: bool,
 }
 
+bitflags_lite! {
+    /// Which note dialects a plugin's note input accepts.
+    ///
+    /// Flags rather than names so the answer can cross a process boundary as a
+    /// number. Empty for a format with no such notion: VST3 has exactly one way
+    /// to deliver a note.
+    pub struct NoteDialects: u32 {
+        /// Notes with ids, note expressions and voice ends (CLAP's own).
+        const CLAP     = 1 << 0;
+        const MIDI     = 1 << 1;
+        const MIDI_MPE = 1 << 2;
+        const MIDI2    = 1 << 3;
+    }
+}
+
+impl NoteDialects {
+    /// The dialects present, by name, for display.
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        [
+            (NoteDialects::CLAP, "clap"),
+            (NoteDialects::MIDI, "midi"),
+            (NoteDialects::MIDI_MPE, "midi-mpe"),
+            (NoteDialects::MIDI2, "midi2"),
+        ]
+        .into_iter()
+        .filter(move |(flag, _)| self.contains(*flag))
+        .map(|(_, name)| name)
+    }
+}
+
 /// How many voices an instrument has, when it will say.
 ///
 /// CLAP's `voice-info` is the only place this comes from; VST3 has no
@@ -203,6 +239,14 @@ mod tests {
             flags: ParamFlags::NONE,
         };
         assert_eq!(p.normalize(1.0), 0.0);
+    }
+
+    /// A dialect set reads back as the names of exactly the dialects in it.
+    #[test]
+    fn note_dialects_name_what_they_hold() {
+        let dialects = NoteDialects::CLAP | NoteDialects::MIDI2;
+        assert_eq!(dialects.names().collect::<Vec<_>>(), ["clap", "midi2"]);
+        assert_eq!(NoteDialects::NONE.names().count(), 0);
     }
 
     #[test]

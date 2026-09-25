@@ -104,6 +104,8 @@ pub fn reclaim_main_thread() {
 
 struct Release {
     released: NonNull<AtomicBool>,
+    /// The registered allocation, which identifies its registry entry.
+    entry: *mut (),
     owner: ThreadId,
 }
 
@@ -114,9 +116,28 @@ impl Drop for Release {
         // after this store, which permits its owner to reclaim it concurrently.
         unsafe { self.released.as_ref() }.store(true, Ordering::Release);
         if on_owner {
-            reclaim_main_thread();
+            destroy_own(self.entry);
         }
     }
+}
+
+/// Destroys one released entry on its owner thread, and nothing else.
+///
+/// Other returned values wait for [`reclaim_main_thread`]: sweeping them here
+/// would run their native teardown at whatever drop happened to come next.
+/// An entry that is not in the registry is part of a sweep already under way,
+/// which destroys it once it sees the release.
+fn destroy_own(entry: *mut ()) {
+    let Ok(Some(own)) = REGISTRY.try_with(|registry| {
+        let mut registry = registry.try_borrow_mut().ok()?;
+        let index = registry.entries.iter().position(|e| e.pointer == entry)?;
+        Some(registry.entries.swap_remove(index))
+    }) else {
+        return;
+    };
+    // SAFETY: the release store above ended all access through the handle, and
+    // removing the entry makes this the only destruction of it.
+    unsafe { (own.destroy)(own.pointer) };
 }
 
 fn retain<T: 'static>(value: T) -> (NonNull<T>, Release) {
@@ -138,6 +159,7 @@ fn retain<T: 'static>(value: T) -> (NonNull<T>, Release) {
         value,
         Release {
             released,
+            entry: entry.cast(),
             owner: std::thread::current().id(),
         },
     )
@@ -288,6 +310,22 @@ mod tests {
         let parent = MainThread::new(child);
         drop(parent);
         assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
+    }
+
+    /// Dropping one handle on its owner destroys that handle's value and no other.
+    ///
+    /// Values returned from other threads are destroyed where the host pumps
+    /// them, not at whatever unrelated drop happens to come next.
+    #[test]
+    fn an_owner_drop_leaves_other_returns_for_the_pump() {
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let returned = MainThread::new(Dropped(drops.clone()));
+        std::thread::spawn(move || drop(returned)).join().unwrap();
+        let local = MainThread::new(());
+        drop(local);
+        assert!(drops.lock().unwrap().is_empty());
+        reclaim_main_thread();
+        assert_eq!(drops.lock().unwrap().len(), 1);
     }
 
     /// An exiting owner cannot destroy a resource still owned by another thread.

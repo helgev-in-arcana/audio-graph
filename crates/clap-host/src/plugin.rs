@@ -63,9 +63,9 @@ use clap_sys::process::{
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
-    IoLayout, MainThread, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue, ProcessStatus,
-    Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor, TimeContext, VoiceInfo,
-    reclaim_main_thread,
+    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
+    ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor,
+    TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -130,7 +130,7 @@ pub struct ClapPlugin {
     note_outputs: usize,
     note_end_ports: Vec<i16>,
     /// Diagnostic only; see `SubPluginMain::note_dialects`.
-    note_dialects: Vec<&'static str>,
+    note_dialects: NoteDialects,
 
     ext_params: *const clap_plugin_params,
     ext_state: *const clap_plugin_state,
@@ -664,7 +664,7 @@ impl SubPluginMain for ClapPlugin {
         self.apply(requests);
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "metadata changed during refresh; retry",
+                "metadata changed during refresh; retry".into(),
             ));
         }
         self.params = params;
@@ -690,8 +690,8 @@ impl SubPluginMain for ClapPlugin {
         self.voices.get()
     }
 
-    fn note_dialects(&self) -> Vec<&'static str> {
-        self.note_dialects.clone()
+    fn note_dialects(&self) -> NoteDialects {
+        self.note_dialects
     }
 
     fn note_end_ports(&self) -> Vec<i16> {
@@ -775,18 +775,18 @@ impl SubPluginMain for ClapPlugin {
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
         if !self.params.iter().any(|p| p.id == id) {
-            return Err(HostError::InvalidState("no such parameter"));
+            return Err(HostError::InvalidState("no such parameter".into()));
         }
         // CLAP has no setter: a value reaches the plugin only as an event, and
         // the only question is whether it rides a `flush` or the next block.
         let mut pending = self
             .pending_edits
             .lock()
-            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?;
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned".into()))?;
         if pending.len() == pending.capacity()
             && !pending.iter().any(|(existing, _)| *existing == id)
         {
-            return Err(HostError::InvalidState("parameter queue full"));
+            return Err(HostError::InvalidState("parameter queue full".into()));
         }
         pending.retain(|(existing, _)| *existing != id);
         pending.push((id, plain));
@@ -815,7 +815,7 @@ impl SubPluginMain for ClapPlugin {
         reclaim_main_thread();
         if self.instance.get().active.get() {
             return Err(HostError::InvalidState(
-                "state restoration requires an inactive plugin",
+                "state restoration requires an inactive plugin".into(),
             ));
         }
         self.tick();
@@ -857,11 +857,11 @@ impl SubPluginMain for ClapPlugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         if self.instance.get().active.get() {
-            return Err(HostError::InvalidState("plugin is already active"));
+            return Err(HostError::InvalidState("plugin is already active".into()));
         }
         // Anything queued while inactive has to reach the plugin before it
         // starts, or the first block renders with the old values.
@@ -882,7 +882,9 @@ impl SubPluginMain for ClapPlugin {
                     .filter(|(id, _)| !pending.iter().any(|(queued, _)| queued == id))
                     .count();
                 if additional > pending.capacity() - pending.len() {
-                    return Err(HostError::InvalidState("activation parameter queue full"));
+                    return Err(HostError::InvalidState(
+                        "activation parameter queue full".into(),
+                    ));
                 }
                 for (id, plain) in flushed.drain(..) {
                     pending.retain(|(existing, _)| *existing != id);
@@ -897,7 +899,7 @@ impl SubPluginMain for ClapPlugin {
         self.apply(requests);
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         let plan = bind_ports(&self.ports, &config)?;
@@ -964,6 +966,7 @@ impl SubPluginMain for ClapPlugin {
             self.instance.get().plugin,
             config,
             plan,
+            Ranges::of(&self.params),
             Arc::clone(&self.pending_edits),
             Arc::clone(&self.instance),
         )))
@@ -1149,6 +1152,8 @@ pub struct ClapProcessor {
     /// Samples processed since activation, which is what CLAP's `steady_time`
     /// means. `-1` would mean "the host does not know", and we do.
     steady_time: i64,
+    /// Each parameter's range, for normalized values; see [`Ranges`].
+    ranges: Ranges,
     instance: Arc<MainThread<ClapInstance>>,
 }
 
@@ -1163,6 +1168,7 @@ impl ClapProcessor {
         plugin: *const clap_plugin,
         config: AudioConfig,
         plan: BindingPlan,
+        ranges: Ranges,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
         instance: Arc<MainThread<ClapInstance>>,
     ) -> ClapProcessor {
@@ -1185,8 +1191,39 @@ impl ClapProcessor {
             out_events: OutputEvents::new(MAX_EVENTS_PER_BLOCK),
             pending_edits,
             steady_time: 0,
+            ranges,
             instance,
         }
+    }
+}
+
+/// Every parameter's declared range, sorted by id, taken at activate.
+///
+/// CLAP events carry plain values only, so a normalized one is mapped here, on
+/// the audio thread: linearly across the range, and to the nearest step for a
+/// stepped parameter, which is what a CLAP host's automation lane does.
+struct Ranges(Vec<(ParamId, f64, f64, bool)>);
+
+impl Ranges {
+    fn of(params: &[ParamInfo]) -> Ranges {
+        let mut ranges: Vec<_> = params
+            .iter()
+            .map(|p| (p.id, p.min, p.max, p.flags.contains(ParamFlags::STEPPED)))
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.0);
+        Ranges(ranges)
+    }
+
+    /// The plain value `normalized` stands for, or `None` for an id the
+    /// plugin did not declare or a value that is not a number.
+    fn plain(&self, id: ParamId, normalized: f64) -> Option<f64> {
+        let index = self.0.binary_search_by_key(&id, |r| r.0).ok()?;
+        let (_, min, max, stepped) = self.0[index];
+        if !normalized.is_finite() {
+            return None;
+        }
+        let plain = min + normalized.clamp(0.0, 1.0) * (max - min);
+        Some(if stepped { plain.round() } else { plain })
     }
 }
 
@@ -1225,7 +1262,25 @@ impl SubPluginProcessor for ClapProcessor {
             }
         }
         for event in events {
-            self.in_events.push(event);
+            match *event {
+                Event::Param(plugin_host_api::ParamEvent::SetNormalized {
+                    id,
+                    target,
+                    value,
+                    sample_offset,
+                }) => {
+                    if let Some(value) = self.ranges.plain(id, value) {
+                        self.in_events
+                            .push(&Event::Param(plugin_host_api::ParamEvent::SetValue {
+                                id,
+                                target,
+                                value,
+                                sample_offset,
+                            }));
+                    }
+                }
+                _ => self.in_events.push(event),
+            }
         }
         if self.in_events.overflowed
             || !events.is_sorted_by_key(Event::sample_offset)
@@ -1479,7 +1534,9 @@ unsafe fn read_params(
         return Ok(Vec::new());
     }
     let (Some(count), Some(get_info)) = (unsafe { ((*ext).count, (*ext).get_info) }) else {
-        return Err(HostError::InvalidState("incomplete parameter extension"));
+        return Err(HostError::InvalidState(
+            "incomplete parameter extension".into(),
+        ));
     };
 
     let total = unsafe { count(plugin) };
@@ -1487,7 +1544,9 @@ unsafe fn read_params(
     for index in 0..total {
         let mut raw: clap_param_info = unsafe { std::mem::zeroed() };
         if !unsafe { get_info(plugin, index, &mut raw) } {
-            return Err(HostError::InvalidState("parameter enumeration failed"));
+            return Err(HostError::InvalidState(
+                "parameter enumeration failed".into(),
+            ));
         }
 
         let mut flags = ParamFlags::NONE;
@@ -1543,7 +1602,9 @@ unsafe fn read_ports(
         return Ok(PortLayout::default());
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return Err(HostError::InvalidState("incomplete audio port extension"));
+        return Err(HostError::InvalidState(
+            "incomplete audio port extension".into(),
+        ));
     };
 
     let side = |is_input: bool| -> Result<Vec<Port>> {
@@ -1552,7 +1613,9 @@ unsafe fn read_ports(
             .map(|index| {
                 let mut raw: clap_audio_port_info = unsafe { std::mem::zeroed() };
                 if !unsafe { get(plugin, index, is_input, &mut raw) } {
-                    return Err(HostError::InvalidState("audio port enumeration failed"));
+                    return Err(HostError::InvalidState(
+                        "audio port enumeration failed".into(),
+                    ));
                 }
                 Ok(Port {
                     name: from_char_array(&raw.name[..CLAP_NAME_SIZE]),
@@ -1579,12 +1642,14 @@ unsafe fn read_ports(
 unsafe fn read_note_ports(
     plugin: *const clap_plugin,
     ext: *const clap_plugin_note_ports,
-) -> Result<(usize, usize, Vec<i16>, Vec<&'static str>)> {
+) -> Result<(usize, usize, Vec<i16>, NoteDialects)> {
     if ext.is_null() {
-        return Ok((0, 0, Vec::new(), Vec::new()));
+        return Ok((0, 0, Vec::new(), NoteDialects::NONE));
     }
     let (Some(count), Some(get)) = (unsafe { ((*ext).count, (*ext).get) }) else {
-        return Err(HostError::InvalidState("incomplete note port extension"));
+        return Err(HostError::InvalidState(
+            "incomplete note port extension".into(),
+        ));
     };
 
     let inputs = unsafe { count(plugin, true) } as usize;
@@ -1597,7 +1662,9 @@ unsafe fn read_note_ports(
     for index in 0..inputs as u32 {
         let mut raw: clap_note_port_info = unsafe { std::mem::zeroed() };
         if !unsafe { get(plugin, index, true, &mut raw) } {
-            return Err(HostError::InvalidState("note port enumeration failed"));
+            return Err(HostError::InvalidState(
+                "note port enumeration failed".into(),
+            ));
         }
         dialects |= raw.supported_dialects;
         if raw.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0
@@ -1607,17 +1674,15 @@ unsafe fn read_note_ports(
         }
     }
 
-    let names = [
-        (CLAP_NOTE_DIALECT_CLAP, "clap"),
-        (CLAP_NOTE_DIALECT_MIDI, "midi"),
-        (CLAP_NOTE_DIALECT_MIDI_MPE, "midi-mpe"),
-        (CLAP_NOTE_DIALECT_MIDI2, "midi2"),
-    ];
-    let supported = names
-        .iter()
-        .filter(|(bit, _)| dialects & bit != 0)
-        .map(|(_, name)| *name)
-        .collect();
+    let mut supported = NoteDialects::NONE;
+    for (bit, dialect) in [
+        (CLAP_NOTE_DIALECT_CLAP, NoteDialects::CLAP),
+        (CLAP_NOTE_DIALECT_MIDI, NoteDialects::MIDI),
+        (CLAP_NOTE_DIALECT_MIDI_MPE, NoteDialects::MIDI_MPE),
+        (CLAP_NOTE_DIALECT_MIDI2, NoteDialects::MIDI2),
+    ] {
+        supported.set(dialect, dialects & bit != 0);
+    }
 
     Ok((inputs, outputs, note_end_ports, supported))
 }
@@ -1649,6 +1714,30 @@ mod tests {
         assert_eq!(every_channel(2), 0b11);
         assert_eq!(every_channel(64), u64::MAX);
         assert_eq!(every_channel(65), u64::MAX);
+    }
+
+    /// A normalized value lands linearly across the range, on a step for a stepped parameter.
+    #[test]
+    fn normalized_values_map_across_the_declared_range() {
+        let param = |id, min, max, flags| ParamInfo {
+            id: ParamId(id),
+            name: String::new(),
+            module: String::new(),
+            min,
+            max,
+            default: min,
+            flags,
+        };
+        let ranges = Ranges::of(&[
+            param(7, -12.0, 12.0, ParamFlags::STEPPED),
+            param(2, 20.0, 220.0, ParamFlags::NONE),
+        ]);
+        assert_eq!(ranges.plain(ParamId(2), 0.25), Some(70.0));
+        assert_eq!(ranges.plain(ParamId(2), 2.0), Some(220.0));
+        assert_eq!(ranges.plain(ParamId(7), 0.52), Some(0.0));
+        assert_eq!(ranges.plain(ParamId(7), 1.0), Some(12.0));
+        assert_eq!(ranges.plain(ParamId(3), 0.5), None);
+        assert_eq!(ranges.plain(ParamId(2), f64::NAN), None);
     }
 
     #[test]

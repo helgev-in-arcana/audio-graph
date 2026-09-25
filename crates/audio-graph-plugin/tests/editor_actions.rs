@@ -11,11 +11,13 @@
 //! covers the part that can actually be wrong — the load/bind/activate ordering
 //! — and leaves only the drawing to be checked by eye.
 //!
-//! One `#[test]`, deliberately. VST3 pins its objects to the thread that created
-//! them, and the test harness runs `#[test]` functions on a pool of threads;
-//! splitting this would deadlock rather than fail.
+//! The tests that drive an installed plugin hold [`installed`] throughout. VST3
+//! pins its objects to the thread that created them and a module belongs to one
+//! thread at a time, while the harness runs each `#[test]` on a thread of its
+//! own: two of them opening the same module at once would see it busy, skip to
+//! another candidate, and test a different plugin from one run to the next.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use audio_graph_plugin::{SLOT_COUNT, SUB_HOST};
 use audio_graph_plugin::{Shared, WrapperParams};
@@ -37,6 +39,12 @@ impl subhost_adapter::SubHostContext for SilentHost {
         _value: f64,
     ) {
     }
+}
+
+/// Serialises the tests that load installed plugins; see the module comment.
+fn installed() -> MutexGuard<'static, ()> {
+    static INSTALLED: Mutex<()> = Mutex::new(());
+    INSTALLED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Plugins this test will not instantiate.
@@ -65,6 +73,8 @@ const CANDIDATES: usize = 6;
 /// A plugin to test against, chosen from whatever is installed.
 ///
 /// Discovers any installed plugin with parameters to avoid machine-specific test fixtures.
+/// Only a stereo effect qualifies: the tests activate it with a stereo input, which an
+/// instrument or a mono effect refuses.
 fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
     let mut tried = 0;
     for path in candidate_paths() {
@@ -85,7 +95,10 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
         if shared.load(&path).is_err() {
             continue;
         }
-        if !shared.main().host.params(0).is_empty() {
+        let layout = shared.main().host.io_layout(0);
+        let stereo_effect = layout.main_input_channels() == 2
+            && layout.outputs.first().is_some_and(|bus| bus.channels == 2);
+        if stereo_effect && !shared.main().host.params(0).is_empty() {
             return Some((path, shared));
         }
     }
@@ -110,6 +123,7 @@ fn candidate_paths() -> Vec<std::path::PathBuf> {
 
 #[test]
 fn the_editors_actions_work_against_an_installed_plugin() {
+    let _installed = installed();
     let _thread = plugin_host::init_thread().unwrap();
     let Some((path, shared)) = a_plugin_with_parameters() else {
         eprintln!("no installed plugin with parameters; skipping");
@@ -420,6 +434,7 @@ fn a_graph_survives_the_state_round_trip() {
 /// socket, and drive it from the graph against a real installed plugin.
 #[test]
 fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something() {
+    let _installed = installed();
     let _thread = plugin_host::init_thread().unwrap();
     use audio_graph_engine::{AudioOut, Constant, NodeKind, Plugin, PluginPorts};
 

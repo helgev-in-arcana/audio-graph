@@ -152,6 +152,7 @@ impl Default for PlugFrame {
 /// here.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod run_loop {
+    use std::cell::RefCell;
     use std::time::Duration;
 
     use host_window::watch::{FdWatch, Interest, TimerWheel};
@@ -160,6 +161,7 @@ mod run_loop {
         ITimerHandlerTrait, TimerInterval,
     };
     use vst3::Steinberg::{kInvalidArgument, kResultOk, tresult};
+    use vst3::{ComPtr, ComRef, Interface};
 
     use super::FrameImpl;
 
@@ -168,6 +170,43 @@ mod run_loop {
     pub(super) struct RunLoop {
         events: FdWatch<*mut IEventHandler>,
         timers: TimerWheel<*mut ITimerHandler>,
+        /// A reference to every registered handler, released when it is
+        /// unregistered. The watch lists hold only the raw pointers VST3
+        /// unregisters by; without a reference of our own, a plugin that
+        /// released a handler before unregistering it would leave a dangling
+        /// pointer for the next dispatch to call.
+        held_events: RefCell<Vec<ComPtr<IEventHandler>>>,
+        held_timers: RefCell<Vec<ComPtr<ITimerHandler>>>,
+    }
+
+    /// Take a reference to `handler`, once however often it registers.
+    ///
+    /// # Safety
+    /// `handler` must be null or a live interface pointer.
+    unsafe fn hold<I: Interface>(held: &RefCell<Vec<ComPtr<I>>>, handler: *mut I) {
+        let mut held = held.borrow_mut();
+        if held.iter().any(|h| h.as_ptr() == handler) {
+            return;
+        }
+        if let Some(handler) = unsafe { ComRef::from_raw(handler) } {
+            held.push(handler.to_com_ptr());
+        }
+    }
+
+    /// Give up the reference to `handler`.
+    ///
+    /// Dropped after the list is released: releasing the plugin's last
+    /// reference runs its destructor, which may call straight back in here.
+    fn release<I: Interface>(held: &RefCell<Vec<ComPtr<I>>>, handler: *mut I) {
+        let gone: Vec<_> = {
+            let mut held = held.borrow_mut();
+            let (gone, kept) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition(|h| h.as_ptr() == handler);
+            *held = kept;
+            gone
+        };
+        drop(gone);
     }
 
     impl RunLoop {
@@ -203,13 +242,16 @@ mod run_loop {
             // about what refusal looks like and nice-plug asserts on the
             // result, so a full table hands the plugin a descriptor that is
             // never ready rather than aborting the process.
-            self.run_loop.events.watch(handler, fd, Interest::READ);
+            if self.run_loop.events.watch(handler, fd, Interest::READ) {
+                unsafe { hold(&self.run_loop.held_events, handler) };
+            }
             kResultOk
         }
 
         unsafe fn unregisterEventHandler(&self, handler: *mut IEventHandler) -> tresult {
             // By handler, which is all VST3 gives us.
             self.run_loop.events.forget_by(|key, _| *key == handler);
+            release(&self.run_loop.held_events, handler);
             kResultOk
         }
 
@@ -221,14 +263,19 @@ mod run_loop {
             if handler.is_null() {
                 return kInvalidArgument;
             }
-            self.run_loop
+            if self
+                .run_loop
                 .timers
-                .arm(handler, Duration::from_millis(milliseconds));
+                .arm(handler, Duration::from_millis(milliseconds))
+            {
+                unsafe { hold(&self.run_loop.held_timers, handler) };
+            }
             kResultOk
         }
 
         unsafe fn unregisterTimer(&self, handler: *mut ITimerHandler) -> tresult {
             self.run_loop.timers.disarm(handler);
+            release(&self.run_loop.held_timers, handler);
             kResultOk
         }
     }
@@ -307,6 +354,51 @@ mod tests {
             frame.tick_run_loop();
             libc::close(fd);
         }
+    }
+
+    /// A registered handler stays alive until it is unregistered, whatever
+    /// the plugin does with its own references in between.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_registered_handler_is_kept_alive_until_unregistered() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use vst3::Steinberg::Linux::{IRunLoop, IRunLoopTrait, ITimerHandler, ITimerHandlerTrait};
+        use vst3::{Class, ComWrapper};
+
+        struct Handler(Arc<AtomicBool>);
+        impl Class for Handler {
+            type Interfaces = (ITimerHandler,);
+        }
+        impl ITimerHandlerTrait for Handler {
+            unsafe fn onTimer(&self) {}
+        }
+        impl Drop for Handler {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let frame = PlugFrame::new();
+        let run_loop = unsafe { vst3::ComRef::<IPlugFrame>::from_raw(frame.com_ptr()) }
+            .expect("frame")
+            .cast::<IRunLoop>()
+            .expect("run loop");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let handler = ComWrapper::new(Handler(dropped.clone()))
+            .to_com_ptr::<ITimerHandler>()
+            .expect("a timer handler");
+        let raw = handler.as_ptr();
+        unsafe {
+            assert_eq!(run_loop.registerTimer(raw, 16), kResultOk);
+        }
+        // The plugin lets go of its own reference while still registered.
+        drop(handler);
+        assert!(!dropped.load(Ordering::Acquire), "the run loop holds one");
+        unsafe {
+            assert_eq!(run_loop.unregisterTimer(raw), kResultOk);
+        }
+        assert!(dropped.load(Ordering::Acquire), "and gives it up");
     }
 
     /// A plugin holds the run loop until its own teardown, which is after the
