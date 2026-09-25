@@ -294,7 +294,7 @@ impl Vst3Plugin {
         // Arrangements may only be set while deactivated.
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState(
-                "bus negotiation requires an inactive plugin",
+                "bus negotiation requires an inactive plugin".into(),
             ));
         }
         if input > 2 || output > 2 {
@@ -373,7 +373,7 @@ impl Vst3Plugin {
                             .getBusInfo(media, dir, index, &mut info)
                     } != kResultOk
                     {
-                        return Err(HostError::InvalidState("bus enumeration failed"));
+                        return Err(HostError::InvalidState("bus enumeration failed".into()));
                     }
                     Ok(plugin_host_api::BusInfo {
                         name: crate::util::from_char16(&info.name),
@@ -518,7 +518,7 @@ impl Vst3Plugin {
             .get()
             .controller
             .as_ref()
-            .ok_or(HostError::InvalidState("plugin has no edit controller"))
+            .ok_or_else(|| HostError::InvalidState("plugin has no edit controller".into()))
     }
 }
 
@@ -563,7 +563,7 @@ impl SubPluginMain for Vst3Plugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "metadata changed during refresh; retry",
+                "metadata changed during refresh; retry".into(),
             ));
         }
         self.params = params;
@@ -632,12 +632,14 @@ impl SubPluginMain for Vst3Plugin {
 
     fn set_param(&mut self, id: ParamId, plain: f64) -> Result<()> {
         if !self.params.iter().any(|param| param.id == id) {
-            return Err(HostError::InvalidState("no such parameter"));
+            return Err(HostError::InvalidState("no such parameter".into()));
         }
         let ctrl = self.controller()?;
         let normalized = unsafe { ctrl.plainParamToNormalized(id.0, plain) };
         if !self.instance.get()._handler.queue_edit(id, normalized) {
-            return Err(HostError::InvalidState("parameter queue unavailable"));
+            return Err(HostError::InvalidState(
+                "parameter queue unavailable".into(),
+            ));
         }
         // The return value is advisory. Every iZotope plugin here answers
         // kResultFalse and applies the value anyway, and the SDK's own hosts
@@ -693,7 +695,7 @@ impl SubPluginMain for Vst3Plugin {
         reclaim_main_thread();
         if *self.instance.get().active.borrow() {
             return Err(HostError::InvalidState(
-                "state restoration requires an inactive plugin",
+                "state restoration requires an inactive plugin".into(),
             ));
         }
         self.tick();
@@ -708,7 +710,7 @@ impl SubPluginMain for Vst3Plugin {
         let component_state = data[8..8 + component_len].to_vec();
         self.pending_edits
             .lock()
-            .map_err(|_| HostError::InvalidState("parameter queue poisoned"))?
+            .map_err(|_| HostError::InvalidState("parameter queue poisoned".into()))?
             .clear();
         self.feedback.drain(|_, _| {});
         self.metadata_dirty = true;
@@ -749,11 +751,11 @@ impl SubPluginMain for Vst3Plugin {
         self.tick();
         if self.metadata_dirty {
             return Err(HostError::InvalidState(
-                "refresh metadata before activation",
+                "refresh metadata before activation".into(),
             ));
         }
         if *self.instance.get().active.borrow() {
-            return Err(HostError::InvalidState("plugin is already active"));
+            return Err(HostError::InvalidState("plugin is already active".into()));
         }
 
         let declared = setup_buses(
@@ -1261,7 +1263,9 @@ fn read_params(controller: &ComPtr<IEditController>) -> Result<Vec<ParamInfo>> {
     for index in 0..count {
         let mut raw: ParameterInfo = unsafe { std::mem::zeroed() };
         if unsafe { controller.getParameterInfo(index, &mut raw) } != kResultOk {
-            return Err(HostError::InvalidState("parameter enumeration failed"));
+            return Err(HostError::InvalidState(
+                "parameter enumeration failed".into(),
+            ));
         }
 
         let stepped = raw.stepCount > 0;

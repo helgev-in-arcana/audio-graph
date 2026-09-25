@@ -46,9 +46,15 @@ guess — `VoiceInfo` comes from CLAP's `voice-info` and a VST3 sub-plugin repor
 
 ### Nothing that cannot cross a process boundary appears in a public signature
 
-No `ComPtr`, no raw pointers, no references or `Arc` in payloads, no callbacks.
-`HostError` is a flat owned enum for the same reason. This is what keeps an
-out-of-process backend a drop-in substitution rather than a rewrite.
+No `ComPtr`, no raw pointers, no references, `Arc`s or callbacks in payloads.
+The host's services reach a backend through one injected trait, `HostContext`,
+which an out-of-process backend forwards as messages. `HostError` is a flat
+owned enum for the same reason, down to the message of `InvalidState`. This is
+what keeps an out-of-process backend a drop-in substitution rather than a
+rewrite.
+
+A borrowed return — `params()`, `host_name()` — is a view of state the calling
+side keeps; an out-of-process backend answers it from its own copy.
 
 Two consequences worth stating outright:
 
@@ -64,6 +70,10 @@ Reads are batched by construction: `params()`, `snapshot()`, `io_layout()` each
 return everything in one round trip, and there is no `param(id)` or per-bus
 accessor anywhere in the API. This is not a convenience — it is what stops the
 boundary from becoming chatty enough that IPC stops being viable.
+
+The one exception is text conversion, `param_to_text` and `param_from_text`. It
+is asked for one value at a time, at the pace a user moves a control, so there
+is nothing to batch.
 
 ### Main-thread and audio-thread surfaces are different traits
 
