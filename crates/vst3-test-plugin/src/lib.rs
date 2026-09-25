@@ -302,7 +302,7 @@ impl IAudioProcessorTrait for GainProcessor {
         let input_buses =
             slice::from_raw_parts(process_data.inputs, process_data.numInputs as usize);
         let output_buses =
-            slice::from_raw_parts(process_data.outputs, process_data.numOutputs as usize);
+            slice::from_raw_parts_mut(process_data.outputs, process_data.numOutputs as usize);
 
         if input_buses[0].numChannels != 2 || output_buses[0].numChannels != 2 {
             return kResultOk;
@@ -325,6 +325,9 @@ impl IAudioProcessorTrait for GainProcessor {
         for i in 0..num_samples {
             output_l[i] = gain * input_l[i];
             output_r[i] = gain * input_r[i];
+        }
+        if AUDIT_SILENT.load(Ordering::SeqCst) {
+            output_buses[0].silenceFlags = 0b11;
         }
 
         kResultOk
@@ -661,6 +664,12 @@ pub extern "C" fn audit_vst_gui_edit(value: f64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn audit_vst_emit() {
     AUDIT_EMIT.store(true, Ordering::SeqCst);
+}
+/// Mark both main output channels silent in every block while set.
+static AUDIT_SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_silent(on: bool) {
+    AUDIT_SILENT.store(on, Ordering::SeqCst);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn audit_vst_depth() -> u32 {
