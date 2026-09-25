@@ -155,7 +155,8 @@ impl Plugin {
 
     pub fn has_editor(&self) -> bool {
         match &self.inner {
-            Backend::Vst3 { plugin, .. } => plugin.has_editor(),
+            // An open editor answers without probing for a second view.
+            Backend::Vst3 { plugin, editor, .. } => editor.is_some() || plugin.has_editor(),
             Backend::Clap { plugin, .. } => plugin.has_editor(),
         }
     }

@@ -94,6 +94,8 @@ pub struct Vst3Plugin {
     pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
     feedback: Arc<ParamFeedback>,
     latency: RefCell<u32>,
+    /// Whether a view could be created, once one has been tried; see `has_editor`.
+    editor_probe: std::cell::Cell<Option<bool>>,
     context: Arc<dyn HostContext>,
 }
 
@@ -205,6 +207,7 @@ impl Vst3Plugin {
             pending_edits,
             feedback: Arc::new(ParamFeedback::new(&[])),
             latency: RefCell::new(0),
+            editor_probe: std::cell::Cell::new(None),
             context,
         };
         loaded.params = loaded
@@ -496,8 +499,18 @@ impl Vst3Plugin {
     }
 
     /// Whether the plugin offers an editor at all.
+    ///
+    /// VST3 has no way to ask short of creating a view, and creating one can
+    /// be expensive or have side effects, so the answer is found once and
+    /// kept. Ask before opening an editor: a plugin that allows only one view
+    /// at a time refuses the probe while its editor is open.
     pub fn has_editor(&self) -> bool {
-        self.create_view().is_some()
+        if let Some(known) = self.editor_probe.get() {
+            return known;
+        }
+        let found = self.create_view().is_some();
+        self.editor_probe.set(Some(found));
+        found
     }
 
     fn controller(&self) -> Result<&ComPtr<IEditController>> {
