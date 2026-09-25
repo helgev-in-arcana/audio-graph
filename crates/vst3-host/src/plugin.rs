@@ -1128,20 +1128,10 @@ impl SubPluginProcessor for Vst3Processor {
             out_events.mark_overflow();
         }
 
-        // The plugin sets silence flags on the output bus when it has nothing
-        // to say; honouring that is what lets a chain skip downstream work.
-        // The main bus alone: `output_ptrs` may now span several buses, and a
-        // silent main output says nothing about the aux ones.
-        let main_width = self.config.output_channels as usize;
-        if let Some(main) = self.output_buses.first()
-            && main.silenceFlags != 0
-            && main_width <= 64
-        {
-            let all_silent = (0..main_width).all(|c| main.silenceFlags & (1 << c) != 0);
-            if all_silent {
-                return ProcessStatus::Silent;
-            }
-        }
+        // Never `Silent`: that status promises the output stays silent until new
+        // input arrives, and VST3 has no way to say so. Its silence flags cover
+        // this block alone, and a delay's echo can follow a silent block with no
+        // new input at all.
         ProcessStatus::Continue
     }
 

@@ -267,6 +267,42 @@ fn view_retains_its_native_owner() {
     assert_eq!(unsafe { exit_views() }, 0);
 }
 
+/// A silent VST3 block is only that block: it is not reported as the sleep a `Silent` status promises.
+///
+/// VST3 silence flags describe one block's output and say nothing about the
+/// next, where a delay's echo may still arrive without any new input.
+#[test]
+fn silence_flags_do_not_claim_lasting_silence() {
+    let _thread = vst3_host::init_apartment().unwrap();
+    use plugin_host_api::*;
+    let _lock = fixture();
+    let path = fixture_path();
+    let observer = unsafe { libloading::Library::new(&path) }.unwrap();
+    let silent =
+        unsafe { observer.get::<unsafe extern "C" fn(bool)>(b"audit_vst_silent") }.unwrap();
+    struct Silenced<'a>(libloading::Symbol<'a, unsafe extern "C" fn(bool)>);
+    impl Drop for Silenced<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.0)(false) };
+        }
+    }
+    unsafe { silent(true) };
+    let _silenced = Silenced(silent);
+
+    let module = Module::open(&path).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    let mut processor = plugin.activate(AudioConfig::default()).unwrap();
+    let input = [0.0; 8];
+    let mut output = [0.0; 8];
+    let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 4, BufferLayout::Planar);
+    let mut sink = EventSink::with_capacity(8);
+    assert_eq!(
+        processor.process(&mut buffers, &[], &TimeContext::default(), &mut sink),
+        ProcessStatus::Continue
+    );
+}
+
 /// A stepped VST3 parameter's plain value is its step, whatever the plugin calls plain.
 ///
 /// The fixture's Mode declares four choices and, like the SDK's base
