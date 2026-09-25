@@ -960,6 +960,7 @@ impl SubPluginMain for ClapPlugin {
             self.instance.get().plugin,
             config,
             plan,
+            Ranges::of(&self.params),
             Arc::clone(&self.pending_edits),
             Arc::clone(&self.instance),
         )))
@@ -1145,6 +1146,8 @@ pub struct ClapProcessor {
     /// Samples processed since activation, which is what CLAP's `steady_time`
     /// means. `-1` would mean "the host does not know", and we do.
     steady_time: i64,
+    /// Each parameter's range, for normalized values; see [`Ranges`].
+    ranges: Ranges,
     instance: Arc<MainThread<ClapInstance>>,
 }
 
@@ -1159,6 +1162,7 @@ impl ClapProcessor {
         plugin: *const clap_plugin,
         config: AudioConfig,
         plan: BindingPlan,
+        ranges: Ranges,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
         instance: Arc<MainThread<ClapInstance>>,
     ) -> ClapProcessor {
@@ -1181,8 +1185,39 @@ impl ClapProcessor {
             out_events: OutputEvents::new(MAX_EVENTS_PER_BLOCK),
             pending_edits,
             steady_time: 0,
+            ranges,
             instance,
         }
+    }
+}
+
+/// Every parameter's declared range, sorted by id, taken at activate.
+///
+/// CLAP events carry plain values only, so a normalized one is mapped here, on
+/// the audio thread: linearly across the range, and to the nearest step for a
+/// stepped parameter, which is what a CLAP host's automation lane does.
+struct Ranges(Vec<(ParamId, f64, f64, bool)>);
+
+impl Ranges {
+    fn of(params: &[ParamInfo]) -> Ranges {
+        let mut ranges: Vec<_> = params
+            .iter()
+            .map(|p| (p.id, p.min, p.max, p.flags.contains(ParamFlags::STEPPED)))
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.0);
+        Ranges(ranges)
+    }
+
+    /// The plain value `normalized` stands for, or `None` for an id the
+    /// plugin did not declare or a value that is not a number.
+    fn plain(&self, id: ParamId, normalized: f64) -> Option<f64> {
+        let index = self.0.binary_search_by_key(&id, |r| r.0).ok()?;
+        let (_, min, max, stepped) = self.0[index];
+        if !normalized.is_finite() {
+            return None;
+        }
+        let plain = min + normalized.clamp(0.0, 1.0) * (max - min);
+        Some(if stepped { plain.round() } else { plain })
     }
 }
 
@@ -1221,7 +1256,25 @@ impl SubPluginProcessor for ClapProcessor {
             }
         }
         for event in events {
-            self.in_events.push(event);
+            match *event {
+                Event::Param(plugin_host_api::ParamEvent::SetNormalized {
+                    id,
+                    target,
+                    value,
+                    sample_offset,
+                }) => {
+                    if let Some(value) = self.ranges.plain(id, value) {
+                        self.in_events
+                            .push(&Event::Param(plugin_host_api::ParamEvent::SetValue {
+                                id,
+                                target,
+                                value,
+                                sample_offset,
+                            }));
+                    }
+                }
+                _ => self.in_events.push(event),
+            }
         }
         if self.in_events.overflowed
             || !events.is_sorted_by_key(Event::sample_offset)
@@ -1655,6 +1708,30 @@ mod tests {
         assert_eq!(every_channel(2), 0b11);
         assert_eq!(every_channel(64), u64::MAX);
         assert_eq!(every_channel(65), u64::MAX);
+    }
+
+    /// A normalized value lands linearly across the range, on a step for a stepped parameter.
+    #[test]
+    fn normalized_values_map_across_the_declared_range() {
+        let param = |id, min, max, flags| ParamInfo {
+            id: ParamId(id),
+            name: String::new(),
+            module: String::new(),
+            min,
+            max,
+            default: min,
+            flags,
+        };
+        let ranges = Ranges::of(&[
+            param(7, -12.0, 12.0, ParamFlags::STEPPED),
+            param(2, 20.0, 220.0, ParamFlags::NONE),
+        ]);
+        assert_eq!(ranges.plain(ParamId(2), 0.25), Some(70.0));
+        assert_eq!(ranges.plain(ParamId(2), 2.0), Some(220.0));
+        assert_eq!(ranges.plain(ParamId(7), 0.52), Some(0.0));
+        assert_eq!(ranges.plain(ParamId(7), 1.0), Some(12.0));
+        assert_eq!(ranges.plain(ParamId(3), 0.5), None);
+        assert_eq!(ranges.plain(ParamId(2), f64::NAN), None);
     }
 
     #[test]

@@ -62,6 +62,11 @@ impl ParamMap {
         ParamMap { entries }
     }
 
+    /// Whether the plugin declared `id`. Audio-thread safe.
+    pub fn contains(&self, id: ParamId) -> bool {
+        self.entry(id).is_some()
+    }
+
     fn entry(&self, id: ParamId) -> Option<&Entry> {
         let index = self.entries.binary_search_by_key(&id, |e| e.id).ok()?;
         Some(&self.entries[index])
