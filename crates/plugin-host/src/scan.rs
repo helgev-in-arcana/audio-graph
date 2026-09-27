@@ -58,28 +58,11 @@ impl ClassInfo {
     }
 }
 
-/// Directories the OS conventionally keeps plugins in, every format together.
-///
-/// Not what gets scanned — [`plugin_directories`] is. This is what a first run
-/// seeds the user's settings with, and what "put the usual folders back" means
-/// afterwards.
-pub fn default_plugin_directories() -> Vec<(Format, PathBuf)> {
-    let mut out = Vec::new();
-    for dir in vst3_host::default_plugin_directories() {
-        out.push((Format::Vst3, dir));
-    }
-    for dir in clap_host::default_plugin_directories() {
-        out.push((Format::Clap, dir));
-    }
-    out
-}
-
 /// Every directory a scan should look in, as the user's settings have it.
 ///
-/// The supplied directory list is the whole answer, not an addition to
-/// [`default_plugin_directories`]: the conventional folders are written into
-/// the settings the first time they are read, and are the user's to keep or
-/// remove from then on.
+/// The supplied directory list is the whole answer: which folders to look in
+/// is the caller's to say, including the ones a platform conventionally keeps
+/// plugins in. Nothing here adds any of its own.
 ///
 /// Each directory is paired with every format, because the user pointed at a
 /// folder of plugins and not at a folder of VST3s.

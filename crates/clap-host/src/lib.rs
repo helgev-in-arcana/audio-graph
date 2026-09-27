@@ -18,55 +18,6 @@ pub use plugin::{ClapPlugin, ClapProcessor};
 /// The file extension of a CLAP module.
 pub const CLAP_EXTENSION: &str = "clap";
 
-/// Directories the OS conventionally keeps CLAP plugins in.
-///
-/// `CLAP_PATH` comes first when it is set: the format specifies it, and a
-/// developer pointing at a build directory expects it to win over an installed
-/// copy of the same plugin.
-pub fn default_plugin_directories() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Some(path) = std::env::var_os("CLAP_PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(pf) = std::env::var("CommonProgramFiles") {
-            dirs.push(std::path::PathBuf::from(pf).join("CLAP"));
-        }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            dirs.push(
-                std::path::PathBuf::from(local)
-                    .join("Programs")
-                    .join("Common")
-                    .join("CLAP"),
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        dirs.push(std::path::PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
-        if let Ok(home) = std::env::var("HOME") {
-            dirs.push(std::path::PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP"));
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            dirs.push(std::path::PathBuf::from(&home).join(".clap"));
-        }
-        dirs.push(std::path::PathBuf::from("/usr/lib/clap"));
-        dirs.push(std::path::PathBuf::from("/usr/local/lib/clap"));
-    }
-
-    dirs.retain(|d| d.is_dir());
-    dirs.dedup();
-    dirs
-}
-
 /// List the `.clap` modules directly inside `dir`.
 ///
 /// Not recursive, for the same reason as the VST3 scanner's: vendors nest their

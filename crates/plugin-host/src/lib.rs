@@ -41,8 +41,8 @@ mod scan;
 pub use format::{FORMATS, Format};
 pub use plugin::Plugin;
 pub use scan::{
-    ClassInfo, PluginRef, default_plugin_directories, find_modules, installed_modules,
-    plugin_directories, reference_candidates, scan_module, scan_module_as,
+    ClassInfo, PluginRef, find_modules, installed_modules, plugin_directories,
+    reference_candidates, scan_module, scan_module_as,
 };
 
 // The shared data model, re-exported wholesale. Callers depend on this crate

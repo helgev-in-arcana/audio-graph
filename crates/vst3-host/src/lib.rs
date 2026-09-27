@@ -34,46 +34,6 @@ pub use plugin::{Vst3Plugin, Vst3Processor, Vst3View};
 /// The file extension of a VST3 module, bundle or bare library alike.
 pub const VST3_EXTENSION: &str = "vst3";
 
-/// Standard platform directories where VST3 plugins are installed.
-pub fn default_plugin_directories() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(pf) = std::env::var("CommonProgramFiles") {
-            dirs.push(std::path::PathBuf::from(pf).join("VST3"));
-        }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            dirs.push(
-                std::path::PathBuf::from(local)
-                    .join("Programs")
-                    .join("Common")
-                    .join("VST3"),
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        dirs.push(std::path::PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
-        if let Ok(home) = std::env::var("HOME") {
-            dirs.push(std::path::PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"));
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            dirs.push(std::path::PathBuf::from(&home).join(".vst3"));
-        }
-        dirs.push(std::path::PathBuf::from("/usr/lib/vst3"));
-        dirs.push(std::path::PathBuf::from("/usr/local/lib/vst3"));
-    }
-
-    dirs.retain(|d| d.is_dir());
-    dirs
-}
-
 /// List the `.vst3` modules directly inside `dir`.
 ///
 /// Not recursive by default because vendors nest their own subfolders and a
