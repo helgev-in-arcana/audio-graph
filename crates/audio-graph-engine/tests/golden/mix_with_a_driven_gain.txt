@@ -98,4 +98,5 @@ Program {
     lfo_nodes: [
         5,
     ],
+    dsp_nodes: [],
 }

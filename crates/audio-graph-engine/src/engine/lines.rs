@@ -181,6 +181,33 @@ impl Slot for Latch {
     }
 }
 
+/// One audio node's state between blocks — see [`AudioOp::Math`].
+pub(super) struct DspState {
+    pub(super) values: [f64; DSP_VALUES],
+    node: u32,
+}
+
+impl DspState {
+    pub(super) fn new() -> DspState {
+        DspState {
+            values: [0.0; DSP_VALUES],
+            node: u32::MAX,
+        }
+    }
+}
+
+impl Slot for DspState {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    fn clear(&mut self) {
+        self.values = [0.0; DSP_VALUES];
+    }
+}
+
 /// Move each slot to the index the new program gave its node, contents intact.
 ///
 /// Work out the permutation first, then apply it by swapping whole slots: for

@@ -520,6 +520,91 @@ impl Engine {
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
                 }
+                AudioOp::Math {
+                    out,
+                    a,
+                    b,
+                    op,
+                    state,
+                } => {
+                    let width = (program.buffers[*out as usize] as usize).min(MAX_CHANNELS);
+                    self.audio_math(
+                        *out,
+                        *a,
+                        *b,
+                        *op,
+                        *state as usize,
+                        width,
+                        win,
+                        ctx.sample_rate,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One chunk of an [`AudioOp::Math`], channel by channel.
+    #[allow(clippy::too_many_arguments)]
+    fn audio_math(
+        &mut self,
+        out: Buf,
+        a: Buf,
+        b: Option<Buf>,
+        op: AudioMathOp,
+        state: usize,
+        width: usize,
+        win: Window,
+        sample_rate: f64,
+    ) {
+        // The pole of a first-order DC blocker at `DC_CUTOFF_HZ`, from the
+        // one-pole approximation `1 - 2πfc/fs` — exact enough three decades
+        // below the sample rate, and cheaper than the exponential.
+        let pole =
+            (1.0 - std::f64::consts::TAU * DC_CUTOFF_HZ / sample_rate.max(1.0)).clamp(0.0, 1.0);
+        for ch in 0..width {
+            let from = self.at(a, ch, win);
+            let to = self.at(out, ch, win);
+            let with = b.map(|b| self.at(b, ch, win));
+            let pool = &mut self.pool;
+            match op {
+                AudioMathOp::RemoveDc => {
+                    let Some(held) = self.dsp.get_mut(state) else {
+                        continue;
+                    };
+                    // `y[n] = x[n] - x[n-1] + pole * y[n-1]`, the previous
+                    // input and output carried in the node's state.
+                    let (mut x1, mut y1) = (held.values[2 * ch], held.values[2 * ch + 1]);
+                    for i in 0..win.frames {
+                        let x = f64::from(pool[from + i]);
+                        let y = x - x1 + pole * y1;
+                        pool[to + i] = y as f32;
+                        (x1, y1) = (x, y);
+                    }
+                    held.values[2 * ch] = x1;
+                    held.values[2 * ch + 1] = y1;
+                }
+                AudioMathOp::Invert => {
+                    for i in 0..win.frames {
+                        pool[to + i] = -pool[from + i];
+                    }
+                }
+                AudioMathOp::Rectify => {
+                    for i in 0..win.frames {
+                        pool[to + i] = pool[from + i].abs();
+                    }
+                }
+                AudioMathOp::Multiply => match with {
+                    Some(with) => {
+                        for i in 0..win.frames {
+                            pool[to + i] = pool[from + i] * pool[with + i];
+                        }
+                    }
+                    None => {
+                        if to != from {
+                            pool.copy_within(from..from + win.frames, to);
+                        }
+                    }
+                },
             }
         }
     }

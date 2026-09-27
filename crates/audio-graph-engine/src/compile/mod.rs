@@ -216,6 +216,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_rings: Vec::new(),
         lfo_nodes: param.lfo_nodes,
         latch_nodes: param.latch_nodes,
+        dsp_nodes: audio.dsp_nodes,
     })
 }
 

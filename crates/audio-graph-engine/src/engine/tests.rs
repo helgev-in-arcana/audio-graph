@@ -4231,3 +4231,117 @@ fn an_unreadable_node_compiles_as_if_absent() {
     engine.run(&ctx(32), &mut slots);
     assert_eq!(slots[SINK], 0.25, "the input it fed reads as unwired");
 }
+
+fn audio_math(graph: &mut Graph, op: crate::ir::AudioMathOp) -> NodeId {
+    graph.add(
+        NodeKind::AudioMath(crate::nodes::AudioMath { channels: 2, op }),
+        [0.0, 0.0],
+    )
+}
+
+/// Runs `blocks` blocks of 128 frames with `signal(n)` on both input
+/// channels, and returns channel 0 of the output.
+fn play(
+    engine: &mut Engine,
+    start: usize,
+    blocks: usize,
+    signal: impl Fn(usize) -> f32,
+) -> Vec<f32> {
+    let mut heard = Vec::new();
+    for block in 0..blocks {
+        let mut daw_in = vec![0.0f32; 2 * 128];
+        for i in 0..128 {
+            let v = signal(start + block * 128 + i);
+            daw_in[i] = v;
+            daw_in[128 + i] = v;
+        }
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+        heard.extend_from_slice(&daw_out[..128]);
+    }
+    heard
+}
+
+/// Removing DC takes a constant offset out within a fraction of a second and
+/// leaves a tone at 1 kHz where it was.
+#[test]
+fn removing_dc_takes_out_an_offset_and_leaves_the_sound() {
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let node = audio_math(&mut graph, crate::ir::AudioMathOp::RemoveDc);
+    graph.connect(input, 0, node, 0);
+    graph.connect(node, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &graph);
+    let tone =
+        |n: usize| 0.5 + 0.25 * (std::f32::consts::TAU * 1000.0 * n as f32 / RATE as f32).sin();
+    let heard = play(&mut engine, 0, 150, tone);
+
+    // The last 20 ms: the offset gone, the tone's peak where it was.
+    let tail = &heard[heard.len() - 960..];
+    let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+    let peak = tail.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(mean.abs() < 0.005, "offset left: {mean}");
+    assert!((peak - 0.25).abs() < 0.01, "tone at {peak}, not 0.25");
+}
+
+/// A recompile keeps the filter's history. Starting it over would put the
+/// whole offset back on the output for a moment — a thump on every drag of
+/// every control while an offset is flowing.
+#[test]
+fn a_recompile_keeps_the_dc_filters_history() {
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let node = audio_math(&mut graph, crate::ir::AudioMathOp::RemoveDc);
+    graph.connect(input, 0, node, 0);
+    graph.connect(node, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &graph);
+    play(&mut engine, 0, 150, |_| 0.5);
+
+    load(&mut engine, &graph);
+    let after = play(&mut engine, 150 * 128, 1, |_| 0.5);
+    let peak = after.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        peak < 0.005,
+        "the offset came back at {peak} after the swap"
+    );
+}
+
+/// Multiplying gives the product of the two signals, and with nothing wired
+/// to the second passes the first unchanged; inverting flips it, and
+/// rectifying takes its magnitude.
+#[test]
+fn the_sample_by_sample_ops_do_what_they_say() {
+    use crate::ir::AudioMathOp;
+    let run = |op: AudioMathOp, wire_b: bool| {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let node = audio_math(&mut graph, op);
+        graph.connect(input, 0, node, 0);
+        if wire_b {
+            graph.connect(input, 0, node, 1);
+        }
+        graph.connect(node, 0, output, 0);
+        let mut engine = Engine::new();
+        engine.prepare(128, &[2]);
+        load(&mut engine, &graph);
+        play(&mut engine, 0, 1, |_| -0.5)[64]
+    };
+    assert_eq!(run(AudioMathOp::Multiply, true), 0.25);
+    assert_eq!(run(AudioMathOp::Multiply, false), -0.5);
+    assert_eq!(run(AudioMathOp::Invert, false), 0.5);
+    assert_eq!(run(AudioMathOp::Rectify, false), 0.5);
+    assert_eq!(
+        run(AudioMathOp::Invert, true),
+        0.5,
+        "an op that reads one signal ignores the second"
+    );
+}

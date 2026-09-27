@@ -15,6 +15,7 @@
 pub mod widgets;
 
 mod audio_io;
+mod audio_math;
 mod cc_in;
 mod constant;
 mod delay;
@@ -39,6 +40,7 @@ mod switch;
 mod unknown;
 
 pub use audio_io::{AudioIn, AudioOut};
+pub use audio_math::AudioMath;
 pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};
@@ -328,6 +330,7 @@ pub enum NodeKind {
     DelayWrite(DelayWrite),
     Mix(Mix),
     Gate(Gate),
+    AudioMath(AudioMath),
     NoteGate(NoteGate),
     KeySwitch(KeySwitch),
     KeySplit(KeySplit),
@@ -378,6 +381,7 @@ macro_rules! for_kind {
             NodeKind::DelayWrite($node) => $body,
             NodeKind::Mix($node) => $body,
             NodeKind::Gate($node) => $body,
+            NodeKind::AudioMath($node) => $body,
             NodeKind::NoteGate($node) => $body,
             NodeKind::KeySwitch($node) => $body,
             NodeKind::KeySplit($node) => $body,
@@ -624,6 +628,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Audio,
         Gate::catalogue_defaults(),
         NodeKind::Gate,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        AudioMath::catalogue_defaults(),
+        NodeKind::AudioMath,
     );
     take(
         &mut out,
