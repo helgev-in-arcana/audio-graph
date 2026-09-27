@@ -44,6 +44,12 @@ pub struct Wrapper {
     /// The DAW's automation, before the graph has had a say.
     daw_slots: Vec<f64>,
     events: Vec<Event>,
+    /// Note events the DAW sent past `events`' capacity since activation.
+    ///
+    /// They never reach the engine, so its own count cannot include them; the
+    /// notice adds the two, because to the user a note lost here and one lost
+    /// inside the graph are the same missing note.
+    events_dropped: u64,
     out_events: InstanceEventSink,
     /// Notes the graph has finished with, to be handed back to the DAW.
     ///
@@ -87,6 +93,7 @@ impl Default for Wrapper {
             schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM).unwrap(),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
+            events_dropped: 0,
             out_events: InstanceEventSink::new(),
             ended_notes: Vec::new(),
             input_scratch: Vec::new(),
@@ -307,6 +314,7 @@ impl Wrapper {
         self.output_scratch = vec![0.0; (self.channels * max_block) as usize];
         self.daw_slots = vec![0.0; SLOT_COUNT];
         self.events = Vec::with_capacity(1024);
+        self.events_dropped = 0;
         self.out_events = InstanceEventSink::with_capacity(256);
         self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
@@ -376,10 +384,12 @@ impl Wrapper {
         // single ordered event stream.
         self.events.clear();
         while let Some(event) = context.next_event() {
-            if let Some(converted) = convert_note(&event)
-                && self.events.len() < self.events.capacity()
-            {
-                self.events.push(Event::Note(converted));
+            if let Some(converted) = convert_note(&event) {
+                if self.events.len() < self.events.capacity() {
+                    self.events.push(Event::Note(converted));
+                } else {
+                    self.events_dropped += 1;
+                }
             }
         }
 
@@ -537,8 +547,10 @@ impl Wrapper {
             report_ended(&self.ended_notes, context);
             self.out_events.clear();
         }
-        self.shared
-            .report_note_losses(self.engine.notes_dropped(), self.engine.notes_stolen());
+        self.shared.report_note_losses(
+            self.engine.notes_dropped() + self.events_dropped,
+            self.engine.notes_stolen(),
+        );
         // What the editor's meters show. The DAW's own parameter value stops
         // being the answer the moment the graph drives a slot.
         self.shared
