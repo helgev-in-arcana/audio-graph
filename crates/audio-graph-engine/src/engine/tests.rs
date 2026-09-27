@@ -65,6 +65,7 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
         frames,
         quantum: 32,
         sample_rate: RATE,
+        tempo_bpm: 120.0,
         lanes: &[],
         lanes_per_row: 0,
     }
@@ -528,6 +529,7 @@ fn hear(graph: &Graph, events: &[Event], lanes: &[f64]) -> Heard {
             frames: 8,
             quantum: 32,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &row,
             lanes_per_row: width,
         },
@@ -875,6 +877,7 @@ fn a_controller_is_sent_once_until_it_moves() {
                 frames: 8,
                 quantum: 32,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &row,
                 lanes_per_row: width,
             },
@@ -1063,6 +1066,7 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
             frames: 64,
             quantum: 16,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &rows,
             lanes_per_row: width,
         },
@@ -1187,6 +1191,7 @@ fn a_note_that_reaches_no_plugin_is_reported_ended() {
             frames: 8,
             quantum: 32,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &row,
             lanes_per_row: width,
         },
@@ -1235,6 +1240,7 @@ fn a_delivered_note_is_reported_only_when_the_plugin_ends_it() {
             frames: 8,
             quantum: 32,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &row,
             lanes_per_row: width,
         },
@@ -1342,6 +1348,7 @@ fn completion_policy_can_differ_between_instances() {
                     frames: 8,
                     quantum: 8,
                     sample_rate: RATE,
+                    tempo_bpm: 120.0,
                     lanes: &row,
                     lanes_per_row: width,
                 },
@@ -1428,6 +1435,7 @@ fn a_note_lands_in_one_sub_block_only() {
             frames: 8,
             quantum: 4,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &row,
             lanes_per_row: width,
         },
@@ -1568,6 +1576,7 @@ fn the_boundary_a_block_starts_on_belongs_to_the_block_before() {
                 frames: 8,
                 quantum: 32,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &row,
                 lanes_per_row: width,
             },
@@ -3022,6 +3031,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 frames: BLOCK,
                 quantum: QUANTUM,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &[],
                 lanes_per_row: width,
             };
@@ -3523,6 +3533,7 @@ fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
                 frames: 128,
                 quantum: 32,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &lanes,
                 lanes_per_row,
             },
@@ -3595,6 +3606,7 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
                 frames: 128,
                 quantum: 32,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &lanes,
                 lanes_per_row,
             },
@@ -3721,6 +3733,7 @@ fn a_gate_passes_or_silences_by_its_control() {
                 frames: 8,
                 quantum: 32,
                 sample_rate: RATE,
+                tempo_bpm: 120.0,
                 lanes: &lanes,
                 lanes_per_row: width,
             },
@@ -3794,6 +3807,7 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
             frames: 64,
             quantum: 16,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &rows,
             lanes_per_row: width,
         },
@@ -3916,6 +3930,7 @@ fn a_driven_gain_socket_interprets_its_value_as_decibels() {
             frames: 8,
             quantum: 8,
             sample_rate: RATE,
+            tempo_bpm: 120.0,
             lanes: &lanes,
             lanes_per_row,
         },
@@ -4344,4 +4359,63 @@ fn the_sample_by_sample_ops_do_what_they_say() {
         0.5,
         "an op that reads one signal ignores the second"
     );
+}
+
+fn tremolo_patch(depth: f64) -> Graph {
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let tremolo = graph.add(
+        NodeKind::Tremolo(crate::nodes::Tremolo {
+            channels: 2,
+            waveform: Waveform::Sine,
+            // 480 samples a cycle at 48 kHz.
+            rate: Rate::Hz(100.0),
+            depth,
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(input, 0, tremolo, 0);
+    graph.connect(tremolo, 0, output, 0);
+    graph
+}
+
+/// At full depth the gain swings all the way to silence and back once a
+/// cycle; at none it leaves the signal alone.
+#[test]
+fn a_tremolo_swings_the_gain_by_its_depth() {
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &tremolo_patch(1.0));
+    let heard = play(&mut engine, 0, 8, |_| 1.0);
+    let cycle = &heard[..480];
+    let low = cycle.iter().fold(1.0f32, |m, v| m.min(*v));
+    let high = cycle.iter().fold(0.0f32, |m, v| m.max(*v));
+    assert!(low < 0.01 && high > 0.99, "swung between {low} and {high}");
+
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &tremolo_patch(0.0));
+    let heard = play(&mut engine, 0, 4, |_| 0.7);
+    assert!(heard.iter().all(|v| (v - 0.7).abs() < 1e-6));
+}
+
+/// A recompile does not restart the oscillator: the output across a swap is
+/// the output with no swap at all. Restarting it would jump the gain on every
+/// drag of every control.
+#[test]
+fn a_recompile_does_not_restart_the_tremolo() {
+    let graph = tremolo_patch(0.8);
+    let mut straight = Engine::new();
+    straight.prepare(128, &[2]);
+    load(&mut straight, &graph);
+    let expected = play(&mut straight, 0, 6, |_| 1.0);
+
+    let mut swapped = Engine::new();
+    swapped.prepare(128, &[2]);
+    load(&mut swapped, &graph);
+    let mut heard = play(&mut swapped, 0, 3, |_| 1.0);
+    load(&mut swapped, &graph);
+    heard.extend(play(&mut swapped, 3 * 128, 3, |_| 1.0));
+    assert_eq!(heard, expected);
 }

@@ -85,6 +85,9 @@ pub struct AudioContext<'a> {
     /// `i` cover the same samples.
     pub quantum: u32,
     pub sample_rate: f64,
+    /// The host's tempo, for audio ops that follow it — a tremolo synced to
+    /// the beat.
+    pub tempo_bpm: f64,
     pub lanes: &'a [f64],
     /// Number of lanes per sub-block row.
     pub lanes_per_row: usize,
@@ -625,6 +628,7 @@ impl Engine {
                     frames,
                     quantum: view.quantum(),
                     sample_rate,
+                    tempo_bpm,
                     lanes: view.rows(),
                     lanes_per_row: view.lanes(),
                 },
