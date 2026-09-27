@@ -168,7 +168,10 @@ impl IComponentTrait for GainProcessor {
         kResultOk
     }
 
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        if state != 0 && AUDIT_ANNOUNCE_ON_ACTIVATE.load(Ordering::SeqCst) {
+            audit_vst_announce_latency();
+        }
         kResultOk
     }
 
@@ -246,7 +249,7 @@ impl IAudioProcessorTrait for GainProcessor {
     }
 
     unsafe fn getLatencySamples(&self) -> u32 {
-        0
+        AUDIT_LATENCY.load(Ordering::SeqCst)
     }
 
     unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
@@ -689,6 +692,27 @@ pub extern "C" fn audit_vst_gui_edit(value: f64) {
         handler.performEdit(0, value);
         handler.endEdit(0);
     }
+}
+static AUDIT_LATENCY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_latency(samples: u32) {
+    AUDIT_LATENCY.store(samples, Ordering::SeqCst);
+}
+/// Say the latency changed, whether or not it did.
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_announce_latency() {
+    let handler = AUDIT_HANDLER.load(Ordering::SeqCst);
+    if let Some(handler) = unsafe { ComRef::from_raw(handler) } {
+        unsafe { handler.restartComponent(RestartFlags_::kLatencyChanged as i32) };
+    }
+}
+/// Announce a latency change from every `setActive(true)` while set, the way
+/// some plugins do with a latency that has not moved.
+static AUDIT_ANNOUNCE_ON_ACTIVATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_announce_on_activate(on: bool) {
+    AUDIT_ANNOUNCE_ON_ACTIVATE.store(on, Ordering::SeqCst);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn audit_vst_emit() {

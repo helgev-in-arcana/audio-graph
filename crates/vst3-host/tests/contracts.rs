@@ -193,6 +193,60 @@ fn activation_requires_the_actual_requested_bus_layout() {
     }
 }
 
+/// A latency change that leaves the latency where it was does not take the
+/// plugin down, and one that moves it still does.
+///
+/// Some plugins announce a change from every activation. Deactivating to read
+/// the new number reactivates, which announces again, so believing every
+/// announcement restarts such a plugin on every tick for as long as it is
+/// loaded.
+#[test]
+fn an_unchanged_latency_does_not_restart_the_plugin() {
+    use plugin_host_api::MetadataUpdate;
+    let _thread = vst3_host::init_apartment().unwrap();
+    let _lock = fixture();
+    let path = fixture_path();
+    let observer = unsafe { libloading::Library::new(&path) }.unwrap();
+    let latency =
+        unsafe { observer.get::<unsafe extern "C" fn(u32)>(b"audit_vst_latency") }.unwrap();
+    let announce =
+        unsafe { observer.get::<unsafe extern "C" fn()>(b"audit_vst_announce_latency") }.unwrap();
+    let on_activate =
+        unsafe { observer.get::<unsafe extern "C" fn(bool)>(b"audit_vst_announce_on_activate") }
+            .unwrap();
+    // Statics inside the fixture, shared with every later test in this
+    // process, so they go back however this test ends.
+    struct Restore<'a>(
+        libloading::Symbol<'a, unsafe extern "C" fn(u32)>,
+        libloading::Symbol<'a, unsafe extern "C" fn(bool)>,
+    );
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            unsafe { (self.0)(0) };
+            unsafe { (self.1)(false) };
+        }
+    }
+    let _restore = Restore(latency.clone(), on_activate.clone());
+
+    let module = Module::open(&path).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    unsafe { on_activate(true) };
+    let processor = plugin.activate(AudioConfig::default()).unwrap();
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::Unchanged
+    );
+
+    unsafe { latency(64) };
+    unsafe { announce() };
+    assert_eq!(
+        plugin.refresh_metadata().unwrap(),
+        MetadataUpdate::NeedsDeactivation
+    );
+    processor.deactivate();
+}
+
 struct Host;
 impl HostContext for Host {
     fn host_name(&self) -> &str {

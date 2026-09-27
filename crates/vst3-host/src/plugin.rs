@@ -106,7 +106,20 @@ impl Vst3Plugin {
         use vst3::Steinberg::Vst::RestartFlags_::{
             kIoChanged, kIoTitlesChanged, kLatencyChanged, kParamTitlesChanged, kParamValuesChanged,
         };
-        let flags = self.instance.get()._handler.take_restart_requests();
+        let mut flags = self.instance.get()._handler.take_restart_requests();
+        // Some plugins announce a latency change from every activation, with
+        // the latency they already had. Believing it means deactivating to
+        // read the new number, and reactivating announces it again: a restart
+        // of the whole plugin on every tick for as long as it is loaded. So an
+        // active plugin is asked first, and a latency that has not moved is not
+        // a change. An inactive one is asked at its next activation anyway.
+        if flags & kLatencyChanged != 0
+            && *self.instance.get().active.borrow()
+            && unsafe { self.instance.get().processor.getLatencySamples() }
+                == *self.latency.borrow()
+        {
+            flags &= !kLatencyChanged;
+        }
         if flags & kParamValuesChanged != 0 {
             // Native value invalidation supersedes feedback collected before the notification.
             self.feedback.drain(|_, _| {});
