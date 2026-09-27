@@ -53,15 +53,10 @@ const CANDIDATES: usize = 6;
 /// Only a stereo effect qualifies: the tests activate it with a stereo input, which an
 /// instrument or a mono effect refuses.
 fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
-    let mut tried = 0;
-    for path in candidate_paths() {
-        if tried >= CANDIDATES {
-            break;
-        }
+    for path in candidate_paths().into_iter().take(CANDIDATES) {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        tried += 1;
         eprintln!("trying {name}");
 
         let params = WrapperParams::new();
