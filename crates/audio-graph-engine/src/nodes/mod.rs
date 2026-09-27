@@ -37,6 +37,7 @@ mod plugin;
 mod range_map;
 mod slot;
 mod switch;
+mod tremolo;
 mod unknown;
 
 pub use audio_io::{AudioIn, AudioOut};
@@ -62,6 +63,7 @@ pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
 pub use slot::SlotIn;
 pub use switch::Switch;
+pub use tremolo::Tremolo;
 pub use unknown::Unknown;
 
 use serde::{Deserialize, Serialize};
@@ -331,6 +333,7 @@ pub enum NodeKind {
     Mix(Mix),
     Gate(Gate),
     AudioMath(AudioMath),
+    Tremolo(Tremolo),
     NoteGate(NoteGate),
     KeySwitch(KeySwitch),
     KeySplit(KeySplit),
@@ -382,6 +385,7 @@ macro_rules! for_kind {
             NodeKind::Mix($node) => $body,
             NodeKind::Gate($node) => $body,
             NodeKind::AudioMath($node) => $body,
+            NodeKind::Tremolo($node) => $body,
             NodeKind::NoteGate($node) => $body,
             NodeKind::KeySwitch($node) => $body,
             NodeKind::KeySplit($node) => $body,
@@ -634,6 +638,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Audio,
         AudioMath::catalogue_defaults(),
         NodeKind::AudioMath,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
+        Tremolo::catalogue_defaults(),
+        NodeKind::Tremolo,
     );
     take(
         &mut out,

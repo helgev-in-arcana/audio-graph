@@ -111,19 +111,7 @@ impl Engine {
                 } => {
                     let i = state as usize;
                     let phase = (self.lfos[i].phase + offset_phase).rem_euclid(1.0);
-                    let shape = match waveform {
-                        Waveform::Sine => (phase * std::f64::consts::TAU).sin(),
-                        Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
-                        Waveform::Saw => 2.0 * phase - 1.0,
-                        Waveform::Square => {
-                            if phase < 0.5 {
-                                -1.0
-                            } else {
-                                1.0
-                            }
-                        }
-                        Waveform::Random => self.lfos[i].hold,
-                    };
+                    let shape = waveform.shape(phase).unwrap_or(self.lfos[i].hold);
                     self.registers[out as usize] = centre + depth * shape;
 
                     let hz = match rate {

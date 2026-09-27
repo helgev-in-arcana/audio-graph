@@ -47,7 +47,7 @@ pub use nodes::{
     AudioIn, AudioMath, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower,
     FilterMode, Gate, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math, Mix,
     NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn, NoteMute, ParamPort, ParamToCc, Plugin,
-    PluginPorts, RangeMap, Rate, SlotIn, Switch, Unknown, db_to_linear, linear_to_db,
+    PluginPorts, RangeMap, Rate, SlotIn, Switch, Tremolo, Unknown, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{

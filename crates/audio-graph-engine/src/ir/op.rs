@@ -247,6 +247,25 @@ pub enum Waveform {
 }
 
 impl Waveform {
+    /// The waveform at `phase` (0..1), from -1 to 1. `None` for
+    /// [`Waveform::Random`], whose value is held between cycles rather than
+    /// drawn from the phase.
+    pub fn shape(self, phase: f64) -> Option<f64> {
+        Some(match self {
+            Waveform::Sine => (phase * std::f64::consts::TAU).sin(),
+            Waveform::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+            Waveform::Saw => 2.0 * phase - 1.0,
+            Waveform::Square => {
+                if phase < 0.5 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            }
+            Waveform::Random => return None,
+        })
+    }
+
     pub const ALL: [Waveform; 5] = [
         Waveform::Sine,
         Waveform::Triangle,
