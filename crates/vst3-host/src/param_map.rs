@@ -39,8 +39,17 @@ pub fn normalized_to_step(normalized: f64, steps: f64) -> f64 {
 /// while staying small enough to hold for hundreds of parameters.
 const TABLE_SIZE: usize = 257;
 
-/// Points used to decide whether the closed form is good enough.
-const PROBE_COUNT: usize = 33;
+/// Points used to decide whether the closed form is good enough, counting
+/// both ends.
+///
+/// Three interior points, at a quarter, a half and three quarters. Every
+/// skewed range in common use — exponential, logarithmic, a power, and a skew
+/// symmetric about the middle that the half point alone would miss — is off
+/// the straight line at one of them. A curve that is straight at all three
+/// and bent elsewhere is not worth more probes: each is a call into the
+/// plugin, some plugins take close to half a millisecond to answer, and a
+/// parameter list runs to thousands.
+const PROBE_COUNT: usize = 5;
 
 /// Relative tolerance for calling a mapping linear.
 const LINEARITY_TOLERANCE: f64 = 1e-9;
@@ -71,7 +80,10 @@ pub struct ParamMap {
 
 impl ParamMap {
     /// Build the table. `sample` must return the plain value corresponding to
-    /// a normalised one — i.e. `IEditController::normalizedParamToPlain`.
+    /// a normalised one — i.e. `IEditController::normalizedParamToPlain` —
+    /// and each parameter's `min` and `max` must be what it returns at 0 and
+    /// 1, which is how `read_params` fills them in. They are not asked for
+    /// again.
     ///
     /// Called on the main thread during activate.
     pub fn build(params: &[ParamInfo], mut sample: impl FnMut(ParamId, f64) -> f64) -> ParamMap {
@@ -133,8 +145,7 @@ fn build_curve(param: &ParamInfo, sample: &mut impl FnMut(ParamId, f64) -> f64) 
     if param.flags.contains(ParamFlags::STEPPED) {
         return Curve::Stepped(param.max);
     }
-    let min = sample(param.id, 0.0);
-    let max = sample(param.id, 1.0);
+    let (min, max) = (param.min, param.max);
     let span = max - min;
     if span == 0.0 || !span.is_finite() {
         return Curve::Constant(min);
@@ -249,6 +260,22 @@ mod tests {
                 (back - target).abs() / target < 1e-3,
                 "{target} Hz round-tripped to {back} Hz"
             );
+        }
+    }
+
+    /// A skew symmetric about the middle, straight through the half point,
+    /// is still found to be a curve.
+    #[test]
+    fn a_symmetric_skew_is_not_mistaken_for_a_line() {
+        let params = [info(7, -1.0, 1.0)];
+        let curve = |n: f64| {
+            let centred = 2.0 * n - 1.0;
+            centred.signum() * centred.abs().powi(3)
+        };
+        let map = ParamMap::build(&params, |_, n| curve(n));
+        for target in [-0.5, -0.1, 0.1, 0.5] {
+            let back = curve(map.normalize(ParamId(7), target).unwrap());
+            assert!((back - target).abs() < 1e-3, "{target} came back as {back}");
         }
     }
 
