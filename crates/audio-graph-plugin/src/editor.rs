@@ -648,10 +648,20 @@ impl WrapperEditor {
 impl NiceEguiApp for WrapperEditor {
     fn build(
         &mut self,
-        _egui_ctx: egui::Context,
+        egui_ctx: egui::Context,
         _nice_gui_ctx: nice_plug::context::gui::GuiContext,
         frame: &mut nice_plug_egui::Frame,
     ) -> Result<(), nice_plug_egui::baseview::HandlerError> {
+        // egui's proportional font has no arrows: "→" in a node title or on a
+        // row would draw as a box. Hack, already loaded for monospace, has
+        // them, so it goes last in the proportional fallbacks, where it only
+        // ever supplies what the fonts before it lack.
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            family.push("Hack".to_owned());
+        }
+        egui_ctx.set_fonts(fonts);
+
         // The window the sub-plugin's editor will be owned by, so it floats
         // above the DAW instead of being buried the moment the user clicks
         // anywhere else. Our own view sits deep inside the DAW's window tree,

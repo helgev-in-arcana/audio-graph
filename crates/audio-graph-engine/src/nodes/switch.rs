@@ -12,6 +12,11 @@ use crate::port::Port;
 #[cfg(feature = "ui")]
 const MAX_VALUES: usize = 8;
 
+/// Points given to each number on a row: room for `≥ -10.00` at the default
+/// text size, which is past anything a parameter in 0..1 asks for.
+#[cfg(feature = "ui")]
+const FIELD_WIDTH: f32 = 60.0;
+
 /// One of several values, chosen by where a control sits against a ladder of
 /// thresholds.
 ///
@@ -187,19 +192,34 @@ impl Node for Switch {
         }
         self.thresholds.resize(self.values.len().max(1) - 1, 0.0);
         let mut changed = false;
-        // The row runs right to left, so the first thing added is the
-        // right-hand one: condition, then value, reading back as
-        // "socket, value, condition" — `2  1.00  ≥ 0.50`.
+        // Reads as "socket, condition → value": `2  ≥ 0.50 → 1.00`. The row
+        // is laid out right to left, so the value goes in first.
         //
-        // Two bare numbers side by side do not say which one is compared with
-        // the control, so the condition carries its comparison. The first row
-        // has no threshold of its own, but it does have a condition: it is
-        // what the control reads below the next row's threshold, and saying so
-        // is what makes the ladder read top to bottom.
+        // Two numbers side by side do not say which one is compared with the
+        // control and which one comes out, so the condition carries its
+        // comparison and an arrow points at the value. The first row has no
+        // threshold of its own, but it does have a condition — it is what the
+        // control reads below the next row's threshold — and saying so is what
+        // makes the ladder read top to bottom.
+        //
+        // Both fields have a fixed width so each lines up with the one in the
+        // row above; sized to their contents they would wander as the numbers
+        // change length.
+        let size = egui::vec2(FIELD_WIDTH, ui.spacing().interact_size.y);
+        changed |= fallback(ui, connected, |ui| {
+            ui.add_sized(
+                size,
+                egui::DragValue::new(&mut self.values[index]).speed(0.01),
+            )
+            .on_hover_text("the value this row outputs while its socket is unwired")
+            .changed()
+        });
+        ui.label("→");
         match index.checked_sub(1) {
             Some(rung) => {
                 changed |= ui
-                    .add(
+                    .add_sized(
+                        size,
                         egui::DragValue::new(&mut self.thresholds[rung])
                             .speed(0.01)
                             .prefix("≥ "),
@@ -208,18 +228,17 @@ impl Node for Switch {
                     .changed();
             }
             None => {
-                if let Some(next) = self.thresholds.first() {
-                    ui.weak(format!("< {next:.2}")).on_hover_text(
-                        "the control picks this value below the next row's threshold",
-                    );
-                }
+                let condition = match self.thresholds.first() {
+                    Some(next) => format!("< {next:.2}"),
+                    None => "always".to_owned(),
+                };
+                ui.add_sized(
+                    size,
+                    egui::Label::new(egui::RichText::new(condition).weak()),
+                )
+                .on_hover_text("the control picks this value below the next row's threshold");
             }
         }
-        changed |= fallback(ui, connected, |ui| {
-            ui.add(egui::DragValue::new(&mut self.values[index]).speed(0.01))
-                .on_hover_text("the value this row outputs while its socket is unwired")
-                .changed()
-        });
         changed
     }
 
