@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use plugin_host::{
-    Format, HostContext, Plugin, RestartReason, SubPluginMain, resolve_reference, scan_module,
+    Format, HostContext, Plugin, RestartReason, SubPluginMain, reference_candidates, scan_module,
 };
 
 #[derive(Default)]
@@ -100,14 +100,7 @@ fn the_facade_loads_a_clap_by_path_alone() {
     // The saved form round-trips back to the same file.
     let reference = plugin.reference();
     assert_eq!(reference.format, Format::Clap);
-    assert_eq!(
-        resolve_reference(
-            &reference,
-            &[(Format::Clap, path.parent().unwrap().to_path_buf())]
-        )
-        .as_deref(),
-        Some(path.as_path())
-    );
+    assert_eq!(reference_candidates(&reference, &[]), vec![path.clone()]);
 
     drop(plugin);
     let _ = std::fs::remove_file(&path);

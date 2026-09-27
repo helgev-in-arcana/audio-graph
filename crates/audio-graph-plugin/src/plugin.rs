@@ -187,10 +187,16 @@ impl Wrapper {
         self.shared.set_quantum(state.sub_block);
         let needs_default_patch = graph.is_none();
         self.shared.restore_graph(graph.unwrap_or_else(Graph::new));
-        for problem in self.shared.main().host.load_state(
-            &state.sub_host_state(),
-            &plugin_host::plugin_directories(&audio_graph_settings::directories()),
-        ) {
+        // The catalogue as the last scan left it. No scan here: this runs on
+        // the DAW's main thread while a project opens.
+        let known = audio_graph_settings::catalogue_path()
+            .map_or_else(Vec::new, |path| plugin_host::catalogue::cached(&path));
+        for problem in self
+            .shared
+            .main()
+            .host
+            .load_state(&state.sub_host_state(), &known)
+        {
             log::warn!("audio-graph: {problem}");
         }
         if needs_default_patch {
