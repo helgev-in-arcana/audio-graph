@@ -49,6 +49,10 @@ struct Entry {
     serial: u64,
     /// The next note on the same `(channel, key)`, later in arrival order.
     next: Option<Idx>,
+    /// The live notes that arrived just before and just after this one, at
+    /// any address. See [`NoteLedger::oldest`].
+    older: Option<Idx>,
+    newer: Option<Idx>,
     /// How many sub-plugins were handed this note's note-on and have not said
     /// they are done with it.
     voices: u16,
@@ -87,6 +91,8 @@ impl Entry {
         daw_id: None,
         serial: 0,
         next: None,
+        older: None,
+        newer: None,
         voices: 0,
         released: false,
         fresh: false,
@@ -114,6 +120,18 @@ pub struct NoteLedger {
     free: Vec<Idx>,
     /// `(channel, key)` → the oldest live note at that address.
     head: Vec<Option<Idx>>,
+    /// Every live note in arrival order, oldest first, linked through
+    /// `Entry::older` / `Entry::newer`.
+    ///
+    /// What makes stealing cheap. Picking the oldest note by scanning the pool
+    /// costs a pass over all [`MAX_LIVE_NOTES`] entries per stolen note, and
+    /// notes are stolen exactly when a burst arrives: 768 of them for a
+    /// thousand note-ons in one block, about a millisecond on the audio thread.
+    oldest: Option<Idx>,
+    newest: Option<Idx>,
+    /// How many live notes have had their note-off. When none have, the note
+    /// to steal is simply [`oldest`][Self::oldest].
+    released: u16,
     next_serial: u64,
     /// Ids the graph handed out but the pool could not hold, since the last
     /// reset. A stolen note is a real fault and the number is the only way
@@ -156,6 +174,9 @@ impl NoteLedger {
             fallback: Vec::new(),
             free: (0..MAX_LIVE_NOTES as Idx).rev().collect(),
             head: vec![None; CHANNELS * KEYS],
+            oldest: None,
+            newest: None,
+            released: 0,
             next_serial: 0,
             stolen: 0,
         }
@@ -179,6 +200,9 @@ impl NoteLedger {
         self.free.clear();
         self.free.extend((0..MAX_LIVE_NOTES as Idx).rev());
         self.head.iter_mut().for_each(|h| *h = None);
+        self.oldest = None;
+        self.newest = None;
+        self.released = 0;
         self.next_serial = 0;
     }
 
@@ -297,6 +321,8 @@ impl NoteLedger {
             daw_id,
             serial,
             next: None,
+            older: None,
+            newer: None,
             voices: 0,
             released: false,
             fresh: true,
@@ -305,6 +331,7 @@ impl NoteLedger {
             voice_slot: None,
             live: true,
         };
+        self.age_push(index);
 
         // The tail, so the chain reads oldest first and a note-off with no id
         // to go on releases the note that has been sounding longest — which is
@@ -356,7 +383,10 @@ impl NoteLedger {
         }
         let entry = &mut self.entries[index as usize];
         entry.next = None;
-        entry.released = true;
+        if !entry.released {
+            entry.released = true;
+            self.released += 1;
+        }
         Some(index)
     }
 
@@ -385,23 +415,60 @@ impl NoteLedger {
     /// polyphonic instrument out of voices does.
     fn steal(&mut self) -> Idx {
         self.stolen += 1;
-        let pick = |released: bool, entries: &[Entry]| {
-            entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.live && e.released == released)
-                .min_by_key(|(_, e)| e.serial)
-                .map(|(index, _)| index as Idx)
-        };
-        let index = pick(true, &self.entries)
-            .or_else(|| pick(false, &self.entries))
-            // Every entry dead and the free list empty cannot happen, but
-            // taking entry 0 is a better answer than a panic on the audio
-            // thread.
-            .unwrap_or(0);
+        // The oldest released note is the first released one walking from the
+        // oldest; with none released, the oldest note is the answer and the
+        // walk is not taken — which is the case a burst of note-ons is.
+        let mut pick = self.oldest;
+        if self.released > 0 {
+            while let Some(index) = pick {
+                let entry = &self.entries[index as usize];
+                if entry.released {
+                    break;
+                }
+                pick = entry.newer;
+            }
+        }
+        // Every entry dead and the free list empty cannot happen, but taking
+        // entry 0 is a better answer than a panic on the audio thread.
+        let index = pick.or(self.oldest).unwrap_or(0);
         self.unlink(index);
-        self.entries[index as usize].live = false;
+        self.retire(index);
         index
+    }
+
+    /// Append a note that has just arrived to the arrival order.
+    fn age_push(&mut self, index: Idx) {
+        self.entries[index as usize].older = self.newest;
+        self.entries[index as usize].newer = None;
+        match self.newest {
+            Some(newest) => self.entries[newest as usize].newer = Some(index),
+            None => self.oldest = Some(index),
+        }
+        self.newest = Some(index);
+    }
+
+    /// Take a note out of the arrival order and out of the live count, ahead
+    /// of its entry being reused.
+    fn retire(&mut self, index: Idx) {
+        let entry = self.entries[index as usize];
+        if !entry.live {
+            return;
+        }
+        match entry.older {
+            Some(older) => self.entries[older as usize].newer = entry.newer,
+            None => self.oldest = entry.newer,
+        }
+        match entry.newer {
+            Some(newer) => self.entries[newer as usize].older = entry.older,
+            None => self.newest = entry.older,
+        }
+        if entry.released {
+            self.released -= 1;
+        }
+        let entry = &mut self.entries[index as usize];
+        entry.older = None;
+        entry.newer = None;
+        entry.live = false;
     }
 
     /// Take an entry out of its address's chain, wherever it sits.
@@ -542,6 +609,7 @@ impl NoteLedger {
             let entry = self.entries[index];
             if entry.reported && entry.released && entry.voices == 0 {
                 self.unlink(index as Idx);
+                self.retire(index as Idx);
                 self.entries[index] = Entry::EMPTY;
                 self.free.push(index as Idx);
             }
@@ -750,5 +818,50 @@ mod tests {
         let stolen = id_of(ledger.translate(on(1, 64, None))).unwrap();
         assert_eq!(ledger.stolen(), 1);
         assert_eq!(stolen, released, "the released note gave up its entry");
+    }
+
+    /// A released note is taken before older notes that are still held,
+    /// wherever it sits in the order they arrived.
+    #[test]
+    fn a_released_note_is_stolen_before_older_held_ones() {
+        let mut ledger = NoteLedger::new();
+        let ids: Vec<i32> = (0..MAX_LIVE_NOTES as i16)
+            .map(|n| id_of(ledger.translate(on(n / 128, n % 128, None))).unwrap())
+            .collect();
+        // Released but still sounding in a plugin, so it keeps its entry.
+        ledger.delivered(ids[100]);
+        ledger.translate(off(0, 100, None));
+
+        let taken = id_of(ledger.translate(on(5, 0, None))).unwrap();
+        assert_eq!(taken, ids[100]);
+        let taken = id_of(ledger.translate(on(5, 1, None))).unwrap();
+        assert_eq!(taken, ids[0], "with none released, the oldest held note");
+    }
+
+    /// Stealing follows arrival order even after entries have been freed and
+    /// handed to newer notes: an entry's position in the pool says nothing
+    /// about how old the note in it is.
+    #[test]
+    fn stealing_follows_arrival_order_through_reused_entries() {
+        let mut ledger = NoteLedger::new();
+        let ids: Vec<i32> = (0..MAX_LIVE_NOTES as i16)
+            .map(|n| id_of(ledger.translate(on(n / 128, n % 128, None))).unwrap())
+            .collect();
+        // The first ten end and free their entries, which ten newer notes take.
+        for key in 0..10 {
+            ledger.translate(off(0, key, None));
+        }
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        ledger.end_block(&mut ended);
+        for key in 0..10 {
+            ledger.translate(on(2, key, None));
+        }
+        assert_eq!(ledger.stolen(), 0, "the freed entries were enough");
+
+        let taken: Vec<i32> = (0..3)
+            .map(|key| id_of(ledger.translate(on(3, key, None))).unwrap())
+            .collect();
+        assert_eq!(taken, ids[10..13], "the oldest notes still held");
+        assert_eq!(ledger.stolen(), 3);
     }
 }
