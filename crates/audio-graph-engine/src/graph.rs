@@ -238,6 +238,36 @@ impl Graph {
         }
     }
 
+    /// Whether any node is one this build could not read. See
+    /// [`NodeKind::Unknown`].
+    pub fn has_unreadable(&self) -> bool {
+        self.unreadable_count() > 0
+    }
+
+    /// How many nodes this build could not read.
+    pub fn unreadable_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Unknown(_)))
+            .count()
+    }
+
+    /// This graph without the nodes it could not read and the links that
+    /// touch them: what there is to run.
+    pub fn without_unreadable(&self) -> Graph {
+        let mut graph = self.clone();
+        let unreadable: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, NodeKind::Unknown(_)))
+            .map(|node| node.id)
+            .collect();
+        for id in unreadable {
+            graph.remove(id);
+        }
+        graph
+    }
+
     /// Remove a node and every link that touched it.
     pub fn remove(&mut self, id: NodeId) {
         self.nodes.retain(|n| n.id != id);
@@ -448,12 +478,22 @@ impl Graph {
         let ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
         self.pending_links
             .retain(|p| ids.contains(&p.link.from) && ids.contains(&p.link.to));
+        // A node this build could not read has no sockets to check a link
+        // against, and dropping its links would lose them from the saved patch
+        // too. They stay as they are; the compiler sees nothing at either end
+        // of them to act on.
+        let unknown = |id: NodeId| {
+            self.node(id)
+                .is_some_and(|node| matches!(node.kind, NodeKind::Unknown(_)))
+        };
         let mut keep = Vec::with_capacity(self.links.len());
         for link in &self.links {
             keep.push(
                 ids.contains(&link.from)
                     && ids.contains(&link.to)
-                    && self.can_connect(link.from, link.from_port, link.to, link.to_port),
+                    && (unknown(link.from)
+                        || unknown(link.to)
+                        || self.can_connect(link.from, link.from_port, link.to, link.to_port)),
             );
         }
         let mut alive = keep.into_iter();
@@ -944,5 +984,36 @@ mod tests {
 
         let json = serde_json::to_string(&graph).unwrap();
         assert_eq!(serde_json::from_str::<Graph>(&json).unwrap(), graph);
+    }
+
+    /// A patch naming a node this build cannot read opens with that node kept
+    /// as saved and its links intact, and writes both back unchanged.
+    #[test]
+    fn an_unreadable_node_is_kept_as_saved() {
+        let saved = serde_json::json!({
+            "nodes": [
+                {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},
+                {"id": 1, "pos": [10.0, 0.0], "kind": {"Granular": {"grains": 8}}},
+                {"id": 2, "pos": [20.0, 0.0], "kind": {"Lfo": {"waveform": 12}}},
+            ],
+            "links": [{"from": 0, "from_port": 0, "to": 1, "to_port": 3}],
+            "next_id": 3
+        });
+        let mut graph: Graph = serde_json::from_value(saved.clone()).unwrap();
+        graph.prune();
+
+        assert!(matches!(graph.nodes[0].kind, NodeKind::Constant(_)));
+        assert!(matches!(graph.nodes[1].kind, NodeKind::Unknown(_)));
+        assert!(
+            matches!(graph.nodes[2].kind, NodeKind::Unknown(_)),
+            "a known kind with settings it cannot parse is kept the same way"
+        );
+        assert_eq!(graph.links.len(), 1, "the link into it survives pruning");
+
+        let back = serde_json::to_value(&graph).unwrap();
+        for node in 0..3 {
+            assert_eq!(back["nodes"][node]["kind"], saved["nodes"][node]["kind"]);
+        }
+        assert_eq!(back["links"], saved["links"]);
     }
 }

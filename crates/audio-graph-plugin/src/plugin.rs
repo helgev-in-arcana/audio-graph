@@ -186,7 +186,19 @@ impl Wrapper {
         };
         self.shared.set_quantum(state.sub_block);
         let needs_default_patch = graph.is_none();
+        let unreadable = graph.as_ref().map_or(0, Graph::unreadable_count);
         self.shared.restore_graph(graph.unwrap_or_else(Graph::new));
+        // After `restore_graph`, which starts the document's notices afresh.
+        if let Some(warning) =
+            crate::notification::compatibility_message(state.written_by_newer(), unreadable)
+        {
+            log::warn!("audio-graph: {warning}");
+            self.shared.report_error(
+                self.shared.document_generation(),
+                crate::ErrorSource::Compatibility,
+                &warning,
+            );
+        }
         // The catalogue as the last scan left it. No scan here: this runs on
         // the DAW's main thread while a project opens.
         let known = audio_graph_settings::catalogue_path()

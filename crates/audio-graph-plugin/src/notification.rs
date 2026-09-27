@@ -6,11 +6,14 @@ pub enum ErrorSource {
     Processing,
     /// Notes the engine lost to its fixed limits. See [`note_loss_message`].
     Notes,
+    /// A document written by a newer release, or holding nodes this one could
+    /// not read. See [`compatibility_message`].
+    Compatibility,
 }
 
 #[derive(Default)]
 pub(crate) struct Notifications {
-    messages: [Option<String>; 4],
+    messages: [Option<String>; 5],
 }
 
 impl Notifications {
@@ -54,6 +57,28 @@ pub(crate) fn note_loss_message(dropped: u64, stolen: u64) -> Option<String> {
         ));
     }
     (!parts.is_empty()).then(|| format!("{}.", parts.join("; ")))
+}
+
+/// What to tell the user about a document this build may not fully
+/// understand, or `None` when it understands all of it.
+///
+/// A warning rather than a refusal: the document is open and playing, and
+/// what is at stake is only what the next save writes — a field this build
+/// has no place for is not written back.
+pub(crate) fn compatibility_message(newer: Option<&str>, unreadable: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(newer) = newer {
+        parts.push(format!(
+            "Saved by AudioGraph {newer}, newer than this {}. Settings this version does not know may be lost if the project is saved",
+            crate::state::THIS_RELEASE
+        ));
+    }
+    if unreadable > 0 {
+        parts.push(format!(
+            "{unreadable} node(s) could not be read; they are kept as saved and do not run"
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("{}.", parts.join(". ")))
 }
 
 #[cfg(test)]

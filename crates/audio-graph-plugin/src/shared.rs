@@ -1078,6 +1078,7 @@ impl Shared {
         let mut blob = WrapperState::default();
         blob.set_sub_host_state(state.host.save_state());
         blob.version = crate::state::STATE_VERSION;
+        blob.written_by = Some(crate::state::THIS_RELEASE.into());
         blob.graph = graph;
         blob.sub_block = self.quantum();
         drop(state);

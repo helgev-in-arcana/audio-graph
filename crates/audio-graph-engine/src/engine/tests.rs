@@ -4189,3 +4189,45 @@ fn delays_in_different_stages_keep_their_own_read_positions() {
         .count();
     assert_eq!(stray, 0, "and nowhere else");
 }
+
+/// A node this build could not read runs nothing and breaks nothing: what it
+/// would have fed reads as unwired, and the rest of the patch compiles and
+/// plays.
+#[test]
+fn an_unreadable_node_compiles_as_if_absent() {
+    let mut graph = Graph::new();
+    let constant = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+    let unknown = graph.add(
+        NodeKind::Unknown(crate::nodes::Unknown(serde_json::json!({"Granular": {}}))),
+        [0.0, 0.0],
+    );
+    let add = graph.add(
+        NodeKind::Math(Math {
+            op: MathOp::Add,
+            b: 0.25,
+        }),
+        [0.0, 0.0],
+    );
+    let out = param_sink(&mut graph);
+    // Links into and out of it, as a saved patch would hold them; `connect`
+    // refuses them because the node has no sockets to check against.
+    graph.links.push(crate::graph::Link {
+        from: constant,
+        from_port: 0,
+        to: unknown,
+        to_port: 2,
+    });
+    graph.links.push(crate::graph::Link {
+        from: unknown,
+        from_port: 1,
+        to: add,
+        to_port: 0,
+    });
+    graph.connect(add, 0, out, 0);
+
+    let mut engine = Engine::new();
+    load(&mut engine, &graph);
+    let mut slots = lanes();
+    engine.run(&ctx(32), &mut slots);
+    assert_eq!(slots[SINK], 0.25, "the input it fed reads as unwired");
+}
