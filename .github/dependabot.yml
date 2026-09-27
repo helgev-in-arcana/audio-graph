@@ -1,0 +1,33 @@
+version: 2
+
+# Monthly and grouped: main requires a branch to be up to date before it
+# merges, so pull requests land one after another, and a dozen single-crate
+# bumps would each wait for the one ahead of it. Minor and patch updates go in
+# one pull request per ecosystem; a major version stays on its own, because
+# that is the one that can need code changed.
+#
+# Security updates are not bound by this schedule and arrive when advised.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Updates the commit each action is pinned to, along with the version
+  # written beside it.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
