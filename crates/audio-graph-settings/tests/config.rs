@@ -31,15 +31,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
     // First run: no file, so the conventional folders are written into one.
     // Compared as a set of paths, because that is what the settings hold — the
     // format each is conventionally for is dropped on the way in.
-    let expected: Vec<PathBuf> = {
-        let mut dirs = Vec::new();
-        for (_, d) in plugin_host::default_plugin_directories() {
-            if !dirs.contains(&d) {
-                dirs.push(d);
-            }
-        }
-        dirs
-    };
+    let expected: Vec<PathBuf> = config::conventional_directories();
     assert_eq!(config::catalogue_path(), Some(dir.join("plugins.json")));
     let seeded = config::directories();
     assert_eq!(seeded, expected, "a first run starts from the conventions");

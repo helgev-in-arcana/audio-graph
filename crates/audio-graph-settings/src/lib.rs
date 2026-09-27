@@ -152,18 +152,71 @@ fn stamp_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// The conventional directories, as plain paths.
+/// The folders plugins are conventionally installed in on this platform,
+/// both formats together, that exist on this machine.
 ///
-/// The format each is conventionally for is dropped on the way in, because
-/// past this point a folder is a folder — see [`Config::directories`].
-fn conventional() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for (_, dir) in plugin_host::default_plugin_directories() {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
+/// What a first run seeds the settings with, and what "put the usual folders
+/// back" means afterwards. It lives here rather than with the plugin hosting
+/// crates because it is a guess about where a user keeps things — the VST3
+/// and CLAP documents describe these places, but nothing obliges an installer
+/// or a user to use them — and a guess is the product's to make and to let
+/// the user overrule, not something a hosting library should decide for every
+/// caller.
+///
+/// The format each folder is conventionally for is dropped, because past this
+/// point a folder is a folder — see [`Config::directories`]. `CLAP_PATH` comes
+/// first when it is set: the CLAP format specifies it, and a developer pointing
+/// at a build directory expects it to win over an installed copy.
+pub fn conventional_directories() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("CLAP_PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+
+    #[cfg(target_os = "windows")]
+    for format in ["VST3", "CLAP"] {
+        if let Some(common) = std::env::var_os("CommonProgramFiles") {
+            dirs.push(PathBuf::from(common).join(format));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(
+                PathBuf::from(local)
+                    .join("Programs")
+                    .join("Common")
+                    .join(format),
+            );
         }
     }
-    dirs
+
+    #[cfg(target_os = "macos")]
+    for format in ["VST3", "CLAP"] {
+        dirs.push(PathBuf::from("/Library/Audio/Plug-Ins").join(format));
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(
+                PathBuf::from(home)
+                    .join("Library/Audio/Plug-Ins")
+                    .join(format),
+            );
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    for format in ["vst3", "clap"] {
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(format!(".{format}")));
+        }
+        dirs.push(PathBuf::from("/usr/lib").join(format));
+        dirs.push(PathBuf::from("/usr/local/lib").join(format));
+    }
+
+    dirs.retain(|dir| dir.is_dir());
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
 }
 
 /// Reads the config exactly as the file has it, with no seeding, updating the
@@ -213,7 +266,7 @@ pub fn load() -> Config {
     // found in anyway, so the list the user is shown is complete from the
     // start and every line of it is theirs to remove.
     let seeded = Config {
-        directories: conventional(),
+        directories: conventional_directories(),
         ..Config::default()
     };
     if let Err(e) = store(&seeded) {
@@ -332,7 +385,7 @@ pub fn remove_directory(dir: &Path) -> Result<(), String> {
 pub fn restore_defaults() -> Result<(), String> {
     let mut config = load();
     let mut added = false;
-    for dir in conventional() {
+    for dir in conventional_directories() {
         if !config.directories.contains(&dir) {
             config.directories.push(dir);
             added = true;
