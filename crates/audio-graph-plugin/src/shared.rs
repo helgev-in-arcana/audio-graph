@@ -745,6 +745,32 @@ impl Shared {
         self.with_stopped_host(|host| host.load(instance, path, None))
     }
 
+    /// Loads every sub-plugin the project names but could not load, looking for
+    /// it in `known` — the catalogue a scan has just brought up to date.
+    /// Returns how many came back.
+    ///
+    /// Nothing is stopped unless something is waiting, because a finished scan
+    /// calls this whether or not any plugin went missing.
+    pub fn find_missing_children(
+        &self,
+        known: &[plugin_host::catalogue::Module],
+    ) -> Result<usize, String> {
+        let waiting = {
+            let main = self.main();
+            (0..main.host.config().max_instances)
+                .any(|i| main.host.reference(i).is_some() && !main.host.is_loaded(i))
+        };
+        if !waiting {
+            return Ok(0);
+        }
+        let restored = self.with_stopped_host(|host| Ok(host.retry_unloaded(known)))?;
+        if restored > 0 {
+            self.changed();
+            self.store_state();
+        }
+        Ok(restored)
+    }
+
     /// Restores a sub-plugin's state with no processor concurrently using its configuration.
     pub fn load_sub_state(&self, instance: usize, data: &[u8]) -> Result<(), String> {
         self.with_stopped_host(|host| host.load_sub_state(instance, data))

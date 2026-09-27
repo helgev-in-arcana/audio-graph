@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use plugin_host::{Format, ParamId, RestartReason};
+use plugin_host::{ParamId, RestartReason};
 use subhost_adapter::{InstanceState, SubHost, SubHostConfig, SubHostState, SubPluginRef};
 
 struct Host;
@@ -71,9 +71,11 @@ fn fixture(name: &str) -> PathBuf {
     path
 }
 
-/// Relocation follows caller-selected folders without consulting standard installations.
+/// A plugin that moved is found through the catalogue, and only through it:
+/// with no catalogue entry the instance stays unloaded rather than every
+/// module in its folder being opened to ask.
 #[test]
-fn restore_uses_the_callers_search_directories() {
+fn restore_finds_a_moved_plugin_through_the_catalogue() {
     let _thread = plugin_host::init_thread().unwrap();
     let path = fixture("relocation");
     let mut host = host();
@@ -82,9 +84,38 @@ fn restore_uses_the_callers_search_directories() {
     saved.instances[0].reference.path_hint = path.with_extension("missing").display().to_string();
     assert_eq!(host.load_state(&saved, &[]).len(), 1);
     assert!(!host.is_loaded(0));
-    let directories = [(Format::Clap, path.parent().unwrap().to_path_buf())];
-    assert!(host.load_state(&saved, &directories).is_empty());
+    let known = plugin_host::catalogue::refresh(&[path.parent().unwrap().to_path_buf()], None);
+    assert!(host.load_state(&saved, &known).is_empty());
     assert!(host.is_loaded(0));
+}
+
+/// An instance that could not be loaded when the project opened comes back,
+/// state and all, once a scan has put its plugin in the catalogue.
+#[test]
+fn a_later_scan_brings_a_missing_instance_back() {
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture("later-scan");
+    let mut host = host();
+    host.load(0, &path, None).unwrap();
+    let mut saved = host.save_state();
+    saved.instances[0].reference.path_hint = path.with_extension("missing").display().to_string();
+    host.load_state(&saved, &[]);
+    assert!(!host.is_loaded(0));
+    assert_eq!(host.retry_unloaded(&[]), 0, "nothing new to go on");
+
+    let known = plugin_host::catalogue::refresh(&[path.parent().unwrap().to_path_buf()], None);
+    assert_eq!(host.retry_unloaded(&known), 1);
+    assert!(host.is_loaded(0));
+    assert_eq!(
+        host.reference(0).unwrap().path_hint,
+        path.display().to_string(),
+        "and is saved at where it was found"
+    );
+    assert_eq!(
+        host.retry_unloaded(&known),
+        0,
+        "a loaded instance is left alone"
+    );
 }
 
 /// Missing and out-of-range entries survive saves and reserve their document identities.

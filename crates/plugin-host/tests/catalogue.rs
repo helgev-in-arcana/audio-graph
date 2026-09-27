@@ -140,3 +140,118 @@ fn the_cache_is_stamped_stored_at_the_chosen_path_and_survives_being_lost() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A temporary directory of empty files standing in for modules.
+///
+/// `reference_candidates` never opens a module, so a file that exists is all a
+/// candidate needs to be.
+fn stand_ins(name: &str, files: &[&str]) -> (PathBuf, Vec<PathBuf>) {
+    let dir = std::env::temp_dir().join(format!(
+        "plugin-host-candidates-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = files
+        .iter()
+        .map(|file| {
+            let path = dir.join(file);
+            std::fs::write(&path, b"module").unwrap();
+            path
+        })
+        .collect();
+    (dir, paths)
+}
+
+fn module(path: &std::path::Path, format: plugin_host::Format, ids: &[&str]) -> catalogue::Module {
+    catalogue::Module {
+        path: path.to_path_buf(),
+        format,
+        stamp: catalogue::stamp_of(path),
+        classes: ids
+            .iter()
+            .map(|id| catalogue::Class {
+                id: (*id).into(),
+                name: (*id).into(),
+                category: String::new(),
+                is_instrument: false,
+            })
+            .collect(),
+        error: None,
+    }
+}
+
+fn reference(format: plugin_host::Format, id: &str, hint: PathBuf) -> plugin_host::PluginRef {
+    plugin_host::PluginRef {
+        format,
+        id: id.into(),
+        path_hint: hint,
+        display_name: id.into(),
+    }
+}
+
+/// The saved path is tried first while it exists, and the catalogue's modules
+/// that export the id after it — so a project on the machine it was saved on
+/// loads what it loaded before.
+#[test]
+fn the_hint_comes_before_the_catalogue() {
+    use plugin_host::Format;
+    let (_dir, paths) = stand_ins("hint-first", &["saved.clap", "elsewhere.clap"]);
+    let known = [module(&paths[1], Format::Clap, &["com.example.a"])];
+    let wanted = reference(Format::Clap, "com.example.a", paths[0].clone());
+    assert_eq!(
+        plugin_host::reference_candidates(&wanted, &known),
+        vec![paths[0].clone(), paths[1].clone()]
+    );
+}
+
+/// A plugin that moved is found through the catalogue by its id alone, and
+/// only among modules of its own format that export that id.
+#[test]
+fn a_moved_plugin_is_found_by_its_id() {
+    use plugin_host::Format;
+    let (dir, paths) = stand_ins(
+        "moved",
+        &["other.clap", "moved.clap", "moved.vst3", "broken.clap"],
+    );
+    let mut broken = module(&paths[3], Format::Clap, &["com.example.a"]);
+    broken.error = Some("would not open".into());
+    let known = [
+        module(&paths[0], Format::Clap, &["com.example.b"]),
+        module(&paths[1], Format::Clap, &["com.example.b", "com.example.a"]),
+        module(&paths[2], Format::Vst3, &["com.example.a"]),
+        broken,
+    ];
+    let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
+    assert_eq!(
+        plugin_host::reference_candidates(&wanted, &known),
+        vec![paths[1].clone()]
+    );
+}
+
+/// A module the catalogue has not seen is not a candidate, even one sitting
+/// next to the saved path: finding it would mean opening modules to ask, on
+/// the thread restoring the project.
+#[test]
+fn nothing_outside_the_catalogue_is_a_candidate() {
+    use plugin_host::Format;
+    let (dir, _paths) = stand_ins("unscanned", &["unscanned.clap"]);
+    let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
+    assert!(plugin_host::reference_candidates(&wanted, &[]).is_empty());
+}
+
+/// A module whose file changed since it was scanned may no longer export the
+/// id, so it is tried after the ones the catalogue still vouches for.
+#[test]
+fn a_changed_module_is_tried_last() {
+    use plugin_host::Format;
+    let (dir, paths) = stand_ins("changed", &["changed.clap", "unchanged.clap"]);
+    let mut changed = module(&paths[0], Format::Clap, &["com.example.a"]);
+    changed.stamp.size += 1;
+    let known = [changed, module(&paths[1], Format::Clap, &["com.example.a"])];
+    let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
+    assert_eq!(
+        plugin_host::reference_candidates(&wanted, &known),
+        vec![paths[1].clone(), paths[0].clone()]
+    );
+}

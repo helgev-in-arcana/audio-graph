@@ -228,6 +228,47 @@ fn unavailable_plugins_keep_their_wiring_through_save_and_recovery() {
     wrapper.deactivate();
 }
 
+/// A project whose plugin has moved opens with that plugin unloaded, and a
+/// finished scan brings it back without the project being opened again.
+#[test]
+fn a_moved_plugin_comes_back_after_a_scan() {
+    use audio_graph_plugin::WrapperState;
+    use harness::{Block, Daw};
+
+    let _thread = plugin_host::init_thread().unwrap();
+    let path = fixture_as_clap("moved-plugin");
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper.shared().load(&path).unwrap();
+    wrapper.shared().adopt_default_patch();
+    wrapper.shared().publish_graph();
+    wrapper.store_state();
+
+    // Where the plugin is now, and a project that still says where it was.
+    let moved_dir = path.with_file_name("moved-plugin-elsewhere");
+    std::fs::create_dir_all(&moved_dir).unwrap();
+    std::fs::copy(&path, moved_dir.join("moved-plugin.clap")).unwrap();
+    let mut saved: WrapperState =
+        serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+    saved.sub_plugins[0].reference.path_hint = path.with_extension("gone").display().to_string();
+    *wrapper.wrapper_params().state.0.write().unwrap() = serde_json::to_string(&saved).unwrap();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    assert!(!wrapper.shared().main().host.is_loaded(0));
+
+    let known = plugin_host::catalogue::refresh(&[moved_dir], None);
+    assert_eq!(wrapper.shared().find_missing_children(&known), Ok(1));
+    assert!(wrapper.shared().main().host.is_loaded(0));
+    let mut block = Block::silent(64);
+    block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+    assert!(block.peak() > 0.0, "and the patch plays through it again");
+    assert_eq!(wrapper.shared().find_missing_children(&known), Ok(0));
+    wrapper.deactivate();
+}
+
 /// Unreadable documents remain byte-for-byte intact, silent and replaceable by a valid preset.
 #[test]
 fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement() {

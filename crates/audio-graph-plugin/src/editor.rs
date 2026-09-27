@@ -47,6 +47,9 @@ enum Command {
     OpenSub(usize),
     CloseSub(usize),
     SetQuantum(u32),
+    /// Load the sub-plugins the project names but could not find, from the
+    /// catalogue a scan just finished.
+    FindMissing(Vec<plugin_host::catalogue::Module>),
     /// Throw away everything the running graph remembers.
     Reset,
 }
@@ -253,6 +256,7 @@ impl WrapperEditor {
             Ok(Ok(modules)) => {
                 self.fill_entries(&modules);
                 self.scan = None;
+                self.commands.push(Command::FindMissing(modules));
                 let unknown = self
                     .entries
                     .iter()
@@ -592,6 +596,11 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
                 shared.store_state();
                 status.set(format!("modulation rate {quantum} samples"));
             }
+            Command::FindMissing(modules) => match shared.find_missing_children(&modules) {
+                Ok(0) => {}
+                Ok(found) => status.set(format!("found {found} missing plugin(s)")),
+                Err(error) => status.set(format!("missing plugins: {error}")),
+            },
             Command::OpenSub(instance) => {
                 let result = shared
                     .main()

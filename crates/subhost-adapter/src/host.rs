@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::schedule::ScheduleView;
+use plugin_host::catalogue::Module;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, MainThread, ParamEvent,
     ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain, SubPluginProcessor,
@@ -348,31 +349,6 @@ impl SubHost {
         self.slots.unresolve_all();
     }
 
-    /// Attempts to resolve a sub-plugin reference to an existing file path.
-    ///
-    /// Projects move between machines, and a plugin folder that differs by
-    /// one directory should not cost the user their patch: the class id is the
-    /// authority and the recorded path is only a hint.
-    pub fn resolve_reference(
-        reference: &SubPluginRef,
-        search_directories: &[(Format, PathBuf)],
-    ) -> Option<PathBuf> {
-        // An unrecognised format tag is "not found" rather than an error,
-        // which is what the caller already handles: a reference saved before
-        // CLAP existed has no format tag worth trusting, and one saved by a
-        // newer build might name a format this build does not have.
-        let format = Format::from_tag(&reference.format)?;
-        plugin_host::resolve_reference(
-            &plugin_host::PluginRef {
-                format,
-                id: reference.plugin_id.clone(),
-                path_hint: PathBuf::from(&reference.path_hint),
-                display_name: reference.display_name.clone(),
-            },
-            search_directories,
-        )
-    }
-
     pub fn class(&self, instance: usize) -> Option<&ClassInfo> {
         self.at(instance).map(|l| l.plugin.class())
     }
@@ -706,41 +682,95 @@ impl SubHost {
 
     /// Restores sub-host state, attempting to locate and reload each saved sub-plugin instance.
     ///
+    /// `known` is the plugin catalogue, which is where a plugin that is no
+    /// longer at its saved path is looked for; see
+    /// [`plugin_host::reference_candidates`].
+    ///
     /// Returns a list of diagnostic messages rather than an error: a missing
     /// sub-plugin must not stop the rest of the patch from loading.
-    pub fn load_state(
-        &mut self,
-        state: &SubHostState,
-        search_directories: &[(Format, PathBuf)],
-    ) -> Vec<String> {
+    pub fn load_state(&mut self, state: &SubHostState, known: &[Module]) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
         self.unload_all();
 
         for entry in &state.instances {
-            let reference = &entry.reference;
-            let result = (|| {
-                self.reserve(entry.instance)?;
-                let path = Self::resolve_reference(reference, search_directories)
-                    .ok_or("plugin could not be found")?;
-                self.load(entry.instance, &path, Some(&reference.plugin_id))?;
-                if entry.state.is_some() {
-                    let bytes = entry.state_bytes().ok_or("invalid saved state encoding")?;
-                    self.load_sub_state(entry.instance, &bytes)?;
-                }
-                Ok::<_, String>(())
-            })();
-            if let Err(error) = result {
+            if let Err(error) = self.restore(entry, known) {
                 self.detach(entry.instance);
                 self.remember(entry.clone());
                 problems.push(format!(
                     "{}: {error}; saved settings are retained",
-                    reference.display_name
+                    entry.reference.display_name
                 ));
             }
         }
 
         problems
+    }
+
+    /// Tries again to load every saved instance that is not loaded, against a
+    /// catalogue that may know more than the one the project was opened with.
+    /// Returns how many came back.
+    ///
+    /// What a finished scan calls: a project opened before its plugins were
+    /// scanned, or after one moved, keeps each such instance's settings and
+    /// wiring, and this is where it gets its plugin back.
+    pub fn retry_unloaded(&mut self, known: &[Module]) -> usize {
+        let waiting: Vec<InstanceState> = self
+            .saved
+            .iter()
+            .filter(|entry| self.at(entry.instance).is_none())
+            .cloned()
+            .collect();
+        let mut restored = 0;
+        for entry in &waiting {
+            match self.restore(entry, known) {
+                Ok(()) => restored += 1,
+                Err(_) => {
+                    self.detach(entry.instance);
+                    self.remember(entry.clone());
+                }
+            }
+        }
+        restored
+    }
+
+    /// Loads one saved instance from the first of its candidate paths that
+    /// takes, then hands it its saved state.
+    fn restore(&mut self, entry: &InstanceState, known: &[Module]) -> Result<(), String> {
+        let reference = &entry.reference;
+        self.reserve(entry.instance)?;
+        // An unrecognised format tag is "not found" rather than an error: a
+        // reference saved before CLAP existed has no format tag worth
+        // trusting, and one saved by a newer build might name a format this
+        // build does not have.
+        let format =
+            Format::from_tag(&reference.format).ok_or("its plugin format is not available")?;
+        let candidates = plugin_host::reference_candidates(
+            &plugin_host::PluginRef {
+                format,
+                id: reference.plugin_id.clone(),
+                path_hint: PathBuf::from(&reference.path_hint),
+                display_name: reference.display_name.clone(),
+            },
+            known,
+        );
+        if candidates.is_empty() {
+            return Err("plugin could not be found; a plugin rescan may find it".into());
+        }
+        let mut last = String::new();
+        let loaded = candidates.iter().any(|path| {
+            self.load(entry.instance, path, Some(&reference.plugin_id))
+                .map_err(|error| last = error)
+                .is_ok()
+        });
+        if !loaded {
+            return Err(format!("plugin could not be loaded: {last}"));
+        }
+        if entry.state.is_some() {
+            let bytes = entry.state_bytes().ok_or("invalid saved state encoding")?;
+            self.load_sub_state(entry.instance, &bytes)?;
+        }
+        Ok(())
     }
 }
 

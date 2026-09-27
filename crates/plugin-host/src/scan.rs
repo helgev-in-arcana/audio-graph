@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use plugin_host_api::Result;
 
+use crate::catalogue;
 use crate::format::{FORMATS, Format};
 
 /// Information describing a single plugin class exported by a module.
@@ -178,37 +179,54 @@ pub fn scan_module_as(format: Format, path: &Path) -> Result<Vec<ClassInfo>> {
     }
 }
 
-/// Resolves a saved [`PluginRef`] to an existing module path.
+/// Where a saved [`PluginRef`] may be found, most likely first, without
+/// loading anything.
 ///
 /// The id is the authority and the path only a hint, so a project that moved
-/// between machines still opens. Each candidate module has to be loaded to be
-/// asked, which is why `path_hint` is tried first and the directory search is
-/// the fallback.
-pub fn resolve_reference(
-    reference: &PluginRef,
-    search_directories: &[(Format, PathBuf)],
-) -> Option<PathBuf> {
-    if reference.path_hint.exists()
-        && scan_module_as(reference.format, &reference.path_hint)
-            .is_ok_and(|classes| classes.iter().any(|c| c.id == reference.id))
-    {
-        return Some(reference.path_hint.clone());
+/// between machines still opens. The hint comes first when the file is still
+/// there; after it, every module the catalogue says exports the id, those
+/// whose file is unchanged since they were scanned ahead of those it has
+/// changed under.
+///
+/// Nothing here opens a module, and nothing searches the disk: a module the
+/// catalogue has not seen is not a candidate. Asking every module on the
+/// machine whether it is the one would load third-party code by the hundred,
+/// on whatever thread is restoring the project — the DAW's main thread — and
+/// a scan belongs on a thread of its own. A reference with no candidate stays
+/// unresolved until a scan has found its module.
+///
+/// The caller loads the candidates in turn with the id and keeps the first
+/// that takes, which is also what checks the hint: a file at the hint's path
+/// that no longer exports the id fails to load and the next candidate is
+/// tried.
+pub fn reference_candidates(reference: &PluginRef, known: &[catalogue::Module]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if reference.path_hint.exists() {
+        out.push(reference.path_hint.clone());
     }
-
-    for (format, dir) in search_directories {
-        if *format != reference.format {
-            continue;
-        }
-        for candidate in find_modules(*format, dir) {
-            let Ok(classes) = scan_module_as(*format, &candidate) else {
-                continue;
-            };
-            if classes.iter().any(|c| c.id == reference.id) {
-                return Some(candidate);
-            }
+    let mut listed: Vec<(bool, &PathBuf)> = known
+        .iter()
+        .filter(|module| {
+            module.format == reference.format
+                && module.error.is_none()
+                && module.classes.iter().any(|class| class.id == reference.id)
+                && module.path.exists()
+        })
+        .map(|module| {
+            (
+                catalogue::stamp_of(&module.path) != module.stamp,
+                &module.path,
+            )
+        })
+        .collect();
+    // Stable, so modules with the same freshness keep the catalogue's order.
+    listed.sort_by_key(|&(stale, _)| stale);
+    for (_, path) in listed {
+        if !out.contains(path) {
+            out.push(path.clone());
         }
     }
-    None
+    out
 }
 
 /// Suppress an unused-import warning where only one format is compiled.
