@@ -403,11 +403,15 @@ impl Node for Plugin {
         }
     }
 
-    /// The sub-plugin's own window, opened from the title bar.
+    /// The sub-plugin's own window, opened from the title bar, and learning a
+    /// parameter socket from it.
     ///
-    /// A request rather than the thing itself: opening a window may not happen
-    /// inside a draw callback. Nothing here changes the patch, so it always
-    /// reports `false`.
+    /// Opening a window is a request rather than the thing itself: it may not
+    /// happen inside a draw callback. Learning is done here: armed, the node
+    /// watches its instance's [`NodeUi::touched`], and the first parameter
+    /// moved after that gets a socket — unless it has one already — and ends
+    /// the learning. One parameter per arming, so a knob brushed on the way to
+    /// another does not leave a socket behind.
     #[cfg(feature = "ui")]
     fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let Some(view) = cx.instances.get(self.instance).cloned() else {
@@ -444,7 +448,53 @@ impl Node for Plugin {
                 NodeAction::OpenSubEditor(self.instance)
             });
         }
-        false
+
+        let armed = cx
+            .learning
+            .and_then(|(instance, since)| (instance == self.instance).then_some(since));
+        let mut changed = false;
+        if let Some(since) = armed
+            && let Some(touch) = cx.touched.get(self.instance)
+            && touch.edit != 0
+            && touch.edit != since
+        {
+            if !self.ports.params.iter().any(|port| port.id == touch.param) {
+                let name = view
+                    .params
+                    .iter()
+                    .find(|(id, _)| *id == touch.param)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default();
+                self.ports.params.push(ParamPort {
+                    id: touch.param,
+                    name,
+                });
+                changed = true;
+            }
+            cx.act(NodeAction::StopLearning);
+        }
+        if ui
+            .add(
+                egui::Button::new("Learn")
+                    .small()
+                    .selected(armed.is_some())
+                    .frame(true)
+                    .frame_when_inactive(true),
+            )
+            .on_hover_text(if armed.is_some() {
+                "move a control in the plugin's window to give it a socket; click to cancel"
+            } else {
+                "give a socket to the next control moved in the plugin's window"
+            })
+            .clicked()
+        {
+            cx.act(if armed.is_some() {
+                NodeAction::StopLearning
+            } else {
+                NodeAction::Learn(self.instance)
+            });
+        }
+        changed
     }
 
     /// Why the node is drawn with sockets it cannot currently use.

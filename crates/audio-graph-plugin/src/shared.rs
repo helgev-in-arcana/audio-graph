@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::config::SLOT_COUNT;
 use crate::notification::{ErrorSource, Notifications, note_loss_message};
 use crate::state::WrapperState;
+use crate::touched::Touched;
 use audio_graph_engine::NodeId;
 use audio_graph_engine::{Graph, ProgramPublisher, compile};
 use audio_graph_engine::{NodeKind, Plugin, PluginPorts};
@@ -112,6 +113,9 @@ pub struct AudioState {
 /// an executor or audio thread.
 pub struct Shared {
     processing_error: AtomicU64,
+    /// The parameter last moved in each sub-plugin's own window. Shared with
+    /// the host context, which records the edits a format delivers there.
+    touched: Arc<Touched>,
     /// The engine's running totals of note events dropped and notes stolen,
     /// stored by the audio thread after every block.
     ///
@@ -199,8 +203,19 @@ impl Drop for Shared {
 
 impl Shared {
     pub fn new(host: SubHost, params: Arc<WrapperParams>) -> Arc<Shared> {
+        Shared::with_touched(host, params, Arc::default())
+    }
+
+    /// As [`new`][Self::new], recording parameter touches into `touched` —
+    /// the table the host context behind `host` records into too.
+    pub fn with_touched(
+        host: SubHost,
+        params: Arc<WrapperParams>,
+        touched: Arc<Touched>,
+    ) -> Arc<Shared> {
         Arc::new(Shared {
             processing_error: AtomicU64::new(0),
+            touched,
             note_losses: array::from_fn(|_| AtomicU64::new(0)),
             note_losses_shown: array::from_fn(|_| AtomicU64::new(0)),
             main: MainThread::new(RefCell::new(MainState {
@@ -488,6 +503,11 @@ impl Shared {
     /// Audio thread: zero means no report, so the document is encoded as its generation plus one.
     pub(crate) fn report_processing_error(&self, document: u64) {
         self.processing_error.store(document + 1, Ordering::Release);
+    }
+
+    /// Where edits made in the sub-plugins' own windows are recorded.
+    pub fn touched(&self) -> &Touched {
+        &self.touched
     }
 
     /// Audio thread: the engine's totals after a block.

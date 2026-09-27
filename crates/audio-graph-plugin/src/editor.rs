@@ -305,6 +305,7 @@ impl WrapperEditor {
         // The canvas edits the graph in place: it is plain data behind a lock
         // and needs no particular thread. What must not happen inline is the
         // *consequence* of an edit — see `GraphEdit::Publish`.
+        let touched = self.shared.touched().snapshot();
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
@@ -315,6 +316,7 @@ impl WrapperEditor {
             live: self.shared.live_slots(),
             quantum: self.shared.quantum(),
             sample_rate: self.shared.sample_rate() as f64,
+            touched: &touched,
         };
 
         let changed = self.graph_ui.ui(ui, &mut patch.graph, &context);

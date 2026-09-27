@@ -7,7 +7,8 @@ use crate::state::WrapperState;
 use audio_graph_engine::{Ended, Engine, Graph, MAX_LIVE_NOTES};
 use nice_plug::prelude::*;
 use plugin_host::{
-    AudioConfig, Event, NoteEvent as ApiNote, ProcessStatus as ApiStatus, TimeContext,
+    AudioConfig, Event, NoteEvent as ApiNote, ParamEvent, ProcessStatus as ApiStatus, Target,
+    TimeContext,
 };
 use subhost_adapter::{InstanceEventSink, SlotSchedule, SubHost};
 
@@ -84,7 +85,11 @@ impl Default for Wrapper {
     fn default() -> Self {
         let context = Arc::new(WrapperHostContext::new());
         let params = WrapperParams::new();
-        let shared = Shared::new(SubHost::new(context.clone(), SUB_HOST), params.clone());
+        let shared = Shared::with_touched(
+            SubHost::new(context.clone(), SUB_HOST),
+            params.clone(),
+            context.touched(),
+        );
         Wrapper {
             params,
             context,
@@ -552,6 +557,22 @@ impl Wrapper {
             &mut self.output_scratch[..(out_channels * frames) as usize],
             nodes,
         );
+        // CLAP reports an edit made in the plugin's window while it is
+        // processing as an output event, here, rather than through the host
+        // context; VST3 reports it there instead.
+        for output in self.out_events.events() {
+            if let Event::Param(
+                ParamEvent::GestureBegin { id, .. }
+                | ParamEvent::SetValue {
+                    id,
+                    target: Target::Global,
+                    ..
+                },
+            ) = output.event
+            {
+                self.shared.touched().record(output.source.index, id.0);
+            }
+        }
         if self.out_events.overflowed()
             || state
                 .processor
