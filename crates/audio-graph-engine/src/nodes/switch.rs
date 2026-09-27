@@ -192,8 +192,8 @@ impl Node for Switch {
         }
         self.thresholds.resize(self.values.len().max(1) - 1, 0.0);
         let mut changed = false;
-        // Reads as "socket, condition → value": `2  ≥ 0.50 → 1.00`. The row
-        // is laid out right to left, so the value goes in first.
+        // Reads left to right as "socket, condition → value":
+        // `2  ≥ 0.50 → 1.00`.
         //
         // Two numbers side by side do not say which one is compared with the
         // control and which one comes out, so the condition carries its
@@ -206,15 +206,6 @@ impl Node for Switch {
         // row above; sized to their contents they would wander as the numbers
         // change length.
         let size = egui::vec2(FIELD_WIDTH, ui.spacing().interact_size.y);
-        changed |= fallback(ui, connected, |ui| {
-            ui.add_sized(
-                size,
-                egui::DragValue::new(&mut self.values[index]).speed(0.01),
-            )
-            .on_hover_text("the value this row outputs while its socket is unwired")
-            .changed()
-        });
-        ui.label("→");
         match index.checked_sub(1) {
             Some(rung) => {
                 changed |= ui
@@ -239,6 +230,15 @@ impl Node for Switch {
                 .on_hover_text("the control picks this value below the next row's threshold");
             }
         }
+        ui.label("→");
+        changed |= fallback(ui, connected, |ui| {
+            ui.add_sized(
+                size,
+                egui::DragValue::new(&mut self.values[index]).speed(0.01),
+            )
+            .on_hover_text("the value this row outputs while its socket is unwired")
+            .changed()
+        });
         changed
     }
 
