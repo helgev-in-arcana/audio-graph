@@ -844,8 +844,12 @@ mod fd {
     }
 
     /// Nothing to watch where the extension does not exist.
+    ///
+    /// Braces rather than a unit struct: the instance is built by one
+    /// expression for every platform, and `Pipe::default()` on a unit struct
+    /// is a lint error on exactly the platforms that get this one.
     #[derive(Default)]
-    pub(crate) struct Pipe;
+    pub(crate) struct Pipe {}
 
     impl Pipe {
         pub(crate) fn open(
