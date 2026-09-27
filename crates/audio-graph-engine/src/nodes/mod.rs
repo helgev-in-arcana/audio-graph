@@ -31,6 +31,7 @@ mod note_filter;
 mod note_follow;
 mod note_gate;
 mod note_in;
+mod note_merge;
 mod note_mute;
 mod param_to_cc;
 mod plugin;
@@ -57,6 +58,7 @@ pub use note_filter::{FilterMode, NoteFilter};
 pub use note_follow::NoteFollow;
 pub use note_gate::NoteGate;
 pub use note_in::NoteIn;
+pub use note_merge::NoteMerge;
 pub use note_mute::NoteMute;
 pub use param_to_cc::ParamToCc;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
@@ -160,6 +162,14 @@ pub(crate) trait Node {
     fn note_passthrough(&self, port: u8) -> Option<u8> {
         let _ = port;
         None
+    }
+
+    /// Which of this node's inputs the notes leaving output `port` join, for a
+    /// node that merges streams — see [`NoteOp::Merge`][crate::ir::NoteOp::Merge].
+    /// Empty for every other node, which hands on at most one stream.
+    fn note_merge(&self, port: u8) -> Vec<u8> {
+        let _ = port;
+        Vec::new()
     }
 
     /// Whether the notes leaving output `port` pass only while a condition this
@@ -340,6 +350,7 @@ pub enum NodeKind {
     KeyParam(KeyParam),
     NoteMute(NoteMute),
     NoteFilter(NoteFilter),
+    NoteMerge(NoteMerge),
     ParamToCc(ParamToCc),
     CcIn(CcIn),
     DelayRead(DelayRead),
@@ -392,6 +403,7 @@ macro_rules! for_kind {
             NodeKind::KeyParam($node) => $body,
             NodeKind::NoteMute($node) => $body,
             NodeKind::NoteFilter($node) => $body,
+            NodeKind::NoteMerge($node) => $body,
             NodeKind::ParamToCc($node) => $body,
             NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
@@ -433,6 +445,11 @@ impl NodeKind {
     /// [`Node::note_passthrough`].
     pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
         for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// The inputs output `port` joins — see [`Node::note_merge`].
+    pub(crate) fn note_merge(&self, port: u8) -> Vec<u8> {
+        for_kind!(self, node => node.note_merge(port))
     }
 
     /// Whether output `port` carries a gate of this node's own — see
@@ -699,6 +716,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         NoteFilter::catalogue_defaults(),
         NodeKind::NoteFilter,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        NoteMerge::catalogue_defaults(),
+        NodeKind::NoteMerge,
     );
     take(
         &mut out,

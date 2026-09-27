@@ -786,7 +786,8 @@ mod tests {
                 .find(|op| match op {
                     NoteOp::Input { out, .. }
                     | NoteOp::Filter { out, .. }
-                    | NoteOp::Emit { out, .. } => *out == want,
+                    | NoteOp::Emit { out, .. }
+                    | NoteOp::Merge { out, .. } => *out == want,
                 })
                 .copied()
                 .expect("every note buffer a program names is written by an op");
@@ -794,7 +795,7 @@ mod tests {
             at = match op {
                 NoteOp::Filter { a, .. } => Some(a),
                 NoteOp::Emit { a, .. } => a,
-                NoteOp::Input { .. } => None,
+                NoteOp::Input { .. } | NoteOp::Merge { .. } => None,
             };
         }
         chain.reverse();
@@ -814,7 +815,7 @@ mod tests {
             .iter()
             .filter_map(|op| match *op {
                 NoteOp::Filter { gate, mute, .. } => Some((gate, mute)),
-                NoteOp::Input { .. } | NoteOp::Emit { .. } => None,
+                NoteOp::Input { .. } | NoteOp::Emit { .. } | NoteOp::Merge { .. } => None,
             })
             .collect()
     }

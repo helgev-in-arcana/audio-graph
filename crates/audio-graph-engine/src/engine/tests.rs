@@ -4419,3 +4419,89 @@ fn a_recompile_does_not_restart_the_tremolo() {
     heard.extend(play(&mut swapped, 3 * 128, 3, |_| 1.0));
     assert_eq!(heard, expected);
 }
+
+/// A stream split and joined again comes out whole: each note once, in time
+/// order, and what both branches carried — the pedal — once. A repeat within
+/// one stream is that stream's own, and is kept.
+#[test]
+fn a_merge_joins_a_split_without_doubling_anything() {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let split = graph.add(
+        NodeKind::KeySplit(KeySplit { splits: vec![60] }),
+        [0.0, 0.0],
+    );
+    let merge = graph.add(
+        NodeKind::NoteMerge(crate::nodes::NoteMerge { inputs: 2 }),
+        [0.0, 0.0],
+    );
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(notes, 0, split, 0);
+    graph.connect(split, 0, merge, 0);
+    graph.connect(split, 1, merge, 1);
+    graph.connect(merge, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+
+    let sustain = Event::Note(NoteEvent::Cc {
+        port: 0,
+        channel: 0,
+        cc: 64,
+        value: 1.0,
+        sample_offset: 3,
+    });
+    let heard = hear(
+        &graph,
+        &[note_on(48, 0), note_on(72, 2), sustain, sustain],
+        &[],
+    );
+    let stream = &heard.0[&0];
+    let keys: Vec<i16> = stream
+        .iter()
+        .filter_map(|event| match event {
+            Event::Note(NoteEvent::NoteOn { key, .. }) => Some(*key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![48, 72], "each note once, in time order");
+    let pedals = stream
+        .iter()
+        .filter(|event| matches!(event, Event::Note(NoteEvent::Cc { cc: 64, .. })))
+        .count();
+    assert_eq!(
+        pedals, 2,
+        "the pedal the DAW sent twice arrives twice, not four times"
+    );
+    assert!(
+        stream
+            .windows(2)
+            .all(|pair| pair[0].sample_offset() <= pair[1].sample_offset()),
+        "the joined stream stays sorted"
+    );
+}
+
+/// With one stream wired, a merge costs nothing: the socket carries that
+/// stream, and no op is emitted for it.
+#[test]
+fn a_merge_of_one_stream_is_no_op_at_all() {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let merge = graph.add(
+        NodeKind::NoteMerge(crate::nodes::NoteMerge { inputs: 3 }),
+        [0.0, 0.0],
+    );
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(notes, 0, merge, 1);
+    graph.connect(merge, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+    let program = compile(&graph, SLOTS).unwrap();
+    assert!(
+        !program
+            .note_ops
+            .iter()
+            .any(|op| matches!(op, NoteOp::Merge { .. }))
+    );
+    let heard = hear(&graph, &[note_on(60, 0)], &[]);
+    assert_eq!(heard.0[&0].len(), 1);
+}

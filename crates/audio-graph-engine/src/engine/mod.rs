@@ -26,8 +26,8 @@ use crate::ir::{
     AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DSP_VALUES, Detect, Follow,
     MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION,
     MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
-    MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, NoteStream,
-    Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
+    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
+    NoteOp, NoteStream, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};

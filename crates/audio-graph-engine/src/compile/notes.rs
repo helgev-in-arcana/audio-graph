@@ -18,8 +18,8 @@
 use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf, NoteOp, NoteStream,
-    NoteStreamKind, Span,
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf,
+    NoteOp, NoteStream, NoteStreamKind, Span,
 };
 use crate::nodes::NodeKind;
 
@@ -148,9 +148,10 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
     drop.dedup();
     for op in drop.into_iter().rev() {
         let out = match notes.ops.remove(op) {
-            NoteOp::Input { out, .. } | NoteOp::Filter { out, .. } | NoteOp::Emit { out, .. } => {
-                out
-            }
+            NoteOp::Input { out, .. }
+            | NoteOp::Filter { out, .. }
+            | NoteOp::Emit { out, .. }
+            | NoteOp::Merge { out, .. } => out,
         };
         notes.streams[usize::from(out)].kind = NoteStreamKind::Empty;
         notes.stages.remove(op);
@@ -212,6 +213,43 @@ fn route(
         // filling those would spend the pool on streams no plugin will ever be
         // handed.
         if readers_of(graph, order, id, port) == 0 {
+            continue;
+        }
+
+        let merged = kind.note_merge(port);
+        if !merged.is_empty() {
+            let mut wired: Vec<NoteBuf> = merged
+                .iter()
+                .filter_map(|&input| notes.source_of(graph, id, input))
+                .collect();
+            // One stream wired twice is still one stream.
+            wired.dedup();
+            match wired.len() {
+                0 => {}
+                // Nothing to join: the socket carries the one stream, the way
+                // an open filter does.
+                1 => notes.outputs.push(((id, port), wired[0])),
+                _ => {
+                    let count = wired.len().min(MAX_MERGE_INPUTS);
+                    let mut inputs = [0; MAX_MERGE_INPUTS];
+                    inputs[..count].copy_from_slice(&wired[..count]);
+                    let out = alloc_buf(
+                        notes,
+                        NoteStream {
+                            node: id,
+                            port,
+                            source: None,
+                            kind: NoteStreamKind::Merge { count: count as u8 },
+                        },
+                    )?;
+                    notes.ops.push(NoteOp::Merge {
+                        inputs,
+                        count: count as u8,
+                        out,
+                    });
+                    notes.outputs.push(((id, port), out));
+                }
+            }
             continue;
         }
 
