@@ -483,6 +483,7 @@ impl IEditControllerTrait for GainController {
     }
 
     unsafe fn normalizedParamToPlain(&self, id: u32, value_normalized: f64) -> f64 {
+        AUDIT_TO_PLAIN.fetch_add(1, Ordering::SeqCst);
         match id {
             0 => value_normalized * f64::from_bits(AUDIT_SCALE.load(Ordering::Relaxed)),
             1 => value_normalized,
@@ -692,6 +693,12 @@ pub extern "C" fn audit_vst_gui_edit(value: f64) {
         handler.performEdit(0, value);
         handler.endEdit(0);
     }
+}
+static AUDIT_TO_PLAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// How many times the host has asked for a plain value, ever.
+#[unsafe(no_mangle)]
+pub extern "C" fn audit_vst_to_plain_calls() -> u32 {
+    AUDIT_TO_PLAIN.load(Ordering::SeqCst)
 }
 static AUDIT_LATENCY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[unsafe(no_mangle)]

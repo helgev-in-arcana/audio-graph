@@ -77,6 +77,14 @@ pub struct Vst3Plugin {
     _main_thread: std::marker::PhantomData<Rc<()>>,
 
     params: Vec<ParamInfo>,
+    /// The conversion table for `params`, built at the first activation that
+    /// needs it and kept until the parameters' ranges change.
+    ///
+    /// Building it asks the controller for dozens of points per parameter,
+    /// and a plugin is free to answer slowly: one with 2359 continuous
+    /// parameters takes about 0.4 ms a call, which rebuilt at every
+    /// activation stalled the main thread for half a minute each time.
+    param_map: Option<Arc<ParamMap>>,
     io: plugin_host_api::IoLayout,
     metadata_dirty: bool,
     metadata_structural: bool,
@@ -214,6 +222,7 @@ impl Vst3Plugin {
                 active: RefCell::new(false),
             })),
             params: Vec::new(),
+            param_map: None,
             io: plugin_host_api::IoLayout::default(),
             metadata_dirty: false,
             metadata_structural: false,
@@ -606,6 +615,9 @@ impl SubPluginMain for Vst3Plugin {
                 "metadata changed during refresh; retry".into(),
             ));
         }
+        if mapping_changed {
+            self.param_map = None;
+        }
         self.params = params;
         self.io = io;
         Ok(MetadataUpdate::Refreshed)
@@ -845,11 +857,18 @@ impl SubPluginMain for Vst3Plugin {
 
         // Built here, on the main thread, because IEditController may only be
         // called from it — see param_map's module comment.
-        let map = match &self.instance.get().controller {
-            Some(ctrl) => ParamMap::build(&self.params, |id, normalized| unsafe {
-                ctrl.normalizedParamToPlain(id.0, normalized)
-            }),
-            None => ParamMap::build(&[], |_, n| n),
+        let map = match &self.param_map {
+            Some(map) => Arc::clone(map),
+            None => {
+                let map = Arc::new(match &self.instance.get().controller {
+                    Some(ctrl) => ParamMap::build(&self.params, |id, normalized| unsafe {
+                        ctrl.normalizedParamToPlain(id.0, normalized)
+                    }),
+                    None => ParamMap::build(&[], |_, n| n),
+                });
+                self.param_map = Some(Arc::clone(&map));
+                map
+            }
         };
 
         // Same thread, same reason: IMidiMapping hangs off IEditController.
@@ -959,7 +978,7 @@ pub struct Vst3Processor {
     output_buses: Vec<vst3::Steinberg::Vst::AudioBusBuffers>,
 
     /// Plain→normalised conversion captured at activate.
-    param_map: ParamMap,
+    param_map: Arc<ParamMap>,
     /// MIDI controller → parameter id, also captured at activate.
     midi_map: MidiMap,
     /// Shared with the main-thread half; see `Vst3Plugin::pending_edits`.
@@ -978,7 +997,7 @@ impl Vst3Processor {
         instance: Arc<MainThread<Vst3Instance>>,
         config: AudioConfig,
         declared: &DeclaredBuses,
-        param_map: ParamMap,
+        param_map: Arc<ParamMap>,
         midi_map: MidiMap,
         pending_edits: Arc<Mutex<Vec<(ParamId, f64)>>>,
         feedback: Arc<ParamFeedback>,

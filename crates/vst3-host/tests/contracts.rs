@@ -247,6 +247,36 @@ fn an_unchanged_latency_does_not_restart_the_plugin() {
     processor.deactivate();
 }
 
+/// Activating again asks the controller nothing it was already asked.
+///
+/// The conversion table costs dozens of calls per parameter, and the wrapper
+/// reactivates every sub-plugin whenever a graph edit reroutes one. A plugin
+/// slow to answer turned each of those edits into a stall of seconds.
+#[test]
+fn reactivation_reuses_the_parameter_conversion() {
+    let _thread = vst3_host::init_apartment().unwrap();
+    let _lock = fixture();
+    let path = fixture_path();
+    let observer = unsafe { libloading::Library::new(&path) }.unwrap();
+    let calls =
+        unsafe { observer.get::<unsafe extern "C" fn() -> u32>(b"audit_vst_to_plain_calls") }
+            .unwrap();
+
+    let module = Module::open(&path).unwrap();
+    let cid = module.audio_modules().unwrap()[0].cid;
+    let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
+    plugin
+        .activate(AudioConfig::default())
+        .unwrap()
+        .deactivate();
+    let before = unsafe { calls() };
+    plugin
+        .activate(AudioConfig::default())
+        .unwrap()
+        .deactivate();
+    assert_eq!(unsafe { calls() }, before);
+}
+
 struct Host;
 impl HostContext for Host {
     fn host_name(&self) -> &str {
