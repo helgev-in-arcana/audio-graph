@@ -23,7 +23,7 @@ mod op;
 
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
-pub use audio_op::{AudioOp, Buf, Chunking, MixIn, Span, Stage};
+pub use audio_op::{AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, MixIn, Span, Stage};
 pub use note_op::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NoteBuf,
     NoteOp,
@@ -60,6 +60,15 @@ pub const MAX_LFOS: usize = 64;
 /// How many latches one program may have — one per key-switch node. A ceiling
 /// because the table is allocated once and never resized.
 pub const MAX_LATCHES: usize = 64;
+
+/// How many audio nodes one program may have that keep state between blocks
+/// of their own (a filter's history) — see [`AudioOp::Math`]. A ceiling for
+/// the same reason as the latches.
+pub const MAX_DSP_STATES: usize = 64;
+
+/// Values in one node's DSP state: two per channel for a first-order filter,
+/// with room for twice that.
+pub const DSP_VALUES: usize = 4 * MAX_CHANNELS;
 pub const MAX_DELAY_LINES: usize = 16;
 
 /// How far back a param delay line can read, in sub-blocks.
@@ -213,6 +222,11 @@ pub struct Program {
     /// of every knob — does not restart the oscillators. Without it, editing an
     /// unrelated node would put a click in the middle of a slow LFO sweep.
     pub(crate) lfo_nodes: Vec<NodeId>,
+    /// DSP state index → the audio node it belongs to.
+    ///
+    /// Carried across a swap like the LFOs: a filter whose history emptied on
+    /// every recompile would click on every drag of every control.
+    pub(crate) dsp_nodes: Vec<NodeId>,
 }
 
 /// A compiled program prepared for its publisher's receiving engine and sample
@@ -382,6 +396,7 @@ impl Program {
             audio_ring_seconds: Vec::new(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
+            dsp_nodes: Vec::new(),
         }
     }
 

@@ -115,4 +115,5 @@ Program {
         2,
     ],
     lfo_nodes: [],
+    dsp_nodes: [],
 }

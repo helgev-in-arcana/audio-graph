@@ -5,6 +5,8 @@
 //! pointer, so a `Program` stays a value that could cross a process boundary
 //! unchanged.
 
+use serde::{Deserialize, Serialize};
+
 use crate::ir::NoteBuf;
 
 /// An index into the audio buffer pool.
@@ -225,9 +227,70 @@ pub enum AudioOp {
     },
     /// Write buffer audio into an audio delay line ring buffer.
     DelayWrite { line: u16, a: Buf },
+    /// A sample-by-sample operation on a buffer, or on two.
+    ///
+    /// `out` may be `a`: every op reads a sample before writing it. `b` is the
+    /// second operand where the op takes one, and `None` when nothing is wired
+    /// to it — see [`AudioMathOp`] for what each op does then. `state` is the
+    /// op's history between blocks, booked by the node whether or not this op
+    /// needs one, so switching ops does not change what the node owns.
+    Math {
+        out: Buf,
+        a: Buf,
+        b: Option<Buf>,
+        op: AudioMathOp,
+        state: u16,
+    },
     /// Advance an audio delay line's write head over silence.
     ///
     /// Emitted for a line nothing writes. The read position is measured back
     /// from the head, so a head that stopped would replay the ring forever.
     DelaySilence { line: u16 },
+}
+
+/// What an [`AudioOp::Math`] does to each sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioMathOp {
+    /// Take out any constant offset: a first-order high-pass at
+    /// [`DC_CUTOFF_HZ`]. What a chain that rectifies, waveshapes or sums an
+    /// offset in leaves behind, and what eats headroom and thumps on the next
+    /// gate.
+    #[default]
+    RemoveDc,
+    /// Flip the polarity.
+    Invert,
+    /// The magnitude of each sample: full-wave rectification.
+    Rectify,
+    /// `a × b`, sample by sample: ring modulation. With nothing wired to `b`,
+    /// `a` passes unchanged rather than going silent — an unwired modulator
+    /// is not a modulator of zero.
+    Multiply,
+}
+
+/// Where [`AudioMathOp::RemoveDc`] crosses over, in hertz. Low enough to leave
+/// the lowest note of a piano (27.5 Hz) alone, high enough to settle an offset
+/// within a fraction of a second.
+pub const DC_CUTOFF_HZ: f64 = 5.0;
+
+impl AudioMathOp {
+    pub const ALL: [AudioMathOp; 4] = [
+        AudioMathOp::RemoveDc,
+        AudioMathOp::Invert,
+        AudioMathOp::Rectify,
+        AudioMathOp::Multiply,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioMathOp::RemoveDc => "Remove DC",
+            AudioMathOp::Invert => "Invert",
+            AudioMathOp::Rectify => "Rectify",
+            AudioMathOp::Multiply => "Multiply",
+        }
+    }
+
+    /// Whether the op reads a second signal.
+    pub fn takes_b(self) -> bool {
+        matches!(self, AudioMathOp::Multiply)
+    }
 }

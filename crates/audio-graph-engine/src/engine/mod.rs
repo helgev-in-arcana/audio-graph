@@ -23,10 +23,11 @@ use plugin_host::{Event, NoteEvent};
 
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioOp, Buf, Chunking, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS,
-    MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS,
-    MAX_LATCHES, MAX_LFOS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
-    NoteOp, NoteStream, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
+    AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DSP_VALUES, Detect, Follow,
+    MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION,
+    MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
+    MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NoteOp, NoteStream,
+    Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -40,7 +41,7 @@ mod params;
 mod tests;
 
 use audio::Window;
-use lines::{AudioLine, Latch, Lfo, ParamLine, Slot, copy_ring, reorder};
+use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Slot, copy_ring, reorder};
 use notes::{NoteState, key_bit};
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
@@ -157,6 +158,9 @@ pub struct Engine {
     /// One per latch index of the current program. Carried across a swap so a
     /// key switch does not forget which way it was thrown.
     latches: Vec<Latch>,
+    /// One per DSP state index of the current program. Carried across a swap
+    /// so a filter keeps its history through a recompile.
+    dsp: Vec<DspState>,
     /// Scratch for [`reorder`], as long as the longest of the slot tables, so a
     /// swap allocates nothing.
     order: Vec<usize>,
@@ -197,10 +201,12 @@ impl Engine {
             compensators: Vec::new(),
             compensator_heads: vec![0; MAX_COMPENSATORS],
             latches: (0..MAX_LATCHES).map(|_| Latch::new()).collect(),
+            dsp: (0..MAX_DSP_STATES).map(|_| DspState::new()).collect(),
             order: vec![
                 0;
                 MAX_LFOS
                     .max(MAX_LATCHES)
+                    .max(MAX_DSP_STATES)
                     .max(MAX_DELAY_LINES)
                     .max(MAX_AUDIO_DELAY_LINES)
             ],
@@ -256,6 +262,7 @@ impl Engine {
         // Everything a node owns follows it to wherever the new program put it.
         reorder(&mut self.lfos, &mut self.order, &next.lfo_nodes);
         reorder(&mut self.latches, &mut self.order, &next.latch_nodes);
+        reorder(&mut self.dsp, &mut self.order, &next.dsp_nodes);
         reorder(&mut self.lines, &mut self.order, &next.delay_nodes);
         reorder(
             &mut self.audio_lines,
@@ -380,6 +387,8 @@ impl Engine {
         // allocated on the main thread and rides in on the program, so there
         // is nothing to hand back and nothing to resize.
         self.audio_lines.iter_mut().for_each(Slot::clear);
+        // A filter's history is the sound it last heard, which is gone too.
+        self.dsp.iter_mut().for_each(Slot::clear);
     }
 
     /// Allocates and sizes audio buffers for worst-case limits. Called from the main thread on activation.

@@ -22,7 +22,7 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
     MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
+    MAX_DSP_STATES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -520,6 +520,7 @@ pub(crate) struct AudioCx<'a> {
     audio_lines: Vec<LineId>,
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
+    dsp_nodes: Vec<NodeId>,
 
     notes: &'a Notes,
 }
@@ -557,6 +558,7 @@ impl<'a> AudioCx<'a> {
             audio_lines: Vec::new(),
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
+            dsp_nodes: Vec::new(),
             notes,
         }
     }
@@ -637,10 +639,25 @@ impl<'a> AudioCx<'a> {
             ops: self.ops,
             spans: self.spans,
             delay_nodes: self.delay_nodes,
+            dsp_nodes: self.dsp_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
             latency: self.latency,
         }
+    }
+
+    /// Books this node a DSP state, which survives a program swap — see
+    /// [`AudioOp::Math`]. One per node: the table that carries them across a
+    /// swap is keyed by node.
+    pub(crate) fn dsp_state(&mut self) -> Result<u16, CompileError> {
+        if self.dsp_nodes.len() >= MAX_DSP_STATES {
+            return Err(CompileError::TooLarge {
+                what: "audio nodes that keep a state of their own",
+                limit: MAX_DSP_STATES,
+            });
+        }
+        self.dsp_nodes.push(self.id);
+        Ok((self.dsp_nodes.len() - 1) as u16)
     }
 
     // --- what is wired in -------------------------------------------------

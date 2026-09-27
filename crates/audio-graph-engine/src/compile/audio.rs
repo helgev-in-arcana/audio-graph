@@ -21,6 +21,8 @@ pub(crate) struct Audio {
     /// Audio line index → its `DelayWrite` node, so a program swap can carry
     /// the ring contents over.
     pub delay_nodes: Vec<NodeId>,
+    /// DSP state index → the node that took it out.
+    pub dsp_nodes: Vec<NodeId>,
     /// Audio line index → the longest any read on it asks for, in seconds.
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,

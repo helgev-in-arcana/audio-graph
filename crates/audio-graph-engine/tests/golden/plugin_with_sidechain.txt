@@ -104,4 +104,5 @@ Program {
     latency: 0,
     latch_nodes: [],
     lfo_nodes: [],
+    dsp_nodes: [],
 }
