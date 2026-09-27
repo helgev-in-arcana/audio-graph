@@ -168,9 +168,9 @@ dependencies = [
 
 [[package]]
 name = "baseview"
-version = "0.3.2"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69412dad79c1ed7a3f6960eda3707a31f1407a384bc6d49bc133624b347ac185"
+checksum = "cf732d87e8d8ac8c1960e6c360006e914467aae53e1c385c8c087e54a9f80292"
 dependencies = [
  "block2 0.6.2",
  "bytemuck",
@@ -606,9 +606,9 @@ dependencies = [
 
 [[package]]
 name = "egui-baseview"
-version = "0.7.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e39f175a1a715c0313904d0cf7bca9dc8fe88fbdd1f422bb97b0ca6182db1230"
+checksum = "f197eade3efd9bfe76b9cbf8357beb6a48e0a2ac262901b0f52c736e2710fdaf"
 dependencies = [
  "baseview",
  "copypasta",
@@ -1231,7 +1231,7 @@ dependencies = [
  "libc",
  "nice-assert-no-alloc",
  "nice-log",
- "nice-plug-core",
+ "nice-plug-core 0.3.0",
  "nice-plug-derive",
  "objc2 0.6.4",
  "parking_lot",
@@ -1267,6 +1267,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nice-plug-core"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8fe3f3e395c1140d7519a78069b59b2e3bf6da2b904d0c54ad7ab49a60ba09"
+dependencies = [
+ "atomic_float",
+ "atomic_refcell",
+ "bitflags 2.13.1",
+ "crossbeam-utils",
+ "dpi",
+ "midi-consts",
+ "nice-plug-derive",
+ "parking_lot",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "nice-plug-derive"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,14 +1300,14 @@ dependencies = [
 
 [[package]]
 name = "nice-plug-egui"
-version = "0.4.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be992a08bb4413b683bc48752adf92b8540541e885fd4e6401957d9b768e6f4f"
+checksum = "3fcf7478a8ceedb1658e0de4f1548488807f177a962727c54753d78d649f9472"
 dependencies = [
  "crossbeam",
  "egui",
  "egui-baseview",
- "nice-plug-core",
+ "nice-plug-core 0.4.2",
  "parking_lot",
  "raw-window-handle",
  "serde",
