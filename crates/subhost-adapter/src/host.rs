@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::schedule::ScheduleView;
-use plugin_host::catalogue::Module;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, MainThread, ParamEvent,
     ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain, SubPluginProcessor,
@@ -682,19 +681,27 @@ impl SubHost {
 
     /// Restores sub-host state, attempting to locate and reload each saved sub-plugin instance.
     ///
-    /// `known` is the plugin catalogue, which is where a plugin that is no
-    /// longer at its saved path is looked for; see
-    /// [`plugin_host::reference_candidates`].
+    /// The saved path is tried first while the file is there. After it,
+    /// `candidates` says where else the reference may be, most likely first.
+    /// Each is loaded in turn with the reference's id and the first that takes
+    /// is kept, which is also what checks a path: a file that no longer
+    /// exports the id fails to load. Where else to look is the caller's — a
+    /// scan catalogue, or nowhere at all — because finding plugins is not what
+    /// hosting one inside another needs to know about.
     ///
     /// Returns a list of diagnostic messages rather than an error: a missing
     /// sub-plugin must not stop the rest of the patch from loading.
-    pub fn load_state(&mut self, state: &SubHostState, known: &[Module]) -> Vec<String> {
+    pub fn load_state(
+        &mut self,
+        state: &SubHostState,
+        candidates: impl Fn(&plugin_host::PluginRef) -> Vec<PathBuf>,
+    ) -> Vec<String> {
         let mut problems = Vec::new();
         self.slots.load_state(state.slots.clone());
         self.unload_all();
 
         for entry in &state.instances {
-            if let Err(error) = self.restore(entry, known) {
+            if let Err(error) = self.restore(entry, &candidates) {
                 self.detach(entry.instance);
                 self.remember(entry.clone());
                 problems.push(format!(
@@ -707,14 +714,17 @@ impl SubHost {
         problems
     }
 
-    /// Tries again to load every saved instance that is not loaded, against a
-    /// catalogue that may know more than the one the project was opened with.
-    /// Returns how many came back.
+    /// Tries again to load every saved instance that is not loaded, with
+    /// candidates that may know more than those the project was opened with —
+    /// see [`load_state`][Self::load_state]. Returns how many came back.
     ///
     /// What a finished scan calls: a project opened before its plugins were
     /// scanned, or after one moved, keeps each such instance's settings and
     /// wiring, and this is where it gets its plugin back.
-    pub fn retry_unloaded(&mut self, known: &[Module]) -> usize {
+    pub fn retry_unloaded(
+        &mut self,
+        candidates: impl Fn(&plugin_host::PluginRef) -> Vec<PathBuf>,
+    ) -> usize {
         let waiting: Vec<InstanceState> = self
             .saved
             .iter()
@@ -723,7 +733,7 @@ impl SubHost {
             .collect();
         let mut restored = 0;
         for entry in &waiting {
-            match self.restore(entry, known) {
+            match self.restore(entry, &candidates) {
                 Ok(()) => restored += 1,
                 Err(_) => {
                     self.detach(entry.instance);
@@ -736,7 +746,11 @@ impl SubHost {
 
     /// Loads one saved instance from the first of its candidate paths that
     /// takes, then hands it its saved state.
-    fn restore(&mut self, entry: &InstanceState, known: &[Module]) -> Result<(), String> {
+    fn restore(
+        &mut self,
+        entry: &InstanceState,
+        candidates: &dyn Fn(&plugin_host::PluginRef) -> Vec<PathBuf>,
+    ) -> Result<(), String> {
         let reference = &entry.reference;
         self.reserve(entry.instance)?;
         // An unrecognised format tag is "not found" rather than an error: a
@@ -745,15 +759,19 @@ impl SubHost {
         // build does not have.
         let format =
             Format::from_tag(&reference.format).ok_or("its plugin format is not available")?;
-        let candidates = plugin_host::reference_candidates(
-            &plugin_host::PluginRef {
-                format,
-                id: reference.plugin_id.clone(),
-                path_hint: PathBuf::from(&reference.path_hint),
-                display_name: reference.display_name.clone(),
-            },
-            known,
-        );
+        let hint = PathBuf::from(&reference.path_hint);
+        let others = candidates(&plugin_host::PluginRef {
+            format,
+            id: reference.plugin_id.clone(),
+            path_hint: hint.clone(),
+            display_name: reference.display_name.clone(),
+        });
+        let candidates: Vec<PathBuf> = hint
+            .exists()
+            .then(|| hint.clone())
+            .into_iter()
+            .chain(others.into_iter().filter(|path| *path != hint))
+            .collect();
         if candidates.is_empty() {
             return Err("plugin could not be found; a plugin rescan may find it".into());
         }

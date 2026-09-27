@@ -218,7 +218,7 @@ fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
         .cloned()
         .collect();
     if args.is_empty() {
-        return plugin_host::installed_modules(&audio_graph_settings::directories())
+        return plugin_scan::installed_modules(&audio_graph_settings::directories())
             .into_iter()
             .map(|(_, path)| path)
             .collect();
@@ -233,7 +233,7 @@ fn modules_from_args(args: &[String]) -> Vec<PathBuf> {
             continue;
         }
         for format in plugin_host::FORMATS {
-            out.extend(plugin_host::find_modules(format, &d));
+            out.extend(plugin_scan::find_modules(format, &d));
         }
     }
     out

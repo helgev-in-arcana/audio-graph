@@ -11,6 +11,7 @@ members = [
     "crates/clap-test-plugin",
     "crates/vst3-test-plugin",
     "crates/plugin-host",
+    "crates/plugin-scan",
     "crates/subhost-adapter",
     "crates/audio-graph-engine",
     "crates/audio-graph-plugin",
@@ -31,6 +32,7 @@ vst3-host-view = { path = "crates/vst3-host-view" }
 host-window = { path = "crates/host-window" }
 clap-host = { path = "crates/clap-host" }
 plugin-host = { path = "crates/plugin-host" }
+plugin-scan = { path = "crates/plugin-scan" }
 subhost-adapter = { path = "crates/subhost-adapter" }
 audio-graph-engine = { path = "crates/audio-graph-engine" }
 

@@ -17,8 +17,11 @@
 - [vst3-host-view](../crates/vst3-host-view/README.md)
 - [clap-host](../crates/clap-host/README.md)
 - [plugin-host](../crates/plugin-host/README.md)
+- [plugin-scan](../crates/plugin-scan/README.md)
 
 VST3とCLAPを共通化します。
+
+`plugin-host`は呼び出し側が指定した1つのモジュールを読み込みます。複数のモジュールを見る処理（フォルダ内の列挙、スキャン結果のカタログ、保存された参照の解決）は、その上の`plugin-scan`が担当します。既知のパスを読み込むだけの呼び出し側は`plugin-scan`に依存しません。
 
 `plugin-module`は形式に依存しないモジュール読み込みの部品（共有ライブラリのロード、バンドル内のバイナリ解決、1バイナリ1スレッドの占有、スレッドごとのロード済み表、フォルダ内のモジュール列挙）で、`vst3-host`と`clap-host`が共有します。どのフォルダを探すかは持たず、呼び出し側が渡します。
 
@@ -48,7 +51,7 @@ VST3とCLAPを共通化します。
 
 グラフのI/Oやパラメーター対応が変わる場合、製品側が旧processorの使用終了、再設定、Programの公開を統括します。processor構成には必要なProgramの公開番号を記録し、ブロック開始時にその番号以降のProgramを実際に採用できた場合だけ実行します。公開番号は `ProgramPublisher` 内で単調増加し、エンジンの `publication()` が採用済み番号を返します。構成を変えない値の編集ではprocessorを再生成せず、オーディオ用mutexも取得しません。
 
-AudioGraph固有の設定ファイル、探索フォルダー、ピン留め、カタログの保存先は `audio-graph-settings` が所有し、製品とCLIで共有します。`plugin-host` は呼び出し側から渡された探索対象とカタログ保存先を扱います。ブラウザー上の表示分類は `audio-graph-plugin` が決定します。
+AudioGraph固有の設定ファイル、探索フォルダー、ピン留め、カタログの保存先は `audio-graph-settings` が所有し、製品とCLIで共有します。`plugin-scan` は呼び出し側から渡された探索対象とカタログ保存先を扱います。ブラウザー上の表示分類は `audio-graph-plugin` が決定します。
 
 ### 開発用CLIツール
 

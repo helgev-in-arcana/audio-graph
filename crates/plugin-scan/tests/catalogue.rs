@@ -10,7 +10,7 @@
 //!
 use std::path::PathBuf;
 
-use plugin_host::catalogue;
+use plugin_scan::catalogue;
 
 /// A busy native module retains old metadata and remains eligible for a later scan.
 #[test]
@@ -200,7 +200,7 @@ fn the_hint_comes_before_the_catalogue() {
     let known = [module(&paths[1], Format::Clap, &["com.example.a"])];
     let wanted = reference(Format::Clap, "com.example.a", paths[0].clone());
     assert_eq!(
-        plugin_host::reference_candidates(&wanted, &known),
+        plugin_scan::reference_candidates(&wanted, &known),
         vec![paths[0].clone(), paths[1].clone()]
     );
 }
@@ -224,7 +224,7 @@ fn a_moved_plugin_is_found_by_its_id() {
     ];
     let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
     assert_eq!(
-        plugin_host::reference_candidates(&wanted, &known),
+        plugin_scan::reference_candidates(&wanted, &known),
         vec![paths[1].clone()]
     );
 }
@@ -237,7 +237,7 @@ fn nothing_outside_the_catalogue_is_a_candidate() {
     use plugin_host::Format;
     let (dir, _paths) = stand_ins("unscanned", &["unscanned.clap"]);
     let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
-    assert!(plugin_host::reference_candidates(&wanted, &[]).is_empty());
+    assert!(plugin_scan::reference_candidates(&wanted, &[]).is_empty());
 }
 
 /// A module whose file changed since it was scanned may no longer export the
@@ -251,7 +251,7 @@ fn a_changed_module_is_tried_last() {
     let known = [changed, module(&paths[1], Format::Clap, &["com.example.a"])];
     let wanted = reference(Format::Clap, "com.example.a", dir.join("gone.clap"));
     assert_eq!(
-        plugin_host::reference_candidates(&wanted, &known),
+        plugin_scan::reference_candidates(&wanted, &known),
         vec![paths[1].clone(), paths[0].clone()]
     );
 }

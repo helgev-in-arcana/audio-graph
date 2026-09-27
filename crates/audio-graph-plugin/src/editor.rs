@@ -49,7 +49,7 @@ enum Command {
     SetQuantum(u32),
     /// Load the sub-plugins the project names but could not find, from the
     /// catalogue a scan just finished.
-    FindMissing(Vec<plugin_host::catalogue::Module>),
+    FindMissing(Vec<plugin_scan::catalogue::Module>),
     /// Throw away everything the running graph remembers.
     Reset,
 }
@@ -85,7 +85,7 @@ pub struct WrapperEditor {
     scanned: bool,
     /// A scan running on its own thread, if one is. Never more than one: a
     /// second would open the same modules again for the same answer.
-    scan: Option<std::sync::mpsc::Receiver<Result<Vec<plugin_host::catalogue::Module>, String>>>,
+    scan: Option<std::sync::mpsc::Receiver<Result<Vec<plugin_scan::catalogue::Module>, String>>>,
 
     /// Whether the plugin-folders window is showing.
     folders_open: bool,
@@ -166,7 +166,7 @@ impl WrapperEditor {
     /// background scan started here says otherwise.
     fn rescan(&mut self) {
         let known = audio_graph_settings::catalogue_path()
-            .map_or_else(Vec::new, |p| plugin_host::catalogue::cached(&p));
+            .map_or_else(Vec::new, |p| plugin_scan::catalogue::cached(&p));
         self.fill_entries(&known);
         self.scanned = true;
         self.start_scan();
@@ -174,10 +174,10 @@ impl WrapperEditor {
 
     /// Rebuild the menu's entries from the modules on disk and what `known`
     /// says about them.
-    fn fill_entries(&mut self, known: &[plugin_host::catalogue::Module]) {
+    fn fill_entries(&mut self, known: &[plugin_scan::catalogue::Module]) {
         let pinned = audio_graph_settings::pinned();
         self.entries.clear();
-        for (format, path) in plugin_host::installed_modules(&audio_graph_settings::directories()) {
+        for (format, path) in plugin_scan::installed_modules(&audio_graph_settings::directories()) {
             let name = path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -234,7 +234,7 @@ impl WrapperEditor {
                     .map(|_thread| {
                         let dirs = audio_graph_settings::directories();
                         let cache = audio_graph_settings::catalogue_path();
-                        plugin_host::catalogue::refresh(&dirs, cache.as_deref())
+                        plugin_scan::catalogue::refresh(&dirs, cache.as_deref())
                     })
                     .map_err(|error| error.to_string());
                 let _ = tx.send(result);
@@ -468,7 +468,7 @@ impl WrapperEditor {
                         .clicked()
                     {
                         if let Some(cache) = audio_graph_settings::catalogue_path()
-                            && let Err(e) = plugin_host::catalogue::forget(&cache)
+                            && let Err(e) = plugin_scan::catalogue::forget(&cache)
                         {
                             self.status.set(format!("cache not cleared: {e}"));
                         }
