@@ -1,12 +1,11 @@
 //! Loading a VST3 module and enumerating the classes it offers.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
-use std::sync::{Mutex, OnceLock};
+use std::rc::Rc;
 
 use plugin_host_api::{HostError, Result};
+use plugin_module::{Loaded, ModuleLease};
 use vst3::Steinberg::{
     IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactory3, IPluginFactory3Trait,
     IPluginFactoryTrait, PClassInfo, PClassInfo2, PClassInfoW, PFactoryInfo, kResultOk,
@@ -86,41 +85,13 @@ pub(crate) struct ModuleInner {
     _lease: ModuleLease,
 }
 
-static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-struct ModuleLease(PathBuf);
-
-impl ModuleLease {
-    fn acquire(key: PathBuf) -> Result<Self> {
-        let mut claimed = CLAIMED.get_or_init(Mutex::default).lock().unwrap();
-        if !claimed.insert(key.clone()) {
-            return Err(HostError::ModuleBusy(key.display().to_string()));
-        }
-        Ok(Self(key))
-    }
-}
-
-impl Drop for ModuleLease {
-    fn drop(&mut self) {
-        CLAIMED.get().unwrap().lock().unwrap().remove(&self.0);
-    }
-}
-
 thread_local! {
-    /// Modules already loaded on this thread, keyed by canonical path.
-    ///
-    /// A VST3 module's entry point (`InitDll` / `bundleEntry` / `ModuleEntry`)
-    /// initialises process-wide state and must be balanced exactly once, no
-    /// matter how many times a host asks for the module. Loading it twice and
-    /// dropping one handle runs the exit point while the other handle is still
-    /// in use, which tears the plugin's globals down underneath it — the C++
-    /// SDK's own `Module` caches for the same reason.
-    ///
-    /// `Weak`, so a module is genuinely unloaded once nothing refers to it.
-    /// Thread-local rather than global because `ModuleInner` is deliberately
-    /// not `Send`: VST3 pins factory use to the loading thread.
-    static LOADED: RefCell<HashMap<PathBuf, Weak<ModuleInner>>> =
-        RefCell::new(HashMap::new());
+    /// Modules already loaded on this thread. A VST3 module's entry point
+    /// (`InitDll` / `bundleEntry` / `ModuleEntry`) has to be balanced exactly
+    /// once — the C++ SDK's own `Module` caches for the same reason — and
+    /// `ModuleInner` is deliberately not `Send`, because VST3 pins factory use
+    /// to the loading thread. See [`Loaded`].
+    static LOADED: Loaded<ModuleInner> = Loaded::default();
 }
 
 impl Module {
@@ -133,11 +104,9 @@ impl Module {
     pub fn open(path: impl AsRef<Path>) -> Result<Module> {
         let path = path.as_ref();
         let binary = crate::library::resolve_binary(path)?;
-        let key = std::fs::canonicalize(&binary).unwrap_or(binary);
+        let key = plugin_module::identity(binary);
 
-        if let Some(existing) =
-            LOADED.with(|loaded| loaded.borrow().get(&key).and_then(Weak::upgrade))
-        {
+        if let Some(existing) = LOADED.with(|loaded| loaded.get(&key)) {
             return Ok(Module { inner: existing });
         }
 
@@ -172,7 +141,7 @@ impl Module {
             path: path.to_path_buf(),
             _lease: lease,
         });
-        LOADED.with(|loaded| loaded.borrow_mut().insert(key, Rc::downgrade(&inner)));
+        LOADED.with(|loaded| loaded.insert(key, &inner));
 
         Ok(Module { inner })
     }

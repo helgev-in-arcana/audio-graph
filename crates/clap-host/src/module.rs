@@ -3,12 +3,9 @@
 //! Provides a reference-counted handle onto a loaded CLAP library module, cached by path
 //! to ensure entry points are initialized exactly once per module.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_char};
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
-use std::sync::{Mutex, OnceLock};
+use std::rc::Rc;
 
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_factory};
@@ -16,8 +13,8 @@ use clap_sys::plugin::clap_plugin_descriptor;
 use clap_sys::version::clap_version_is_compatible;
 use plugin_host_api::{HostError, Result};
 
-use crate::library::Library;
 use crate::util::from_cstr;
+use plugin_module::{Library, Loaded, ModuleLease};
 
 /// One plugin exported by a module.
 ///
@@ -84,26 +81,6 @@ pub(crate) struct ModuleInner {
     _lease: ModuleLease,
 }
 
-static CLAIMED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-struct ModuleLease(PathBuf);
-
-impl ModuleLease {
-    fn acquire(key: PathBuf) -> Result<Self> {
-        let mut claimed = CLAIMED.get_or_init(Mutex::default).lock().unwrap();
-        if !claimed.insert(key.clone()) {
-            return Err(HostError::ModuleBusy(key.display().to_string()));
-        }
-        Ok(Self(key))
-    }
-}
-
-impl Drop for ModuleLease {
-    fn drop(&mut self) {
-        CLAIMED.get().unwrap().lock().unwrap().remove(&self.0);
-    }
-}
-
 impl Drop for ModuleInner {
     fn drop(&mut self) {
         // Balances the `init` in `Module::open`. The factory pointer belongs to
@@ -120,12 +97,9 @@ impl Drop for ModuleInner {
 }
 
 thread_local! {
-    /// Modules already loaded on this thread, keyed by canonical path.
-    ///
-    /// Ensures `clap_entry.init` is balanced once per module. Uses `Weak` so modules
-    /// are unloaded when no live references remain.
-    static LOADED: RefCell<HashMap<PathBuf, Weak<ModuleInner>>> =
-        RefCell::new(HashMap::new());
+    /// Modules already loaded on this thread, so `clap_entry.init` is
+    /// balanced once per module. See [`Loaded`].
+    static LOADED: Loaded<ModuleInner> = Loaded::default();
 }
 
 impl Module {
@@ -137,16 +111,14 @@ impl Module {
     pub fn open(path: impl AsRef<Path>) -> Result<Module> {
         let path = path.as_ref();
         let binary = crate::library::resolve_binary(path)?;
-        let key = std::fs::canonicalize(&binary).unwrap_or(binary);
+        let key = plugin_module::identity(binary.clone());
 
-        if let Some(existing) =
-            LOADED.with(|loaded| loaded.borrow().get(&key).and_then(Weak::upgrade))
-        {
+        if let Some(existing) = LOADED.with(|loaded| loaded.get(&key)) {
             return Ok(Module { inner: existing });
         }
 
         let lease = ModuleLease::acquire(key.clone())?;
-        let library = Library::open(path)?;
+        let library = Library::open(&binary)?;
 
         let Some(sym) = library.symbol("clap_entry") else {
             return Err(HostError::NoFactory(format!(
@@ -214,7 +186,7 @@ impl Module {
             path: path.to_path_buf(),
             _lease: lease,
         });
-        LOADED.with(|loaded| loaded.borrow_mut().insert(key, Rc::downgrade(&inner)));
+        LOADED.with(|loaded| loaded.insert(key, &inner));
 
         Ok(Module { inner })
     }
@@ -226,7 +198,7 @@ impl Module {
     /// The binary actually loaded — the same file as [`Module::path`] except on
     /// macOS, where the path is a bundle directory.
     pub fn binary_path(&self) -> &Path {
-        self.inner.library.binary_path()
+        self.inner.library.path()
     }
 
     pub(crate) fn factory(&self) -> *const clap_plugin_factory {

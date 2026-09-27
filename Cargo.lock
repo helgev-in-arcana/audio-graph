@@ -346,10 +346,9 @@ version = "0.1.5"
 dependencies = [
  "clap-sys",
  "host-window",
- "libc",
  "log",
  "plugin-host-api",
- "windows-sys 0.61.2",
+ "plugin-module",
 ]
 
 [[package]]
@@ -1750,6 +1749,15 @@ name = "plugin-host-api"
 version = "0.1.5"
 
 [[package]]
+name = "plugin-module"
+version = "0.1.5"
+dependencies = [
+ "libc",
+ "plugin-host-api",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "polling"
 version = "3.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2420,10 +2428,10 @@ name = "vst3-host"
 version = "0.1.5"
 dependencies = [
  "dotenvy",
- "libc",
  "libloading 0.9.0",
  "log",
  "plugin-host-api",
+ "plugin-module",
  "serde",
  "serde_json",
  "vst3",
