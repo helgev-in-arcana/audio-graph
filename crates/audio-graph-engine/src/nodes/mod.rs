@@ -207,7 +207,8 @@ pub(crate) trait Node {
     /// the always-on toggle.
     ///
     /// Only for what is about the node as a whole rather than about one of its
-    /// sockets: opening a sub-plugin's window is the only one so far.
+    /// sockets: a sub-plugin's window, and learning a socket from it. Returns
+    /// whether the node changed.
     #[cfg(feature = "ui")]
     fn title_controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         let _ = (ui, cx);

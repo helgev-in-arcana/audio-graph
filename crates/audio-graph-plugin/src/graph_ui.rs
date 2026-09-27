@@ -162,6 +162,8 @@ pub struct GraphContext<'a> {
     /// the audio thread also clamps it dynamically.
     pub quantum: u32,
     pub sample_rate: f64,
+    /// The last parameter moved in each instance's own window, by instance.
+    pub touched: &'a [audio_graph_engine::Touch],
 }
 
 /// How far the canvas may be zoomed. Past the low end the text stops being
@@ -183,6 +185,9 @@ pub struct GraphEditor {
     /// An output port the user has picked up but not yet dropped, and which
     /// of the node's outputs it was.
     linking: Option<(NodeId, u8)>,
+    /// The instance a plugin node is learning a parameter socket for, and its
+    /// last touch when learning was armed. See [`NodeUi::learning`].
+    learning: Option<(usize, u32)>,
     /// Where a right-click asked for a new node, in graph coordinates.
     add_at: Option<Pos2>,
     /// Where to draw the add-node menu, in screen coordinates. The place the
@@ -206,6 +211,7 @@ impl Default for GraphEditor {
             zoom: 1.0,
             dragging: None,
             linking: None,
+            learning: None,
             add_at: None,
             add_screen: None,
             plugin_filter: String::new(),
@@ -464,7 +470,9 @@ impl GraphEditor {
         let outputs = graph.nodes[index].kind.output_ports();
         // Not `title()`: a plugin node is named for what is loaded in it,
         // and only the wrapper knows what that is.
-        let title = graph.nodes[index].kind.ui_title(&node_ui(ctx));
+        let title = graph.nodes[index]
+            .kind
+            .ui_title(&node_ui(ctx, self.learning));
 
         let zoom = self.zoom;
         let width = NODE_WIDTH * zoom;
@@ -577,7 +585,7 @@ impl GraphEditor {
                             outcome.changed = true;
                         }
                     }
-                    let mut cx = node_ui(ctx);
+                    let mut cx = node_ui(ctx, self.learning);
                     outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
                     actions.append(&mut cx.actions);
                     // The name fills what the buttons left, laid out the
@@ -620,7 +628,7 @@ impl GraphEditor {
                         outcome.changed = true;
                     }
                 }
-                let mut cx = node_ui(ctx);
+                let mut cx = node_ui(ctx, self.learning);
                 let changed = graph.nodes[index].kind.controls(ui, &mut cx);
                 actions.append(&mut cx.actions);
                 changed
@@ -653,7 +661,7 @@ impl GraphEditor {
                             if remove_button(ui, port.remove, "remove this output") {
                                 dropped_output = Some(i as u8);
                             }
-                            let mut cx = node_ui(ctx);
+                            let mut cx = node_ui(ctx, self.learning);
                             outcome.changed |=
                                 graph.nodes[index].kind.output_control(ui, i as u8, &mut cx);
                             actions.append(&mut cx.actions);
@@ -723,7 +731,7 @@ impl GraphEditor {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.label(port.name.as_ref());
-                                    let mut cx = node_ui(ctx);
+                                    let mut cx = node_ui(ctx, self.learning);
                                     outcome.changed |= graph.nodes[index]
                                         .kind
                                         .input_control(ui, i as u8, wired, &mut cx);
@@ -769,6 +777,17 @@ impl GraphEditor {
             self.actions.push(match action {
                 NodeAction::OpenSubEditor(instance) => GraphAction::OpenSubEditor(instance),
                 NodeAction::CloseSubEditor(instance) => GraphAction::CloseSubEditor(instance),
+                // Learning is the canvas's own state, not something the
+                // wrapper has to do.
+                NodeAction::Learn(instance) => {
+                    let since = ctx.touched.get(instance).map_or(0, |touch| touch.edit);
+                    self.learning = Some((instance, since));
+                    continue;
+                }
+                NodeAction::StopLearning => {
+                    self.learning = None;
+                    continue;
+                }
             });
         }
 
@@ -1219,8 +1238,10 @@ fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> RowHit {
 /// what those controls asked the wrapper to do and every caller drains its own
 /// — a node's title bar, its body and each of its socket rows are three
 /// separate asks.
-fn node_ui<'a>(ctx: &'a GraphContext<'a>) -> NodeUi<'a> {
+fn node_ui<'a>(ctx: &'a GraphContext<'a>, learning: Option<(usize, u32)>) -> NodeUi<'a> {
     NodeUi {
+        touched: ctx.touched,
+        learning,
         slot_count: SLOT_COUNT,
         bindings: ctx.bindings,
         live: &ctx.live,
@@ -1327,6 +1348,8 @@ mod tests {
         editor: GraphEditor,
         graph: Graph,
         time: f64,
+        instances: Vec<InstanceView>,
+        touched: Vec<audio_graph_engine::Touch>,
     }
 
     impl Canvas {
@@ -1336,6 +1359,8 @@ mod tests {
                 editor: GraphEditor::default(),
                 graph: Graph::default_patch(),
                 time: 0.0,
+                instances: Vec::new(),
+                touched: Vec::new(),
             }
         }
 
@@ -1351,10 +1376,12 @@ mod tests {
             };
             let editor = &mut self.editor;
             let graph = &mut self.graph;
+            let (instances, touched) = (&self.instances, &self.touched);
             let output = self.ctx.run_ui(input, |ui| {
                 let context = GraphContext {
                     plugins: &[],
-                    instances: &[],
+                    instances,
+                    touched,
                     free_instance: Some(0),
                     bindings: &[],
                     poly_modulation: false,
@@ -1467,5 +1494,56 @@ mod tests {
         let settled = canvas.editor.pan;
         canvas.wheel(6.0, egui::Modifiers::COMMAND);
         assert_eq!(canvas.editor.pan, settled, "nothing moves at the limit");
+    }
+
+    /// Armed, a plugin node gives the next parameter moved in its window a
+    /// socket, named as the plugin names it, and stops learning; a touch from
+    /// before it was armed does not count.
+    #[test]
+    fn learning_gives_the_next_touched_parameter_a_socket() {
+        use audio_graph_engine::{Plugin, PluginPorts, Touch};
+
+        let mut canvas = Canvas::new();
+        canvas.graph = Graph::new();
+        let node = canvas.graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts::default(),
+            }),
+            [40.0, 40.0],
+        );
+        canvas.instances = vec![InstanceView {
+            loaded: true,
+            name: "Synth".into(),
+            editor_open: true,
+            params: vec![(3, "Cutoff".into()), (9, "Drive".into())],
+        }];
+        let params = |canvas: &Canvas| match &canvas.graph.node(node).unwrap().kind {
+            NodeKind::Plugin(plugin) => plugin
+                .ports
+                .params
+                .iter()
+                .map(|p| (p.id, p.name.clone()))
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+
+        // Touched before learning was armed.
+        canvas.touched = vec![Touch { edit: 5, param: 9 }];
+        canvas.editor.learning = Some((0, 5));
+        canvas.frame(Vec::new());
+        assert!(params(&canvas).is_empty(), "an old touch is not a new one");
+        assert_eq!(canvas.editor.learning, Some((0, 5)), "still waiting");
+
+        canvas.touched = vec![Touch { edit: 6, param: 3 }];
+        canvas.frame(Vec::new());
+        assert_eq!(params(&canvas), vec![(3, "Cutoff".to_owned())]);
+        assert_eq!(canvas.editor.learning, None, "one socket per arming");
+
+        // Learning the same parameter again adds nothing.
+        canvas.editor.learning = Some((0, 6));
+        canvas.touched = vec![Touch { edit: 7, param: 3 }];
+        canvas.frame(Vec::new());
+        assert_eq!(params(&canvas).len(), 1);
     }
 }

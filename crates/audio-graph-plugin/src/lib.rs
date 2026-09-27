@@ -15,6 +15,7 @@ mod plugin;
 mod shared;
 mod state;
 mod tick;
+mod touched;
 mod view;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub use params::{SlotParam, WrapperParams};
 pub use plugin::{Wrapper, WrapperKind};
 pub use shared::{GraphEdit, MainState, Shared};
 pub use state::{STATE_VERSION, WrapperState};
+pub use touched::Touched;
 
 /// The effect form: audio in, audio out.
 #[derive(Default)]

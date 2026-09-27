@@ -52,7 +52,7 @@ pub use nodes::{
 #[cfg(feature = "ui")]
 pub use nodes::{
     NodeGroup, catalogue,
-    widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi},
+    widgets::{InstanceView, NODE_WIDTH, NodeAction, NodeUi, Touch},
 };
 pub use notes::{Ended, MAX_LIVE_NOTES};
 pub use port::{Port, PortType, Remove};

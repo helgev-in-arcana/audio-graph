@@ -44,6 +44,19 @@ pub struct InstanceView {
 pub enum NodeAction {
     OpenSubEditor(usize),
     CloseSubEditor(usize),
+    /// Arm learning on an instance: the next parameter moved in its window
+    /// gets a socket. See [`NodeUi::learning`].
+    Learn(usize),
+    StopLearning,
+}
+
+/// The last parameter moved in one sub-plugin's own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Touch {
+    /// Which edit this was, counted across every instance; 0 for an instance
+    /// nobody has touched. Compared for change, never for order.
+    pub edit: u32,
+    pub param: u32,
 }
 
 /// What a node's controls know about the world outside the graph.
@@ -72,6 +85,12 @@ pub struct NodeUi<'a> {
     pub sample_rate: f64,
     /// Indexed by instance number, so a plugin node can look itself up.
     pub instances: &'a [InstanceView],
+    /// The last parameter moved in each instance's own window, by instance.
+    pub touched: &'a [Touch],
+    /// The instance whose next touched parameter becomes a socket, and the
+    /// [`Touch::edit`] it had when learning was armed — a touch still carrying
+    /// that number happened before the user asked.
+    pub learning: Option<(usize, u32)>,
     /// List of requested actions queued for execution by the host wrapper.
     pub actions: Vec<NodeAction>,
 }
