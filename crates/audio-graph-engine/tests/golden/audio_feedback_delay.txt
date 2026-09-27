@@ -21,6 +21,7 @@ Program {
         DelayRead {
             out: 1,
             line: 0,
+            state: 0,
             lane: None,
             time: 0.25,
             max_time: 2.0,
@@ -110,6 +111,8 @@ Program {
         },
     ],
     latency: 0,
-    latch_nodes: [],
+    latch_nodes: [
+        2,
+    ],
     lfo_nodes: [],
 }

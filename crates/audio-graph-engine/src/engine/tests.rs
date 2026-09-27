@@ -4053,3 +4053,139 @@ fn a_recompile_leaves_the_line_full() {
         8 + 200 - 128
     );
 }
+
+/// Changing a delay's time from the editor sweeps the read position to the
+/// new time rather than landing on it.
+///
+/// Every edit recompiles and swaps the program. A read position that started
+/// over at each swap would reach the new time in one sample, and a signal
+/// passing through would step by the whole difference — a click on every drag
+/// of the control.
+#[test]
+fn a_recompiled_delay_time_is_swept_to_not_jumped_to() {
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let (write, read) = audio_delay(&mut graph, 64.0);
+    graph.connect(input, 0, write, 0);
+    graph.connect(read, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &graph);
+
+    // A ramp rising by one step a sample, so a delayed copy of it rises by the
+    // same step and a jump in the read position shows as a larger one.
+    const STEP: f32 = 1e-3;
+    let mut sample = 0usize;
+    let mut block = |engine: &mut Engine| {
+        let mut daw_in = vec![0.0f32; 2 * 128];
+        for i in 0..128 {
+            daw_in[i] = (sample + i) as f32 * STEP;
+            daw_in[128 + i] = daw_in[i];
+        }
+        sample += 128;
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+        daw_out[..128].to_vec()
+    };
+    let mut heard = block(&mut engine);
+    heard.extend(block(&mut engine));
+
+    if let Some(NodeKind::DelayRead(DelayRead { time, .. })) =
+        graph.node_mut(read).map(|n| &mut n.kind)
+    {
+        *time = seconds(96.0);
+    }
+    load(&mut engine, &graph);
+    heard.extend(block(&mut engine));
+
+    let largest = heard[200..]
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        largest < 2.0 * STEP,
+        "the output moved by {largest} in one sample across the swap"
+    );
+}
+
+/// Two delays in a row each read from where they themselves left off.
+///
+/// A read position belongs to its node. Counted per stage instead, delays in
+/// different stages would share one, each chunk of the second would start from
+/// the first one's distance, and an impulse through both would come out
+/// smeared across the sweep between them.
+#[test]
+fn delays_in_different_stages_keep_their_own_read_positions() {
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let (first_write, first_read) = audio_delay(&mut graph, 64.0);
+    let second_write = graph.add(
+        NodeKind::DelayWrite(DelayWrite {
+            line: 1,
+            ty: PortType::STEREO,
+        }),
+        [0.0, 0.0],
+    );
+    let second_read = graph.add(
+        NodeKind::DelayRead(DelayRead {
+            line: 1,
+            ty: PortType::STEREO,
+            max_time: 0.05,
+            time: seconds(96.0),
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(input, 0, first_write, 0);
+    graph.connect(first_read, 0, second_write, 0);
+    graph.connect(second_read, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(128, &[2]);
+    load(&mut engine, &graph);
+    let reads = |stage: &Stage| {
+        engine.program.as_ref().unwrap().audio_ops[stage.audio.range()]
+            .iter()
+            .filter(|op| matches!(op, AudioOp::DelayRead { .. }))
+            .count()
+    };
+    assert!(
+        engine
+            .program
+            .as_ref()
+            .unwrap()
+            .stages
+            .iter()
+            .all(|stage| reads(stage) <= 1),
+        "the two reads are meant to sit in stages of their own"
+    );
+
+    // Timed so the first delay hands the impulse on during the first chunk of
+    // a block, which is where a shared position would be sweeping from the
+    // other delay's distance.
+    const AT: usize = 70;
+    let mut heard = Vec::new();
+    for block in 0..3 {
+        let daw_in = if block == 0 {
+            impulse(128, AT)
+        } else {
+            vec![0.0; 2 * 128]
+        };
+        let mut daw_out = vec![0.0f32; 2 * 128];
+        engine.run_audio(&audio_ctx(128), &daw_in, &mut daw_out, &mut Adders);
+        heard.extend_from_slice(&daw_out[..128]);
+    }
+    assert!(
+        (heard[AT + 64 + 96] - 1.0).abs() < 1e-3,
+        "the impulse arrives whole after both delays, got {}",
+        heard[AT + 64 + 96]
+    );
+    let stray = heard
+        .iter()
+        .enumerate()
+        .filter(|&(i, v)| i != AT + 64 + 96 && v.abs() > 0.05)
+        .count();
+    assert_eq!(stray, 0, "and nowhere else");
+}

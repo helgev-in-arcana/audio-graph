@@ -126,6 +126,9 @@ impl Node for DelayRead {
         let line = cx.line_index(self.line);
         let time_reg = cx.input(0);
         if matches!(self.ty, PortType::Audio { .. }) {
+            // Where the read pointer stood, carried across a swap. Only the
+            // param half hands latches out; see `AudioOp::DelayRead::state`.
+            cx.latch()?;
             // For audio lines, route the dynamic delay time parameter register
             // to drive the audio processing lane.
             if let Some(reg) = time_reg {
@@ -151,10 +154,14 @@ impl Node for DelayRead {
         };
         let line = cx.audio_line(self.line)?;
         cx.want_ring(line, self.max_time);
+        let state = cx
+            .latch_of()
+            .expect("the param half books every audio read a latch");
         let out = cx.alloc(channels, cx.readers())?;
         cx.emit(AudioOp::DelayRead {
             out,
             line,
+            state,
             lane: cx.lane(0),
             time: self.time.max(0.0),
             max_time: self.max_time.max(0.0),
