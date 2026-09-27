@@ -43,15 +43,6 @@ use audio::Window;
 use lines::{AudioLine, Latch, Lfo, ParamLine, Slot, copy_ring, reorder};
 use notes::{NoteState, key_bit};
 
-/// Maximum number of `DelayRead` taps supported in a single program.
-///
-/// More than one read may share a line — that is a multi-tap delay, and it falls
-/// out of splitting a delay into a write and a read for free — so this is not
-/// `MAX_AUDIO_DELAY_LINES`. The engine keeps one number per tap: where its read
-/// pointer was at the end of the last chunk, so the next one can ramp rather
-/// than jump.
-pub const MAX_AUDIO_TAPS: usize = 16;
-
 /// Sentinel indicating that no ring buffer currently holds this delay line.
 const NOT_PRESENT: usize = usize::MAX;
 
@@ -160,11 +151,6 @@ pub struct Engine {
     daw_inputs: Vec<u16>,
     /// One per audio delay line, each ring as long as its node asked for.
     audio_lines: Vec<AudioLine>,
-    /// Where each tap's read pointer stood at the end of the last chunk, in
-    /// samples. NaN means "no previous", which is what a fresh program leaves
-    /// behind and what makes the first chunk after a swap jump rather than sweep
-    /// from wherever the old patch happened to be.
-    tap_distance: Vec<f64>,
     /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
@@ -195,7 +181,6 @@ impl Engine {
             audio_lines: (0..MAX_AUDIO_DELAY_LINES)
                 .map(|_| AudioLine::new())
                 .collect(),
-            tap_distance: vec![f64::NAN; MAX_AUDIO_TAPS],
             pool: Vec::new(),
             daw_inputs: Vec::new(),
             stride: 0,
@@ -299,7 +284,6 @@ impl Engine {
         for line in next.audio_delay_nodes.len()..MAX_AUDIO_DELAY_LINES {
             self.audio_lines[line].len = 0;
         }
-        self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
         true
     }
 
@@ -396,9 +380,6 @@ impl Engine {
         // allocated on the main thread and rides in on the program, so there
         // is nothing to hand back and nothing to resize.
         self.audio_lines.iter_mut().for_each(Slot::clear);
-        // No previous position, so the first chunk after this jumps to where
-        // its tap says rather than sweeping from where the old one left off.
-        self.tap_distance.iter_mut().for_each(|d| *d = f64::NAN);
     }
 
     /// Allocates and sizes audio buffers for worst-case limits. Called from the main thread on activation.

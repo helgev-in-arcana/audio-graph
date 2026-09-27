@@ -207,6 +207,15 @@ pub enum AudioOp {
     DelayRead {
         out: Buf,
         line: u16,
+        /// The latch holding where this read's pointer stood at the end of the
+        /// last chunk, in samples, so the next chunk sweeps from there.
+        ///
+        /// A latch because it is keyed by node and carried across a swap: the
+        /// time is baked into the op, every edit to it recompiles, and a
+        /// position that started over at each swap would jump to the new time
+        /// in one sample. Numbering reads as they run instead would give reads
+        /// in different stages the same number and each other's positions.
+        state: u16,
         lane: Option<u16>,
         /// Static delay time in seconds (used if `lane` is `None`).
         time: f64,

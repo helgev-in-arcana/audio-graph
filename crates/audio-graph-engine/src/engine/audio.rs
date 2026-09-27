@@ -144,7 +144,6 @@ impl Engine {
             daw_out.fill(0.0);
             return;
         };
-        let mut tap = 0usize;
         // Which rows of the note buffers this chunk covers. The buffers were
         // filled by the parameter half and hold the whole block; a chunk is a
         // contiguous run of rows, so its events are a contiguous slice.
@@ -494,18 +493,17 @@ impl Engine {
                 AudioOp::DelayRead {
                     out,
                     line,
+                    state,
                     lane,
                     time,
                     max_time,
                 } => {
-                    let index = tap;
-                    tap += 1;
                     let seconds = lane
                         .and_then(|lane| ctx.lane(row, lane))
                         .unwrap_or(*time)
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
-                    self.delay_read(*line as usize, index, *out, width, win, {
+                    self.delay_read(*line as usize, *state as usize, *out, width, win, {
                         // Minimum floor in samples, plus the two samples the
                         // interpolator needs ahead of the read pointer.
                         let floor = frames as f64 + 2.0;
@@ -543,11 +541,13 @@ impl Engine {
 
     /// Reads samples from an audio delay line into `buf` with cubic Hermite interpolation.
     ///
-    /// Smooths the read pointer across chunks to prevent clicks during delay modulation.
+    /// Smooths the read pointer across chunks to prevent clicks during delay
+    /// modulation. `state` is the latch holding where the pointer stood at the
+    /// end of the last chunk; see [`AudioOp::DelayRead`].
     fn delay_read(
         &mut self,
         line: usize,
-        tap: usize,
+        state: usize,
         buf: Buf,
         width: usize,
         win: Window,
@@ -559,9 +559,13 @@ impl Engine {
             self.fill(buf, win, 0.0);
             return;
         }
-        // NaN on the first chunk after a swap, and on the very first block.
-        let from = match self.tap_distance.get(tap).copied() {
-            Some(previous) if previous.is_finite() => previous,
+        // NaN for a read no program has run yet, which starts where it is
+        // asked to. A previous position is held to what this chunk may read:
+        // the ring may have shrunk under it, or the chunk grown past it.
+        let from = match self.latches.get(state).map(|latch| latch.value) {
+            Some(previous) if previous.is_finite() => previous
+                .min(ring_len.saturating_sub(4) as f64)
+                .max(frames as f64 + 2.0),
             _ => distance,
         };
         let head = self.audio_lines[line].head;
@@ -583,8 +587,8 @@ impl Engine {
                 self.pool[to + i] = hermite(y(-1), y(0), y(1), y(2), fraction as f32);
             }
         }
-        if let Some(slot) = self.tap_distance.get_mut(tap) {
-            *slot = distance;
+        if let Some(latch) = self.latches.get_mut(state) {
+            latch.value = distance;
         }
     }
 
