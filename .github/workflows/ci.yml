@@ -35,7 +35,7 @@ jobs:
       # moved to point at other code, and this workflow is a step away from one
       # that signs binaries other people install. The version beside each is
       # what the commit was released as.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Not the composite action the build jobs use. Nothing here links, so the
       # system libraries a link wants are not wanted here, and installing them
@@ -76,7 +76,7 @@ jobs:
           - macos-14
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Xvfb because this job runs the tests, and the Linux window tests open
       # real X windows. The reason is on the Test step below.

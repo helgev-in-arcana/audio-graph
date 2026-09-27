@@ -35,7 +35,7 @@ jobs:
       # moved to point at other code, and this workflow hands binaries to
       # people who install them. The version beside each is what that commit
       # was released as.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -97,7 +97,7 @@ jobs:
             name: aarch64-macos
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The same setup the CI build jobs get, minus Xvfb: nothing here runs a
       # test, so nothing here wants a display. The compiler is the one
