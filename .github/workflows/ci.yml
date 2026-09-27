@@ -43,7 +43,10 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install
 
+      # Saved from main only; the reason is on the test job's cache step.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -81,9 +84,15 @@ jobs:
         with:
           xvfb: "true"
 
+      # A pull request restores main's cache and saves none of its own. The
+      # repository gets 10 GB of cache, one run of this matrix writes about
+      # 2.7 GB, and past the limit the least recently used entries go: a few
+      # open pull requests saving their own would push main's out, and every
+      # run after that would build from cold.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # CLAP and VST3 host tests load their fixture cdylibs. cargo will not build
       # another package's cdylib on its own, so it is built once before the
@@ -122,7 +131,14 @@ jobs:
 
       # What the release actually hands out is a release build, so the check
       # goes that far.
+      #
+      # On main only. A pull request's run is what the next step waits on, and
+      # these two steps are up to two minutes of it on the slowest runner while
+      # almost never failing where the debug build passed. main still runs
+      # them for every commit, and the release guard only accepts a commit
+      # whose main run went green, so nothing reaches a tag unchecked.
       - name: Build release
+        if: github.event_name == 'push'
         run: cargo build --workspace --release
 
       # What is handed out is a bundle rather than a bare shared library, so
@@ -132,4 +148,5 @@ jobs:
       # What came out is xtask's own business to check, and it does: a bundle
       # that is a name with nothing loadable inside fails this step.
       - name: Bundle
+        if: github.event_name == 'push'
         run: cargo xtask bundle audio-graph-plugin --release
