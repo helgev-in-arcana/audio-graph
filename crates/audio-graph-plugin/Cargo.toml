@@ -26,6 +26,9 @@ parking_lot = "0.12"
 egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
 raw-window-handle = "0.6"
 
+[dev-dependencies]
+dotenvy.workspace = true
+
 [features]
 # Abort if anything allocates inside `process` (M5's DoD). Not on by default —
 # the check costs time on every block — so it is a deliberate run:

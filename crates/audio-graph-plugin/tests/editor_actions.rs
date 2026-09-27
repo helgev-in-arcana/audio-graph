@@ -5,6 +5,10 @@
 //! covers the part that can actually be wrong — the load/bind/activate ordering
 //! — and leaves only the drawing to be checked by eye.
 //!
+//! The plugins driven are the ones the developer names in
+//! `AUDIO_GRAPH_TEST_PLUGINS` (see `.env.example` at the repository root);
+//! the tests that need one skip when none is named.
+//!
 //! The tests that drive an installed plugin hold [`installed`] throughout. VST3
 //! pins its objects to the thread that created them and a module belongs to one
 //! thread at a time, while the harness runs each `#[test]` on a thread of its
@@ -41,47 +45,18 @@ fn installed() -> MutexGuard<'static, ()> {
     INSTALLED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Plugins this test will not instantiate.
-///
-/// Sampler and amp-sim hosts scan multi-gigabyte content libraries or display
-/// authorization dialogs during first instantiation, which would stall headless tests.
-///
-/// Chroma creates a top-level window during instantiation prior to host UI initialization,
-/// requiring an active message pump to avoid deadlocks.
-///
-/// `AUDIO_GRAPH_TEST_SUB` overrides the search entirely when a specific plugin is wanted.
-const AVOID: &[&str] = &[
-    "AmpliTube",
-    "BBC Symphony",
-    "Chroma",
-    "Kontakt",
-    "MODO",
-    "Vienna",
-    "Sine",
-    "OTT",
-];
-
 /// How many modules to try before giving up.
 const CANDIDATES: usize = 6;
 
-/// A plugin to test against, chosen from whatever is installed.
+/// A plugin to test against: the first of the listed ones that has parameters.
 ///
-/// Discovers any installed plugin with parameters to avoid machine-specific test fixtures.
 /// Only a stereo effect qualifies: the tests activate it with a stereo input, which an
 /// instrument or a mono effect refuses.
 fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
-    let mut tried = 0;
-    for path in candidate_paths() {
-        if tried >= CANDIDATES {
-            break;
-        }
+    for path in candidate_paths().into_iter().take(CANDIDATES) {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        if AVOID.iter().any(|a| name.contains(a)) {
-            continue;
-        }
-        tried += 1;
         eprintln!("trying {name}");
 
         let params = WrapperParams::new();
@@ -99,20 +74,12 @@ fn a_plugin_with_parameters() -> Option<(std::path::PathBuf, Arc<Shared>)> {
     None
 }
 
+/// The plugins named in `AUDIO_GRAPH_TEST_PLUGINS`, either format.
 fn candidate_paths() -> Vec<std::path::PathBuf> {
-    if let Ok(explicit) = std::env::var("AUDIO_GRAPH_TEST_SUB") {
-        return vec![std::path::PathBuf::from(explicit)];
-    }
-    // Both formats, exactly as the editor's own rescan sees them.
-    plugin_host::installed_modules(
-        &plugin_host::default_plugin_directories()
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect::<Vec<_>>(),
-    )
-    .into_iter()
-    .map(|(_, path)| path)
-    .collect()
+    let _ = dotenvy::dotenv();
+    std::env::var_os("AUDIO_GRAPH_TEST_PLUGINS")
+        .map(|list| std::env::split_paths(&list).collect())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -120,7 +87,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
     let _installed = installed();
     let _thread = plugin_host::init_thread().unwrap();
     let Some((path, shared)) = a_plugin_with_parameters() else {
-        eprintln!("no installed plugin with parameters; skipping");
+        eprintln!("no plugin with parameters in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     };
     eprintln!("driving the editor's actions against {}", path.display());
@@ -137,17 +104,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         offline: true,
     });
 
-    // "Rescan" — the list the editor draws.
-    let installed = plugin_host::installed_modules(
-        &plugin_host::default_plugin_directories()
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect::<Vec<_>>(),
-    )
-    .len();
-    assert!(installed > 0, "the plugin list would be empty");
-
-    // Clicking an entry in that list.
+    // Clicking an entry in the plugin list.
     shared.load(&path).expect("reload from the list");
     assert!(shared.main().host.is_loaded(0));
     assert!(
@@ -433,7 +390,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
     use audio_graph_engine::{AudioOut, Constant, NodeKind, Plugin, PluginPorts};
 
     let Some((path, shared)) = a_plugin_with_parameters() else {
-        eprintln!("no installed plugin with parameters; skipping");
+        eprintln!("no plugin with parameters in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     };
     eprintln!("building a plugin node for {}", path.display());

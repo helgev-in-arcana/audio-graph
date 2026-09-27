@@ -21,3 +21,4 @@ libc = "0.2"
 [dev-dependencies]
 plugin-host-api.workspace = true
 libloading = "0.9"
+dotenvy.workspace = true
