@@ -138,6 +138,7 @@ pub fn run(shared: &Arc<Shared>, context: &Arc<WrapperHostContext>, state: &Tick
     // did.
     shared.publish_view();
     shared.collect_processing_error();
+    shared.collect_note_losses();
 
     // An open editor needs the full rate whether or not anything is loaded: it
     // is the only thing turning our event loop, and off the main thread it is

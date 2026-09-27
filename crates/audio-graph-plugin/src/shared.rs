@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::config::SLOT_COUNT;
-use crate::notification::{ErrorSource, Notifications};
+use crate::notification::{ErrorSource, Notifications, note_loss_message};
 use crate::state::WrapperState;
 use audio_graph_engine::NodeId;
 use audio_graph_engine::{Graph, ProgramPublisher, compile};
@@ -112,6 +112,15 @@ pub struct AudioState {
 /// an executor or audio thread.
 pub struct Shared {
     processing_error: AtomicU64,
+    /// The engine's running totals of note events dropped and notes stolen,
+    /// stored by the audio thread after every block.
+    ///
+    /// Stored rather than added to, so a count the engine zeroes on a reset
+    /// reads as zero here as well.
+    note_losses: [AtomicU64; 2],
+    /// The totals the current notification was written from. Main thread
+    /// only; it keeps the tick from taking the patch lock when nothing moved.
+    note_losses_shown: [AtomicU64; 2],
     main: MainThread<RefCell<MainState>>,
     patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
@@ -192,6 +201,8 @@ impl Shared {
     pub fn new(host: SubHost, params: Arc<WrapperParams>) -> Arc<Shared> {
         Arc::new(Shared {
             processing_error: AtomicU64::new(0),
+            note_losses: array::from_fn(|_| AtomicU64::new(0)),
+            note_losses_shown: array::from_fn(|_| AtomicU64::new(0)),
             main: MainThread::new(RefCell::new(MainState {
                 host,
                 config: None,
@@ -477,6 +488,30 @@ impl Shared {
     /// Audio thread: zero means no report, so the document is encoded as its generation plus one.
     pub(crate) fn report_processing_error(&self, document: u64) {
         self.processing_error.store(document + 1, Ordering::Release);
+    }
+
+    /// Audio thread: the engine's totals after a block.
+    pub(crate) fn report_note_losses(&self, dropped: u64, stolen: u64) {
+        self.note_losses[0].store(dropped, Ordering::Relaxed);
+        self.note_losses[1].store(stolen, Ordering::Relaxed);
+    }
+
+    /// Main thread: shows the totals as a notification on the current
+    /// document, or takes it down once the engine is back at zero.
+    pub(crate) fn collect_note_losses(&self) {
+        let now = [0, 1].map(|i| self.note_losses[i].load(Ordering::Relaxed));
+        let shown = [0, 1].map(|i| self.note_losses_shown[i].load(Ordering::Relaxed));
+        if now == shown {
+            return;
+        }
+        for (slot, value) in self.note_losses_shown.iter().zip(now) {
+            slot.store(value, Ordering::Relaxed);
+        }
+        let document = self.document_generation();
+        match note_loss_message(now[0], now[1]) {
+            Some(message) => self.report_error(document, ErrorSource::Notes, &message),
+            None => self.clear_error(document, ErrorSource::Notes),
+        }
     }
 
     pub(crate) fn collect_processing_error(&self) {
@@ -1117,6 +1152,29 @@ mod tests {
         assert!(shared.error_message(ErrorSource::Graph).is_some());
         shared.clear_error(current, ErrorSource::Graph);
         assert!(shared.error_message(ErrorSource::Graph).is_none());
+    }
+
+    /// Lost notes stay on screen for as long as the engine counts them, and
+    /// leave once it no longer does.
+    #[test]
+    fn note_losses_are_shown_until_the_engine_forgets_them() {
+        let shared = shared();
+        let audio = shared.clone();
+        std::thread::spawn(move || audio.report_note_losses(2, 0))
+            .join()
+            .unwrap();
+        shared.collect_note_losses();
+        let shown = shared.error_message(ErrorSource::Notes).expect("reported");
+        assert!(shown.contains("2 note event(s)"), "{shown}");
+
+        shared.report_note_losses(2, 1);
+        shared.collect_note_losses();
+        let shown = shared.error_message(ErrorSource::Notes).unwrap();
+        assert!(shown.contains("1 note(s) were cut off"), "{shown}");
+
+        shared.report_note_losses(0, 0);
+        shared.collect_note_losses();
+        assert!(shared.error_message(ErrorSource::Notes).is_none());
     }
 
     /// A detected audio error reaches the shared notice without waiting for another audio block.
