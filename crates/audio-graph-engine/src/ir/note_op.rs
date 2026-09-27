@@ -44,6 +44,10 @@ pub const ALL_CONTROLLERS: u128 = u128::MAX;
 /// Ceiling on the ops that remember the last value they sent.
 pub const MAX_NOTE_EMITS: usize = 16;
 
+/// How many streams one [`NoteOp::Merge`] joins. A `Mix`'s ceiling, for a
+/// `Mix`'s reason: past it the node is a wall of sockets.
+pub const MAX_MERGE_INPUTS: usize = 8;
+
 /// Buffer numbers move with compilation; a stream is its producer and upstream meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NoteStream {
@@ -66,6 +70,11 @@ pub(crate) enum NoteStreamKind {
     Emit {
         channel: u8,
         cc: u8,
+    },
+    /// Several streams joined; which ones is the node's wiring, and `count`
+    /// says how many were wired.
+    Merge {
+        count: u8,
     },
 }
 
@@ -126,5 +135,22 @@ pub enum NoteOp {
         mute: u128,
         channels: u16,
         controllers: u128,
+    },
+    /// Join the first `count` of `inputs` into `out`, in time order.
+    ///
+    /// An event that another input has already put into this sub-block's
+    /// share of `out` is not put in again. That is what a note split into
+    /// two branches and joined back looks like — the same note, id and all,
+    /// arriving twice — and passing both would sound it twice and end it
+    /// twice. Two different notes on one key are not duplicates: the graph
+    /// gave them different ids, and both go through. Repeats within one input
+    /// are that input's business and are kept.
+    ///
+    /// Stable across inputs: at one instant, the earlier input's events come
+    /// first.
+    Merge {
+        inputs: [NoteBuf; MAX_MERGE_INPUTS],
+        count: u8,
+        out: NoteBuf,
     },
 }

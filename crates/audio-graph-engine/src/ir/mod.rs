@@ -25,8 +25,8 @@ pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
 pub use audio_op::{AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, MixIn, Span, Stage};
 pub use note_op::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NoteBuf,
-    NoteOp,
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS,
+    NOTE_BUF_CAPACITY, NoteBuf, NoteOp,
 };
 
 pub use op::{Detect, Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};

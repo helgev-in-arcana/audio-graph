@@ -314,6 +314,53 @@ impl NoteState {
                     }
                     self.follow_notes(out, base[out as usize]);
                 }
+                NoteOp::Merge { inputs, count, out } => {
+                    let count = usize::from(count).min(MAX_MERGE_INPUTS);
+                    let start_at = base[out as usize];
+                    let mut next = [0usize; MAX_MERGE_INPUTS];
+                    for (slot, &input) in next.iter_mut().zip(&inputs[..count]) {
+                        *slot = base[input as usize].min(self.bufs[input as usize].events.len());
+                    }
+                    // Which input each event this sub-block added came from,
+                    // so a duplicate is judged against the other inputs only.
+                    let mut origin = [0u8; NOTE_BUF_CAPACITY];
+                    loop {
+                        // The input whose next event is earliest; the lower
+                        // input wins a tie, which keeps the join stable.
+                        let mut pick: Option<(usize, u32)> = None;
+                        for (index, &input) in inputs[..count].iter().enumerate() {
+                            let events = &self.bufs[input as usize].events;
+                            if let Some(event) = events.get(next[index]) {
+                                let at = event.sample_offset();
+                                if pick.is_none_or(|(_, best)| at < best) {
+                                    pick = Some((index, at));
+                                }
+                            }
+                        }
+                        let Some((index, _)) = pick else {
+                            break;
+                        };
+                        let event = self.bufs[inputs[index] as usize].events[next[index]];
+                        next[index] += 1;
+                        let dest = &self.bufs[out as usize].events;
+                        let added = &dest[start_at.min(dest.len())..];
+                        let seen = added.iter().zip(origin.iter()).any(|(earlier, &from)| {
+                            usize::from(from) != index && *earlier == event
+                        });
+                        if seen {
+                            continue;
+                        }
+                        if let Some(slot) = origin.get_mut(added.len()) {
+                            *slot = index as u8;
+                        }
+                        NoteState::push(
+                            &mut self.bufs[out as usize].events,
+                            &mut self.dropped,
+                            event,
+                        );
+                    }
+                    self.follow_notes(out, base[out as usize]);
+                }
             }
         }
     }

@@ -182,7 +182,8 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                 .map(|op| match *op {
                     NoteOp::Input { out, .. }
                     | NoteOp::Emit { out, .. }
-                    | NoteOp::Filter { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
+                    | NoteOp::Filter { out, .. }
+                    | NoteOp::Merge { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
                 })
                 .fold(0, |mask, bit| mask | bit),
             chunking,
