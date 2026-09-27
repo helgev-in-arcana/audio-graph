@@ -48,4 +48,5 @@ Program {
     latch_nodes: [],
     lfo_nodes: [],
     dsp_nodes: [],
+    note_delay_nodes: [],
 }

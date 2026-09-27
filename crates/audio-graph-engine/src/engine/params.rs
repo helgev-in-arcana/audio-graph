@@ -405,6 +405,8 @@ impl Engine {
             ctx.frames,
             slots,
             &base,
+            (ctx.sample_rate, ctx.tempo_bpm),
+            &mut self.ledger,
         );
         self.note_rows = self.note_rows.max(row + 1);
 
