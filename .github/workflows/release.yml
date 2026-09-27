@@ -224,7 +224,7 @@ jobs:
 
       # Release notes are not generated; the body is written by hand. A tag
       # carrying a suffix like `-rc.1` is published as a prerelease.
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}
