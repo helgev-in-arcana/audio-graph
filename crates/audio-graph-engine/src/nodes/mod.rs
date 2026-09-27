@@ -27,6 +27,7 @@ mod key_switch;
 mod lfo;
 mod math;
 mod mix;
+mod note_delay;
 mod note_filter;
 mod note_follow;
 mod note_gate;
@@ -54,6 +55,7 @@ pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
 pub use mix::{Mix, db_to_linear, linear_to_db};
+pub use note_delay::MidiDelay;
 pub use note_filter::{FilterMode, NoteFilter};
 pub use note_follow::NoteFollow;
 pub use note_gate::NoteGate;
@@ -160,6 +162,14 @@ pub(crate) trait Node {
     /// [`Node::note_source`] produces no note buffer, and a plugin behind it
     /// hears nothing.
     fn note_passthrough(&self, port: u8) -> Option<u8> {
+        let _ = port;
+        None
+    }
+
+    /// For a node that holds notes back: where the notes leaving output `port`
+    /// come in, and how long they wait — see
+    /// [`NoteOp::Delay`][crate::ir::NoteOp::Delay].
+    fn note_delay(&self, port: u8) -> Option<NoteDelay> {
         let _ = port;
         None
     }
@@ -313,6 +323,18 @@ pub(crate) trait Node {
 }
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
+
+/// What a node that delays notes says about one of its outputs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoteDelay {
+    /// The note input the delayed stream comes in through.
+    pub input: u8,
+    /// The parameter input that can drive the time instead of `time`.
+    pub time_input: u8,
+    /// Seconds, or beats when `beats` is set.
+    pub time: f64,
+    pub beats: bool,
+}
 use crate::port::Port;
 
 /// One node's identity and settings.
@@ -351,6 +373,7 @@ pub enum NodeKind {
     NoteMute(NoteMute),
     NoteFilter(NoteFilter),
     NoteMerge(NoteMerge),
+    MidiDelay(MidiDelay),
     ParamToCc(ParamToCc),
     CcIn(CcIn),
     DelayRead(DelayRead),
@@ -404,6 +427,7 @@ macro_rules! for_kind {
             NodeKind::NoteMute($node) => $body,
             NodeKind::NoteFilter($node) => $body,
             NodeKind::NoteMerge($node) => $body,
+            NodeKind::MidiDelay($node) => $body,
             NodeKind::ParamToCc($node) => $body,
             NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
@@ -445,6 +469,11 @@ impl NodeKind {
     /// [`Node::note_passthrough`].
     pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
         for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// How output `port` delays its notes — see [`Node::note_delay`].
+    pub(crate) fn note_delay(&self, port: u8) -> Option<NoteDelay> {
+        for_kind!(self, node => node.note_delay(port))
     }
 
     /// The inputs output `port` joins — see [`Node::note_merge`].
@@ -722,6 +751,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         NoteMerge::catalogue_defaults(),
         NodeKind::NoteMerge,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        MidiDelay::catalogue_defaults(),
+        NodeKind::MidiDelay,
     );
     take(
         &mut out,

@@ -18,8 +18,8 @@
 use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, NoteBuf,
-    NoteOp, NoteStream, NoteStreamKind, Span,
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
+    MAX_NOTE_EMITS, NoteBuf, NoteOp, NoteStream, NoteStreamKind, Span,
 };
 use crate::nodes::NodeKind;
 
@@ -39,6 +39,9 @@ enum Wants {
     Gate,
     /// A generator's value, filed against the node's input socket 0.
     Value,
+    /// A delay's time, filed against the input socket the op names. Optional:
+    /// without one the op keeps the time it was compiled with.
+    Time,
 }
 
 /// An op whose lane number the parameter half has yet to book.
@@ -66,6 +69,8 @@ pub(crate) struct Notes {
     outputs: Vec<((NodeId, u8), NoteBuf)>,
     pending: Vec<Pending>,
     states: u16,
+    /// Note delay index → the node whose queue it is.
+    pub delay_nodes: Vec<NodeId>,
 }
 
 impl Notes {
@@ -98,6 +103,7 @@ pub(crate) fn compile_notes(
         outputs: Vec::new(),
         pending: Vec::new(),
         states: 0,
+        delay_nodes: Vec::new(),
     };
 
     // Once per stage rather than once through: a stage's ops have to be
@@ -129,6 +135,7 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
         let socket = match pending.wants {
             Wants::Gate => (pending.node, OUTPUT_SOCKET + pending.port),
             Wants::Value => (pending.node, 0),
+            Wants::Time => (pending.node, pending.port),
         };
         let found = lanes
             .iter()
@@ -137,6 +144,8 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
         match (found, &mut notes.ops[pending.op]) {
             (Some(lane), NoteOp::Filter { gate, .. }) => *gate = Some(lane),
             (Some(lane), NoteOp::Emit { lane: slot, .. }) => *slot = lane,
+            (Some(lane), NoteOp::Delay { lane: slot, .. }) => *slot = Some(lane),
+            (None, NoteOp::Delay { .. }) => {}
             (None, _) => drop.push(pending.op),
             _ => {}
         }
@@ -151,7 +160,8 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
             NoteOp::Input { out, .. }
             | NoteOp::Filter { out, .. }
             | NoteOp::Emit { out, .. }
-            | NoteOp::Merge { out, .. } => out,
+            | NoteOp::Merge { out, .. }
+            | NoteOp::Delay { out, .. } => out,
         };
         notes.streams[usize::from(out)].kind = NoteStreamKind::Empty;
         notes.stages.remove(op);
@@ -213,6 +223,47 @@ fn route(
         // filling those would spend the pool on streams no plugin will ever be
         // handed.
         if readers_of(graph, order, id, port) == 0 {
+            continue;
+        }
+
+        if let Some(delay) = kind.note_delay(port) {
+            // Unwired, there is nothing to hold back, and no queue is booked.
+            let Some(a) = notes.source_of(graph, id, delay.input) else {
+                continue;
+            };
+            if notes.delay_nodes.len() >= MAX_NOTE_DELAYS {
+                return Err(CompileError::TooLarge {
+                    what: "MIDI delays",
+                    limit: MAX_NOTE_DELAYS,
+                });
+            }
+            let state = notes.delay_nodes.len() as u16;
+            notes.delay_nodes.push(id);
+            let out = alloc_buf(
+                notes,
+                NoteStream {
+                    node: id,
+                    port,
+                    source: Some(a),
+                    kind: NoteStreamKind::Delay,
+                },
+            )?;
+            notes.ops.push(NoteOp::Delay {
+                a,
+                out,
+                state,
+                // Filled in by `resolve_lanes` when the time is wired.
+                lane: None,
+                time: delay.time.max(0.0),
+                beats: delay.beats,
+            });
+            notes.pending.push(Pending {
+                op: notes.ops.len() - 1,
+                node: id,
+                port: delay.time_input,
+                wants: Wants::Time,
+            });
+            notes.outputs.push(((id, port), out));
             continue;
         }
 

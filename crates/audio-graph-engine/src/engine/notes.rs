@@ -102,6 +102,57 @@ impl NoteBuf {
     }
 }
 
+/// One [`NoteOp::Delay`]'s events in flight, each with the samples left
+/// until it comes out, counted from the start of the next sub-block.
+///
+/// Sized once, in [`Engine::new`], and carried across a swap by node like the
+/// other per-node state; see [`Engine::adopt_handoff`].
+#[derive(Debug)]
+pub(super) struct NoteDelayLine {
+    pub(super) queue: std::collections::VecDeque<(u64, Event)>,
+    /// When the newest queued event comes out. Nothing queued after it may
+    /// come out earlier.
+    pub(super) last: u64,
+    node: u32,
+}
+
+impl NoteDelayLine {
+    pub(super) fn new() -> NoteDelayLine {
+        NoteDelayLine {
+            queue: std::collections::VecDeque::with_capacity(NOTE_DELAY_CAPACITY),
+            last: 0,
+            node: u32::MAX,
+        }
+    }
+
+    /// Give back the note-ons this line was holding for the ledger, ahead of
+    /// forgetting them. See [`NoteOp::Delay`].
+    pub(super) fn release(&mut self, ledger: &mut NoteLedger) {
+        for (_, event) in self.queue.drain(..) {
+            if let Event::Note(NoteEvent::NoteOn {
+                note_id: Some(id), ..
+            }) = event
+            {
+                ledger.finished(id);
+            }
+        }
+        self.last = 0;
+    }
+}
+
+impl Slot for NoteDelayLine {
+    fn node(&self) -> u32 {
+        self.node
+    }
+    fn set_node(&mut self, node: u32) {
+        self.node = node;
+    }
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.last = 0;
+    }
+}
+
 /// What the note half fills in as it runs.
 ///
 /// Held apart from the stream it reads ([`Engine::translated`]) rather than
@@ -127,6 +178,8 @@ pub(super) struct NoteState {
     /// nothing here may be sized from the program.
     pub(super) bufs: Vec<NoteBuf>,
     pub(super) streams: [Option<NoteStream>; MAX_NOTE_BUFS],
+    /// One queue per note delay index of the current program.
+    pub(super) delays: Vec<NoteDelayLine>,
     /// Last value each controller-generating op sent, or NaN before its first.
     /// Forgotten on a program swap; see [`NoteOp::Emit`].
     pub(super) emitted: Vec<f64>,
@@ -142,6 +195,7 @@ impl NoteState {
         NoteState {
             bufs: (0..MAX_NOTE_BUFS).map(|_| NoteBuf::new()).collect(),
             streams: [None; MAX_NOTE_BUFS],
+            delays: (0..MAX_NOTE_DELAYS).map(|_| NoteDelayLine::new()).collect(),
             emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             dropped: 0,
         }
@@ -211,6 +265,8 @@ impl NoteState {
         frames: u32,
         lanes: &[f64],
         base: &[usize; MAX_NOTE_BUFS],
+        (sample_rate, tempo_bpm): (f64, f64),
+        ledger: &mut NoteLedger,
     ) {
         for op in &program.note_ops[stage.notes.range()] {
             match *op {
@@ -312,6 +368,70 @@ impl NoteState {
                         }
                         NoteState::push(dest, &mut self.dropped, event);
                     }
+                    self.follow_notes(out, base[out as usize]);
+                }
+                NoteOp::Delay {
+                    a,
+                    out,
+                    state,
+                    lane,
+                    time,
+                    beats,
+                } => {
+                    let Some(line) = self.delays.get_mut(state as usize) else {
+                        continue;
+                    };
+                    let amount = lane
+                        .and_then(|lane| lanes.get(lane as usize).copied())
+                        .unwrap_or(time)
+                        .max(0.0);
+                    let seconds = if beats {
+                        amount * 60.0 / tempo_bpm.max(1.0)
+                    } else {
+                        amount
+                    };
+                    let delay = (seconds * sample_rate.max(0.0)).round() as u64;
+
+                    let source = &self.bufs[a as usize].events;
+                    for &event in &source[base[a as usize].min(source.len())..] {
+                        if line.queue.len() == NOTE_DELAY_CAPACITY {
+                            self.dropped += 1;
+                            continue;
+                        }
+                        let due = (u64::from(event.sample_offset().saturating_sub(start)) + delay)
+                            .max(line.last);
+                        if let Event::Note(NoteEvent::NoteOn {
+                            note_id: Some(id), ..
+                        }) = event
+                        {
+                            ledger.delivered(id);
+                        }
+                        line.queue.push_back((due, event));
+                        line.last = due;
+                    }
+
+                    let frames = u64::from(frames);
+                    while let Some(&(due, event)) = line.queue.front() {
+                        if due >= frames {
+                            break;
+                        }
+                        line.queue.pop_front();
+                        if let Event::Note(NoteEvent::NoteOn {
+                            note_id: Some(id), ..
+                        }) = event
+                        {
+                            ledger.finished(id);
+                        }
+                        NoteState::push(
+                            &mut self.bufs[out as usize].events,
+                            &mut self.dropped,
+                            event.at_offset(start + due as u32),
+                        );
+                    }
+                    for (due, _) in line.queue.iter_mut() {
+                        *due -= frames;
+                    }
+                    line.last = line.last.saturating_sub(frames);
                     self.follow_notes(out, base[out as usize]);
                 }
                 NoteOp::Merge { inputs, count, out } => {

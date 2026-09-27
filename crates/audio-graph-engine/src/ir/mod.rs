@@ -25,8 +25,8 @@ pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
 pub use audio_op::{AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, MixIn, Span, Stage};
 pub use note_op::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS,
-    NOTE_BUF_CAPACITY, NoteBuf, NoteOp,
+    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
+    MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteBuf, NoteOp,
 };
 
 pub use op::{Detect, Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};
@@ -227,6 +227,9 @@ pub struct Program {
     /// Carried across a swap like the LFOs: a filter whose history emptied on
     /// every recompile would click on every drag of every control.
     pub(crate) dsp_nodes: Vec<NodeId>,
+    /// Note delay index → the node whose queue it is, carried across a swap
+    /// so the notes in flight are not lost to a recompile.
+    pub(crate) note_delay_nodes: Vec<NodeId>,
 }
 
 /// A compiled program prepared for its publisher's receiving engine and sample
@@ -397,6 +400,7 @@ impl Program {
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             dsp_nodes: Vec::new(),
+            note_delay_nodes: Vec::new(),
         }
     }
 

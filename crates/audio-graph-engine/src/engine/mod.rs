@@ -26,8 +26,9 @@ use crate::ir::{
     AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DSP_VALUES, Detect, Follow,
     MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION,
     MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
-    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY,
-    NoteOp, NoteStream, Op, Operand, PreparedProgram, Program, RateSpec, Stage, Waveform,
+    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp,
+    NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand, PreparedProgram,
+    Program, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -210,6 +211,7 @@ impl Engine {
                 MAX_LFOS
                     .max(MAX_LATCHES)
                     .max(MAX_DSP_STATES)
+                    .max(MAX_NOTE_DELAYS)
                     .max(MAX_DELAY_LINES)
                     .max(MAX_AUDIO_DELAY_LINES)
             ],
@@ -256,6 +258,18 @@ impl Engine {
         );
         let next = self.program.as_ref().expect("take reported a swap");
 
+        // A delay the new program no longer has gives back the notes it was
+        // holding, or the ledger would wait for them for good.
+        for line in &mut self.notes.delays {
+            if !next.note_delay_nodes.contains(&line.node()) {
+                line.release(&mut self.ledger);
+            }
+        }
+        reorder(
+            &mut self.notes.delays,
+            &mut self.order,
+            &next.note_delay_nodes,
+        );
         let remap = self.notes.adopt(&next.note_streams);
         for marks in self.note_marks.iter_mut().take(self.note_rows) {
             let previous = *marks;
@@ -367,6 +381,9 @@ impl Engine {
         // its value again rather than holding back a number that matches what
         // a sub-plugin no longer has.
         self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
+        // What was in flight is not coming; the ledger is settled by the
+        // caller.
+        self.notes.delays.iter_mut().for_each(Slot::clear);
     }
 
     /// The parameter half: what a modulator has been carrying between blocks.

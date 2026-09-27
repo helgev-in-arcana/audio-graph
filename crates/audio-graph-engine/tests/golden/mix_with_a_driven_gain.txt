@@ -99,4 +99,5 @@ Program {
         5,
     ],
     dsp_nodes: [],
+    note_delay_nodes: [],
 }

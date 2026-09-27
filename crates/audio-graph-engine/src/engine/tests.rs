@@ -4505,3 +4505,132 @@ fn a_merge_of_one_stream_is_no_op_at_all() {
     let heard = hear(&graph, &[note_on(60, 0)], &[]);
     assert_eq!(heard.0[&0].len(), 1);
 }
+
+fn midi_delay(graph: &mut Graph, time: f64, beats: bool) -> NodeId {
+    graph.add(
+        NodeKind::MidiDelay(crate::nodes::MidiDelay { time, beats }),
+        [0.0, 0.0],
+    )
+}
+
+/// MIDI in → a delay → a synth, the synth wired to the output.
+fn delayed_synth(time: f64, beats: bool) -> Graph {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let delay = midi_delay(&mut graph, time, beats);
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(notes, 0, delay, 0);
+    graph.connect(delay, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+    graph
+}
+
+/// Blocks of 64 frames through `engine`, `events[b]` into block `b`. Returns
+/// what instance 0 heard, at absolute sample times, and what the ledger
+/// reported ended after each block.
+fn hear_blocks(
+    engine: &mut Engine,
+    from: usize,
+    events: &[Vec<Event>],
+) -> (Vec<(usize, Event)>, Vec<Vec<Ended>>) {
+    const FRAMES: u32 = 64;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut schedule = SlotSchedule::new(width, FRAMES, 32).unwrap();
+    let mut heard_at = Vec::new();
+    let mut reports = Vec::new();
+    for (index, block) in events.iter().enumerate() {
+        let mut heard = Heard::default();
+        let mut daw_out = vec![0.0f32; 2 * FRAMES as usize];
+        engine.run_block(
+            &mut schedule,
+            &[0.0; SLOTS],
+            block,
+            FRAMES,
+            32,
+            RATE,
+            120.0,
+            &[],
+            &mut daw_out,
+            &mut heard,
+        );
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        engine.end_block([], &mut ended);
+        reports.push(ended);
+        let start = (from + index) * FRAMES as usize;
+        for event in heard.0.get(&0).into_iter().flatten() {
+            heard_at.push((start + event.sample_offset() as usize, *event));
+        }
+    }
+    (heard_at, reports)
+}
+
+fn notes_only(heard: &[(usize, Event)]) -> Vec<(usize, &'static str, i16)> {
+    heard
+        .iter()
+        .filter_map(|(at, event)| match event {
+            Event::Note(NoteEvent::NoteOn { key, .. }) => Some((*at, "on", *key)),
+            Event::Note(NoteEvent::NoteOff { key, .. }) => Some((*at, "off", *key)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Notes come out the delay's time later, in seconds or in beats, and the
+/// ledger does not report a note as ended just because no plugin has heard
+/// it yet — the delay is holding it.
+#[test]
+fn a_midi_delay_hands_the_stream_on_later() {
+    // 2 ms at 48 kHz is 96 samples.
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(&mut engine, &delayed_synth(0.002, false));
+    let mut blocks = vec![Vec::new(); 4];
+    blocks[0] = vec![note_on(60, 10), note_off(60, 20)];
+    let (heard, reports) = hear_blocks(&mut engine, 0, &blocks);
+    assert_eq!(notes_only(&heard), vec![(106, "on", 60), (116, "off", 60)]);
+    assert!(
+        reports[0].is_empty(),
+        "a note still in the delay is not over: {:?}",
+        reports[0]
+    );
+
+    // A hundredth of a beat at 120 bpm is 240 samples.
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(&mut engine, &delayed_synth(0.01, true));
+    let mut blocks = vec![Vec::new(); 6];
+    blocks[0] = vec![note_on(64, 0)];
+    let (heard, _) = hear_blocks(&mut engine, 0, &blocks);
+    assert_eq!(notes_only(&heard), vec![(240, "on", 64)]);
+}
+
+/// Shortening the time with a note in flight does not let its note-off
+/// overtake it — a note-off first would leave the note sounding for good —
+/// and a recompile does not lose what is in flight.
+#[test]
+fn a_shorter_delay_never_lets_a_note_off_overtake_its_note_on() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    // 10 ms: 480 samples.
+    load(&mut engine, &delayed_synth(0.01, false));
+    let (mut heard, _) = hear_blocks(&mut engine, 0, &[vec![note_on(60, 0)]]);
+    // Now no delay at all, and the release arrives straight away.
+    load(&mut engine, &delayed_synth(0.0, false));
+    let mut blocks = vec![Vec::new(); 8];
+    blocks[0] = vec![note_off(60, 0)];
+    let (later, _) = hear_blocks(&mut engine, 1, &blocks);
+    heard.extend(later);
+    let notes = notes_only(&heard);
+    assert_eq!(notes.len(), 2, "both halves came out: {notes:?}");
+    assert_eq!(
+        notes[0],
+        (480, "on", 60),
+        "the note in flight survived the swap"
+    );
+    assert_eq!(notes[1].1, "off");
+    assert!(
+        notes[1].0 >= notes[0].0,
+        "the release came after the note: {notes:?}"
+    );
+}
