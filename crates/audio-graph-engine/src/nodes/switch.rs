@@ -188,16 +188,36 @@ impl Node for Switch {
         self.thresholds.resize(self.values.len().max(1) - 1, 0.0);
         let mut changed = false;
         // The row runs right to left, so the first thing added is the
-        // right-hand one: threshold, then value, reading back as
-        // "socket, value, threshold".
-        if let Some(rung) = index.checked_sub(1) {
-            changed |= ui
-                .add(egui::DragValue::new(&mut self.thresholds[rung]).speed(0.01))
-                .on_hover_text("the control picks this value at this threshold and above")
-                .changed();
+        // right-hand one: condition, then value, reading back as
+        // "socket, value, condition" — `2  1.00  ≥ 0.50`.
+        //
+        // Two bare numbers side by side do not say which one is compared with
+        // the control, so the condition carries its comparison. The first row
+        // has no threshold of its own, but it does have a condition: it is
+        // what the control reads below the next row's threshold, and saying so
+        // is what makes the ladder read top to bottom.
+        match index.checked_sub(1) {
+            Some(rung) => {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.thresholds[rung])
+                            .speed(0.01)
+                            .prefix("≥ "),
+                    )
+                    .on_hover_text("the control picks this value at this threshold and above")
+                    .changed();
+            }
+            None => {
+                if let Some(next) = self.thresholds.first() {
+                    ui.weak(format!("< {next:.2}")).on_hover_text(
+                        "the control picks this value below the next row's threshold",
+                    );
+                }
+            }
         }
         changed |= fallback(ui, connected, |ui| {
             ui.add(egui::DragValue::new(&mut self.values[index]).speed(0.01))
+                .on_hover_text("the value this row outputs while its socket is unwired")
                 .changed()
         });
         changed
