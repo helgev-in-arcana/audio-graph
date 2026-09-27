@@ -11,6 +11,7 @@
 ### プラグインホスト抽象化層
 
 - [plugin-host-api](../crates/plugin-host-api/README.md)
+- [plugin-module](../crates/plugin-module/README.md)
 - [host-window](../crates/host-window/README.md)
 - [vst3-host](../crates/vst3-host/README.md)
 - [vst3-host-view](../crates/vst3-host-view/README.md)
@@ -18,6 +19,8 @@
 - [plugin-host](../crates/plugin-host/README.md)
 
 VST3とCLAPを共通化します。
+
+`plugin-module`は形式に依存しないモジュール読み込みの部品（共有ライブラリのロード、バンドル内のバイナリ解決、1バイナリ1スレッドの占有、スレッドごとのロード済み表、フォルダ内のモジュール列挙）で、`vst3-host`と`clap-host`が共有します。どのフォルダを探すかは持たず、呼び出し側が渡します。
 
 `vst3-host-view`は`vst3-host`へ依存し、instanceとmoduleの寿命を保持する`Vst3View`を受け取ります。windowを所有する層はこのhandleを通じてnative viewを操作します。
 

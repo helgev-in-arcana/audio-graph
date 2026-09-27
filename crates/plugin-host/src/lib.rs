@@ -10,6 +10,7 @@
 //! plugin-host             <- unified facade: Format, ClassInfo, Plugin
 //!   ├── vst3-host / vst3-host-view
 //!   ├── clap-host
+//!   │     └── plugin-module  <- format-independent module loading, both backends
 //!   └── plugin-host-api    <- shared traits and data model
 //! ```
 //!

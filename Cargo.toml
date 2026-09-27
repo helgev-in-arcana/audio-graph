@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/audio-graph-settings",
     "crates/plugin-host-api",
+    "crates/plugin-module",
     "crates/host-window",
     "crates/vst3-host",
     "crates/vst3-host-view",
@@ -24,6 +25,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 plugin-host-api = { path = "crates/plugin-host-api" }
+plugin-module = { path = "crates/plugin-module" }
 vst3-host = { path = "crates/vst3-host" }
 vst3-host-view = { path = "crates/vst3-host-view" }
 host-window = { path = "crates/host-window" }

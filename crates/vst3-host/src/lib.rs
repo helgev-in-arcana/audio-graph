@@ -34,37 +34,13 @@ pub use plugin::{Vst3Plugin, Vst3Processor, Vst3View};
 /// The file extension of a VST3 module, bundle or bare library alike.
 pub const VST3_EXTENSION: &str = "vst3";
 
-/// List the `.vst3` modules directly inside `dir`.
-///
-/// Not recursive by default because vendors nest their own subfolders and a
-/// deep walk turns a scan into a filesystem crawl; [`find_modules`] handles the
-/// one level of vendor subdirectory that is conventional.
+/// The `.vst3` modules directly inside `dir`. See [`plugin_module::list_modules`].
 pub fn list_modules(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == VST3_EXTENSION))
-        .collect();
-    out.sort();
-    out
+    plugin_module::list_modules(dir, VST3_EXTENSION)
 }
 
-/// Modules in `dir` plus those one level down, which is how vendors group them.
+/// The `.vst3` modules in `dir` and one level down. See
+/// [`plugin_module::find_modules`].
 pub fn find_modules(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = list_modules(dir);
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && p.extension().is_none_or(|e| e != VST3_EXTENSION))
-            .collect();
-        subdirs.sort();
-        for sub in subdirs {
-            out.extend(list_modules(&sub));
-        }
-    }
-    out
+    plugin_module::find_modules(dir, VST3_EXTENSION)
 }
