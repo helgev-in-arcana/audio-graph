@@ -14,6 +14,14 @@ use subhost_adapter::{
 pub struct WrapperState {
     /// Incremented on breaking schema changes.
     pub version: u32,
+    /// The AudioGraph release that wrote this, as its package version.
+    ///
+    /// Not a schema version — [`version`][Self::version] is that — but what
+    /// lets a build say it is reading something newer than itself, which is
+    /// the one case where settings it has no field for are lost on the next
+    /// save. Absent from states written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
     pub slots: Vec<Slot>,
     /// Legacy single-sub-plugin reference for backwards compatibility with earlier state formats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +54,18 @@ fn default_sub_block() -> u32 {
 /// Current layout version.
 pub const STATE_VERSION: u32 = 1;
 
+/// This build's release, as [`WrapperState::written_by`] records it.
+pub const THIS_RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+/// `major.minor.patch` as numbers, ignoring any pre-release or build suffix.
+/// `None` for anything not shaped like a release number.
+fn release(version: &str) -> Option<[u64; 3]> {
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let release = [parts.next()??, parts.next()??, parts.next()??];
+    parts.next().is_none().then_some(release)
+}
+
 impl WrapperState {
     pub(crate) fn decode_graph(&self) -> Result<Option<audio_graph_engine::Graph>, String> {
         if self.version > STATE_VERSION {
@@ -58,9 +78,19 @@ impl WrapperState {
             .map_err(|error| format!("node graph unreadable: {error}"))
     }
 
+    /// The release that wrote this, when it is newer than this build.
+    ///
+    /// A suffix is not compared: `0.2.0-alpha` and `0.2.0` are the same
+    /// release as far as which fields exist.
+    pub fn written_by_newer(&self) -> Option<&str> {
+        let saved = self.written_by.as_deref()?;
+        (release(saved)? > release(THIS_RELEASE)?).then_some(saved)
+    }
+
     pub fn new(slots: Vec<Slot>) -> WrapperState {
         WrapperState {
             version: STATE_VERSION,
+            written_by: Some(THIS_RELEASE.into()),
             slots,
             sub_plugin: None,
             sub_state: None,
@@ -176,6 +206,25 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(back.graph, state.graph);
         assert_eq!(back.sub_block, 64);
+    }
+
+    /// Only a release above this one counts as newer, whatever its suffix;
+    /// a state that does not say, or says something unreadable, does not.
+    #[test]
+    fn only_a_newer_release_is_reported_as_newer() {
+        let mut state = WrapperState::new(Vec::new());
+        let [major, minor, patch] = release(THIS_RELEASE).unwrap();
+        let written = |state: &mut WrapperState, by: Option<String>| {
+            state.written_by = by;
+            state.written_by_newer().map(str::to_owned)
+        };
+        assert_eq!(written(&mut state, Some(THIS_RELEASE.into())), None);
+        assert_eq!(written(&mut state, None), None);
+        assert_eq!(written(&mut state, Some("not a version".into())), None);
+        let older = format!("{major}.{minor}.{}", patch.saturating_sub(1));
+        assert_eq!(written(&mut state, Some(older)), None);
+        let newer = format!("{major}.{}.0-alpha", minor + 1);
+        assert_eq!(written(&mut state, Some(newer.clone())), Some(newer));
     }
 
     #[test]

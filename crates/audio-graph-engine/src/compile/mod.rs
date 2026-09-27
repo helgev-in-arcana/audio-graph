@@ -90,6 +90,15 @@ impl std::error::Error for CompileError {}
 
 /// Compiles a [`Graph`] into an execution [`Program`] for a host with `slot_count` automation slots.
 pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError> {
+    // A node this build could not read is compiled as if it were not there,
+    // links and all, so nothing past this point has to know it exists.
+    let readable;
+    let graph = if graph.has_unreadable() {
+        readable = graph.without_unreadable();
+        &readable
+    } else {
+        graph
+    };
     check_links(graph)?;
 
     let mut order: Vec<NodeId> = Vec::new();

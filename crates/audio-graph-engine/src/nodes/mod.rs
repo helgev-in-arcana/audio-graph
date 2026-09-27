@@ -36,6 +36,7 @@ mod plugin;
 mod range_map;
 mod slot;
 mod switch;
+mod unknown;
 
 pub use audio_io::{AudioIn, AudioOut};
 pub use cc_in::CcIn;
@@ -59,6 +60,7 @@ pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
 pub use slot::SlotIn;
 pub use switch::Switch;
+pub use unknown::Unknown;
 
 use serde::{Deserialize, Serialize};
 
@@ -334,6 +336,15 @@ pub enum NodeKind {
     ParamToCc(ParamToCc),
     CcIn(CcIn),
     DelayRead(DelayRead),
+    /// Anything the variants above cannot read, as it was saved. See
+    /// [`Unknown`].
+    ///
+    /// Untagged and last: serde tries it only after every named variant has
+    /// failed, and writes it back as the bare JSON it holds, so the saved form
+    /// is exactly what was read. It must stay the last variant — serde
+    /// requires untagged variants to follow the tagged ones.
+    #[serde(untagged)]
+    Unknown(Unknown),
 }
 
 /// Runs `$body` against whichever node the kind is carrying.
@@ -375,6 +386,7 @@ macro_rules! for_kind {
             NodeKind::ParamToCc($node) => $body,
             NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
+            NodeKind::Unknown($node) => $body,
         }
     };
 }

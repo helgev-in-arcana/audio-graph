@@ -269,6 +269,67 @@ fn a_moved_plugin_comes_back_after_a_scan() {
     wrapper.deactivate();
 }
 
+/// A project from a newer release with a node this one cannot read opens and
+/// plays everything else, says why, and saves the unread node back as it was.
+#[test]
+fn a_project_with_an_unreadable_node_opens_with_a_warning() {
+    use audio_graph_plugin::{ErrorSource, WrapperState};
+    use harness::{Block, Daw};
+
+    let _thread = plugin_host::init_thread().unwrap();
+    let mut wrapper = Wrapper::default();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+    wrapper.shared().adopt_default_patch();
+    wrapper.store_state();
+
+    let mut saved: WrapperState =
+        serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+    let future_node = serde_json::json!({"Granular": {"grains": 8}});
+    let graph = saved.graph.as_mut().unwrap();
+    graph["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": 99, "pos": [0.0, 0.0], "kind": future_node.clone()
+        }));
+    saved.written_by = Some("999.0.0".into());
+    *wrapper.wrapper_params().state.0.write().unwrap() = serde_json::to_string(&saved).unwrap();
+    wrapper
+        .activate(WrapperKind::Effect, &fx_layout(), &LIVE)
+        .unwrap();
+
+    assert!(
+        wrapper.shared().restore_error().is_none(),
+        "not held back whole"
+    );
+    let warning = wrapper
+        .shared()
+        .error_message(ErrorSource::Compatibility)
+        .expect("a warning");
+    assert!(warning.contains("999.0.0"), "{warning}");
+    assert!(warning.contains("1 node(s) could not be read"), "{warning}");
+
+    let mut block = Block::silent(64);
+    block.fill(0.25).process(&mut wrapper, &mut Daw::playing());
+    assert_eq!(block.peak(), 0.25, "the rest of the patch plays");
+
+    wrapper.store_state();
+    let written: WrapperState =
+        serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
+    let nodes = written.graph.unwrap()["nodes"].clone();
+    assert!(
+        nodes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["id"] == 99 && node["kind"] == future_node),
+        "the unread node is saved back as it was"
+    );
+    wrapper.deactivate();
+}
+
 /// Unreadable documents remain byte-for-byte intact, silent and replaceable by a valid preset.
 #[test]
 fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement() {
@@ -290,17 +351,12 @@ fn unreadable_documents_are_retained_until_a_valid_load_or_explicit_replacement(
     let valid = wrapper.wrapper_params().state.0.read().unwrap().clone();
     let mut future: WrapperState = serde_json::from_str(&valid).unwrap();
     future.version = STATE_VERSION + 1;
-    let mut unknown = future.clone();
-    unknown.version = STATE_VERSION;
-    unknown.graph = Some(serde_json::json!({
-        "nodes": [{"id": 0, "kind": {"UnrecognizedNode": {"value": 0.5}}}],
-        "links": [], "next_id": 1,
-    }));
 
+    // A node of an unknown kind is not on this list: the document around it
+    // opens, see `a_project_with_an_unreadable_node_opens_with_a_warning`.
     for unreadable in [
         " { not valid JSON\n".to_owned(),
         serde_json::to_string_pretty(&future).unwrap(),
-        serde_json::to_string_pretty(&unknown).unwrap(),
     ] {
         *wrapper.wrapper_params().state.0.write().unwrap() = unreadable.clone();
         wrapper
