@@ -1,12 +1,16 @@
 //! Tests that need an actual VST3 plugin on the machine.
 //!
-//! They discover plugins through the OS-conventional directories and skip
-//! themselves when there are none, so `cargo test` stays green on a bare CI
-//! box while still doing real work on a developer machine.
+//! Which plugins is the developer's to say, in `AUDIO_GRAPH_TEST_PLUGINS` (see
+//! `.env.example` at the repository root). Picking from whatever is installed
+//! would make the result depend on the machine, and would need a list of that
+//! machine's troublesome plugins kept in the repository. Unset, these skip, so
+//! `cargo test` stays green on a bare CI box.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use vst3_host::{Module, default_plugin_directories, find_modules};
+use std::path::PathBuf;
+
+use vst3_host::Module;
 
 /// Serialises the tests that open installed modules.
 ///
@@ -18,20 +22,27 @@ fn installed() -> MutexGuard<'static, ()> {
     INSTALLED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn installed_modules() -> Vec<std::path::PathBuf> {
-    default_plugin_directories()
-        .iter()
-        .flat_map(|d| find_modules(d))
+/// The VST3 modules named in `AUDIO_GRAPH_TEST_PLUGINS`.
+fn listed_modules() -> Vec<PathBuf> {
+    let _ = dotenvy::dotenv();
+    std::env::var_os("AUDIO_GRAPH_TEST_PLUGINS")
+        .map(|list| std::env::split_paths(&list).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("vst3"))
+        })
         .collect()
 }
 
 #[test]
-fn every_installed_module_loads_and_enumerates() {
+fn every_listed_module_loads_and_enumerates() {
     let _installed = installed();
     let _thread = vst3_host::init_apartment().unwrap();
-    let modules = installed_modules();
+    let modules = listed_modules();
     if modules.is_empty() {
-        eprintln!("no VST3 plugins installed; skipping");
+        eprintln!("no VST3 plugin in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     }
 
@@ -77,8 +88,8 @@ fn every_installed_module_loads_and_enumerates() {
 fn repeated_load_unload_is_stable() {
     let _installed = installed();
     let _thread = vst3_host::init_apartment().unwrap();
-    let Some(path) = installed_modules().into_iter().next() else {
-        eprintln!("no VST3 plugins installed; skipping");
+    let Some(path) = listed_modules().into_iter().next() else {
+        eprintln!("no VST3 plugin in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     };
 

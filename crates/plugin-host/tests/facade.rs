@@ -1,9 +1,10 @@
-//! Integration tests for the unified plugin host facade, driven against
-//! whatever is actually on the machine.
+//! Integration tests for the unified plugin host facade.
 //!
 //! The CLAP half runs everywhere, because the fixture is built from this
-//! workspace. The VST3 half skips itself when no plugin is installed, which is
-//! the same convention `vst3-host`'s own tests use.
+//! workspace. The VST3 half runs against a VST3 the developer names in
+//! `AUDIO_GRAPH_TEST_PLUGINS` (see `.env.example` at the repository root) and
+//! skips itself when none is named, the same convention `vst3-host`'s own
+//! tests use.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,31 +114,25 @@ fn the_facade_loads_a_clap_by_path_alone() {
 }
 
 #[test]
-fn the_facade_loads_an_installed_vst3() {
+fn the_facade_loads_a_listed_vst3() {
     let _thread = plugin_host::init_thread().unwrap();
 
-    // First module that yields a class. Some installed plugins are wrappers
-    // around a scanner and export nothing loadable, so this is a search rather
-    // than a first-hit assertion.
-    let found = plugin_host::installed_modules(
-        &plugin_host::default_plugin_directories()
-            .into_iter()
-            .map(|(_, d)| d)
-            .collect::<Vec<_>>(),
-    )
-    .into_iter()
-    .filter(|(format, _)| *format == Format::Vst3)
-    // Known to corrupt its own heap on teardown, and excluded from
-    // `vst3-host`'s tests for the same reason.
-    .filter(|(_, path)| !path.ends_with("OTT.vst3"))
-    .take(8)
-    .find_map(|(_, path)| {
-        let classes = scan_module(&path).ok()?;
-        classes.into_iter().next()
-    });
+    // First module that yields a class. A module may be a wrapper around a
+    // scanner that exports nothing loadable, so this is a search rather than a
+    // first-hit assertion.
+    let _ = dotenvy::dotenv();
+    let found = std::env::var_os("AUDIO_GRAPH_TEST_PLUGINS")
+        .map(|list| std::env::split_paths(&list).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| Format::from_path(path) == Some(Format::Vst3))
+        .find_map(|path| {
+            let classes = scan_module(&path).ok()?;
+            classes.into_iter().next()
+        });
 
     let Some(class) = found else {
-        eprintln!("no VST3 plugins installed; skipping");
+        eprintln!("no VST3 plugin in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     };
 

@@ -1,7 +1,10 @@
 //! Lifecycle and state checks against real installed plugins.
 //!
-//! Skips itself when no plugins are present, so this stays green on a bare CI
-//! box while doing real work on a developer machine.
+//! The candidates are the VST3 modules the developer names in
+//! `AUDIO_GRAPH_TEST_PLUGINS` (see `.env.example` at the repository root), so
+//! which plugins are fit to probe is decided on their machine rather than in a
+//! list kept here. Skips itself when none are named, so this stays green on a
+//! bare CI box.
 //!
 //! **Everything here runs inside one `#[test]` on purpose.** VST3 pins these
 //! calls to the thread that created the instance, and the test harness runs
@@ -15,7 +18,7 @@ use std::sync::Arc;
 use plugin_host_api::{
     AudioConfig, HostContext, ParamFlags, ParamId, RestartReason, SubPluginMain, SubPluginProcessor,
 };
-use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin, default_plugin_directories, find_modules};
+use vst3_host::{Cid, ClassInfo, Module, Vst3Plugin};
 
 #[derive(Default)]
 struct TestHost;
@@ -27,9 +30,6 @@ impl HostContext for TestHost {
     fn request_restart(&self, _reason: RestartReason) {}
     fn param_edited(&self, _id: ParamId, _plain: f64) {}
 }
-
-/// Plugins excluded from in-process lifecycle tests due to known teardown issues.
-const EXCLUDED: &[&str] = &["OTT.vst3"];
 
 /// Cap the search: the point is to find *a* usable effect, and some sampler
 /// hosts take seconds to instantiate.
@@ -49,17 +49,16 @@ const MAX_PARAMS_FOR_PROBE: usize = 200;
 /// recompute others from the transport on every block.
 const CANDIDATES: usize = 8;
 
+/// The VST3 modules named in `AUDIO_GRAPH_TEST_PLUGINS`.
 fn candidates() -> Vec<PathBuf> {
-    default_plugin_directories()
-        .iter()
-        .flat_map(|d| find_modules(d))
-        .filter(|p| {
-            let name = p
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            !EXCLUDED.contains(&name.as_str())
+    let _ = dotenvy::dotenv();
+    std::env::var_os("AUDIO_GRAPH_TEST_PLUGINS")
+        .map(|list| std::env::split_paths(&list).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("vst3"))
         })
         .collect()
 }
@@ -95,7 +94,7 @@ fn find_stereo_effect() -> Option<(PathBuf, Cid)> {
 fn vst3_lifecycle_against_installed_plugins() {
     let _thread = vst3_host::init_apartment().unwrap();
     let Some((path, cid)) = find_stereo_effect() else {
-        eprintln!("no stereo VST3 effect installed; skipping");
+        eprintln!("no stereo VST3 effect in AUDIO_GRAPH_TEST_PLUGINS; skipping");
         return;
     };
     let module = Module::open(&path).expect("reopen module");
