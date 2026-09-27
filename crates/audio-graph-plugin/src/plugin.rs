@@ -537,6 +537,8 @@ impl Wrapper {
             report_ended(&self.ended_notes, context);
             self.out_events.clear();
         }
+        self.shared
+            .report_note_losses(self.engine.notes_dropped(), self.engine.notes_stolen());
         // What the editor's meters show. The DAW's own parameter value stops
         // being the answer the moment the graph drives a slot.
         self.shared
