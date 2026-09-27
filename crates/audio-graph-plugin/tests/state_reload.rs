@@ -259,7 +259,7 @@ fn a_moved_plugin_comes_back_after_a_scan() {
         .unwrap();
     assert!(!wrapper.shared().main().host.is_loaded(0));
 
-    let known = plugin_host::catalogue::refresh(&[moved_dir], None);
+    let known = plugin_scan::catalogue::refresh(&[moved_dir], None);
     assert_eq!(wrapper.shared().find_missing_children(&known), Ok(1));
     assert!(wrapper.shared().main().host.is_loaded(0));
     let mut block = Block::silent(64);

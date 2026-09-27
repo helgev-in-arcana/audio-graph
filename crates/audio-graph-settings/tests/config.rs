@@ -42,7 +42,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
 
     // Every one of them is a scanned directory, for every format: past the
     // settings, a folder is a folder.
-    let scanned = plugin_host::plugin_directories(&config::directories());
+    let scanned = plugin_scan::plugin_directories(&config::directories());
     for d in seeded.iter().filter(|d| d.is_dir()) {
         for format in plugin_host::FORMATS {
             assert!(
@@ -62,7 +62,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
             "a conventional folder can be removed"
         );
         assert!(
-            !plugin_host::plugin_directories(&config::directories())
+            !plugin_scan::plugin_directories(&config::directories())
                 .iter()
                 .any(|(_, d)| *d == first),
             "and removing it stops it being scanned"
@@ -84,7 +84,7 @@ fn folders_are_seeded_saved_reread_and_scanned() {
         config::directories().is_empty(),
         "an emptied list stays empty"
     );
-    assert!(plugin_host::plugin_directories(&config::directories()).is_empty());
+    assert!(plugin_scan::plugin_directories(&config::directories()).is_empty());
 
     // Restore defaults appends conventional directories.
     config::restore_defaults().expect("saving works");

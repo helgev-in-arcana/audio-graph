@@ -130,6 +130,7 @@ dependencies = [
  "nice-plug-egui",
  "parking_lot",
  "plugin-host",
+ "plugin-scan",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -142,6 +143,7 @@ version = "0.1.5"
 dependencies = [
  "log",
  "plugin-host",
+ "plugin-scan",
  "serde",
  "serde_json",
 ]
@@ -912,6 +914,7 @@ dependencies = [
  "audio-graph-settings",
  "libc",
  "plugin-host",
+ "plugin-scan",
  "serde_json",
  "subhost-adapter",
 ]
@@ -1755,6 +1758,19 @@ dependencies = [
  "libc",
  "plugin-host-api",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "plugin-scan"
+version = "0.1.5"
+dependencies = [
+ "clap-host",
+ "clap-test-plugin",
+ "log",
+ "plugin-host",
+ "plugin-module",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

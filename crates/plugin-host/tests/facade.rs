@@ -9,9 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use plugin_host::{
-    Format, HostContext, Plugin, RestartReason, SubPluginMain, reference_candidates, scan_module,
-};
+use plugin_host::{Format, HostContext, Plugin, RestartReason, SubPluginMain, scan_module};
 
 #[derive(Default)]
 struct TestHost;
@@ -100,7 +98,7 @@ fn the_facade_loads_a_clap_by_path_alone() {
     // The saved form round-trips back to the same file.
     let reference = plugin.reference();
     assert_eq!(reference.format, Format::Clap);
-    assert_eq!(reference_candidates(&reference, &[]), vec![path.clone()]);
+    assert_eq!(reference.path_hint, path);
 
     drop(plugin);
     let _ = std::fs::remove_file(&path);

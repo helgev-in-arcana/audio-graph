@@ -56,6 +56,11 @@ fn host() -> SubHost {
     )
 }
 
+/// Offers no path beyond the saved one.
+fn nowhere(_: &plugin_host::PluginRef) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn fixture(name: &str) -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let build = exe.parent().unwrap().parent().unwrap();
@@ -71,40 +76,39 @@ fn fixture(name: &str) -> PathBuf {
     path
 }
 
-/// A plugin that moved is found through the catalogue, and only through it:
-/// with no catalogue entry the instance stays unloaded rather than every
-/// module in its folder being opened to ask.
+/// Where else a saved plugin may be is the caller's to say: with nothing
+/// offered, one that moved stays unloaded rather than every module in its
+/// folder being opened to ask; offered its new path, it loads from there.
 #[test]
-fn restore_finds_a_moved_plugin_through_the_catalogue() {
+fn restore_finds_a_moved_plugin_where_the_caller_says() {
     let _thread = plugin_host::init_thread().unwrap();
     let path = fixture("relocation");
     let mut host = host();
     host.load(0, &path, None).unwrap();
     let mut saved = host.save_state();
     saved.instances[0].reference.path_hint = path.with_extension("missing").display().to_string();
-    assert_eq!(host.load_state(&saved, &[]).len(), 1);
+    assert_eq!(host.load_state(&saved, nowhere).len(), 1);
     assert!(!host.is_loaded(0));
-    let known = plugin_host::catalogue::refresh(&[path.parent().unwrap().to_path_buf()], None);
-    assert!(host.load_state(&saved, &known).is_empty());
+    assert!(host.load_state(&saved, |_| vec![path.clone()]).is_empty());
     assert!(host.is_loaded(0));
 }
 
 /// An instance that could not be loaded when the project opened comes back,
-/// state and all, once a scan has put its plugin in the catalogue.
+/// state and all, once the caller knows where its plugin is.
 #[test]
-fn a_later_scan_brings_a_missing_instance_back() {
+fn a_later_retry_brings_a_missing_instance_back() {
     let _thread = plugin_host::init_thread().unwrap();
     let path = fixture("later-scan");
     let mut host = host();
     host.load(0, &path, None).unwrap();
     let mut saved = host.save_state();
     saved.instances[0].reference.path_hint = path.with_extension("missing").display().to_string();
-    host.load_state(&saved, &[]);
+    host.load_state(&saved, nowhere);
     assert!(!host.is_loaded(0));
-    assert_eq!(host.retry_unloaded(&[]), 0, "nothing new to go on");
+    assert_eq!(host.retry_unloaded(nowhere), 0, "nothing new to go on");
 
-    let known = plugin_host::catalogue::refresh(&[path.parent().unwrap().to_path_buf()], None);
-    assert_eq!(host.retry_unloaded(&known), 1);
+    let found = |_: &plugin_host::PluginRef| vec![path.clone()];
+    assert_eq!(host.retry_unloaded(found), 1);
     assert!(host.is_loaded(0));
     assert_eq!(
         host.reference(0).unwrap().path_hint,
@@ -112,7 +116,7 @@ fn a_later_scan_brings_a_missing_instance_back() {
         "and is saved at where it was found"
     );
     assert_eq!(
-        host.retry_unloaded(&known),
+        host.retry_unloaded(found),
         0,
         "a loaded instance is left alone"
     );
@@ -137,7 +141,7 @@ fn unavailable_instances_survive_until_explicitly_removed() {
             })
             .into(),
     };
-    assert_eq!(host.load_state(&saved, &[]).len(), 2);
+    assert_eq!(host.load_state(&saved, nowhere).len(), 2);
     assert_eq!(host.save_state().instances, saved.instances);
     assert_eq!(host.free_instance(), Some(1));
     assert_eq!(host.reference(0).unwrap().display_name, "Unavailable");
@@ -158,7 +162,7 @@ fn failed_native_restoration_keeps_the_original_blob() {
     host.bind_slot(0, 0, ParamId(0)).unwrap();
     let mut saved = host.save_state();
     saved.instances[0].state = Some("AQID".into());
-    assert_eq!(host.load_state(&saved, &[]).len(), 1);
+    assert_eq!(host.load_state(&saved, nowhere).len(), 1);
     assert!(!host.is_loaded(0));
     assert_eq!(host.save_state(), saved);
     assert!(host.slots().resolved(0).is_none());
@@ -585,7 +589,7 @@ fn slot_edits_preserve_direct_lane_positions() {
     saved
         .slots
         .resize(host.config().slot_count + 1, Default::default());
-    assert!(host.load_state(&saved, &[]).is_empty());
+    assert!(host.load_state(&saved, nowhere).is_empty());
     assert_eq!(host.slots().count(), host.config().slot_count);
     let mut processors = host.activate(audio_config(), &[], &direct).unwrap();
     assert_eq!(run(&mut processors, &[0.25, 0.0, 0.75]), 1.5);

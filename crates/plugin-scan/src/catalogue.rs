@@ -8,7 +8,7 @@
 //!
 //! Doing that for every plugin on the machine just to draw a menu takes
 //! seconds, and some modules crash while at least one is known to hang — which
-//! is why [`crate::scan::installed_modules`] deliberately does not. So it is
+//! is why [`crate::installed_modules`] deliberately does not. So it is
 //! done once, persisted at the caller's chosen path, and read back. This is what every
 //! DAW's plugin database is, and for the same reason.
 //!
@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::format::Format;
+use plugin_host::Format;
 
 /// One class a module exports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,7 +177,7 @@ pub fn refresh(directories: &[PathBuf], cache_path: Option<&Path>) -> Vec<Module
     let known = cache_path.map_or_else(Vec::new, cached);
     let mut out = Vec::new();
 
-    for (format, path) in crate::scan::installed_modules(directories) {
+    for (format, path) in crate::installed_modules(directories) {
         let stamp = stamp_of(&path);
         // Unchanged since we looked: keep what we know, including the fact that
         // it could not be opened.
@@ -209,7 +209,7 @@ pub fn refresh(directories: &[PathBuf], cache_path: Option<&Path>) -> Vec<Module
 
 /// Opens one module and writes down what it holds.
 fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Option<Module> {
-    match crate::scan::scan_module_as(format, path) {
+    match plugin_host::scan_module_as(format, path) {
         Ok(classes) => Some(Module {
             path: path.to_path_buf(),
             format,
@@ -225,7 +225,7 @@ fn scan_one(format: Format, path: &Path, stamp: Stamp) -> Option<Module> {
                 .collect(),
             error: None,
         }),
-        Err(crate::HostError::ModuleBusy(_)) => {
+        Err(plugin_host::HostError::ModuleBusy(_)) => {
             log::debug!("plugin-host: deferring busy module {}", path.display());
             None
         }

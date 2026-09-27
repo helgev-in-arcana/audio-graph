@@ -202,12 +202,14 @@ impl Wrapper {
         // The catalogue as the last scan left it. No scan here: this runs on
         // the DAW's main thread while a project opens.
         let known = audio_graph_settings::catalogue_path()
-            .map_or_else(Vec::new, |path| plugin_host::catalogue::cached(&path));
+            .map_or_else(Vec::new, |path| plugin_scan::catalogue::cached(&path));
         for problem in self
             .shared
             .main()
             .host
-            .load_state(&state.sub_host_state(), &known)
+            .load_state(&state.sub_host_state(), |reference| {
+                plugin_scan::reference_candidates(reference, &known)
+            })
         {
             log::warn!("audio-graph: {problem}");
         }

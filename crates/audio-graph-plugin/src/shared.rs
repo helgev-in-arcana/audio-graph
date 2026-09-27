@@ -753,7 +753,7 @@ impl Shared {
     /// calls this whether or not any plugin went missing.
     pub fn find_missing_children(
         &self,
-        known: &[plugin_host::catalogue::Module],
+        known: &[plugin_scan::catalogue::Module],
     ) -> Result<usize, String> {
         let waiting = {
             let main = self.main();
@@ -763,7 +763,12 @@ impl Shared {
         if !waiting {
             return Ok(0);
         }
-        let restored = self.with_stopped_host(|host| Ok(host.retry_unloaded(known)))?;
+        let restored =
+            self.with_stopped_host(|host| {
+                Ok(host.retry_unloaded(|reference| {
+                    plugin_scan::reference_candidates(reference, known)
+                }))
+            })?;
         if restored > 0 {
             self.changed();
             self.store_state();

@@ -22,8 +22,14 @@
 //!
 //! ## What belongs here, and what does not
 //!
-//! Here: anything whose answer differs by format. Where plugins live, how a
-//! module is enumerated, how an instance is created, how an editor is attached.
+//! Here: anything whose answer differs by format about one module the caller
+//! names — what classes it exports, how an instance is created, how an editor
+//! is attached.
+//!
+//! Not here either: looking at more than one module — listing folders, the
+//! scan catalogue, finding where a saved reference went. That is
+//! `plugin-scan`, above this crate, so that a caller that only ever loads
+//! paths it knows does not carry it.
 //!
 //! Not here: anything specific to hosting a plugin *inside another plugin* —
 //! forwarding the DAW's transport, combining latency, nesting state. That is
@@ -34,17 +40,13 @@
 //! ownership contract implemented by both backends. Their return records live
 //! on the thread responsible for native destruction.
 
-pub mod catalogue;
 mod format;
 mod plugin;
 mod scan;
 
 pub use format::{FORMATS, Format};
 pub use plugin::Plugin;
-pub use scan::{
-    ClassInfo, PluginRef, find_modules, installed_modules, plugin_directories,
-    reference_candidates, scan_module, scan_module_as,
-};
+pub use scan::{ClassInfo, PluginRef, scan_module, scan_module_as};
 
 // The shared data model, re-exported wholesale. Callers depend on this crate
 // and get the vocabulary with it.
