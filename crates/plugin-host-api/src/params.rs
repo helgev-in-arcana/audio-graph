@@ -104,6 +104,30 @@ pub struct Capabilities {
     pub note_expression: bool,
     /// Parameters may appear/disappear at runtime.
     pub dynamic_params: bool,
+    /// What the format makes of the samples between two parameter points.
+    pub param_interpolation: ParamInterpolation,
+}
+
+/// How a plugin format reads the stretch between two parameter points it is
+/// handed in one `process` call.
+///
+/// A property of the format rather than of the plugin: the format's own
+/// specification says what a point means, and a host that sends points has
+/// to mean the same thing by them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParamInterpolation {
+    /// Each value holds from its own sample until the next point (CLAP).
+    #[default]
+    Hold,
+    /// Each point ends a straight line drawn from the point before it, and
+    /// the value after the last point holds (VST3's `IParamValueQueue`). The
+    /// line into a call's first point starts from where the previous call
+    /// left the parameter, at the sample before the call begins.
+    ///
+    /// So a value that should step needs a point where the step starts as
+    /// well as one where it ends, or it ramps across everything since the
+    /// last point.
+    Linear,
 }
 
 bitflags_lite! {

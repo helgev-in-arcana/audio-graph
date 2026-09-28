@@ -1,6 +1,6 @@
 //! Parameter instruction set and evaluation primitives.
 //!
-//! Contains the scalar operations the parameter engine executes each sub-block.
+//! Contains the scalar operations the parameter engine executes each row.
 //!
 //! The payload enums a node's settings reduce to — [`Waveform`], [`MathOp`],
 //! [`Follow`] — live here rather than next to the node that offers them,
@@ -38,7 +38,7 @@ pub enum RateSpec {
     Hz(f64),
     /// Cycles per beat is what the evaluator wants; the editor thinks in beats
     /// per cycle, so the reciprocal is taken once, here, rather than every
-    /// sub-block.
+    /// row.
     CyclesPerBeat(f64),
 }
 
@@ -121,12 +121,12 @@ pub enum Op {
     /// The one op that reads the note half, and the reason the note pass runs
     /// before this one: it names a buffer, so the buffer had to exist already.
     ///
-    /// It sees the *previous* sub-block's stream, because the note half fills
-    /// the buffers at the end of each sub-block's parameter evaluation. That is
+    /// It sees the *previous* row's stream, because the note half fills
+    /// the buffers at the end of each row's parameter evaluation. That is
     /// the honest answer rather than a shortcut: a parameter signal has
-    /// sub-block resolution, so the value a reader wants is the one in effect
+    /// row resolution, so the value a reader wants is the one in effect
     /// at the boundary — the last event before it, not one from the middle of
-    /// the sub-block it is about to start. Events reaching a sub-plugin keep
+    /// the row it is about to start. Events reaching a sub-plugin keep
     /// their own sample offsets and are not delayed by this.
     ///
     /// `channel` of -1 means any. `state` is a latch holding the last value
@@ -141,16 +141,16 @@ pub enum Op {
         /// What the controller reads as before it has ever been moved.
         initial: f64,
     },
-    /// How loud audio buffer `buf` is over this sub-block.
+    /// How loud audio buffer `buf` is over this row.
     ///
     /// The one op that reads the audio pool, and the reason a program is cut
     /// into stages at all: how loud a signal is cannot be known before the
     /// signal is, so this runs in a stage after the one that made it. Every
     /// audio op of that stage has covered the whole block by then, so the
-    /// window read here is this sub-block's own — no lookahead and nothing
+    /// window read here is this row's own — no lookahead and nothing
     /// held back, which a sidechain wants and a limiter would want more of.
     ///
-    /// The floor on the attack and release times is one sub-block: the value
+    /// The floor on the attack and release times is one row: the value
     /// only moves at a boundary, because that is what a parameter is.
     ///
     /// `state` is a latch, so the envelope carries on across blocks and
@@ -217,17 +217,19 @@ pub enum Op {
     /// Read from a parameter delay line, `time` seconds back.
     ///
     /// When `time_reg` is present, its value overrides `time`.
-    /// The delay duration is clamped at run time to at least one sub-block: a
-    /// read that could see the current sub-block's own write would close a loop
-    /// with no delay in it. The compiler cannot do the clamping — the floor
-    /// depends on the sample rate and the quantum, and it knows neither.
+    /// The delay is clamped at run time to at least one sample, which reads
+    /// the previous row: a read that could see the current row's own write
+    /// would close a loop with no delay in it. And to at most what the line's
+    /// ring holds, which is the reads' longest `max_time` — a length in
+    /// samples, so the compiler, which does not know the sample rate, cannot
+    /// do either.
     DelayRead {
         out: Reg,
         line: u16,
         time: f64,
         time_reg: Option<Reg>,
     },
-    /// Write the current sub-block's value into a parameter delay line.
+    /// Write the current row's value into a parameter delay line.
     /// Deliberately does not write to a register to omit an edge in the topological
     /// sort, thereby preventing cycles.
     DelayWrite {

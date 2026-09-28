@@ -2,11 +2,18 @@ Program {
     ops: [],
     registers: 0,
     outputs: [],
-    audio_ring_len: [],
-    audio_rings: [],
-    audio_ring_seconds: [],
-    audio_delay_nodes: [],
-    delay_nodes: [],
+    audio_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    param_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
     audio_ops: [
         Input {
             out: 0,
@@ -81,6 +88,10 @@ Program {
             audio: Span {
                 start: 0,
                 end: 6,
+            },
+            outputs: Span {
+                start: 0,
+                end: 0,
             },
             note_bufs: 0,
             chunking: WholeBlock,

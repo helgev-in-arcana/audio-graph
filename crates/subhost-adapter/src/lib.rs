@@ -12,7 +12,7 @@
 //! the nesting itself.
 //!
 //! Upward: nothing here knows what AudioGraph is. The wrapper above decides how
-//! many slots to publish, how many lanes a sub-block carries and what its saved
+//! many slots to publish, how many lanes a row carries and what its saved
 //! document looks like, and hands those in ([`SubHostConfig`],
 //! [`SlotSchedule`], [`SubHostState`]); a different wrapper — a chain, a rack,
 //! a bare pair of plugins — makes different choices and gets the same crate.
@@ -34,7 +34,9 @@ pub use host::{
     BoundInstances, SubHost, SubHostConfig, SubHostProcessor, SubHostProcessors, SubPluginRef,
 };
 pub use instances::{AudioChunk, AudioInstances, InstanceIo, NoInstances, ParamTarget};
-pub use schedule::{DEFAULT_QUANTUM, MIN_QUANTUM, QUANTUM_CHOICES, ScheduleView, SlotSchedule};
+pub use schedule::{
+    DEFAULT_RESOLUTION, MIN_RESOLUTION, RESOLUTION_CHOICES, ScheduleView, SlotSchedule,
+};
 pub use slots::{Binding, ResolvedTarget, Slot, SlotTable, TargetPriority};
 pub use state::{InstanceState, SubHostState, base64_decode, base64_encode};
 

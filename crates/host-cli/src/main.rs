@@ -83,6 +83,7 @@ fn main() -> ExitCode {
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
         "live" => cmd_live(rest),
+        "resolution" => cmd_resolution(rest),
         "automate" => cmd_automate(rest),
         _ => {
             usage();
@@ -174,6 +175,9 @@ fn usage() {
                                     open the wrapper's editor on a patch whose
                                     fallback controls are all driven by LFOs,
                                     processing silence so their values move
+  host-cli resolution <PLUGIN> [ID]  check every parameter resolution fits a
+                                    plugin's event buffers, with eight
+                                    parameters moving on every row
   host-cli gui <PLUGIN> [ID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down.
                                     Without SECONDS it stays up until the
@@ -748,6 +752,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     };
     let frames = 64u32;
     let mut processor = plugin.activate(config).map_err(|e| e.to_string())?;
@@ -784,17 +789,19 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
 /// therefore overwrites on the next block. Neither is a host fault, so the
 /// caller works down the list.
 fn writable_params(plugin: &Plugin) -> Vec<plugin_host::ParamInfo> {
-    use plugin_host::ParamFlags;
     SubPluginMain::params(plugin)
         .iter()
-        .filter(|p| {
-            p.flags.contains(ParamFlags::AUTOMATABLE)
-                && !p.flags.contains(ParamFlags::BYPASS)
-                && !p.flags.contains(ParamFlags::READONLY)
-                && (p.max - p.min).abs() > 0.0
-        })
+        .filter(|p| is_writable(p))
         .cloned()
         .collect()
+}
+
+fn is_writable(p: &plugin_host::ParamInfo) -> bool {
+    use plugin_host::ParamFlags;
+    p.flags.contains(ParamFlags::AUTOMATABLE)
+        && !p.flags.contains(ParamFlags::BYPASS)
+        && !p.flags.contains(ParamFlags::READONLY)
+        && (p.max - p.min).abs() > 0.0
 }
 
 fn pick_writable_param(plugin: &Plugin) -> Option<plugin_host::ParamInfo> {
@@ -986,6 +993,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 aux_inputs: Default::default(),
                 aux_outputs: Default::default(),
                 offline: true,
+                ..Default::default()
             };
             let processor = plugin
                 .activate(config)
@@ -1024,6 +1032,7 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: false,
+        ..Default::default()
     };
     let processor = sub.activate(config, &[], &[])?;
 
@@ -3060,6 +3069,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
             offline: false,
+            ..Default::default()
         },
         &[],
         &[],
@@ -3082,6 +3092,149 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     );
     println!("teardown completed cleanly");
     Ok(())
+}
+
+/// Check every parameter resolution reaches a real plugin without running out
+/// of room.
+///
+/// A finer resolution is more points per call: one per row for each moving
+/// parameter, and one more at the end of the block where the format joins
+/// points with lines. The hosts on both formats hold those in buffers sized
+/// before any audio runs, so what is worth asking of a real plugin is whether
+/// the finest setting at the longest block still fits. Eight parameters move
+/// on every row: a busy patch, not a pathological one.
+fn cmd_resolution(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use plugin_host::{AudioBuffers, BufferLayout, EventSink, ProcessStatus, TimeContext};
+    use subhost_adapter::{RESOLUTION_CHOICES, SlotSchedule, SubHost};
+
+    const MAX_BLOCK: u32 = 4096;
+    const MOVING: usize = 8;
+    const BLOCKS: usize = 3;
+
+    let path = args.first().ok_or("expected a plugin path")?;
+    let cid = args.get(1).map(String::as_str);
+
+    let mut sub = SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
+    sub.load(0, Path::new(path), cid)?;
+    let moving: Vec<_> = sub
+        .params(0)
+        .iter()
+        .filter(|p| is_writable(p))
+        .take(MOVING)
+        .map(|p| p.id)
+        .collect();
+    if moving.is_empty() {
+        return Err("plugin has no writable parameter".into());
+    }
+    for (slot, &id) in moving.iter().enumerate() {
+        sub.bind_slot(0, slot, id)?;
+    }
+    println!(
+        "{} parameters moving on every row, {:?} interpolation",
+        moving.len(),
+        sub.capabilities(0).param_interpolation
+    );
+
+    let input = vec![0.0f32; 2 * MAX_BLOCK as usize];
+    let mut output = vec![0.0f32; 2 * MAX_BLOCK as usize];
+    let mut sink = EventSink::with_capacity(4096);
+    let mut schedule = SlotSchedule::new(SUB_HOST.lanes, MAX_BLOCK, 32)?;
+    let context = TimeContext::default();
+    // A different value on every row and every lane, so nothing is left out
+    // as a repeat.
+    let value = |row: usize, lane: usize| ((row as f64 * 0.013) + lane as f64 * 0.1).fract();
+
+    let mut failed = Vec::new();
+    for resolution in RESOLUTION_CHOICES {
+        // What the wrapper does when the setting moves: activate again, with
+        // room for this resolution's events.
+        sub.set_resolution(resolution);
+        // Between activations, as the wrapper's tick does: a plugin that
+        // asked for a restart while it ran has to be heard and read again
+        // first.
+        plugin_host::pump_events();
+        sub.tick_editors();
+        sub.refresh_metadata()?;
+        let mut processors = sub.activate(
+            plugin_host::AudioConfig {
+                sample_rate: 48_000.0,
+                max_block_size: MAX_BLOCK,
+                input_channels: 2,
+                output_channels: 2,
+                offline: true,
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )?;
+        schedule.set_resolution(resolution);
+        for block in [512, MAX_BLOCK] {
+            let mut status = ProcessStatus::Continue;
+            let mut rows = 0;
+            let mut row = 0usize;
+            for _ in 0..BLOCKS {
+                rows = schedule.begin(block)?;
+                for index in 0..rows {
+                    for (lane, v) in schedule.row_mut(index)[..moving.len()]
+                        .iter_mut()
+                        .enumerate()
+                    {
+                        *v = value(row + index, lane);
+                    }
+                }
+                row += rows;
+                for (lane, v) in schedule.end_row_mut()[..moving.len()]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *v = value(row, lane);
+                }
+                let processor = processors.get_mut(0).ok_or("no processor")?;
+                let mut buffers = AudioBuffers::new(
+                    &input[..2 * block as usize],
+                    &mut output[..2 * block as usize],
+                    2,
+                    2,
+                    block,
+                    BufferLayout::Planar,
+                );
+                sink.clear();
+                status = processor.process(
+                    &mut buffers,
+                    schedule.view(),
+                    &[],
+                    0..block,
+                    &context,
+                    &mut sink,
+                );
+                if status == ProcessStatus::Error {
+                    break;
+                }
+            }
+            let verdict = if status == ProcessStatus::Error {
+                failed.push((block, resolution));
+                "FAILED"
+            } else {
+                "ok"
+            };
+            println!(
+                "  resolution {resolution:>3}, block {block:>4}: {rows:>4} rows, up to {:>5} points per call  {verdict}",
+                moving.len() * (rows + 1)
+            );
+        }
+        processors.deactivate();
+    }
+    sub.unload_all();
+    if failed.is_empty() {
+        println!("every resolution fits");
+        Ok(())
+    } else {
+        Err(format!(
+            "processing failed at (block, resolution) {failed:?}"
+        ))
+    }
 }
 
 /// Opens the wrapper's editor on [`live_patch`] with blocks running.
@@ -3123,6 +3276,7 @@ fn cmd_live(args: &[String]) -> Result<(), String> {
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
             offline: false,
+            ..Default::default()
         },
         &[],
         &[],

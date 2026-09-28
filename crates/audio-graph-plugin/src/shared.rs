@@ -42,11 +42,11 @@ use crate::sockets::{LiveSockets, Socket};
 use crate::state::WrapperState;
 use crate::touched::Touched;
 use audio_graph_engine::NodeId;
-use audio_graph_engine::{Graph, ProgramPublisher, compile};
+use audio_graph_engine::{DEFAULT_QUANTUM, Granularity, Graph, ProgramPublisher, compile};
 use audio_graph_engine::{NodeKind, Plugin, PluginPorts};
 use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
-use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
+use subhost_adapter::{DEFAULT_RESOLUTION, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
 
 use crate::params::WrapperParams;
 use crate::view::View;
@@ -103,6 +103,10 @@ pub struct AudioState {
     /// Missing or failed hosted processors are represented by silence through NoInstances.
     pub(crate) processor: Option<SubHostProcessors>,
     pub(crate) reset_notes: bool,
+    /// The parameter resolution `processor` was sized for, and so the one the
+    /// audio thread runs at: installed with it, so the two cannot disagree
+    /// for the block in between. See [`SubHost::set_resolution`].
+    pub(crate) resolution: u32,
     required_publication: u64,
     ready: bool,
 }
@@ -130,11 +134,15 @@ pub struct Shared {
     patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
     programs: ProgramPublisher,
-    /// Sub-block modulation quantum in samples.
+    /// Sub-block size in samples: how often a stage caught in an audio loop
+    /// runs.
     ///
     /// Stored as a standalone atomic rather than in `MainState` because the audio
     /// thread reads it every block and must not have to acquire a lock to do so.
     quantum: AtomicU32,
+    /// Parameter resolution in samples: how often a parameter value is known.
+    /// An atomic for the same reason as `quantum`.
+    resolution: AtomicU32,
     /// What the DAW is running at, so the editor can show a delay's floor in
     /// seconds. Bits of an `f32`, the same trick `live` uses.
     sample_rate: AtomicU32,
@@ -240,11 +248,13 @@ impl Shared {
                 document: 0,
                 processor: None,
                 reset_notes: false,
+                resolution: DEFAULT_RESOLUTION,
                 required_publication: 0,
                 ready: true,
             }),
             programs: ProgramPublisher::default(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
+            resolution: AtomicU32::new(DEFAULT_RESOLUTION),
             // Until the DAW says otherwise. A wrong rate here only makes the
             // floor shown in the editor wrong, never the audio.
             sample_rate: AtomicU32::new(48_000f32.to_bits()),
@@ -423,6 +433,23 @@ impl Shared {
 
     pub fn set_quantum(&self, quantum: u32) {
         self.quantum.store(quantum, Ordering::Relaxed);
+    }
+
+    pub fn resolution(&self) -> u32 {
+        self.resolution.load(Ordering::Relaxed)
+    }
+
+    pub fn set_resolution(&self, resolution: u32) {
+        self.resolution.store(resolution, Ordering::Relaxed);
+    }
+
+    /// Both ways the block is cut, as the engine takes them, given the
+    /// resolution the running processors were sized for.
+    pub(crate) fn granularity(&self, resolution: u32) -> Granularity {
+        Granularity {
+            resolution,
+            quantum: self.quantum(),
+        }
     }
 
     /// Ask for the graph's state to be thrown away on the next block.
@@ -716,12 +743,18 @@ impl Shared {
 
     fn publish(&self, force_rebind: bool) -> Result<(), String> {
         let mut program = self.compile_program()?;
+        // A new resolution rebuilds too: the processors' event buffers are
+        // sized for the one they were activated at, so changing it is a
+        // reactivation — which cuts what the sub-plugins are sounding, and is
+        // why it happens here and only when the setting moves.
+        let resolution = self.resolution();
         let rebuild = {
             let state = self.main();
             force_rebind
                 || state.rebind_required
                 || state.instance_io != program.instances()
                 || state.graph_params != program.param_targets()
+                || state.host.resolution() != resolution
         };
         if !rebuild {
             self.latency.store(program.latency(), Ordering::Relaxed);
@@ -736,6 +769,7 @@ impl Shared {
             let mut state = self.main();
             state.instance_io = program.instances().to_vec();
             state.graph_params = program.param_targets().to_vec();
+            state.host.set_resolution(resolution);
             match state.config.filter(|_| state.host.any_loaded()) {
                 Some(config) => state
                     .host
@@ -761,6 +795,7 @@ impl Shared {
             document: self.document_generation(),
             processor,
             reset_notes: true,
+            resolution,
             required_publication: publication,
             ready: true,
         };
@@ -1130,6 +1165,7 @@ impl Shared {
         blob.written_by = Some(crate::state::THIS_RELEASE.into());
         blob.graph = graph;
         blob.sub_block = self.quantum();
+        blob.param_resolution = self.resolution();
         drop(state);
         self.write_state(&blob);
     }
@@ -1318,6 +1354,34 @@ mod tests {
         shared.publish_graph();
         assert!(shared.begin_block(&mut engine).is_some());
         assert!(!shared.main().rebind_required);
+    }
+
+    /// A new resolution reaches the audio thread only together with
+    /// processors sized for it.
+    ///
+    /// The audio thread runs at the resolution recorded beside the processors
+    /// rather than at the setting, so the block between the user's click and
+    /// the rebuild runs the old pair and never a finer schedule against
+    /// buffers sized for a coarser one.
+    #[test]
+    fn a_new_resolution_arrives_with_processors_built_for_it() {
+        let shared = shared();
+        let mut engine = audio_graph_engine::Engine::new();
+        shared.publish_graph();
+        assert_eq!(
+            shared.begin_block(&mut engine).unwrap().resolution,
+            subhost_adapter::DEFAULT_RESOLUTION
+        );
+
+        shared.set_resolution(4);
+        assert_eq!(
+            shared.begin_block(&mut engine).unwrap().resolution,
+            subhost_adapter::DEFAULT_RESOLUTION,
+            "not before the processors are rebuilt"
+        );
+        shared.publish_graph();
+        assert_eq!(shared.begin_block(&mut engine).unwrap().resolution, 4);
+        assert_eq!(shared.main().host.resolution(), 4);
     }
 
     /// The wrapper's own last word on the state is not mistaken for the DAW's.

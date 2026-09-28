@@ -68,28 +68,34 @@ impl Engine {
                 Chunking::SubBlock => (ctx.quantum as usize).max(1),
             };
             let mut start = 0usize;
-            let mut row = 0usize;
             while start < total {
                 let len = step.min(total - start);
-                self.run_chunk(
-                    &program, stage, ctx, nodes, daw_in, daw_out, start, len, row,
-                );
+                self.run_chunk(&program, stage, ctx, nodes, daw_in, daw_out, start, len);
                 start += len;
-                row += 1;
             }
         }
 
         self.program = Some(program);
     }
 
-    /// Where the rows `first..end` sit in note buffer `buf`.
+    /// Where the events of samples `window` sit in note buffer `buf`, given
+    /// that they lie in rows `first..end`.
     ///
     /// The buffer holds the whole block, so this is how the audio half asks
     /// for its own chunk's events without the note half having to run again.
     /// A row past what the parameter half has filled reads to the end, which
     /// is what makes the last chunk right whether or not the block divides
-    /// evenly by the quantum.
-    fn note_slice(&self, buf: u16, first: usize, end: usize) -> std::ops::Range<usize> {
+    /// evenly by the resolution.
+    ///
+    /// The rows find the stretch; the window trims it. A row coarser than the
+    /// chunk holds events on both sides of it, and an instance is owed exactly
+    /// what falls inside its own call.
+    fn note_slice(
+        &self,
+        buf: u16,
+        (first, end): (usize, usize),
+        window: std::ops::Range<usize>,
+    ) -> std::ops::Range<usize> {
         let len = self
             .notes
             .bufs
@@ -109,8 +115,19 @@ impl Engine {
             len
         } else {
             mark(end)
+        }
+        .max(from);
+        let Some(events) = self
+            .notes
+            .bufs
+            .get(buf as usize)
+            .map(|b| &b.events[from..to])
+        else {
+            return from..to;
         };
-        from..to.max(from)
+        let before = |at: usize| move |e: &Event| (e.sample_offset() as usize) < at;
+        from + events.partition_point(before(window.start))
+            ..from + events.partition_point(before(window.end))
     }
 
     /// How many events have been dropped for want of buffer space.
@@ -131,24 +148,26 @@ impl Engine {
         daw_out: &mut [f32],
         start: usize,
         frames: usize,
-        row: usize,
     ) {
         let block = ctx.frames as usize;
         let Ok(schedule) = ScheduleView::from_parts(
             ctx.lanes,
             ctx.lanes_per_row,
-            ctx.frames.div_ceil(ctx.quantum.max(1)) as usize,
-            ctx.quantum,
+            ctx.frames.div_ceil(ctx.resolution.max(1)) as usize,
+            ctx.resolution,
             ctx.frames,
-        ) else {
+        )
+        .and_then(|view| view.with_end(ctx.end)) else {
             daw_out.fill(0.0);
             return;
         };
         // Which rows of the note buffers this chunk covers. The buffers were
-        // filled by the parameter half and hold the whole block; a chunk is a
-        // contiguous run of rows, so its events are a contiguous slice.
-        let first_row = row;
-        let end_row = row + frames.div_ceil((ctx.quantum as usize).max(1));
+        // filled by the parameter half and hold the whole block, and the rows
+        // touching a chunk are a contiguous run, so its events are a
+        // contiguous slice. A chunk inside one row is handed that row's
+        // events whole, and the adapter keeps only the ones inside the chunk.
+        let first_row = ctx.row_at(start);
+        let end_row = (start + frames).div_ceil((ctx.resolution as usize).max(1));
         let win = Window {
             block,
             start,
@@ -262,7 +281,9 @@ impl Engine {
                 } => {
                     // Worked out before the pool is split, because that borrow
                     // covers the rest of the arm.
-                    let heard = notes.map(|buf| self.note_slice(buf, first_row, end_row));
+                    let heard = notes.map(|buf| {
+                        self.note_slice(buf, (first_row, end_row), start..start + frames)
+                    });
                     // The compiler guarantees these differ, so the two regions
                     // cannot overlap and `split_at_mut` is enough to prove it.
                     let span = MAX_BUFFER_CHANNELS * self.stride;
@@ -381,26 +402,45 @@ impl Engine {
                     }
                     let width = program.buffers[*out as usize] as usize;
                     for (n, input) in inputs.iter().enumerate() {
-                        let gain = input
-                            .lane
-                            .and_then(|lane| ctx.lane(row, lane))
-                            .map(|db| db_to_linear(db) as f32)
-                            .unwrap_or(input.gain as f32);
-                        for ch in 0..width.min(MAX_CHANNELS) {
-                            let from = self.at(input.buf, ch, win);
-                            let to = self.at(*out, ch, win);
-                            if from == to && gain == 1.0 {
-                                // Already in place and unchanged: unity gain on destination buffer.
-                                continue;
-                            }
-                            for i in 0..frames {
-                                let value = self.pool[from + i] * gain;
-                                if n == 0 {
-                                    self.pool[to + i] = value;
-                                } else {
-                                    self.pool[to + i] += value;
+                        // A wired gain follows its lane's line a row at a
+                        // time, however the audio is chunked. Drawn between
+                        // linear gains rather than decibels: cheaper per
+                        // sample, and over one row the two are the same move.
+                        let mut at = start;
+                        while at < start + frames {
+                            let seg = ctx.run_from(at, start + frames);
+                            let (line, from_gain, to_gain) =
+                                match input.lane.and_then(|lane| ctx.lane_line(at, lane)) {
+                                    Some(line) => {
+                                        (Some(line), db_to_linear(line.from), db_to_linear(line.to))
+                                    }
+                                    None => (None, input.gain, input.gain),
+                                };
+                            let done = at - start;
+                            for ch in 0..width.min(MAX_CHANNELS) {
+                                let from = self.at(input.buf, ch, win) + done;
+                                let to = self.at(*out, ch, win) + done;
+                                if from == to && from_gain == 1.0 && to_gain == 1.0 {
+                                    // Already in place and unchanged: unity
+                                    // gain on the destination buffer.
+                                    continue;
+                                }
+                                for i in 0..seg {
+                                    let gain = match line {
+                                        Some(line) => {
+                                            from_gain + (to_gain - from_gain) * line.along(at + i)
+                                        }
+                                        None => from_gain,
+                                    } as f32;
+                                    let value = self.pool[from + i] * gain;
+                                    if n == 0 {
+                                        self.pool[to + i] = value;
+                                    } else {
+                                        self.pool[to + i] += value;
+                                    }
                                 }
                             }
+                            at += seg;
                         }
                     }
                 }
@@ -414,7 +454,6 @@ impl Engine {
                     fall,
                 } => {
                     let width = program.buffers[*out as usize] as usize;
-                    let quantum = (ctx.quantum as usize).max(1);
                     let rate = ctx.sample_rate.max(1.0);
                     // Where the last block left the ramp. NaN until it has
                     // ever run, which the first target resolves.
@@ -423,17 +462,17 @@ impl Engine {
                         .get(*state as usize)
                         .map(|latch| latch.value)
                         .unwrap_or(f64::NAN);
-                    // One segment per sub-block the chunk covers, so a chunk
+                    // One segment per row the chunk covers, so a chunk
                     // that spans the whole block still follows the lane.
                     let mut target = *gain;
                     let mut done = 0usize;
                     while done < frames {
                         let at = start + done;
-                        let seg = (quantum - at % quantum).min(frames - done);
+                        let seg = ctx.run_from(at, start + frames);
                         // A row the lane grid does not reach holds the target
                         // where it was. Opening a gate because a block ran off
                         // the end of the schedule is not a defensible answer.
-                        if let Some(value) = lane.and_then(|lane| ctx.lane(at / quantum, lane)) {
+                        if let Some(value) = lane.and_then(|lane| ctx.lane(ctx.row_at(at), lane)) {
                             target = db_to_linear(value);
                         }
                         if from.is_nan() {
@@ -498,8 +537,10 @@ impl Engine {
                     time,
                     max_time,
                 } => {
+                    // Where the lane is at the chunk's last sample, because
+                    // that is where the read's sweep lands.
                     let seconds = lane
-                        .and_then(|lane| ctx.lane(row, lane))
+                        .and_then(|lane| ctx.lane_value(start + frames.max(1) - 1, lane))
                         .unwrap_or(*time)
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
@@ -591,29 +632,30 @@ impl Engine {
             RateSpec::CyclesPerBeat(cpb) => cpb * ctx.tempo_bpm / 60.0,
         };
         let step = hz.max(0.0) / ctx.sample_rate.max(1.0);
-        let quantum = (ctx.quantum as usize).max(1);
         // A random level held per cycle is a stepped gain — a click at every
         // step — so a tremolo reads it as the sine instead.
         let wave = match waveform {
             Waveform::Random => Waveform::Sine,
             other => other,
         };
-        let mut target = depth.clamp(0.0, 1.0);
+        let target = depth.clamp(0.0, 1.0);
+        if !started {
+            from = target;
+        }
         let mut done = 0usize;
         while done < win.frames {
             let at = win.start + done;
-            let seg = (quantum - at % quantum).min(win.frames - done);
-            if let Some(value) = lane.and_then(|lane| ctx.lane(at / quantum, lane)) {
-                target = value.clamp(0.0, 1.0);
-            }
-            if !started && done == 0 {
-                from = target;
-            }
+            let seg = ctx.run_from(at, win.start + win.frames);
+            // A wired depth follows its lane's line. A set one slides from the
+            // depth last applied to the one set across the segment, so a
+            // recompile that changes it does not click; the oscillator never
+            // stops either way.
+            let line = lane.and_then(|lane| ctx.lane_line(at, lane));
             for i in 0..seg {
-                // The depth slides to its target across the segment; the
-                // oscillator never stops.
-                let t = (i + 1) as f64 / seg as f64;
-                let d = from + (target - from) * t;
+                let d = match line {
+                    Some(line) => line.at(at + i).clamp(0.0, 1.0),
+                    None => from + (target - from) * (i + 1) as f64 / seg as f64,
+                };
                 let shape = wave
                     .shape((phase + step * i as f64).rem_euclid(1.0))
                     .unwrap_or(0.0);
@@ -625,7 +667,10 @@ impl Engine {
                 }
             }
             phase = (phase + step * seg as f64).rem_euclid(1.0);
-            from = target;
+            from = match line {
+                Some(line) => line.at(at + seg).clamp(0.0, 1.0),
+                None => target,
+            };
             done += seg;
         }
         if let Some(held) = self.dsp.get_mut(state) {

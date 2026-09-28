@@ -95,7 +95,7 @@ impl Default for Wrapper {
             context,
             shared,
             engine: Engine::new(),
-            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_QUANTUM).unwrap(),
+            schedule: SlotSchedule::new(LANES, 0, subhost_adapter::DEFAULT_RESOLUTION).unwrap(),
             daw_slots: vec![0.0; SLOT_COUNT],
             events: Vec::new(),
             events_dropped: 0,
@@ -190,6 +190,7 @@ impl Wrapper {
             }
         };
         self.shared.set_quantum(state.sub_block);
+        self.shared.set_resolution(state.param_resolution);
         let needs_default_patch = graph.is_none();
         let unreadable = graph.as_ref().map_or(0, Graph::unreadable_count);
         self.shared.restore_graph(graph.unwrap_or_else(Graph::new));
@@ -343,9 +344,9 @@ impl Wrapper {
         self.out_events = InstanceEventSink::with_capacity(256);
         self.ended_notes = Vec::with_capacity(MAX_LIVE_NOTES);
         // Every allocation the audio path needs happens here. `SlotSchedule`
-        // is sized for the finest sub-block on offer, so the user can change
-        // the modulation rate mid-playback without this being redone.
-        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.quantum()).ok()?;
+        // is sized for the finest resolution on offer, so the user can change
+        // it mid-playback without this being redone.
+        self.schedule = SlotSchedule::new(LANES, max_block, self.shared.resolution()).ok()?;
         // The graph's audio buffers, sized for the ceilings rather than for the
         // current patch, so a recompile never asks for memory.
         self.engine.prepare(max_block, &self.daw_inputs.clone());
@@ -366,6 +367,7 @@ impl Wrapper {
             // trades accuracy for latency to keep up with a sound card is
             // entitled to know when it no longer has to.
             offline: config.process_mode == ProcessMode::Offline,
+            ..Default::default()
         };
         if let Err(error) = self.shared.activate(audio_config) {
             log::warn!("audio-graph: sub-plugin failed to activate: {error}");
@@ -475,6 +477,7 @@ impl Wrapper {
         // the input through would be exactly the invisible route the graph
         // exists to make visible. The graph runs either way; a plugin node with
         // no plugin behind it produces silence, which `NoInstances` is.
+        let granularity = self.shared.granularity(state.resolution);
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
@@ -550,7 +553,7 @@ impl Wrapper {
             &self.daw_slots,
             &self.events,
             frames,
-            self.shared.quantum(),
+            granularity,
             transport.sample_rate as f64,
             transport.tempo.unwrap_or(120.0),
             &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],
@@ -595,7 +598,7 @@ impl Wrapper {
         // What the editor's meters show. The DAW's own parameter value stops
         // being the answer the moment the graph drives a slot.
         self.shared
-            .report_slots(self.schedule.block(self.schedule.blocks() - 1));
+            .report_slots(self.schedule.row(self.schedule.row_count() - 1));
         self.shared
             .report_sockets(self.engine.publication(), self.engine.registers());
 
@@ -1002,7 +1005,7 @@ mod tests {
             daw_slots,
             &[],
             128,
-            32,
+            audio_graph_engine::Granularity::default(),
             48_000.0,
             120.0,
             &[],
@@ -1022,9 +1025,9 @@ mod tests {
         // No program: every sub-block is the DAW's values, and the graph's own
         // lanes are quiet.
         fill_lanes(&mut engine, &mut schedule, &daw_slots);
-        assert!(schedule.blocks() > 0);
-        for index in 0..schedule.blocks() {
-            let block = schedule.block(index);
+        assert!(schedule.row_count() > 0);
+        for index in 0..schedule.row_count() {
+            let block = schedule.row(index);
             assert_eq!(block.len(), LANES);
             assert!(block[..SLOT_COUNT].iter().all(|&v| v == 0.42));
             assert!(
@@ -1061,8 +1064,8 @@ mod tests {
         assert!(engine.adopt(&publisher));
 
         fill_lanes(&mut engine, &mut schedule, &daw_slots);
-        for index in 0..schedule.blocks() {
-            let block = schedule.block(index);
+        for index in 0..schedule.row_count() {
+            let block = schedule.row(index);
             assert_eq!(block.len(), LANES);
             assert_eq!(block[0], 0.42, "an undriven slot stays the DAW's");
             assert!(

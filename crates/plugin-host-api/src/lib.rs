@@ -18,15 +18,17 @@ mod ownership;
 mod params;
 mod traits;
 
-pub use buffers::{AudioBuffers, AudioConfig, AuxBuses, BufferLayout, MAX_AUX_BUSES};
+pub use buffers::{
+    AudioBuffers, AudioConfig, AuxBuses, BufferLayout, DEFAULT_MAX_INPUT_EVENTS, MAX_AUX_BUSES,
+};
 pub use events::{
     Event, EventSink, NoteEvent, NoteExpression, NoteId, ParamEvent, Target, TimeContext,
     note_id_from_wire, note_id_to_wire,
 };
 pub use ownership::{MainThread, Processor, reclaim_main_thread};
 pub use params::{
-    BusInfo, Capabilities, IoLayout, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot,
-    ParamValue, VoiceInfo,
+    BusInfo, Capabilities, IoLayout, NoteDialects, ParamFlags, ParamId, ParamInfo,
+    ParamInterpolation, ParamSnapshot, ParamValue, VoiceInfo,
 };
 pub use traits::{
     HostContext, MetadataUpdate, ProcessStatus, RestartReason, SubPluginMain, SubPluginProcessor,

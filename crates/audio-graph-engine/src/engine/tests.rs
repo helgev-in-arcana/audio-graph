@@ -64,9 +64,11 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
     AudioContext {
         frames,
         quantum: 32,
+        resolution: 32,
         sample_rate: RATE,
         tempo_bpm: 120.0,
         lanes: &[],
+        end: None,
         lanes_per_row: 0,
     }
 }
@@ -74,7 +76,9 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
 fn load(engine: &mut Engine, graph: &Graph) {
     let handoff = Handoff::new();
     let program = compile(graph, SLOTS).unwrap();
-    handoff.send(Box::new(PreparedProgram::prepare(program, RATE, &[]).0));
+    handoff.send(Box::new(
+        PreparedProgram::prepare(program, RATE, &Default::default()).0,
+    ));
     assert!(engine.adopt_handoff(&handoff));
 }
 
@@ -339,6 +343,125 @@ fn tempo_sync_follows_the_host() {
     );
 }
 
+/// Reading the end of a block moves nothing, and reads what the next block
+/// starts on.
+///
+/// The end row is the next block's first row worked out early. Were reading
+/// it to advance a phase, draw a random number or write a delay line, every
+/// block would be a row ahead of where it was, and the patch would sound
+/// different for being asked where it was going.
+#[test]
+fn the_end_of_a_block_is_where_the_next_one_starts_and_nothing_moves_to_find_it() {
+    const BLOCK: u32 = 48;
+    const RESOLUTION: u32 = 16;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+    // A saw into a delay line whose output is added to a random LFO: a
+    // phase, a line and the random state, all on the way to one lane.
+    let graph = {
+        let mut graph = Graph::new();
+        let lfo = |waveform, hz| {
+            NodeKind::Lfo(Lfo {
+                waveform,
+                rate: Rate::Hz(hz),
+                phase: 0.0,
+                depth: 0.25,
+                offset: 0.25,
+            })
+        };
+        let saw = graph.add(lfo(Waveform::Saw, 300.0), [0.0, 0.0]);
+        let random = graph.add(lfo(Waveform::Random, 2000.0), [0.0, 0.0]);
+        let write = graph.add(
+            NodeKind::DelayWrite(DelayWrite {
+                line: 0,
+                ty: PortType::Param,
+            }),
+            [0.0, 0.0],
+        );
+        let read = graph.add(
+            NodeKind::DelayRead(DelayRead {
+                line: 0,
+                ty: PortType::Param,
+                max_time: 1.0,
+                time: 2.0 * f64::from(RESOLUTION) / RATE,
+            }),
+            [0.0, 0.0],
+        );
+        let sum = graph.add(
+            NodeKind::Math(Math {
+                op: MathOp::Add,
+                b: 0.0,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(saw, 0, write, 0);
+        graph.connect(read, 0, sum, 0);
+        graph.connect(random, 0, sum, 1);
+        graph.connect(sum, 0, out, 0);
+        graph
+    };
+
+    // Row by row with nothing asked about the end: the reference.
+    let mut engine = Engine::new();
+    load(&mut engine, &graph);
+    let mut row = vec![0.0; width];
+    let alone: Vec<f64> = (0..4 * BLOCK / RESOLUTION)
+        .map(|index| {
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: RESOLUTION,
+                    offset: index % (BLOCK / RESOLUTION) * RESOLUTION,
+                    block: BLOCK,
+                    row: index % (BLOCK / RESOLUTION),
+                },
+                &mut row,
+            );
+            row[SINK]
+        })
+        .collect();
+
+    // The same four blocks through `run_block`, which reads each one's end.
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, RESOLUTION).unwrap();
+    let mut rows = Vec::new();
+    let mut ends = Vec::new();
+    for _ in 0..4 {
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: RESOLUTION,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[],
+            &mut [],
+            &mut subhost_adapter::NoInstances,
+        );
+        rows.extend((0..schedule.row_count()).map(|index| schedule.row(index)[SINK]));
+        ends.push(schedule.end_row().expect("the engine reads the end")[SINK]);
+    }
+
+    assert_eq!(rows, alone, "reading the end moved nothing");
+    for (block, end) in ends.iter().take(3).enumerate() {
+        let next = rows[(block + 1) * (BLOCK / RESOLUTION) as usize];
+        assert_eq!(
+            *end,
+            next,
+            "block {block} ends where block {} starts",
+            block + 1
+        );
+    }
+}
+
 /// Helper creating a parameter feedback loop test graph.
 fn feedback_graph(time: f64) -> (Graph, NodeId) {
     let mut graph = Graph::new();
@@ -569,9 +692,11 @@ fn hear(graph: &Graph, events: &[Event], lanes: &[f64]) -> Heard {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -917,9 +1042,11 @@ fn a_controller_is_sent_once_until_it_moves() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
+                end: None,
                 lanes_per_row: width,
             },
             &[0.0; 2 * 8],
@@ -1106,9 +1233,11 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
         &AudioContext {
             frames: 64,
             quantum: 16,
+            resolution: 16,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 64],
@@ -1231,9 +1360,11 @@ fn a_note_that_reaches_no_plugin_is_reported_ended() {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1280,9 +1411,11 @@ fn a_delivered_note_is_reported_only_when_the_plugin_ends_it() {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1388,9 +1521,11 @@ fn completion_policy_can_differ_between_instances() {
                 &AudioContext {
                     frames: 8,
                     quantum: 8,
+                    resolution: 8,
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     lanes: &row,
+                    end: None,
                     lanes_per_row: width,
                 },
                 &[0.0; 16],
@@ -1430,6 +1565,136 @@ fn completion_policy_can_differ_between_instances() {
             assert_eq!(ended.len(), 1);
         }
     }
+}
+
+/// A row coarser than a sub-block still hands each chunk only its own notes.
+///
+/// A loop runs its instance once a sub-block, and the row a chunk sits in
+/// holds the events of its neighbours too: passing the row on whole would
+/// play every note once per chunk.
+#[test]
+fn a_note_lands_in_one_chunk_when_a_row_spans_several() {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let output = stereo_out(&mut graph);
+    let synth = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                audio_in: vec![2],
+                audio_out: vec![2],
+                audio_out_shown: Vec::new(),
+                accepts_notes: true,
+                ..PluginPorts::default()
+            },
+        }),
+        [0.0, 0.0],
+    );
+    let (write, read) = audio_delay(&mut graph, 16.0);
+    graph.connect(read, 0, synth, 0);
+    graph.connect(notes, 0, synth, 1);
+    graph.connect(synth, 0, write, 0);
+    graph.connect(synth, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    load(&mut engine, &graph);
+    assert_eq!(engine.chunking(), Chunking::SubBlock);
+
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut schedule = SlotSchedule::new(width, 64, 64).unwrap();
+    let mut heard = Heard::default();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[note_on(60, 0), note_on(61, 37)],
+        64,
+        Granularity {
+            resolution: 64,
+            quantum: 16,
+        },
+        RATE,
+        120.0,
+        &[0.0; 2 * 64],
+        &mut [0.0; 2 * 64],
+        &mut heard,
+    );
+    assert_eq!(schedule.row_count(), 1, "one row, four chunks");
+    let offsets: Vec<u32> = heard.0[&0].iter().map(Event::sample_offset).collect();
+    assert_eq!(offsets, vec![0, 37], "each note once");
+}
+
+/// A wired gain moves every sample, whatever the audio is cut into.
+///
+/// It follows its lane's line from each row's value to the next, so a stage
+/// run over the whole block still moves its gain sample by sample, and the
+/// sub-block size has no say in it.
+#[test]
+fn a_wired_gain_moves_every_sample_whatever_the_sub_block() {
+    const BLOCK: u32 = 64;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+    let played = |quantum: u32| -> Vec<f32> {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 1,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        // A saw slow enough not to wrap inside the block: every row a new,
+        // lower gain.
+        let lfo = graph.add(
+            NodeKind::Lfo(Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(500.0),
+                phase: 0.0,
+                depth: -3.0,
+                offset: -3.0,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, mix, 0);
+        graph.connect(lfo, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.chunking(), Chunking::WholeBlock);
+
+        let mut schedule = SlotSchedule::new(width, BLOCK, 4).unwrap();
+        let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: 4,
+                quantum,
+            },
+            RATE,
+            120.0,
+            &[1.0; 2 * BLOCK as usize],
+            &mut daw_out,
+            &mut Adders,
+        );
+        daw_out.truncate(BLOCK as usize);
+        daw_out
+    };
+
+    let heard = played(32);
+    assert!(
+        heard.windows(2).all(|pair| pair[1] < pair[0]),
+        "a new, lower gain on every sample: {heard:?}"
+    );
+    assert_eq!(heard, played(16), "the sub-block size has no say");
+    assert_eq!(heard, played(128), "the sub-block size has no say");
 }
 
 /// Each sub-block gets its own events, once. Handing every chunk the whole
@@ -1475,9 +1740,11 @@ fn a_note_lands_in_one_sub_block_only() {
         &AudioContext {
             frames: 8,
             quantum: 4,
+            resolution: 4,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1543,14 +1810,17 @@ fn notes_are_ingested_once_across_parameter_and_audio_stages() {
         &[],
         &[note_on(60, 0), note_on(61, 37)],
         64,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32,
+        },
         RATE,
         120.0,
         &[0.0; 2 * 64],
         &mut daw_out,
         &mut heard,
     );
-    assert_eq!(schedule.blocks(), 2);
+    assert_eq!(schedule.row_count(), 2);
     assert_eq!(heard.0[&0].len(), 2, "each note once: {:?}", heard.0[&0]);
     let mut ended = Vec::with_capacity(8);
     engine.end_block(&[], &mut ended);
@@ -1565,7 +1835,10 @@ fn notes_are_ingested_once_across_parameter_and_audio_stages() {
         &[],
         &[],
         64,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32,
+        },
         RATE,
         120.0,
         &[0.0; 2 * 64],
@@ -1616,9 +1889,11 @@ fn the_boundary_a_block_starts_on_belongs_to_the_block_before() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
+                end: None,
                 lanes_per_row: width,
             },
             &[0.0; 2 * 8],
@@ -2898,7 +3173,10 @@ fn run_block_silences_an_empty_engine() {
         &[],
         &[],
         8,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32
+        },
         RATE,
         120.0,
         &[0.0; 16],
@@ -2957,14 +3235,17 @@ fn a_parameter_is_read_off_audio_in_the_sub_block_it_belongs_to() {
             &[],
             &[],
             BLOCK,
-            QUANTUM,
+            Granularity {
+                resolution: QUANTUM,
+                quantum: QUANTUM,
+            },
             RATE,
             120.0,
             &daw_in,
             &mut daw_out,
             &mut nodes,
         );
-        [schedule.block(0)[SINK], schedule.block(1)[SINK]]
+        [schedule.row(0)[SINK], schedule.row(1)[SINK]]
     };
 
     let steady = level(Detect::Peak, 0.0, false);
@@ -3071,9 +3352,11 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
             let audio = AudioContext {
                 frames: BLOCK,
                 quantum: QUANTUM,
+                resolution: QUANTUM,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &[],
+                end: None,
                 lanes_per_row: width,
             };
             if staged {
@@ -3083,7 +3366,10 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                     &[],
                     &[],
                     BLOCK,
-                    QUANTUM,
+                    Granularity {
+                        resolution: QUANTUM,
+                        quantum: QUANTUM,
+                    },
                     RATE,
                     120.0,
                     &daw_in,
@@ -3099,6 +3385,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 engine.run_audio(
                     &AudioContext {
                         lanes: &lanes,
+                        end: None,
                         ..audio
                     },
                     &daw_in,
@@ -3573,9 +3860,11 @@ fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
             &AudioContext {
                 frames: 128,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: None,
                 lanes_per_row,
             },
             &vec![0.0; 2 * 128],
@@ -3641,14 +3930,20 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
             let swept = (block - 4).max(0) as f64 * 4.0 + row as f64;
             lanes[row * lanes_per_row + lane] = seconds(300.0 - swept * 8.0);
         }
+        // Where the next block's first row will be, which is where the last
+        // row's line runs to.
+        let mut end = vec![0.0f64; lanes_per_row];
+        end[lane] = seconds(300.0 - (block - 3).max(0) as f64 * 4.0 * 8.0);
         let mut daw_out = vec![0.0f32; 2 * 128];
         engine.run_audio(
             &AudioContext {
                 frames: 128,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: Some(&end),
                 lanes_per_row,
             },
             &daw_in,
@@ -3773,9 +4068,11 @@ fn a_gate_passes_or_silences_by_its_control() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: None,
                 lanes_per_row: width,
             },
             &daw_in,
@@ -3847,9 +4144,11 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
         &AudioContext {
             frames: 64,
             quantum: 16,
+            resolution: 16,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
+            end: None,
             lanes_per_row: width,
         },
         &vec![1.0f32; 2 * 64],
@@ -3970,9 +4269,11 @@ fn a_driven_gain_socket_interprets_its_value_as_decibels() {
         &AudioContext {
             frames: 8,
             quantum: 8,
+            resolution: 8,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &lanes,
+            end: None,
             lanes_per_row,
         },
         &daw_in,
@@ -3998,16 +4299,16 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     graph.connect(read, 0, output, 0);
 
     let mut program = compile(&graph, SLOTS).unwrap();
-    let sized = program.size_rings(RATE, &[]);
+    let sized = program.size_rings(RATE, &Default::default());
     // 0.05 s at 48 kHz, plus the interpolator's headroom.
-    assert_eq!(program.audio_ring_len, vec![2404]);
-    assert_eq!(program.audio_rings[0].len(), MAX_CHANNELS * 2404);
+    assert_eq!(program.audio_lines.len, vec![2404]);
+    assert_eq!(program.audio_lines.rings[0].len(), MAX_CHANNELS * 2404);
 
     // Publishing again with nothing changed hands over no ring at all.
     let mut again = compile(&graph, SLOTS).unwrap();
     let sized_again = again.size_rings(RATE, &sized);
     assert!(
-        again.audio_rings[0].is_empty(),
+        again.audio_lines.rings[0].is_empty(),
         "an unchanged line is left alone"
     );
     assert_eq!(sized_again, sized);
@@ -4035,9 +4336,9 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     }
     let mut wider = compile(&graph, SLOTS).unwrap();
     wider.size_rings(RATE, &sized);
-    assert_eq!(wider.audio_ring_len, vec![9604]);
+    assert_eq!(wider.audio_lines.len, vec![9604]);
     assert!(
-        !wider.audio_rings[0].is_empty(),
+        !wider.audio_lines.rings[0].is_empty(),
         "a changed line gets a new ring"
     );
     let handoff = Handoff::new();
@@ -4588,7 +4889,10 @@ fn hear_blocks(
             &[0.0; SLOTS],
             block,
             FRAMES,
-            32,
+            Granularity {
+                resolution: 32,
+                quantum: 32,
+            },
             RATE,
             120.0,
             &[],
@@ -4673,5 +4977,308 @@ fn a_shorter_delay_never_lets_a_note_off_overtake_its_note_on() {
     assert!(
         notes[1].0 >= notes[0].0,
         "the release came after the note: {notes:?}"
+    );
+}
+
+/// A lane keeps the rows of the stage that made its value, whatever stage
+/// its consumer sits in.
+///
+/// One plugin with a socket fed by an LFO and another by an envelope
+/// follower is two stages feeding one node. A later stage writing every lane
+/// would copy the LFO's last row — all its register holds by then — over
+/// every row of the LFO's lane, and over the end of the block too.
+#[test]
+fn a_later_stage_leaves_an_earlier_stages_lanes_alone() {
+    const BLOCK: u32 = 64;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(100.0),
+            phase: 0.0,
+            depth: 0.5,
+            offset: 0.5,
+        }),
+        [0.0, 0.0],
+    );
+    let follower = graph.add(
+        NodeKind::EnvelopeFollower(EnvelopeFollower {
+            detect: Detect::Peak,
+            attack: 0.0,
+            release: 0.0,
+        }),
+        [0.0, 0.0],
+    );
+    let sink = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: vec![
+                    ParamPort {
+                        id: 0,
+                        name: "rate".into(),
+                    },
+                    ParamPort {
+                        id: 1,
+                        name: "level".into(),
+                    },
+                ],
+                ..PluginPorts::default()
+            },
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(lfo, 0, sink, 0);
+    graph.connect(input, 0, follower, 0);
+    graph.connect(follower, 0, sink, 1);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[2]);
+    load(&mut engine, &graph);
+    assert_eq!(engine.stages(), 2, "the follower waits for the audio");
+
+    let mut schedule = SlotSchedule::new(width, BLOCK, 16).unwrap();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[],
+        BLOCK,
+        Granularity {
+            resolution: 16,
+            quantum: 32,
+        },
+        RATE,
+        120.0,
+        &[0.5; 2 * BLOCK as usize],
+        &mut [0.0; 2 * BLOCK as usize],
+        &mut Adders,
+    );
+    let rows: Vec<f64> = (0..4).map(|row| schedule.row(row)[SINK]).collect();
+    assert!(
+        rows.windows(2).all(|pair| pair[1] > pair[0]),
+        "the saw rises row by row: {rows:?}"
+    );
+    let end = schedule.end_row().expect("the engine reads the end")[SINK];
+    assert!(
+        end > rows[3],
+        "and is still rising at the end: {end} after {rows:?}"
+    );
+    assert_eq!(
+        schedule.row(2)[SINK + 1],
+        0.5,
+        "the follower's lane is its own"
+    );
+}
+
+/// A controller generated at the finest resolution leaves room for the notes.
+///
+/// A moving value is a new row every sample at a resolution of one, and a
+/// controller per row would fill the note buffer before the block was half
+/// over — dropping the note-off behind it and leaving the note hanging.
+#[test]
+fn a_fine_resolution_does_not_crowd_the_notes_out() {
+    const BLOCK: u32 = 512;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(10.0),
+            phase: 0.0,
+            depth: 0.5,
+            offset: 0.5,
+        }),
+        [0.0, 0.0],
+    );
+    let wheel = graph.add(
+        NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 1 }),
+        [0.0, 0.0],
+    );
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(lfo, 0, wheel, 0);
+    graph.connect(notes, 0, wheel, 1);
+    graph.connect(wheel, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, 1).unwrap();
+    let mut heard = Heard::default();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[note_on(60, 0), note_off(60, BLOCK - 12)],
+        BLOCK,
+        Granularity {
+            resolution: 1,
+            quantum: 32,
+        },
+        RATE,
+        120.0,
+        &[],
+        &mut [0.0; 2 * BLOCK as usize],
+        &mut heard,
+    );
+    assert_eq!(engine.notes_dropped(), 0);
+    let seen = &heard.0[&0];
+    let controllers = seen
+        .iter()
+        .filter(|e| matches!(e, Event::Note(NoteEvent::Cc { .. })))
+        .count();
+    assert_eq!(controllers, (BLOCK / crate::ir::CC_INTERVAL) as usize);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Note(NoteEvent::NoteOff { key: 60, .. }))),
+        "the note is let go"
+    );
+}
+
+/// A parameter delay delays by its time, whatever the resolution.
+///
+/// Its ring holds a value per sample of delay, as far back as the node asked
+/// to reach, so half a second is half a second at a resolution of one sample
+/// as at thirty-two — rather than a fixed number of rows, which at one
+/// sample a row would reach less than a tenth of a second.
+#[test]
+fn a_parameter_delay_reaches_as_far_at_any_resolution() {
+    const BLOCK: u32 = 512;
+    const DELAY: f64 = 0.5;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let slot = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+    let write = graph.add(
+        NodeKind::DelayWrite(DelayWrite {
+            line: 0,
+            ty: PortType::Param,
+        }),
+        [0.0, 0.0],
+    );
+    let read = graph.add(
+        NodeKind::DelayRead(DelayRead {
+            line: 0,
+            ty: PortType::Param,
+            max_time: 1.0,
+            time: DELAY,
+        }),
+        [0.0, 0.0],
+    );
+    let sink = param_sink(&mut graph);
+    graph.connect(slot, 0, write, 0);
+    graph.connect(read, 0, sink, 0);
+
+    let arrival = |resolution: u32| -> Option<u32> {
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK, &[]);
+        load(&mut engine, &graph);
+        let mut schedule = SlotSchedule::new(width, BLOCK, resolution).unwrap();
+        let mut daw = [0.0; SLOTS];
+        for block in 0..60u32 {
+            // A step on the first sample of the second block.
+            daw[0] = if block >= 1 { 1.0 } else { 0.0 };
+            engine.run_block(
+                &mut schedule,
+                &daw,
+                &[],
+                BLOCK,
+                Granularity {
+                    resolution,
+                    quantum: 32,
+                },
+                RATE,
+                120.0,
+                &[],
+                &mut [],
+                &mut subhost_adapter::NoInstances,
+            );
+            if let Some(row) = (0..schedule.row_count()).find(|&row| schedule.row(row)[SINK] > 0.5)
+            {
+                return Some(block * BLOCK + schedule.offset(row));
+            }
+        }
+        None
+    };
+
+    let expected = BLOCK + (DELAY * RATE) as u32;
+    assert_eq!(arrival(32), Some(expected));
+    assert_eq!(
+        arrival(1),
+        Some(expected),
+        "one sample a row reaches as far"
+    );
+}
+
+/// A wired gain crosses a block boundary as smoothly as a row boundary.
+///
+/// The last row's line runs to the value the next block starts on, so the
+/// gain there moves by one sample's worth like everywhere else. Held for the
+/// row and stepped, it would jump by a whole row's worth at every block.
+#[test]
+fn a_wired_gain_meets_the_next_block_where_it_left_off() {
+    const BLOCK: u32 = 256;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let mix = graph.add(
+        NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 1,
+            gains: Vec::new(),
+        }),
+        [0.0, 0.0],
+    );
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(20.0),
+            phase: 0.0,
+            depth: -3.0,
+            offset: -3.0,
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(input, 0, mix, 0);
+    graph.connect(lfo, 0, mix, 1);
+    graph.connect(mix, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[2]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, 128).unwrap();
+    let mut heard = Vec::new();
+    for _ in 0..3 {
+        let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: 128,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[1.0; 2 * BLOCK as usize],
+            &mut daw_out,
+            &mut Adders,
+        );
+        heard.extend_from_slice(&daw_out[..BLOCK as usize]);
+    }
+    let steps: Vec<f32> = heard.windows(2).map(|pair| pair[0] - pair[1]).collect();
+    let (least, most) = steps
+        .iter()
+        .fold((f32::MAX, 0.0f32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+    assert!(least > 0.0, "the gain falls on every sample");
+    // Not exactly as much: a saw in decibels is a curve in linear gain. A
+    // step would be a row's worth — over a hundred times one sample's.
+    assert!(
+        most < least * 1.5,
+        "and by about as much on each, block boundaries included: {least}..{most}"
     );
 }

@@ -42,13 +42,20 @@ pub struct WrapperState {
     /// Preserved as an opaque value so forward and backward schema versions survive round trips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<serde_json::Value>,
-    /// Sub-block modulation quantum in samples.
+    /// Sub-block size in samples, for a stage caught in an audio loop.
     #[serde(default = "default_sub_block")]
     pub sub_block: u32,
+    /// Parameter resolution in samples.
+    #[serde(default = "default_param_resolution")]
+    pub param_resolution: u32,
 }
 
 fn default_sub_block() -> u32 {
-    subhost_adapter::DEFAULT_QUANTUM
+    audio_graph_engine::DEFAULT_QUANTUM
+}
+
+fn default_param_resolution() -> u32 {
+    subhost_adapter::DEFAULT_RESOLUTION
 }
 
 /// Current layout version.
@@ -97,6 +104,7 @@ impl WrapperState {
             sub_plugins: Vec::new(),
             graph: None,
             sub_block: default_sub_block(),
+            param_resolution: default_param_resolution(),
         }
     }
 
@@ -188,11 +196,13 @@ mod tests {
 
     #[test]
     fn a_state_written_before_the_graph_existed_still_loads() {
-        // States saved without a `graph` or `sub_block` should deserialize successfully with defaults.
+        // States saved without a `graph`, `sub_block` or `param_resolution`
+        // should deserialize successfully with defaults.
         let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null}"#;
         let state: WrapperState = serde_json::from_str(json).unwrap();
         assert!(state.graph.is_none());
-        assert_eq!(state.sub_block, subhost_adapter::DEFAULT_QUANTUM);
+        assert_eq!(state.sub_block, audio_graph_engine::DEFAULT_QUANTUM);
+        assert_eq!(state.param_resolution, subhost_adapter::DEFAULT_RESOLUTION);
     }
 
     #[test]
@@ -200,12 +210,14 @@ mod tests {
         // The field is opaque to `subhost-adapter` on purpose: nesting a plugin
         // must not be the reason a patch is lost when versions disagree.
         let json = r#"{"version":1,"slots":[],"sub_plugin":null,"sub_state":null,
-                       "graph":{"nodes":[{"kind":"SomethingFromTheFuture"}]},"sub_block":64}"#;
+                       "graph":{"nodes":[{"kind":"SomethingFromTheFuture"}]},"sub_block":64,
+                       "param_resolution":4}"#;
         let state: WrapperState = serde_json::from_str(json).unwrap();
         let back: WrapperState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(back.graph, state.graph);
         assert_eq!(back.sub_block, 64);
+        assert_eq!(back.param_resolution, 4);
     }
 
     /// Only a release above this one counts as newer, whatever its suffix;

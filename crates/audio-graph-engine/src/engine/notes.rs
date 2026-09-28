@@ -61,13 +61,13 @@ fn passes(event: &Event, keys: u128, channels: u16, controllers: u128) -> bool {
 /// had already taken out.
 #[derive(Debug)]
 pub(super) struct NoteBuf {
-    /// One whole DAW block of events, appended a sub-block at a time as the
-    /// parameter half walks the rows, plus the last sub-block of the block
+    /// One whole DAW block of events, appended a row at a time as the
+    /// parameter half walks the rows, plus the last row of the block
     /// before it. See [`NoteState`] and [`Engine::note_marks`].
     pub(super) events: Vec<Event>,
     /// Which keys are down, one bit each.
     pub(super) held: u128,
-    /// Which keys were struck in the sub-block this buffer last carried, so an
+    /// Which keys were struck in the row this buffer last carried, so an
     /// op sees each note-on exactly once.
     pub(super) struck: u128,
     /// How many notes are down.
@@ -103,7 +103,7 @@ impl NoteBuf {
 }
 
 /// One [`NoteOp::Delay`]'s events in flight, each with the samples left
-/// until it comes out, counted from the start of the next sub-block.
+/// until it comes out, counted from the start of the next row.
 ///
 /// Sized once, in [`Engine::new`], and carried across a swap by node like the
 /// other per-node state; see [`Engine::adopt_handoff`].
@@ -161,11 +161,11 @@ impl Slot for NoteDelayLine {
 /// taking `&mut self` on a type that owned both could be given neither without
 /// a dance.
 ///
-/// The note ops run once for a sub-block, appending to what the buffers
+/// The note ops run once for a row, appending to what the buffers
 /// already hold, and the two readers differ only in where they look: a
 /// parameter op reads everything the buffer holds, which is the stream up to
 /// the boundary it just crossed — the value in force at that instant, which is
-/// what a parameter signal's sub-block resolution means. The audio half reads
+/// what a parameter signal's resolution means. The audio half reads
 /// the rows of its own chunk, found through [`Engine::note_marks`]. Replaying
 /// them per reader instead, into buffers cleared before each replay, would
 /// copy every event twice per note op, and force the generating ops to keep a
@@ -248,7 +248,7 @@ impl NoteState {
         }
     }
 
-    /// One sub-block's worth of the note half, appended to what the buffers
+    /// One row's worth of the note half, appended to what the buffers
     /// already hold. `base` is where each of them stood beforehand.
     ///
     /// On [`NoteState`] rather than on the engine, so the stream it reads can
@@ -303,9 +303,13 @@ impl NoteState {
                     let value = value.clamp(0.0, 1.0);
                     let last = &mut self.emitted[state as usize];
                     // NaN on the left of a comparison is never equal, which is
-                    // what makes the first sub-block after a swap send.
-                    let moved = *last != value;
-                    *last = value;
+                    // what makes the first row after a swap send. Only rows
+                    // on the controller grid are looked at; see
+                    // [`CC_INTERVAL`].
+                    let moved = start.is_multiple_of(CC_INTERVAL) && *last != value;
+                    if moved {
+                        *last = value;
+                    }
 
                     let event = Event::Note(NoteEvent::Cc {
                         port: 0,
@@ -313,7 +317,7 @@ impl NoteState {
                         cc,
                         value,
                         // The lane's value became true at the start of this
-                        // sub-block, and writing it before the stream keeps
+                        // row, and writing it before the stream keeps
                         // the buffer sorted.
                         sample_offset: start,
                     });
@@ -441,7 +445,7 @@ impl NoteState {
                     for (slot, &input) in next.iter_mut().zip(&inputs[..count]) {
                         *slot = base[input as usize].min(self.bufs[input as usize].events.len());
                     }
-                    // Which input each event this sub-block added came from,
+                    // Which input each event this row added came from,
                     // so a duplicate is judged against the other inputs only.
                     let mut origin = [0u8; NOTE_BUF_CAPACITY];
                     loop {
@@ -487,7 +491,7 @@ impl NoteState {
 
     /// Fold a buffer's notes into the tables the key and follow ops read.
     ///
-    /// Called once per buffer per sub-block, over the events that sub-block
+    /// Called once per buffer per row, over the events that row
     /// appended and no others: the tables are a running total, and folding an
     /// event into them twice would leave a key held after it was let go.
     pub(super) fn follow_notes(&mut self, buf: u16, from: usize) {

@@ -31,8 +31,11 @@ else lives here.
 - **The two-trait split is the activation gate.** `Vst3Plugin` is the
   main-thread half and `activate` yields an owning `Processor`, so a processor
   cannot exist before the sequence that makes one valid has run.
-- **The processing containers are sized before any audio runs.** Input batches
-  that exceed capacity or violate event timing are rejected before native processing.
+- **The processing containers are sized before any audio runs.** Input
+  parameter points share one pool sized from `AudioConfig::max_input_events`,
+  sorted into one run per parameter before `process`, so a caller's points may
+  fall on any parameters in any proportion. Input batches that exceed capacity
+  or violate event timing are rejected before native processing.
   Main-thread edits remain queued until a complete batch can be delivered.
 - **Successful activation matches the requested buses.** The backend verifies
   native arrangements and channel counts; it does not silently substitute stereo.

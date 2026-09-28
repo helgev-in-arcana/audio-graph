@@ -119,7 +119,8 @@ fn parameter_values_cross_both_native_threads() {
     assert_eq!(run(&mut processor, &[], &mut sink), 0.6);
 }
 
-/// A full parameter queue rejects its batch without applying a prefix or losing main edits.
+/// A call carrying more events than the activation allowed for rejects its
+/// batch without applying a prefix or losing main edits.
 #[test]
 fn input_overflow_preserves_pending_main_edits() {
     let _thread = vst3_host::init_apartment().unwrap();
@@ -128,7 +129,12 @@ fn input_overflow_preserves_pending_main_edits() {
     let module = Module::open(fixture_path()).unwrap();
     let cid = module.audio_modules().unwrap()[0].cid;
     let mut plugin = Vst3Plugin::create(&module, cid, Arc::new(Host)).unwrap();
-    let mut processor = plugin.activate(AudioConfig::default()).unwrap();
+    let mut processor = plugin
+        .activate(AudioConfig {
+            max_input_events: 512,
+            ..AudioConfig::default()
+        })
+        .unwrap();
     plugin.set_param(ParamId(0), 0.5).unwrap();
     let events = vec![
         Event::Param(ParamEvent::SetValue {

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Connections are only valid between ports of matching types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortType {
-    /// A scalar parameter value, evaluated per sub-block.
+    /// A scalar parameter value, evaluated once a parameter row.
     Param,
     /// Audio, `channels` wide.
     Audio { channels: u16 },

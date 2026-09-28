@@ -57,9 +57,9 @@ use clap_sys::process::{
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
-    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
-    ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor,
-    TimeContext, VoiceInfo, reclaim_main_thread,
+    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamInterpolation,
+    ParamSnapshot, ParamValue, ProcessStatus, Processor, RestartReason, Result, SubPluginMain,
+    SubPluginProcessor, TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -69,7 +69,10 @@ use crate::module::{ClassInfo, Module, ModuleInner};
 use crate::stream::{InStream, OutStream};
 use crate::util::from_char_array;
 
-/// Ceilings for the pre-allocated event buffers per block.
+/// Ceilings for the pre-allocated event buffers the host fills on its own
+/// account: the plugin's output, and the main thread's edits queued for the
+/// next block. What a caller hands `process` is sized by the caller, through
+/// [`AudioConfig::max_input_events`].
 const MAX_EVENTS_PER_BLOCK: usize = 2048;
 
 /// How long a parameter's formatted text may be.
@@ -704,6 +707,7 @@ impl SubPluginMain for ClapPlugin {
             // CLAP plugins may add and remove parameters and tell the host
             // through `clap.params`, which `tick` acts on.
             dynamic_params: true,
+            param_interpolation: ParamInterpolation::Hold,
         }
     }
 
@@ -1181,7 +1185,9 @@ impl ClapProcessor {
             out_ptrs: vec![std::ptr::null_mut(); out_channels],
             silence: vec![0.0; plan.silence_channels * frames],
             scratch: vec![0.0; plan.scratch_channels * frames],
-            in_events: InputEvents::new(MAX_EVENTS_PER_BLOCK),
+            // The caller's stream, and room for the queued edits that go in
+            // ahead of it.
+            in_events: InputEvents::new(config.max_input_events as usize + MAX_EVENTS_PER_BLOCK),
             out_events: OutputEvents::new(MAX_EVENTS_PER_BLOCK),
             pending_edits,
             steady_time: 0,
@@ -1235,7 +1241,11 @@ impl SubPluginProcessor for ClapProcessor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
-        if !buffers.matches_config(&self.config) {
+        // More events than the caller said it would send would not fit, and
+        // a prefix of them is not what the caller asked for either.
+        if !buffers.matches_config(&self.config)
+            || events.len() > self.config.max_input_events as usize
+        {
             buffers.clear_output();
             return ProcessStatus::Error;
         }

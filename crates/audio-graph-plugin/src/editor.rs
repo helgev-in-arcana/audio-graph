@@ -47,6 +47,7 @@ enum Command {
     OpenSub(usize),
     CloseSub(usize),
     SetQuantum(u32),
+    SetResolution(u32),
     /// Load the sub-plugins the project names but could not find, from the
     /// catalogue a scan just finished.
     FindMissing(Vec<plugin_scan::catalogue::Module>),
@@ -317,6 +318,7 @@ impl WrapperEditor {
             live: self.shared.live_slots(),
             sockets: &sockets,
             quantum: self.shared.quantum(),
+            resolution: self.shared.resolution(),
             sample_rate: self.shared.sample_rate() as f64,
             touched: &touched,
         };
@@ -520,12 +522,30 @@ impl WrapperEditor {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Modulation rate").on_hover_text(
-            "how often the graph's outputs reach the sub-plugin, in samples. \
-             Smaller is smoother and costs more events.",
+        ui.label("Parameter resolution").on_hover_text(
+            "how often a parameter value is worked out and reaches a \
+             sub-plugin, in samples. Smaller is smoother and costs more \
+             events: at 1, a moving value is an event every sample.",
+        );
+        let current = self.shared.resolution();
+        for choice in subhost_adapter::RESOLUTION_CHOICES {
+            if ui
+                .selectable_label(current == choice, choice.to_string())
+                .clicked()
+                && current != choice
+            {
+                self.commands.push(Command::SetResolution(choice));
+            }
+        }
+
+        ui.separator();
+        ui.label("Sub-block").on_hover_text(
+            "how many samples a patch with an audio feedback loop processes \
+             at a time, and so the shortest audio delay. Smaller calls every \
+             plugin in the loop more often.",
         );
         let current = self.shared.quantum();
-        for choice in subhost_adapter::QUANTUM_CHOICES {
+        for choice in audio_graph_engine::QUANTUM_CHOICES {
             if ui
                 .selectable_label(current == choice, choice.to_string())
                 .clicked()
@@ -598,7 +618,15 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
             Command::SetQuantum(quantum) => {
                 shared.set_quantum(quantum);
                 shared.store_state();
-                status.set(format!("modulation rate {quantum} samples"));
+                status.set(format!("sub-block {quantum} samples"));
+            }
+            Command::SetResolution(resolution) => {
+                shared.set_resolution(resolution);
+                // Reactivates the sub-plugins with room for the new
+                // resolution's events; see `Shared::publish`.
+                shared.publish_graph();
+                shared.store_state();
+                status.set(format!("parameter resolution {resolution} samples"));
             }
             Command::FindMissing(modules) => match shared.find_missing_children(&modules) {
                 Ok(0) => {}

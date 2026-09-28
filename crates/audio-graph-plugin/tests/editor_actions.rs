@@ -102,6 +102,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     });
 
     // Clicking an entry in the plugin list.
@@ -348,6 +349,7 @@ fn a_graph_survives_the_state_round_trip() {
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params.clone());
     shared.set_quantum(64);
+    shared.set_resolution(4);
     {
         let mut state = shared.patch();
         state.graph = Graph::default_patch();
@@ -362,6 +364,7 @@ fn a_graph_survives_the_state_round_trip() {
     let json = params.state.0.read().unwrap().clone();
     let saved: audio_graph_plugin::WrapperState = serde_json::from_str(&json).unwrap();
     assert_eq!(saved.sub_block, 64);
+    assert_eq!(saved.param_resolution, 4);
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
     assert_eq!(restored, shared.patch().graph);
@@ -403,6 +406,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     });
 
     // The canvas adds the node first and the plugin arrives afterwards, so the

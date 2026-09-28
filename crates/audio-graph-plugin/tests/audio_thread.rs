@@ -95,6 +95,7 @@ fn editing_the_graph_never_makes_the_audio_thread_miss_a_block() {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     });
 
     // One publish before anything is measured, because the first one is not an

@@ -1,9 +1,9 @@
-//! The parameter half: scalar ops over the register file, one sub-block at a time.
+//! The parameter half: scalar ops over the register file, one row at a time.
 
 use super::*;
 
 impl Engine {
-    /// Every stage's parameter and note ops for one sub-block.
+    /// Every stage's parameter and note ops for one row.
     ///
     /// Overwrites slot table values for lanes driven by the graph.
     ///
@@ -30,11 +30,11 @@ impl Engine {
         }
     }
 
-    /// One stage's parameter and note ops for one sub-block.
+    /// One stage's parameter and note ops for one row.
     ///
-    /// Called once per sub-block, in order, before that stage's audio ops.
+    /// Called once per row, in order, before that stage's audio ops.
     /// What a parameter op reads out of a note buffer is everything the buffer
-    /// holds, which is the stream up to the boundary this sub-block starts on.
+    /// holds, which is the stream up to the boundary this row starts on.
     pub fn run_stage(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
         // Moved out and put back rather than borrowed.
         let Some(program) = self.program.take() else {
@@ -49,15 +49,91 @@ impl Engine {
             return;
         }
 
+        self.eval_row(&program, stage, ctx, slots);
+
+        // Last, so that a reader in *this* row saw the previous one's
+        // stream. A parameter signal has the resolution of a row, so the value it
+        // wants is the one in effect at the boundary it just crossed, not one
+        // from the middle of the row about to start.
+        //
+        // The buffers are appended to rather than refilled, so where they
+        // stand now is both what this row's ops must skip and where the audio
+        // half will later find this row's events.
+        let row = ctx.row as usize;
+        let mut base = [0usize; MAX_NOTE_BUFS];
+        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
+            *slot = buf.events.len();
+        }
+        // Only for the buffers this stage fills. A later stage passing over
+        // the same rows would otherwise overwrite every mark with the length
+        // the buffer finished at, and the audio half would read the whole
+        // block as one row.
+        if let Some(marks) = self.note_marks.get_mut(row) {
+            for (buf, mark) in marks.iter_mut().enumerate() {
+                if stage.note_bufs & (1 << buf) != 0 {
+                    *mark = base[buf] as u32;
+                }
+            }
+        }
+        // Two disjoint fields, which is the whole reason the note half's
+        // state is a type of its own: the pass wants the block's stream by
+        // shared reference and everything it fills by exclusive one.
+        self.notes.run_notes_step(
+            &program,
+            stage,
+            &self.translated,
+            ctx.offset,
+            ctx.frames,
+            slots,
+            &base,
+            (ctx.sample_rate, ctx.tempo_bpm),
+            &mut self.ledger,
+        );
+        self.note_rows = self.note_rows.max(row + 1);
+
+        self.program = Some(program);
+    }
+
+    /// One stage's parameter ops at the end of the block, into `slots`,
+    /// leaving everything the ops carry from row to row where it was.
+    ///
+    /// `ctx` names the block's last sample boundary with a row of no frames.
+    /// The next block's first row is evaluated at that same instant, so this
+    /// is its value worked out early: what a consumer joining points with
+    /// lines needs to draw the last row's line to where the value is going.
+    /// Nothing moves because of it — no phase advances, no latch is set, no
+    /// delay line is written and no note is generated — so the next block
+    /// starts exactly where it would have without it.
+    pub fn run_stage_end(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
+        let Some(program) = self.program.take() else {
+            return;
+        };
+        if let Some(&stage) = program.stages.get(stage)
+            && !program.is_empty()
+        {
+            self.peek.save(
+                &self.lfos,
+                &self.latches,
+                &self.lines,
+                &self.registers,
+                self.rng,
+            );
+            self.eval_row(&program, stage, ctx, slots);
+            self.peek.restore(
+                &mut self.lfos,
+                &mut self.latches,
+                &mut self.lines,
+                &mut self.registers,
+                &mut self.rng,
+            );
+        }
+        self.program = Some(program);
+    }
+
+    /// One stage's parameter ops for one row, and the lanes they drive.
+    fn eval_row(&mut self, program: &Program, stage: Stage, ctx: &BlockContext, slots: &mut [f64]) {
         let dt = if ctx.sample_rate > 0.0 {
             f64::from(ctx.frames) / ctx.sample_rate
-        } else {
-            0.0
-        };
-
-        // Parameter delay distance converted to sub-block taps.
-        let taps_per_second = if ctx.frames > 0 && ctx.sample_rate > 0.0 {
-            ctx.sample_rate / f64::from(ctx.frames)
         } else {
             0.0
         };
@@ -75,25 +151,34 @@ impl Engine {
                         Some(reg) => self.registers[reg as usize].max(0.0),
                         None => time,
                     };
-                    let index = line as usize;
-                    self.registers[out as usize] = if index < self.lines.len() {
-                        let taps = (time * taps_per_second)
-                            .round()
-                            .clamp(1.0, (MAX_DELAY_TAPS - 1) as f64)
-                            as usize;
-                        let head = self.lines[index].head;
-                        let at = (head + MAX_DELAY_TAPS - taps) % MAX_DELAY_TAPS;
-                        self.lines[index].ring[at]
-                    } else {
-                        0.0
+                    self.registers[out as usize] = match self.lines.get(line as usize) {
+                        Some(held) if held.len > 1 && held.ring.len() >= held.len => {
+                            // At least one sample back, which is the last
+                            // sample the previous row wrote: this row's own
+                            // write comes after every read, and a read that
+                            // could see it would close a loop with no delay.
+                            let back = (time * ctx.sample_rate)
+                                .round()
+                                .clamp(1.0, (held.len - 1) as f64)
+                                as usize;
+                            held.ring[(held.head + held.len - back) % held.len]
+                        }
+                        _ => 0.0,
                     };
                 }
                 Op::DelayWrite { line, a } => {
-                    let index = line as usize;
-                    if index < self.lines.len() {
-                        let head = self.lines[index].head;
-                        self.lines[index].ring[head] = self.registers[a as usize];
-                        self.lines[index].head = (head + 1) % MAX_DELAY_TAPS;
+                    // The row's value, over every sample the row covers: a
+                    // read a row's length back and one a sample back then
+                    // agree on what that row was.
+                    let value = self.registers[a as usize];
+                    if let Some(held) = self.lines.get_mut(line as usize)
+                        && held.len > 1
+                        && held.ring.len() >= held.len
+                    {
+                        for i in 0..ctx.frames as usize {
+                            held.ring[(held.head + i) % held.len] = value;
+                        }
+                        held.head = (held.head + ctx.frames as usize) % held.len;
                     }
                 }
                 Op::Const { out, value } => self.registers[out as usize] = value,
@@ -163,9 +248,9 @@ impl Engine {
                         .get(buf as usize)
                         .map_or(0, |&w| (w as usize).min(MAX_CHANNELS));
                     let level = self.loudness(buf, width, win, detect);
-                    // One pole per sub-block, which is as often as a parameter
-                    // is allowed to move. `dt` is this sub-block's length, so
-                    // the times mean the same thing at any quantum and any
+                    // One pole per row, which is as often as a parameter
+                    // is allowed to move. `dt` is this row's length, so
+                    // the times mean the same thing at any resolution and any
                     // block size. A time of zero is a coefficient of zero,
                     // which is following exactly.
                     let held = self
@@ -175,7 +260,12 @@ impl Engine {
                         .unwrap_or(0.0);
                     let held = if held.is_finite() { held } else { 0.0 };
                     let time = if level > held { attack } else { release };
-                    let value = if time > 0.0 && dt > 0.0 {
+                    // An empty window says nothing about how loud anything is,
+                    // which is how the end of a block is read: as where the
+                    // envelope stands, not as silence.
+                    let value = if win.frames == 0 {
+                        held
+                    } else if time > 0.0 && dt > 0.0 {
                         let coeff = (-dt / time).exp();
                         held + (level - held) * (1.0 - coeff)
                     } else {
@@ -280,7 +370,7 @@ impl Engine {
                     cc,
                     initial,
                 } => {
-                    // The last matching event wins: within one sub-block a
+                    // The last matching event wins: within one row a
                     // controller may move several times, and what the boundary
                     // carries is where it ended up.
                     let latest = self
@@ -355,7 +445,7 @@ impl Engine {
             }
         }
 
-        for &(lane, reg) in &program.outputs {
+        for &(lane, reg) in &program.outputs[stage.outputs.range()] {
             if let Some(target) = slots.get_mut(lane as usize) {
                 // Host automation and parameter slots are normalized to 0..1, while audio lanes
                 // carry physical units (decibels, seconds) without clamping.
@@ -369,48 +459,6 @@ impl Engine {
                 };
             }
         }
-
-        // Last, so that a reader in *this* sub-block saw the previous one's
-        // stream. A parameter signal has sub-block resolution, so the value it
-        // wants is the one in effect at the boundary it just crossed, not one
-        // from the middle of the sub-block about to start.
-        //
-        // The buffers are appended to rather than refilled, so where they
-        // stand now is both what this row's ops must skip and where the audio
-        // half will later find this row's events.
-        let row = ctx.row as usize;
-        let mut base = [0usize; MAX_NOTE_BUFS];
-        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
-            *slot = buf.events.len();
-        }
-        // Only for the buffers this stage fills. A later stage passing over
-        // the same rows would otherwise overwrite every mark with the length
-        // the buffer finished at, and the audio half would read the whole
-        // block as one row.
-        if let Some(marks) = self.note_marks.get_mut(row) {
-            for (buf, mark) in marks.iter_mut().enumerate() {
-                if stage.note_bufs & (1 << buf) != 0 {
-                    *mark = base[buf] as u32;
-                }
-            }
-        }
-        // Two disjoint fields, which is the whole reason the note half's
-        // state is a type of its own: the pass wants the block's stream by
-        // shared reference and everything it fills by exclusive one.
-        self.notes.run_notes_step(
-            &program,
-            stage,
-            &self.translated,
-            ctx.offset,
-            ctx.frames,
-            slots,
-            &base,
-            (ctx.sample_rate, ctx.tempo_bpm),
-            &mut self.ledger,
-        );
-        self.note_rows = self.note_rows.max(row + 1);
-
-        self.program = Some(program);
     }
 
     /// How loud one window of an audio buffer is, across its channels.
@@ -447,7 +495,7 @@ impl Engine {
         key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
     }
 
-    /// Whether `key` was struck in the sub-block `buf` last carried.
+    /// Whether `key` was struck in the row `buf` last carried.
     fn struck(&self, buf: u16, key: u8) -> bool {
         let table = self
             .notes

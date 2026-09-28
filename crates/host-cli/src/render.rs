@@ -141,6 +141,7 @@ pub fn render_with_state(
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     };
 
     let mut processor = plugin.activate(config).map_err(|e| e.to_string())?;

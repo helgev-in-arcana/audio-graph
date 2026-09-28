@@ -23,9 +23,12 @@ mod op;
 
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
-pub use audio_op::{AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, MixIn, Span, Stage};
+pub use audio_op::{
+    AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, MixIn, QUANTUM_CHOICES,
+    Span, Stage,
+};
 pub use note_op::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
+    ALL_CHANNELS, ALL_CONTROLLERS, CC_INTERVAL, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
     MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteBuf, NoteOp,
 };
 
@@ -71,27 +74,111 @@ pub const MAX_DSP_STATES: usize = 64;
 pub const DSP_VALUES: usize = 4 * MAX_CHANNELS;
 pub const MAX_DELAY_LINES: usize = 16;
 
-/// How far back a param delay line can read, in sub-blocks.
-///
-/// A param line stores one value per sub-block, so this is a time only once the
-/// sample rate and the quantum are known: 4096 sub-blocks is 2.7 s at 48 kHz
-/// with the default quantum of 32, and 1.4 s at the finest quantum of 16. The
-/// ring is preallocated for it, because the audio thread may not allocate and
-/// the alternative — sizing from the longest delay in the graph — would mean a
-/// reallocation every time the user drags the time control.
-pub const MAX_DELAY_TAPS: usize = 4096;
-
 /// How many *audio* delay lines one program may have.
 ///
-/// Counted apart from [`MAX_DELAY_LINES`] because an audio line costs a ring of
-/// samples rather than a ring of sub-block values.
+/// Counted apart from [`MAX_DELAY_LINES`] because an audio line's ring is a
+/// channel of `f32` per channel of its signal, and the audio half keeps its
+/// own numbering for them.
 pub const MAX_AUDIO_DELAY_LINES: usize = 8;
-/// How far back an audio delay line may be *asked* to read, in seconds.
+/// How far back any delay line may be *asked* to read, in seconds.
 ///
 /// Not what it costs: each ring is allocated from its node's `max_time`, so a
 /// 250 ms delay costs 250 ms. This is the ceiling because something has to bound
 /// `max_time`, and a delay longer than it is a looper rather than a delay.
-pub const MAX_AUDIO_DELAY_SECONDS: f64 = 10.0;
+pub const MAX_DELAY_SECONDS: f64 = 10.0;
+
+/// The rings of one kind of delay line, as a program carries them to the audio
+/// thread.
+///
+/// A ring holds a sample per sample of delay — per channel for audio, one
+/// value for a parameter — so how far back a line reaches is its node's
+/// `max_time` and nothing else. It is sized here, on the main thread, from
+/// that and the sample rate, because the audio thread may not allocate and
+/// only this side knows both.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct Rings<T> {
+    /// Line index → the `DelayWrite` node it belongs to, which is what the
+    /// ring's contents follow across a program swap: a feedback loop that
+    /// emptied itself every time the user nudged an unrelated control would
+    /// not be usable.
+    pub(crate) nodes: Vec<NodeId>,
+    /// Line index → the furthest any read of it asked to reach, in seconds.
+    pub(crate) seconds: Vec<f64>,
+    /// Line index → how many samples per channel its ring holds, or zero for
+    /// none. Filled by [`Rings::size`].
+    pub(crate) len: Vec<usize>,
+    /// Rings for the lines whose length has changed, allocated on the main
+    /// thread and handed over with the program.
+    ///
+    /// Empty — the usual case — means "keep the one you have". A recompile
+    /// happens on every drag of every control, and reallocating 700 kB each
+    /// time to hand back something the same size would be silly.
+    pub(crate) rings: Vec<Vec<T>>,
+}
+
+impl<T: Copy + Default> Rings<T> {
+    /// Gives each line a ring of `len_of(seconds)` samples per channel, where
+    /// `previous` — what the last call returned — does not already say it has
+    /// one that long.
+    ///
+    /// Returns what it decided, for the next call to compare against.
+    fn size(
+        &mut self,
+        channels: usize,
+        len_of: impl Fn(f64) -> usize,
+        previous: &[(NodeId, usize)],
+    ) -> Vec<(NodeId, usize)> {
+        self.len = self
+            .seconds
+            .iter()
+            .map(|&seconds| len_of(seconds))
+            .collect();
+        let want: Vec<(NodeId, usize)> = self
+            .nodes
+            .iter()
+            .copied()
+            .zip(self.len.iter().copied())
+            .collect();
+        self.rings = want
+            .iter()
+            .map(|entry| {
+                if entry.1 == 0 || previous.contains(entry) {
+                    Vec::new()
+                } else {
+                    vec![T::default(); channels * entry.1]
+                }
+            })
+            .collect();
+        want
+    }
+
+    /// Takes over the rings a superseded, never-adopted program was carrying
+    /// for the same nodes at the same lengths, so replacing it does not throw
+    /// them away.
+    fn carry(&mut self, pending: &mut Rings<T>) {
+        for line in 0..self.nodes.len() {
+            let (node, len) = (self.nodes[line], self.len[line]);
+            let Some(old_line) = pending
+                .nodes
+                .iter()
+                .zip(&pending.len)
+                .position(|(&old_node, &old_len)| old_node == node && old_len == len)
+            else {
+                continue;
+            };
+            if self.rings[line].is_empty() && !pending.rings[old_line].is_empty() {
+                std::mem::swap(&mut self.rings[line], &mut pending.rings[old_line]);
+            }
+        }
+    }
+}
+
+/// What [`Program::size_rings`] decided, per kind of line.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct RingSizes {
+    audio: Vec<(NodeId, usize)>,
+    params: Vec<(NodeId, usize)>,
+}
 
 /// Lanes past the slot table that carry something the *audio* half reads: a
 /// delay time or a gain.
@@ -150,36 +237,14 @@ pub struct Program {
     /// Lanes below `slot_count` are the DAW's own automation and the graph never
     /// writes them; what lands here is a parameter lane or an audio lane.
     pub(crate) outputs: Vec<(u16, Reg)>,
-    /// Audio line index → how many samples per channel its ring holds.
-    ///
-    /// From the node's `max_time` and the sample rate, so a line costs what it
-    /// was asked for. The compiler cannot fill it in — it does not know the
-    /// sample rate — so the main thread does, in `size_rings`.
-    pub(crate) audio_ring_len: Vec<usize>,
-    /// Rings for the lines whose length has changed, allocated on the main
-    /// thread and handed over with the program.
-    ///
-    /// Empty — the usual case — means "keep the ones you have". A recompile
-    /// happens on every drag of every control, and reallocating 700 kB each time
-    /// to hand back something the same size would be silly.
-    pub(crate) audio_rings: Vec<Vec<f32>>,
-    /// Maximum delay duration in seconds per audio delay line.
-    pub(crate) audio_ring_seconds: Vec<f64>,
-    /// Audio line index → the `DelayWrite` node it belongs to.
-    ///
-    /// Separate from `delay_nodes`: audio lines are numbered among themselves,
-    /// because their rings are a scarcer resource than a param line's. Carried
-    /// across a swap so the ring contents survive.
-    pub(crate) audio_delay_nodes: Vec<NodeId>,
-    /// Line index → the `DelayWrite` node it belongs to.
-    ///
-    /// Carried across a swap for the same reason as `lfo_nodes`: a feedback loop
-    /// that emptied itself every time the user nudged an unrelated control would
-    /// not be usable.
-    pub(crate) delay_nodes: Vec<NodeId>,
+    /// The audio delay lines, numbered among themselves.
+    pub(crate) audio_lines: Rings<f32>,
+    /// The parameter delay lines, numbered as the compiler numbered every
+    /// line; an audio line's entry asks for no ring.
+    pub(crate) param_lines: Rings<f64>,
     /// Audio processing operations in topological execution order.
     pub(crate) audio_ops: Vec<AudioOp>,
-    /// The note half, run once per sub-block ahead of the audio ops.
+    /// The note half, run once per row ahead of the audio ops.
     pub(crate) note_ops: Vec<NoteOp>,
     /// How many note buffers this program uses.
     pub(crate) note_bufs: u16,
@@ -234,9 +299,9 @@ pub struct Program {
     /// outputs were bound.
     ///
     /// The audio thread never reads it. It is kept for whoever has to say what
-    /// a socket is carrying: every register is written once per sub-block and
+    /// a socket is carrying: every register is written once per row and
     /// never reused, so after a block has run, the register named here still
-    /// holds that socket's value from the last sub-block.
+    /// holds that socket's value from the last row.
     pub(crate) output_registers: Vec<((NodeId, u8), Reg)>,
 }
 
@@ -269,8 +334,8 @@ impl PreparedProgram {
     pub(crate) fn prepare(
         mut program: Program,
         sample_rate: f64,
-        previous: &[(NodeId, usize)],
-    ) -> (Self, Vec<(NodeId, usize)>) {
+        previous: &RingSizes,
+    ) -> (Self, RingSizes) {
         let sizes = program.size_rings(sample_rate, previous);
         (
             Self {
@@ -291,27 +356,12 @@ impl PreparedProgram {
     }
 
     pub(crate) fn carry_pending_rings(&mut self, pending: &mut Self) {
-        for line in 0..self.program.audio_delay_nodes.len() {
-            let node = self.program.audio_delay_nodes[line];
-            let len = self.program.audio_ring_len[line];
-            let Some(old_line) = pending
-                .program
-                .audio_delay_nodes
-                .iter()
-                .zip(&pending.program.audio_ring_len)
-                .position(|(&old_node, &old_len)| old_node == node && old_len == len)
-            else {
-                continue;
-            };
-            if self.program.audio_rings[line].is_empty()
-                && !pending.program.audio_rings[old_line].is_empty()
-            {
-                std::mem::swap(
-                    &mut self.program.audio_rings[line],
-                    &mut pending.program.audio_rings[old_line],
-                );
-            }
-        }
+        self.program
+            .audio_lines
+            .carry(&mut pending.program.audio_lines);
+        self.program
+            .param_lines
+            .carry(&mut pending.program.param_lines);
     }
 }
 
@@ -337,7 +387,7 @@ pub struct ProgramPublisher {
 
 #[derive(Default)]
 struct PublicationHistory {
-    rings: Vec<(NodeId, usize)>,
+    rings: RingSizes,
     publication: u64,
 }
 
@@ -353,7 +403,7 @@ impl Default for ProgramPublisher {
 impl ProgramPublisher {
     /// Forces the next publication to supply every delay ring for a new activation.
     pub fn reset(&self) {
-        self.history.lock().unwrap().rings.clear();
+        self.history.lock().unwrap().rings = RingSizes::default();
     }
 
     pub(crate) fn handoff(&self) -> &crate::Handoff<PreparedProgram> {
@@ -400,11 +450,8 @@ impl Program {
             buffers: Vec::new(),
             stages: Vec::new(),
             latency: 0,
-            delay_nodes: Vec::new(),
-            audio_delay_nodes: Vec::new(),
-            audio_ring_len: Vec::new(),
-            audio_rings: Vec::new(),
-            audio_ring_seconds: Vec::new(),
+            audio_lines: Rings::default(),
+            param_lines: Rings::default(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             dsp_nodes: Vec::new(),
@@ -413,7 +460,7 @@ impl Program {
         }
     }
 
-    /// Gives each audio delay line a ring as long as its node asked for.
+    /// Gives each delay line a ring as long as its node asked for.
     ///
     /// Main thread only — it allocates, and that is the point: the audio thread
     /// must never do it, and only this side knows both the graph's `max_time`
@@ -423,40 +470,33 @@ impl Program {
     ///
     /// `previous` is what the last call returned. A line already holding a ring
     /// of the right length gets an empty entry, which the engine reads as "keep
-    /// the one you have" — otherwise every drag of every control would hand over
-    /// a fresh 700 kB to replace something identical.
-    ///
-    /// Returns what it decided, for the next call to compare against.
-    pub(crate) fn size_rings(
-        &mut self,
-        sample_rate: f64,
-        previous: &[(NodeId, usize)],
-    ) -> Vec<(NodeId, usize)> {
-        let ceiling = (MAX_AUDIO_DELAY_SECONDS * sample_rate.max(1.0)) as usize;
-        self.audio_ring_len = self
-            .audio_ring_seconds
-            .iter()
+    /// the one you have".
+    pub(crate) fn size_rings(&mut self, sample_rate: f64, previous: &RingSizes) -> RingSizes {
+        let ceiling = (MAX_DELAY_SECONDS * sample_rate.max(1.0)) as usize;
+        let samples = |seconds: f64| (seconds.max(0.0) * sample_rate).ceil() as usize;
+        RingSizes {
             // Four samples over what was asked for: the read pointer is
             // fractional and the interpolator looks two samples past it.
-            .map(|&s| ((s.max(0.0) * sample_rate).ceil() as usize + 4).clamp(64, ceiling))
-            .collect();
-        let want: Vec<(NodeId, usize)> = self
-            .audio_delay_nodes
-            .iter()
-            .copied()
-            .zip(self.audio_ring_len.iter().copied())
-            .collect();
-        self.audio_rings = want
-            .iter()
-            .map(|entry| {
-                if previous.contains(entry) {
-                    Vec::new()
-                } else {
-                    vec![0.0; MAX_CHANNELS * entry.1]
-                }
-            })
-            .collect();
-        want
+            audio: self.audio_lines.size(
+                MAX_CHANNELS,
+                |seconds| (samples(seconds) + 4).clamp(64, ceiling),
+                &previous.audio,
+            ),
+            // One over, because a read reaches back from the sample the row's
+            // write is about to fill. A line no read asked anything of — an
+            // audio line's entry among them — gets no ring at all.
+            params: self.param_lines.size(
+                1,
+                |seconds| {
+                    if seconds > 0.0 {
+                        (samples(seconds) + 1).min(ceiling)
+                    } else {
+                        0
+                    }
+                },
+                &previous.params,
+            ),
+        }
     }
 
     /// Whether the graph drives `lane` — a parameter lane or an audio lane,
@@ -498,13 +538,13 @@ mod tests {
     #[test]
     fn pending_ring_transfer_follows_nodes_not_line_numbers() {
         let mut old = Program::empty();
-        old.audio_delay_nodes = vec![11, 22];
-        old.audio_ring_len = vec![4, 8];
-        old.audio_rings = vec![vec![1.0; 8], Vec::new()];
+        old.audio_lines.nodes = vec![11, 22];
+        old.audio_lines.len = vec![4, 8];
+        old.audio_lines.rings = vec![vec![1.0; 8], Vec::new()];
         let mut next = Program::empty();
-        next.audio_delay_nodes = vec![22, 11];
-        next.audio_ring_len = vec![8, 4];
-        next.audio_rings = vec![Vec::new(), Vec::new()];
+        next.audio_lines.nodes = vec![22, 11];
+        next.audio_lines.len = vec![8, 4];
+        next.audio_lines.rings = vec![Vec::new(), Vec::new()];
 
         let mut next = PreparedProgram {
             fallback_destinations: Vec::new(),
@@ -518,7 +558,7 @@ mod tests {
         };
         next.carry_pending_rings(&mut old);
 
-        assert_eq!(next.program.audio_rings[1], vec![1.0; 8]);
-        assert!(next.program.audio_rings[0].is_empty());
+        assert_eq!(next.program.audio_lines.rings[1], vec![1.0; 8]);
+        assert!(next.program.audio_lines.rings[0].is_empty());
     }
 }

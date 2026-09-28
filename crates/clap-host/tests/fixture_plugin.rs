@@ -137,7 +137,8 @@ mod allocations {
     }
 }
 
-/// Rejected input cannot partially update native state or consume queued main-thread edits.
+/// Input beyond what the activation allowed for is rejected whole: it cannot
+/// partially update native state or consume queued main-thread edits.
 #[test]
 fn input_overflow_is_rejected_before_native_delivery() {
     let _fixture = fixture();
@@ -148,7 +149,12 @@ fn input_overflow_is_rejected_before_native_delivery() {
         Arc::new(TestHost),
     )
     .unwrap();
-    let mut processor = plugin.activate(lifecycle_config()).unwrap();
+    let mut processor = plugin
+        .activate(AudioConfig {
+            max_input_events: 2048,
+            ..lifecycle_config()
+        })
+        .unwrap();
     let input = [1.0; 8];
     let mut output = [9.0; 8];
     let mut sink = EventSink::with_capacity(8);
@@ -244,6 +250,7 @@ fn lifecycle_config() -> AudioConfig {
         aux_inputs: AuxBuses::default(),
         aux_outputs: AuxBuses::default(),
         offline: true,
+        ..Default::default()
     }
 }
 
@@ -975,6 +982,7 @@ fn the_backend_drives_a_real_clap_module() {
         aux_inputs: AuxBuses::default(),
         aux_outputs: AuxBuses::default(),
         offline: true,
+        ..Default::default()
     };
 
     let mut processor = SubPluginMain::activate(&mut plugin, config).expect("activates");

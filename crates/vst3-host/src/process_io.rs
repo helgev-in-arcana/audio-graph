@@ -5,6 +5,7 @@
 //! capacity are dropped rather than triggering reallocations on the real-time thread.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use vst3::Steinberg::Vst::{
     Event, IEventList, IEventListTrait, IParamValueQueue, IParamValueQueueTrait, IParameterChanges,
@@ -100,7 +101,12 @@ impl IParamValueQueueTrait for ValueQueue {
     }
 }
 
-/// The `IParameterChanges` handed to `process`, backed by a fixed queue pool.
+/// The `IParameterChanges` a plugin writes its own changes into during
+/// `process`, backed by a fixed queue pool.
+///
+/// Each queue has its own fixed capacity, because the plugin opens queues and
+/// adds points in whatever order it likes and every queue must stay readable
+/// throughout. What the host hands in is [`InputChanges`].
 pub struct ParameterChanges {
     /// Pre-built queues, reused every block. `used` is how many are live now.
     pool: Vec<ComWrapper<ValueQueue>>,
@@ -137,6 +143,7 @@ impl ParameterChanges {
     ///
     /// Consecutive calls for the same parameter reuse its existing queue.
     /// Returns false if a limit was hit and the point was dropped.
+    #[cfg(test)]
     pub fn add_point(&self, id: ParamID, sample_offset: int32, value: ParamValue) -> bool {
         let used = self.used.get();
         for queue in &self.pool[..used] {
@@ -232,6 +239,225 @@ impl IParameterChangesTrait for ParameterChanges {
         queue
             .as_com_ref::<IParamValueQueue>()
             .map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+}
+
+/// One point on its way into `process`: which parameter, where it arrived in
+/// the stream, and what it says.
+#[derive(Clone, Copy)]
+struct Point {
+    id: ParamID,
+    seq: u32,
+    offset: int32,
+    value: ParamValue,
+}
+
+/// Every point of one call, shared by the queues that read it.
+type Store = Rc<RefCell<Vec<Point>>>;
+
+/// One parameter's points: a run of the shared store.
+pub struct SliceQueue {
+    id: Cell<ParamID>,
+    start: Cell<usize>,
+    len: Cell<usize>,
+    store: Store,
+}
+
+impl SliceQueue {
+    fn point(&self, index: usize) -> Option<Point> {
+        (index < self.len.get())
+            .then(|| self.store.borrow().get(self.start.get() + index).copied())
+            .flatten()
+    }
+}
+
+impl Class for SliceQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for SliceQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id.get()
+    }
+
+    unsafe fn getPointCount(&self) -> int32 {
+        self.len.get() as int32
+    }
+
+    unsafe fn getPoint(
+        &self,
+        index: int32,
+        sample_offset: *mut int32,
+        value: *mut ParamValue,
+    ) -> tresult {
+        if sample_offset.is_null() || value.is_null() || index < 0 {
+            return kInvalidArgument;
+        }
+        let Some(point) = self.point(index as usize) else {
+            return kResultFalse;
+        };
+        unsafe {
+            *sample_offset = point.offset;
+            *value = point.value;
+        }
+        kResultOk
+    }
+
+    /// The host's changes are the host's to write. A plugin adding a point to
+    /// one would be writing into another parameter's run.
+    unsafe fn addPoint(
+        &self,
+        _sample_offset: int32,
+        _value: ParamValue,
+        _index: *mut int32,
+    ) -> tresult {
+        kResultFalse
+    }
+}
+
+/// The `IParameterChanges` a `process` call is handed, with one budget of
+/// points shared by every parameter.
+///
+/// Shared rather than a fixed number per parameter because the caller's
+/// stream decides how the points fall: eight parameters moving a point per
+/// sample need four thousand each, and the same budget split evenly across
+/// every queue the list could open would be tens of megabytes. Points
+/// are appended as they come and sorted into runs by [`finish`][Self::finish],
+/// which is what lets one parameter's points be contiguous without knowing
+/// ahead of time how many it will get.
+pub struct InputChanges {
+    store: Store,
+    queues: Vec<ComWrapper<SliceQueue>>,
+    used: Cell<usize>,
+    overflowed: Cell<bool>,
+}
+
+impl InputChanges {
+    /// `max_params` distinct parameters and `max_points` points among them,
+    /// per call. Both are hard limits from here on.
+    pub fn new(max_params: usize, max_points: usize) -> ComWrapper<InputChanges> {
+        let store: Store = Rc::new(RefCell::new(Vec::with_capacity(max_points)));
+        ComWrapper::new(InputChanges {
+            queues: (0..max_params)
+                .map(|_| {
+                    ComWrapper::new(SliceQueue {
+                        id: Cell::new(0),
+                        start: Cell::new(0),
+                        len: Cell::new(0),
+                        store: Rc::clone(&store),
+                    })
+                })
+                .collect(),
+            store,
+            used: Cell::new(0),
+            overflowed: Cell::new(false),
+        })
+    }
+
+    pub fn clear(&self) {
+        self.store.borrow_mut().clear();
+        self.used.set(0);
+        self.overflowed.set(false);
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.get()
+    }
+
+    /// Record `value` (normalized) for `id` at `sample_offset`, after every
+    /// point already recorded for it. Returns false, and remembers it, when
+    /// the budget is spent.
+    pub fn add_point(&self, id: ParamID, sample_offset: int32, value: ParamValue) -> bool {
+        let mut store = self.store.borrow_mut();
+        if store.len() == store.capacity() {
+            self.overflowed.set(true);
+            return false;
+        }
+        let seq = store.len() as u32;
+        store.push(Point {
+            id,
+            seq,
+            offset: sample_offset,
+            value,
+        });
+        true
+    }
+
+    /// Sort what was recorded into one run per parameter, in the order each
+    /// run's points arrived, and open a queue on each.
+    ///
+    /// An unstable sort on a key no two points share, so it is exact and
+    /// needs no scratch memory.
+    pub fn finish(&self) {
+        let mut store = self.store.borrow_mut();
+        store.sort_unstable_by_key(|point| (point.id, point.seq));
+        let mut used = 0;
+        let mut at = 0;
+        while at < store.len() {
+            let id = store[at].id;
+            let start = at;
+            while at < store.len() && store[at].id == id {
+                at += 1;
+            }
+            let Some(queue) = self.queues.get(used) else {
+                self.overflowed.set(true);
+                break;
+            };
+            queue.id.set(id);
+            queue.start.set(start);
+            queue.len.set(at - start);
+            used += 1;
+        }
+        self.used.set(used);
+    }
+
+    /// Every point, parameter by parameter, as the plugin will read them.
+    #[cfg(test)]
+    pub fn points(&self) -> Vec<(ParamID, int32, ParamValue)> {
+        let mut out = Vec::new();
+        for queue in &self.queues[..self.used.get()] {
+            for index in 0..queue.len.get() {
+                let point = queue.point(index).expect("inside the run");
+                out.push((queue.id.get(), point.offset, point.value));
+            }
+        }
+        out
+    }
+
+    pub fn for_each_last(&self, mut apply: impl FnMut(ParamID, ParamValue)) {
+        for queue in &self.queues[..self.used.get()] {
+            if let Some(point) = queue.len.get().checked_sub(1).and_then(|i| queue.point(i)) {
+                apply(queue.id.get(), point.value);
+            }
+        }
+    }
+}
+
+impl Class for InputChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for InputChanges {
+    unsafe fn getParameterCount(&self) -> int32 {
+        self.used.get() as int32
+    }
+
+    unsafe fn getParameterData(&self, index: int32) -> *mut IParamValueQueue {
+        if index < 0 || index as usize >= self.used.get() {
+            return std::ptr::null_mut();
+        }
+        self.queues[index as usize]
+            .as_com_ref::<IParamValueQueue>()
+            .map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+
+    /// See [`SliceQueue::addPoint`].
+    unsafe fn addParameterData(
+        &self,
+        _id: *const ParamID,
+        _index: *mut int32,
+    ) -> *mut IParamValueQueue {
+        std::ptr::null_mut()
     }
 }
 
@@ -353,6 +579,49 @@ mod tests {
         // Second parameter: queue pool exhausted.
         assert!(!changes.add_point(2, 0, 0.0));
         assert!(changes.overflowed());
+    }
+
+    /// Points for several parameters, interleaved in time, reach the plugin as
+    /// one queue each with every point in the order it arrived.
+    #[test]
+    fn input_points_are_sorted_into_one_run_per_parameter() {
+        let changes = InputChanges::new(4, 8);
+        assert!(changes.add_point(9, 0, 0.1));
+        assert!(changes.add_point(7, 0, 0.2));
+        assert!(changes.add_point(9, 16, 0.3));
+        assert!(changes.add_point(7, 16, 0.4));
+        assert!(changes.add_point(9, 32, 0.5));
+        changes.finish();
+        unsafe { assert_eq!(changes.getParameterCount(), 2) };
+        assert_eq!(
+            changes.points(),
+            vec![
+                (7, 0, 0.2),
+                (7, 16, 0.4),
+                (9, 0, 0.1),
+                (9, 16, 0.3),
+                (9, 32, 0.5)
+            ]
+        );
+    }
+
+    /// The point budget is one pool: a single parameter may use all of it,
+    /// and a point past it is dropped and remembered rather than allocated.
+    #[test]
+    fn the_input_point_budget_is_shared_and_never_grows() {
+        let changes = InputChanges::new(2, 3);
+        for offset in 0..3 {
+            assert!(changes.add_point(1, offset, 0.0));
+        }
+        assert!(!changes.add_point(2, 3, 0.0));
+        assert!(changes.overflowed());
+        changes.clear();
+        assert!(!changes.overflowed());
+        for id in 1..=3 {
+            assert!(changes.add_point(id, 0, 0.0));
+        }
+        changes.finish();
+        assert!(changes.overflowed(), "three parameters, two queues");
     }
 
     #[test]
