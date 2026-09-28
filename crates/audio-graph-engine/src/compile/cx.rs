@@ -59,6 +59,9 @@ pub(crate) struct ParamCx<'a> {
     /// that will say. See [`ParamCx::emit_follow`].
     follows: Vec<(usize, (NodeId, u8))>,
     outputs: Vec<(u16, Reg)>,
+    /// Register → the stage whose ops write it, which is the stage of the node
+    /// that allocated it.
+    reg_stage: Vec<u32>,
     lfo_nodes: Vec<NodeId>,
     latch_nodes: Vec<NodeId>,
     param_targets: Vec<ParamTarget>,
@@ -79,7 +82,10 @@ pub(crate) struct ParamHalf {
     /// [`ParamCx::emit_follow`].
     pub follows: Vec<(usize, (NodeId, u8))>,
     pub registers: usize,
+    /// Sorted by the stage that writes each register, then by lane.
     pub outputs: Vec<(u16, Reg)>,
+    /// One per stage: where its lanes sit in `outputs`.
+    pub output_spans: Vec<Span>,
     pub lfo_nodes: Vec<NodeId>,
     pub latch_nodes: Vec<NodeId>,
     pub param_targets: Vec<ParamTarget>,
@@ -107,6 +113,7 @@ impl<'a> ParamCx<'a> {
             span_start: 0,
             follows: Vec::new(),
             outputs: Vec::new(),
+            reg_stage: Vec::new(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             param_targets: Vec::new(),
@@ -136,13 +143,28 @@ impl<'a> ParamCx<'a> {
 
     pub(crate) fn finish(mut self) -> ParamHalf {
         self.ops.append(&mut self.deferred);
-        self.outputs.sort_unstable();
+        let stage_of = |reg: Reg| self.reg_stage.get(reg as usize).copied().unwrap_or(0);
+        self.outputs
+            .sort_unstable_by_key(|&(lane, reg)| (stage_of(reg), lane));
+        let output_spans = (0..self.spans.len() as u32)
+            .map(|stage| Span {
+                start: self
+                    .outputs
+                    .partition_point(|&(_, reg)| stage_of(reg) < stage)
+                    as u32,
+                end: self
+                    .outputs
+                    .partition_point(|&(_, reg)| stage_of(reg) <= stage)
+                    as u32,
+            })
+            .collect();
         ParamHalf {
             spans: self.spans,
             follows: self.follows,
             ops: self.ops,
             registers: self.next_reg,
             outputs: self.outputs,
+            output_spans,
             lfo_nodes: self.lfo_nodes,
             latch_nodes: self.latch_nodes,
             param_targets: self.param_targets,
@@ -206,6 +228,8 @@ impl<'a> ParamCx<'a> {
         }
         let reg = self.next_reg as Reg;
         self.next_reg += 1;
+        // The stage being compiled is the one whose span is not closed yet.
+        self.reg_stage.push(self.spans.len() as u32);
         Ok(reg)
     }
 

@@ -96,6 +96,14 @@ pub struct Stage {
     pub notes: Span,
     /// Its ops in `Program::audio_ops`.
     pub audio: Span,
+    /// The lanes its ops' registers drive, in `Program::outputs`.
+    ///
+    /// A stage writes these and no others. The consumer of a value may sit in
+    /// a later stage than the op that made it — a plugin with one socket fed
+    /// by an LFO and another by an envelope follower — and a later stage
+    /// writing every lane would copy the earlier stage's last row, which is
+    /// what its register holds by then, over every row of that lane.
+    pub outputs: Span,
     /// Which note buffers those note ops write, one bit each.
     ///
     /// The engine records where a buffer stood before each row so the

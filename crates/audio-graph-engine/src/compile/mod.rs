@@ -177,6 +177,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
             params: param.spans[index],
             notes: notes.spans[index],
             audio: audio.spans[index],
+            outputs: param.output_spans[index],
             note_bufs: notes.ops[notes.spans[index].range()]
                 .iter()
                 .map(|op| match *op {

@@ -35,6 +35,18 @@ pub const MAX_NOTE_BUFS: usize = 16;
 /// memory is trivial next to the audio pool.
 pub const NOTE_BUF_CAPACITY: usize = 256;
 
+/// The shortest gap between two controllers a [`NoteOp::Emit`] generates, in
+/// samples: about a third of a millisecond at 48 kHz.
+///
+/// A floor of its own rather than the parameter resolution. A controller is a
+/// note-stream event, and the stream has room for [`NOTE_BUF_CAPACITY`] of
+/// them a block: at a resolution of one sample a single moving controller
+/// would fill a 512-sample block's buffer halfway through, and what did not
+/// fit — the note-offs included — would be dropped, leaving notes hanging.
+/// Sixteen is the finest the controllers were ever sent at, and denser than
+/// MIDI itself carries them by a factor of three.
+pub const CC_INTERVAL: u32 = 16;
+
 /// Every MIDI channel. What a node that has no opinion about channels says.
 pub const ALL_CHANNELS: u16 = u16::MAX;
 

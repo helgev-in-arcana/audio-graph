@@ -303,9 +303,13 @@ impl NoteState {
                     let value = value.clamp(0.0, 1.0);
                     let last = &mut self.emitted[state as usize];
                     // NaN on the left of a comparison is never equal, which is
-                    // what makes the first row after a swap send.
-                    let moved = *last != value;
-                    *last = value;
+                    // what makes the first row after a swap send. Only rows
+                    // on the controller grid are looked at; see
+                    // [`CC_INTERVAL`].
+                    let moved = start.is_multiple_of(CC_INTERVAL) && *last != value;
+                    if moved {
+                        *last = value;
+                    }
 
                     let event = Event::Note(NoteEvent::Cc {
                         port: 0,

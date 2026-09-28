@@ -74,6 +74,10 @@ Program {
                 start: 0,
                 end: 3,
             },
+            outputs: Span {
+                start: 0,
+                end: 0,
+            },
             note_bufs: 1,
             chunking: WholeBlock,
         },

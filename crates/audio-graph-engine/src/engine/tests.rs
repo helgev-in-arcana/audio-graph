@@ -4992,3 +4992,161 @@ fn a_shorter_delay_never_lets_a_note_off_overtake_its_note_on() {
         "the release came after the note: {notes:?}"
     );
 }
+
+/// A lane keeps the rows of the stage that made its value, whatever stage
+/// its consumer sits in.
+///
+/// One plugin with a socket fed by an LFO and another by an envelope
+/// follower is two stages feeding one node. A later stage writing every lane
+/// would copy the LFO's last row — all its register holds by then — over
+/// every row of the LFO's lane, and over the end of the block too.
+#[test]
+fn a_later_stage_leaves_an_earlier_stages_lanes_alone() {
+    const BLOCK: u32 = 64;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(100.0),
+            phase: 0.0,
+            depth: 0.5,
+            offset: 0.5,
+        }),
+        [0.0, 0.0],
+    );
+    let follower = graph.add(
+        NodeKind::EnvelopeFollower(EnvelopeFollower {
+            detect: Detect::Peak,
+            attack: 0.0,
+            release: 0.0,
+        }),
+        [0.0, 0.0],
+    );
+    let sink = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                params: vec![
+                    ParamPort {
+                        id: 0,
+                        name: "rate".into(),
+                    },
+                    ParamPort {
+                        id: 1,
+                        name: "level".into(),
+                    },
+                ],
+                ..PluginPorts::default()
+            },
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(lfo, 0, sink, 0);
+    graph.connect(input, 0, follower, 0);
+    graph.connect(follower, 0, sink, 1);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[2]);
+    load(&mut engine, &graph);
+    assert_eq!(engine.stages(), 2, "the follower waits for the audio");
+
+    let mut schedule = SlotSchedule::new(width, BLOCK, 16).unwrap();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[],
+        BLOCK,
+        Granularity {
+            resolution: 16,
+            quantum: 32,
+        },
+        RATE,
+        120.0,
+        &[0.5; 2 * BLOCK as usize],
+        &mut [0.0; 2 * BLOCK as usize],
+        &mut Adders,
+    );
+    let rows: Vec<f64> = (0..4).map(|row| schedule.row(row)[SINK]).collect();
+    assert!(
+        rows.windows(2).all(|pair| pair[1] > pair[0]),
+        "the saw rises row by row: {rows:?}"
+    );
+    let end = schedule.end_row().expect("the engine reads the end")[SINK];
+    assert!(
+        end > rows[3],
+        "and is still rising at the end: {end} after {rows:?}"
+    );
+    assert_eq!(
+        schedule.row(2)[SINK + 1],
+        0.5,
+        "the follower's lane is its own"
+    );
+}
+
+/// A controller generated at the finest resolution leaves room for the notes.
+///
+/// A moving value is a new row every sample at a resolution of one, and a
+/// controller per row would fill the note buffer before the block was half
+/// over — dropping the note-off behind it and leaving the note hanging.
+#[test]
+fn a_fine_resolution_does_not_crowd_the_notes_out() {
+    const BLOCK: u32 = 512;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(10.0),
+            phase: 0.0,
+            depth: 0.5,
+            offset: 0.5,
+        }),
+        [0.0, 0.0],
+    );
+    let wheel = graph.add(
+        NodeKind::ParamToCc(ParamToCc { channel: 0, cc: 1 }),
+        [0.0, 0.0],
+    );
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(lfo, 0, wheel, 0);
+    graph.connect(notes, 0, wheel, 1);
+    graph.connect(wheel, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, 1).unwrap();
+    let mut heard = Heard::default();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[note_on(60, 0), note_off(60, BLOCK - 12)],
+        BLOCK,
+        Granularity {
+            resolution: 1,
+            quantum: 32,
+        },
+        RATE,
+        120.0,
+        &[],
+        &mut [0.0; 2 * BLOCK as usize],
+        &mut heard,
+    );
+    assert_eq!(engine.notes_dropped(), 0);
+    let seen = &heard.0[&0];
+    let controllers = seen
+        .iter()
+        .filter(|e| matches!(e, Event::Note(NoteEvent::Cc { .. })))
+        .count();
+    assert_eq!(controllers, (BLOCK / crate::ir::CC_INTERVAL) as usize);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::Note(NoteEvent::NoteOff { key: 60, .. }))),
+        "the note is let go"
+    );
+}

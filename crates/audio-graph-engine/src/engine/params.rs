@@ -445,7 +445,7 @@ impl Engine {
             }
         }
 
-        for &(lane, reg) in &program.outputs {
+        for &(lane, reg) in &program.outputs[stage.outputs.range()] {
             if let Some(target) = slots.get_mut(lane as usize) {
                 // Host automation and parameter slots are normalized to 0..1, while audio lanes
                 // carry physical units (decibels, seconds) without clamping.
