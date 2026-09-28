@@ -82,6 +82,7 @@ fn main() -> ExitCode {
         "follow" => cmd_follow(rest),
         "gui" => cmd_gui(rest),
         "editor" => cmd_editor(rest),
+        "live" => cmd_live(rest),
         "automate" => cmd_automate(rest),
         _ => {
             usage();
@@ -169,6 +170,10 @@ fn usage() {
                                     open the wrapper's editor with a plugin
                                     node already in the patch. Without SECONDS
                                     it stays up until the window is closed
+  host-cli live <WRAPPER.vst3> [SECONDS]
+                                    open the wrapper's editor on a patch whose
+                                    fallback controls are all driven by LFOs,
+                                    processing silence so their values move
   host-cli gui <PLUGIN> [ID [SECONDS]] [--reverse]
                                     open a plugin's editor and tear it down.
                                     Without SECONDS it stays up until the
@@ -3077,6 +3082,178 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
     );
     println!("teardown completed cleanly");
     Ok(())
+}
+
+/// Opens the wrapper's editor on [`live_patch`] with blocks running.
+///
+/// [`cmd_editor`] never processes, so a control that shows what its socket
+/// carries would show nothing there: these values come back from the audio
+/// thread. Blocks run on this thread between frames, which makes the LFOs
+/// slower than real time and changes nothing else about what is drawn.
+fn cmd_live(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use plugin_host::{AudioBuffers, BufferLayout, EventSink, TimeContext};
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let hold = hold_for(args.get(1))?;
+
+    let (class, mut probe) = render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+
+    let mut value: serde_json::Value = serde_json::from_str(&read_wrapper_state(&baseline)?)
+        .map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+    value["graph"] = serde_json::to_value(live_patch()).map_err(|e| e.to_string())?;
+    let state = edit_wrapper_state(&baseline, &value.to_string())?;
+
+    let mut sub = subhost_adapter::SubHost::new(Arc::new(host::CliHost::new()), SUB_HOST);
+    sub.load(0, Path::new(wrapper), Some(&class.id))?;
+    sub.load_sub_state(0, &state)?;
+    let frames = 512u32;
+    let mut processors = sub.activate(
+        plugin_host::AudioConfig {
+            sample_rate: 48_000.0,
+            max_block_size: frames,
+            input_channels: 2,
+            output_channels: 2,
+            aux_inputs: Default::default(),
+            aux_outputs: Default::default(),
+            offline: false,
+        },
+        &[],
+        &[],
+    )?;
+    sub.open_editor(0, std::ptr::null_mut())?;
+    println!("opened the wrapper's editor on a patch of LFO-driven controls");
+    match hold {
+        Some(limit) => println!("close the window, or wait {:.0}s", limit.as_secs_f64()),
+        None => println!("close the window when you are done looking"),
+    }
+
+    let mut schedule = subhost_adapter::SlotSchedule::new(SUB_HOST.lanes, frames, 32)?;
+    let input = vec![0.0f32; 2 * frames as usize];
+    let mut output = vec![0.0f32; 2 * frames as usize];
+    let mut sink = EventSink::with_capacity(256);
+    let context = TimeContext::default();
+    let started = Instant::now();
+    let mut blocks = 0u64;
+    while sub.editor_is_open(0) {
+        if hold.is_some_and(|limit| started.elapsed() >= limit) {
+            break;
+        }
+        plugin_host::pump_events();
+        sub.tick_editors();
+        if let Some(processor) = processors.get_mut(0) {
+            schedule.begin(frames)?;
+            let mut buffers =
+                AudioBuffers::new(&input, &mut output, 2, 2, frames, BufferLayout::Planar);
+            sink.clear();
+            processor.process(
+                &mut buffers,
+                schedule.view(),
+                &[],
+                0..frames,
+                &context,
+                &mut sink,
+            );
+            blocks += 1;
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    println!("{blocks} blocks processed");
+    sub.close_editor(0);
+    processors.deactivate();
+    sub.unload_all();
+    println!("teardown completed cleanly");
+    Ok(())
+}
+
+/// Every control that stands in for a socket, with an LFO in the socket.
+///
+/// Each chain ends at the audio output, because a node nothing depends on is
+/// not compiled and would have no value to show.
+fn live_patch() -> audio_graph_engine::Graph {
+    use audio_graph_engine::{Graph, Lfo, Math, MathOp, Rate, Switch, Tremolo, Waveform};
+
+    let lfo = |hz: f64, depth: f64, offset: f64| {
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Sine,
+            rate: Rate::Hz(hz),
+            phase: 0.0,
+            depth,
+            offset,
+        })
+    };
+    let mut graph = Graph::new();
+    let input = graph.add(
+        NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [40.0, 40.0],
+    );
+    let tremolo = graph.add(
+        NodeKind::Tremolo(Tremolo {
+            channels: 2,
+            waveform: Waveform::Sine,
+            rate: Rate::Hz(4.0),
+            depth: 0.5,
+        }),
+        [300.0, 40.0],
+    );
+    let mix = graph.add(
+        NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 2,
+            gains: vec![0.0, -6.0],
+        }),
+        [800.0, 40.0],
+    );
+    let output = graph.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [1060.0, 40.0],
+    );
+    let (write, read) = graph.add_delay(audio_graph_engine::PortType::STEREO, [300.0, 460.0]);
+    let math = graph.add(
+        NodeKind::Math(Math {
+            op: MathOp::Multiply,
+            b: 1.0,
+        }),
+        [560.0, 200.0],
+    );
+    let switch = graph.add(
+        NodeKind::Switch(Switch {
+            values: vec![-12.0, 0.0],
+            thresholds: vec![0.5],
+        }),
+        [560.0, 320.0],
+    );
+    let fast = graph.add(lfo(0.5, 0.5, 0.5), [40.0, 200.0]);
+    let slow = graph.add(lfo(0.1, 0.5, 0.5), [40.0, 320.0]);
+    let short = graph.add(lfo(0.2, 0.05, 0.1), [40.0, 460.0]);
+    let gain = graph.add(lfo(0.3, 20.0, -20.0), [300.0, 320.0]);
+
+    graph.connect(input, 0, tremolo, 0);
+    graph.connect(fast, 0, tremolo, 1);
+    graph.connect(tremolo, 0, mix, 0);
+    graph.connect(fast, 0, math, 0);
+    graph.connect(slow, 0, math, 1);
+    graph.connect(math, 0, mix, 1);
+    graph.connect(read, 0, mix, 2);
+    graph.connect(slow, 0, switch, 0);
+    graph.connect(gain, 0, switch, 1);
+    graph.connect(switch, 0, mix, 3);
+    graph.connect(short, 0, read, 0);
+    graph.connect(mix, 0, output, 0);
+    graph.connect(mix, 0, write, 0);
+    graph
 }
 
 /// Audio in -> one plugin node -> audio out, with the plugin's real sockets.

@@ -231,6 +231,16 @@ impl Engine {
         self.program.as_ref().is_some_and(|p| !p.is_empty())
     }
 
+    /// The current program's registers, as the last sub-block left them.
+    ///
+    /// Indexed by the registers in [`Program::output_registers`], and only
+    /// meaningful for the program that [`Engine::publication`] names: a
+    /// recompile may number them differently.
+    pub fn registers(&self) -> &[f64] {
+        let used = self.program.as_ref().map_or(0, |p| p.registers);
+        &self.registers[..used.min(self.registers.len())]
+    }
+
     /// The adopted publication within its publisher, or zero before adoption.
     pub fn publication(&self) -> u64 {
         self.program

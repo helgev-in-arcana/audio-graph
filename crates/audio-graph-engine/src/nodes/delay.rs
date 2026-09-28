@@ -11,7 +11,7 @@ use crate::graph::LineId;
 use crate::ir::{AudioOp, Op};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback, line_control};
+use crate::nodes::widgets::{NodeUi, decimals, fallback, line_control};
 use crate::port::{Port, PortType};
 
 /// The write endpoint of a delay line.
@@ -219,11 +219,12 @@ impl Node for DelayRead {
             changed = true;
         }
         changed
-            | fallback(ui, connected, |ui| {
+            | fallback(ui, connected, cx.input(port), time, |ui, time| {
                 ui.add(
                     egui::DragValue::new(time)
                         .speed(0.001)
                         .range(floor..=max_time)
+                        .fixed_decimals(decimals::SECONDS)
                         .suffix(" s"),
                 )
                 .on_hover_text("wire this socket to sweep it — the pitch moves with it")

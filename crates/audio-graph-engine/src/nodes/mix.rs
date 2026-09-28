@@ -4,7 +4,7 @@ use crate::compile::{AudioCx, CompileError, ParamCx};
 use crate::ir::{AudioOp, Buf, MixIn};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback};
+use crate::nodes::widgets::{NodeUi, decimals, fallback};
 use crate::port::{Port, PortType};
 
 /// Convert a decibel value to a linear amplitude multiplier.
@@ -167,7 +167,7 @@ impl Node for Mix {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port.is_multiple_of(2) {
             return false;
@@ -178,11 +178,15 @@ impl Node for Mix {
         let Some(gain) = self.gains.get_mut(port as usize / 2) else {
             return false;
         };
-        fallback(ui, connected, |ui| {
+        fallback(ui, connected, cx.input(port), gain, |ui, gain| {
             ui.add(
                 egui::DragValue::new(gain)
                     .speed(0.1)
                     .range(-100.0..=20.0)
+                    // The range is for dragging. A wired gain is applied
+                    // unclamped, so that is how it is shown.
+                    .clamp_existing_to_range(false)
+                    .fixed_decimals(decimals::DB)
                     .suffix(" dB"),
             )
             .changed()

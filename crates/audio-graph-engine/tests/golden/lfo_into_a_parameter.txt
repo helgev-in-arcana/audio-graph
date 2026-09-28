@@ -62,4 +62,13 @@ Program {
     ],
     dsp_nodes: [],
     note_delay_nodes: [],
+    output_registers: [
+        (
+            (
+                0,
+                0,
+            ),
+            0,
+        ),
+    ],
 }

@@ -13,6 +13,7 @@ mod notification;
 mod params;
 mod plugin;
 mod shared;
+mod sockets;
 mod state;
 mod tick;
 mod touched;

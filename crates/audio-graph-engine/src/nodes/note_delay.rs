@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback};
+use crate::nodes::widgets::{NodeUi, decimals, fallback};
 use crate::nodes::{Node, NoteDelay};
 use crate::port::{Port, PortType};
 
@@ -75,18 +75,28 @@ impl Node for MidiDelay {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port != 1 {
             return false;
         }
         let beats = self.beats;
-        let time = &mut self.time;
-        fallback(ui, connected, |ui| {
+        fallback(ui, connected, cx.input(port), &mut self.time, |ui, time| {
+            // A wired time is floored at zero and has no ceiling, so it is
+            // shown the same way; the range is only for dragging.
+            *time = time.max(0.0);
             ui.add(
                 egui::DragValue::new(time)
                     .speed(0.01)
                     .range(0.0..=60.0)
+                    .clamp_existing_to_range(false)
+                    // A beat count is a plain number here. Beats are better
+                    // set as a fraction, which this control is not.
+                    .fixed_decimals(if beats {
+                        decimals::PLAIN
+                    } else {
+                        decimals::SECONDS
+                    })
                     .suffix(if beats { " beats" } else { " s" }),
             )
             .changed()

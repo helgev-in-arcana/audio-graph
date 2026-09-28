@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::compile::{AudioCx, CompileError, ParamCx};
 use crate::ir::{AudioOp, RateSpec, Waveform};
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo, fallback, rate_control};
+use crate::nodes::widgets::{NodeUi, combo, decimals, fallback, rate_control};
 use crate::nodes::{Node, Rate};
 use crate::port::{Port, PortType};
 
@@ -109,16 +109,26 @@ impl Node for Tremolo {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port != 1 {
             return false;
         }
-        let depth = &mut self.depth;
-        fallback(ui, connected, |ui| {
-            ui.add(egui::DragValue::new(depth).speed(0.01).range(0.0..=1.0))
+        fallback(
+            ui,
+            connected,
+            cx.input(port),
+            &mut self.depth,
+            |ui, depth| {
+                ui.add(
+                    egui::DragValue::new(depth)
+                        .speed(0.01)
+                        .range(0.0..=1.0)
+                        .fixed_decimals(decimals::PLAIN),
+                )
                 .changed()
-        })
+            },
+        )
     }
 }
 
