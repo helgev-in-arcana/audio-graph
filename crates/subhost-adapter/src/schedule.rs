@@ -50,13 +50,16 @@ pub struct SlotSchedule {
     /// the ranges are disjoint and fixed, so each consumer reads its own and
     /// no other.
     lanes: usize,
-    /// Contiguous storage for scheduled values (`lanes` per row).
+    /// Contiguous storage for scheduled values (`lanes` per row), with the
+    /// end row after the last row the capacity allows.
     values: Vec<f64>,
     resolution: u32,
     /// Number of rows in the current audio block, set by [`begin`][Self::begin].
     rows: usize,
     frames: u32,
     max_frames: u32,
+    /// Whether the end row has been written since [`begin`][Self::begin].
+    end_written: bool,
 }
 
 /// Read-only view of the rows prepared for one audio block.
@@ -66,6 +69,7 @@ pub struct SlotSchedule {
 #[derive(Clone, Copy)]
 pub struct ScheduleView<'a> {
     values: &'a [f64],
+    end: Option<&'a [f64]>,
     lanes: usize,
     rows: usize,
     resolution: u32,
@@ -108,6 +112,16 @@ impl ScheduleView<'_> {
     pub fn rows(&self) -> &[f64] {
         self.values
     }
+
+    /// The lanes' values at the block's last sample boundary, `frames`, where
+    /// the next block's first row starts — when the caller worked them out.
+    ///
+    /// What lets a consumer that joins points with lines draw the last row's
+    /// line to where the value is going, rather than holding it flat until
+    /// the next block and stepping there.
+    pub fn end_row(&self) -> Option<&[f64]> {
+        self.end
+    }
 }
 
 impl<'a> ScheduleView<'a> {
@@ -126,11 +140,22 @@ impl<'a> ScheduleView<'a> {
         }
         Ok(Self {
             values,
+            end: None,
             lanes,
             rows,
             resolution,
             frames,
         })
+    }
+
+    /// The same view, with the values at the end of the block as well. See
+    /// [`end_row`][Self::end_row].
+    pub fn with_end(mut self, end: Option<&'a [f64]>) -> Result<Self, &'static str> {
+        if end.is_some_and(|end| end.len() != self.lanes) {
+            return Err("inconsistent schedule shape");
+        }
+        self.end = end;
+        Ok(self)
     }
 }
 
@@ -145,7 +170,8 @@ impl SlotSchedule {
         max_block: u32,
         resolution: u32,
     ) -> Result<SlotSchedule, &'static str> {
-        let capacity = (max_block.div_ceil(MIN_RESOLUTION).max(1) as usize)
+        // One more than the rows, for the end row.
+        let capacity = (max_block.div_ceil(MIN_RESOLUTION).max(1) as usize + 1)
             .checked_mul(lanes)
             .filter(|n| *n <= isize::MAX as usize / size_of::<f64>())
             .ok_or("schedule capacity overflow")?;
@@ -156,6 +182,7 @@ impl SlotSchedule {
             rows: 0,
             frames: 0,
             max_frames: max_block,
+            end_written: false,
         })
     }
 
@@ -190,6 +217,7 @@ impl SlotSchedule {
     /// Initializes the schedule for an audio block of `frames` samples and
     /// returns the row count.
     pub fn begin(&mut self, frames: u32) -> Result<usize, &'static str> {
+        self.end_written = false;
         if frames > self.max_frames {
             self.frames = 0;
             self.rows = 0;
@@ -233,6 +261,7 @@ impl SlotSchedule {
     pub fn view(&self) -> ScheduleView<'_> {
         ScheduleView {
             values: self.rows(),
+            end: self.end_row(),
             lanes: self.lanes,
             rows: self.rows,
             resolution: self.resolution,
@@ -248,12 +277,31 @@ impl SlotSchedule {
         &mut self.values[index * self.lanes..(index + 1) * self.lanes]
     }
 
+    /// The values at the end of the block, if they were written since
+    /// [`begin`][Self::begin]. See [`ScheduleView::end_row`].
+    pub fn end_row(&self) -> Option<&[f64]> {
+        let at = self.max_rows() * self.lanes;
+        self.end_written.then(|| &self.values[at..at + self.lanes])
+    }
+
+    /// The end row, to write. Handing it out counts as writing it: a caller
+    /// that asks for it and leaves it alone has said the block ends on the
+    /// values the row held before, which for a fresh block is all zeros.
+    pub fn end_row_mut(&mut self) -> &mut [f64] {
+        self.end_written = true;
+        let at = self.max_rows() * self.lanes;
+        &mut self.values[at..at + self.lanes]
+    }
+
     /// Fills all rows with uniform parameter values — the shape a wrapper with
     /// no graph running produces.
     pub fn fill(&mut self, values: &[f64]) {
         let n = values.len().min(self.lanes);
-        for index in 0..self.rows {
-            let row = self.row_mut(index);
+        let rows = (0..self.rows).map(|index| index * self.lanes);
+        let end = self.max_rows() * self.lanes;
+        self.end_written = true;
+        for at in rows.chain([end]) {
+            let row = &mut self.values[at..at + self.lanes];
             row[..n].copy_from_slice(&values[..n]);
             // Lanes the caller did not supply are graph-driven ones with no
             // graph running. Zeroing rather than leaving the last block's
@@ -370,6 +418,23 @@ mod tests {
         assert_eq!(view.row_at(32), 1);
         assert_eq!(view.row_at(99), 3);
         assert_eq!(view.row_at(100), 3, "the end of the block is the last row");
+    }
+
+    /// The end of the block is unknown until someone says what it is, and
+    /// every block starts without knowing it again.
+    #[test]
+    fn the_end_row_is_only_there_once_written() {
+        let mut schedule = SlotSchedule::new(2, 64, 1).unwrap();
+        schedule.begin(64).unwrap();
+        assert!(schedule.view().end_row().is_none());
+        schedule.row_mut(63).copy_from_slice(&[0.1, 0.2]);
+        schedule.end_row_mut().copy_from_slice(&[0.3, 0.4]);
+        assert_eq!(schedule.row(63), &[0.1, 0.2], "the last row is its own");
+        assert_eq!(schedule.view().end_row(), Some(&[0.3, 0.4][..]));
+        schedule.begin(64).unwrap();
+        assert!(schedule.end_row().is_none());
+        schedule.fill(&[0.5]);
+        assert_eq!(schedule.end_row(), Some(&[0.5, 0.0][..]));
     }
 
     #[test]

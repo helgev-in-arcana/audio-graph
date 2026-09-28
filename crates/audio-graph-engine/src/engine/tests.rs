@@ -69,6 +69,7 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
         sample_rate: RATE,
         tempo_bpm: 120.0,
         lanes: &[],
+        end: None,
         lanes_per_row: 0,
     }
 }
@@ -343,6 +344,126 @@ fn tempo_sync_follows_the_host() {
     );
 }
 
+/// Reading the end of a block moves nothing, and reads what the next block
+/// starts on.
+///
+/// The end row is the next block's first row worked out early. Were reading
+/// it to advance a phase, draw a random number or write a delay line, every
+/// block would be a row ahead of where it was, and the patch would sound
+/// different for being asked where it was going.
+#[test]
+fn the_end_of_a_block_is_where_the_next_one_starts_and_nothing_moves_to_find_it() {
+    const BLOCK: u32 = 48;
+    const RESOLUTION: u32 = 16;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+    // A saw into a delay line whose output is added to a random LFO: a
+    // phase, a line and the random state, all on the way to one lane.
+    let graph = {
+        let mut graph = Graph::new();
+        let lfo = |waveform, hz| {
+            NodeKind::Lfo(Lfo {
+                waveform,
+                rate: Rate::Hz(hz),
+                phase: 0.0,
+                depth: 0.25,
+                offset: 0.25,
+            })
+        };
+        let saw = graph.add(lfo(Waveform::Saw, 300.0), [0.0, 0.0]);
+        let random = graph.add(lfo(Waveform::Random, 2000.0), [0.0, 0.0]);
+        let write = graph.add(
+            NodeKind::DelayWrite(DelayWrite {
+                line: 0,
+                ty: PortType::Param,
+            }),
+            [0.0, 0.0],
+        );
+        let read = graph.add(
+            NodeKind::DelayRead(DelayRead {
+                line: 0,
+                ty: PortType::Param,
+                max_time: 1.0,
+                time: 2.0 * f64::from(RESOLUTION) / RATE,
+            }),
+            [0.0, 0.0],
+        );
+        let sum = graph.add(
+            NodeKind::Math(Math {
+                op: MathOp::Add,
+                b: 0.0,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(saw, 0, write, 0);
+        graph.connect(read, 0, sum, 0);
+        graph.connect(random, 0, sum, 1);
+        graph.connect(sum, 0, out, 0);
+        graph
+    };
+
+    // Row by row with nothing asked about the end: the reference.
+    let mut engine = Engine::new();
+    load(&mut engine, &graph);
+    let mut row = vec![0.0; width];
+    let alone: Vec<f64> = (0..4 * BLOCK / RESOLUTION)
+        .map(|index| {
+            engine.run(
+                &BlockContext {
+                    sample_rate: RATE,
+                    tempo_bpm: 120.0,
+                    frames: RESOLUTION,
+                    resolution: RESOLUTION,
+                    offset: index % (BLOCK / RESOLUTION) * RESOLUTION,
+                    block: BLOCK,
+                    row: index % (BLOCK / RESOLUTION),
+                },
+                &mut row,
+            );
+            row[SINK]
+        })
+        .collect();
+
+    // The same four blocks through `run_block`, which reads each one's end.
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, RESOLUTION).unwrap();
+    let mut rows = Vec::new();
+    let mut ends = Vec::new();
+    for _ in 0..4 {
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: RESOLUTION,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[],
+            &mut [],
+            &mut subhost_adapter::NoInstances,
+        );
+        rows.extend((0..schedule.row_count()).map(|index| schedule.row(index)[SINK]));
+        ends.push(schedule.end_row().expect("the engine reads the end")[SINK]);
+    }
+
+    assert_eq!(rows, alone, "reading the end moved nothing");
+    for (block, end) in ends.iter().take(3).enumerate() {
+        let next = rows[(block + 1) * (BLOCK / RESOLUTION) as usize];
+        assert_eq!(
+            *end,
+            next,
+            "block {block} ends where block {} starts",
+            block + 1
+        );
+    }
+}
+
 /// Helper creating a parameter feedback loop test graph.
 fn feedback_graph(time: f64) -> (Graph, NodeId) {
     let mut graph = Graph::new();
@@ -577,6 +698,7 @@ fn hear(graph: &Graph, events: &[Event], lanes: &[f64]) -> Heard {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -926,6 +1048,7 @@ fn a_controller_is_sent_once_until_it_moves() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
+                end: None,
                 lanes_per_row: width,
             },
             &[0.0; 2 * 8],
@@ -1117,6 +1240,7 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 64],
@@ -1243,6 +1367,7 @@ fn a_note_that_reaches_no_plugin_is_reported_ended() {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1293,6 +1418,7 @@ fn a_delivered_note_is_reported_only_when_the_plugin_ends_it() {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1402,6 +1528,7 @@ fn completion_policy_can_differ_between_instances() {
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     lanes: &row,
+                    end: None,
                     lanes_per_row: width,
                 },
                 &[0.0; 16],
@@ -1628,6 +1755,7 @@ fn a_note_lands_in_one_sub_block_only() {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
+            end: None,
             lanes_per_row: width,
         },
         &[0.0; 2 * 8],
@@ -1776,6 +1904,7 @@ fn the_boundary_a_block_starts_on_belongs_to_the_block_before() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
+                end: None,
                 lanes_per_row: width,
             },
             &[0.0; 2 * 8],
@@ -3243,6 +3372,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &[],
+                end: None,
                 lanes_per_row: width,
             };
             if staged {
@@ -3271,6 +3401,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 engine.run_audio(
                     &AudioContext {
                         lanes: &lanes,
+                        end: None,
                         ..audio
                     },
                     &daw_in,
@@ -3749,6 +3880,7 @@ fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: None,
                 lanes_per_row,
             },
             &vec![0.0; 2 * 128],
@@ -3823,6 +3955,7 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: None,
                 lanes_per_row,
             },
             &daw_in,
@@ -3951,6 +4084,7 @@ fn a_gate_passes_or_silences_by_its_control() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
+                end: None,
                 lanes_per_row: width,
             },
             &daw_in,
@@ -4027,6 +4161,7 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
+            end: None,
             lanes_per_row: width,
         },
         &vec![1.0f32; 2 * 64],
@@ -4151,6 +4286,7 @@ fn a_driven_gain_socket_interprets_its_value_as_decibels() {
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &lanes,
+            end: None,
             lanes_per_row,
         },
         &daw_in,

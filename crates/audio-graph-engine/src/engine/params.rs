@@ -49,6 +49,89 @@ impl Engine {
             return;
         }
 
+        self.eval_row(&program, stage, ctx, slots);
+
+        // Last, so that a reader in *this* row saw the previous one's
+        // stream. A parameter signal has the resolution of a row, so the value it
+        // wants is the one in effect at the boundary it just crossed, not one
+        // from the middle of the row about to start.
+        //
+        // The buffers are appended to rather than refilled, so where they
+        // stand now is both what this row's ops must skip and where the audio
+        // half will later find this row's events.
+        let row = ctx.row as usize;
+        let mut base = [0usize; MAX_NOTE_BUFS];
+        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
+            *slot = buf.events.len();
+        }
+        // Only for the buffers this stage fills. A later stage passing over
+        // the same rows would otherwise overwrite every mark with the length
+        // the buffer finished at, and the audio half would read the whole
+        // block as one row.
+        if let Some(marks) = self.note_marks.get_mut(row) {
+            for (buf, mark) in marks.iter_mut().enumerate() {
+                if stage.note_bufs & (1 << buf) != 0 {
+                    *mark = base[buf] as u32;
+                }
+            }
+        }
+        // Two disjoint fields, which is the whole reason the note half's
+        // state is a type of its own: the pass wants the block's stream by
+        // shared reference and everything it fills by exclusive one.
+        self.notes.run_notes_step(
+            &program,
+            stage,
+            &self.translated,
+            ctx.offset,
+            ctx.frames,
+            slots,
+            &base,
+            (ctx.sample_rate, ctx.tempo_bpm),
+            &mut self.ledger,
+        );
+        self.note_rows = self.note_rows.max(row + 1);
+
+        self.program = Some(program);
+    }
+
+    /// One stage's parameter ops at the end of the block, into `slots`,
+    /// leaving everything the ops carry from row to row where it was.
+    ///
+    /// `ctx` names the block's last sample boundary with a row of no frames.
+    /// The next block's first row is evaluated at that same instant, so this
+    /// is its value worked out early: what a consumer joining points with
+    /// lines needs to draw the last row's line to where the value is going.
+    /// Nothing moves because of it — no phase advances, no latch is set, no
+    /// delay line is written and no note is generated — so the next block
+    /// starts exactly where it would have without it.
+    pub fn run_stage_end(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
+        let Some(program) = self.program.take() else {
+            return;
+        };
+        if let Some(&stage) = program.stages.get(stage)
+            && !program.is_empty()
+        {
+            self.peek.save(
+                &self.lfos,
+                &self.latches,
+                &self.lines,
+                &self.registers,
+                self.rng,
+            );
+            self.eval_row(&program, stage, ctx, slots);
+            self.peek.restore(
+                &mut self.lfos,
+                &mut self.latches,
+                &mut self.lines,
+                &mut self.registers,
+                &mut self.rng,
+            );
+        }
+        self.program = Some(program);
+    }
+
+    /// One stage's parameter ops for one row, and the lanes they drive.
+    fn eval_row(&mut self, program: &Program, stage: Stage, ctx: &BlockContext, slots: &mut [f64]) {
         let dt = if ctx.sample_rate > 0.0 {
             f64::from(ctx.frames) / ctx.sample_rate
         } else {
@@ -177,7 +260,12 @@ impl Engine {
                         .unwrap_or(0.0);
                     let held = if held.is_finite() { held } else { 0.0 };
                     let time = if level > held { attack } else { release };
-                    let value = if time > 0.0 && dt > 0.0 {
+                    // An empty window says nothing about how loud anything is,
+                    // which is how the end of a block is read: as where the
+                    // envelope stands, not as silence.
+                    let value = if win.frames == 0 {
+                        held
+                    } else if time > 0.0 && dt > 0.0 {
                         let coeff = (-dt / time).exp();
                         held + (level - held) * (1.0 - coeff)
                     } else {
@@ -371,48 +459,6 @@ impl Engine {
                 };
             }
         }
-
-        // Last, so that a reader in *this* row saw the previous one's
-        // stream. A parameter signal has the resolution of a row, so the value it
-        // wants is the one in effect at the boundary it just crossed, not one
-        // from the middle of the row about to start.
-        //
-        // The buffers are appended to rather than refilled, so where they
-        // stand now is both what this row's ops must skip and where the audio
-        // half will later find this row's events.
-        let row = ctx.row as usize;
-        let mut base = [0usize; MAX_NOTE_BUFS];
-        for (slot, buf) in base.iter_mut().zip(self.notes.bufs.iter()) {
-            *slot = buf.events.len();
-        }
-        // Only for the buffers this stage fills. A later stage passing over
-        // the same rows would otherwise overwrite every mark with the length
-        // the buffer finished at, and the audio half would read the whole
-        // block as one row.
-        if let Some(marks) = self.note_marks.get_mut(row) {
-            for (buf, mark) in marks.iter_mut().enumerate() {
-                if stage.note_bufs & (1 << buf) != 0 {
-                    *mark = base[buf] as u32;
-                }
-            }
-        }
-        // Two disjoint fields, which is the whole reason the note half's
-        // state is a type of its own: the pass wants the block's stream by
-        // shared reference and everything it fills by exclusive one.
-        self.notes.run_notes_step(
-            &program,
-            stage,
-            &self.translated,
-            ctx.offset,
-            ctx.frames,
-            slots,
-            &base,
-            (ctx.sample_rate, ctx.tempo_bpm),
-            &mut self.ledger,
-        );
-        self.note_rows = self.note_rows.max(row + 1);
-
-        self.program = Some(program);
     }
 
     /// How loud one window of an audio buffer is, across its channels.

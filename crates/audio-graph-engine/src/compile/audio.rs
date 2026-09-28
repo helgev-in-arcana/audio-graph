@@ -84,6 +84,7 @@ mod tests {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             lanes: &[],
+            end: None,
             lanes_per_row: 0,
         }
     }

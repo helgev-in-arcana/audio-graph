@@ -572,15 +572,17 @@ impl SubHost {
             }
             entry.configure(config)?;
         }
-        // One event per bound parameter per row is the worst a caller can ask
-        // for, plus whatever the DAW sends us. Reserved at activation because
+        // One event per bound parameter per row, and one more for the end of
+        // the block, is the worst a caller can ask for, plus whatever the DAW
+        // sends us. Reserved at activation because
         // `process` is not allowed to grow it, and per instance because a row
         // per sample of the finest resolution times every lane would be tens
         // of megabytes for parameters nothing is bound to.
         let rows = config
             .max_block_size
             .div_ceil(crate::schedule::MIN_RESOLUTION)
-            .max(1) as usize;
+            .max(1) as usize
+            + 1;
         let capacity = |targets: usize| {
             targets
                 .checked_mul(rows)
@@ -884,6 +886,13 @@ impl SubHostProcessor {
             .max(chunk.start.saturating_add(1))
             .div_ceil(resolution) as usize)
             .min(slots.row_count());
+        let linear = self.interpolation == ParamInterpolation::Linear;
+        // Where the lanes are going at the end of the block, for a format
+        // that draws lines — and only in the call that reaches that end,
+        // because an earlier one hands over before the line would get there.
+        let block_end = (linear && chunk.end == slots.frames() && chunk.end > chunk.start)
+            .then(|| slots.end_row())
+            .flatten();
         for index in first..end {
             let offset = slots.offset(index) - chunk.start;
 
@@ -901,10 +910,18 @@ impl SubHostProcessor {
             }
 
             let values = slots.row(index);
-            // The row after this one, when this same call will send it. See
-            // the anchor below.
-            let next = (self.interpolation == ParamInterpolation::Linear && index + 1 < end)
-                .then(|| slots.row(index + 1));
+            // What comes after this row within this same call: the next row,
+            // or for the block's last row, the block's end. See the anchor
+            // below.
+            let next = if !linear {
+                None
+            } else if index + 1 < end {
+                Some(slots.row(index + 1))
+            } else if index + 1 == slots.row_count() {
+                block_end
+            } else {
+                None
+            };
             for (target_index, &(slot, target)) in self.targets.iter().enumerate() {
                 let Some(&normalized) = values.get(slot) else {
                     continue;
@@ -937,6 +954,47 @@ impl SubHostProcessor {
                         target: Target::Global,
                         value: normalized,
                         sample_offset: offset,
+                    }),
+                );
+            }
+        }
+
+        // The last row's line, drawn to where the value is going. A point at
+        // the block's last sample, on the line from the last row's start to
+        // the block's end: the next block's first point, one sample later,
+        // then lands on the end value itself. Holding flat to the end and
+        // stepping there instead would make every block boundary a step as
+        // tall as one row's worth of movement.
+        if let Some(end_values) = block_end {
+            let last = slots.row_count() - 1;
+            let from = slots.offset(last);
+            let at = slots.frames() - 1;
+            let fraction = f64::from(at - from) / f64::from(slots.frames() - from);
+            while next_note < events.len() && events[next_note].sample_offset() < at {
+                let event = events[next_note];
+                complete &= push(
+                    &mut self.scratch,
+                    event.at_offset(event.sample_offset() - chunk.start),
+                );
+                next_note += 1;
+            }
+            let values = slots.row(last);
+            for (target_index, &(slot, target)) in self.targets.iter().enumerate() {
+                let (Some(&held), Some(&going)) = (values.get(slot), end_values.get(slot)) else {
+                    continue;
+                };
+                let value = held + (going - held) * fraction;
+                if going == held || value == self.last_sent[target_index] {
+                    continue;
+                }
+                self.last_sent[target_index] = value;
+                complete &= push(
+                    &mut self.scratch,
+                    Event::Param(ParamEvent::SetNormalized {
+                        id: target.id,
+                        target: Target::Global,
+                        value,
+                        sample_offset: at - chunk.start,
                     }),
                 );
             }
@@ -1628,6 +1686,64 @@ mod tests {
         joined.interpolation = ParamInterpolation::Linear;
         run_scheduled(&mut joined, &schedule, &[]);
         assert_eq!(points(&seen), vec![(0, 0.5), (64, 0.5), (96, 0.8)]);
+    }
+
+    /// Where points are joined by lines, the last row's line runs to where
+    /// the value is going, so a block boundary is no step.
+    ///
+    /// Held flat to the end of the block and stepped at the next one's
+    /// start, a moving value would jump by one row's worth of movement once a
+    /// block, at a place the DAW chose. Where values are held, there is no
+    /// line to draw and nothing is added.
+    #[test]
+    fn the_last_row_is_drawn_to_the_end_of_the_block() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+        };
+        let block = |rows: [f64; 4], end: f64| {
+            let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+            schedule.begin(128).unwrap();
+            for (i, value) in rows.into_iter().enumerate() {
+                schedule.row_mut(i)[0] = value;
+            }
+            schedule.end_row_mut()[0] = end;
+            schedule
+        };
+        let last = |from: f64, to: f64| from + (to - from) * 31.0 / 32.0;
+
+        let rising = block([0.0, 0.25, 0.5, 0.75], 1.0);
+        let (mut held, seen) = harness(vec![(0, target)]);
+        run_scheduled(&mut held, &rising, &[]);
+        assert_eq!(
+            points(&seen),
+            vec![(0, 0.0), (32, 0.25), (64, 0.5), (96, 0.75)]
+        );
+
+        let (mut joined, seen) = harness(vec![(0, target)]);
+        joined.interpolation = ParamInterpolation::Linear;
+        run_scheduled(&mut joined, &rising, &[]);
+        assert_eq!(
+            points(&seen),
+            vec![
+                (0, 0.0),
+                (32, 0.25),
+                (64, 0.5),
+                (96, 0.75),
+                (127, last(0.75, 1.0))
+            ]
+        );
+
+        // A value that only starts moving at the end is anchored at the last
+        // row like any other, and the next block lands on where it went.
+        let (mut joined, seen) = harness(vec![(0, target)]);
+        joined.interpolation = ParamInterpolation::Linear;
+        run_scheduled(&mut joined, &block([0.5; 4], 0.8), &[]);
+        run_scheduled(&mut joined, &block([0.8; 4], 0.8), &[]);
+        assert_eq!(
+            points(&seen),
+            vec![(0, 0.5), (96, 0.5), (127, last(0.5, 0.8)), (0, 0.8)]
+        );
     }
 
     /// An anchor is only placed inside the call that moves the value: the

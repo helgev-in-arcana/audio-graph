@@ -254,3 +254,75 @@ pub(super) fn reorder<S: Slot>(slots: &mut [S], order: &mut [usize], want: &[u32
         slot.set_node(u32::MAX);
     }
 }
+
+/// What the parameter ops carry from row to row, held aside while the end of
+/// a block is read and put back afterwards. See [`Engine::run_stage_end`].
+///
+/// Values only, into buffers sized once: the ops write phases, latches, delay
+/// heads, registers and the random state, and nothing else. A delay line's
+/// ring is left alone, because the one slot the read writes is the one the
+/// next real write overwrites before any read can reach it.
+pub(super) struct Peek {
+    lfos: Vec<(f64, f64)>,
+    latches: Vec<f64>,
+    heads: Vec<usize>,
+    registers: Vec<f64>,
+    rng: u32,
+}
+
+impl Peek {
+    pub(super) fn new() -> Peek {
+        Peek {
+            lfos: vec![(0.0, 0.0); MAX_LFOS],
+            latches: vec![0.0; MAX_LATCHES],
+            heads: vec![0; MAX_DELAY_LINES],
+            registers: vec![0.0; MAX_REGISTERS],
+            rng: 0,
+        }
+    }
+
+    pub(super) fn save(
+        &mut self,
+        lfos: &[Lfo],
+        latches: &[Latch],
+        lines: &[ParamLine],
+        registers: &[f64],
+        rng: u32,
+    ) {
+        for (to, lfo) in self.lfos.iter_mut().zip(lfos) {
+            *to = (lfo.phase, lfo.hold);
+        }
+        for (to, latch) in self.latches.iter_mut().zip(latches) {
+            *to = latch.value;
+        }
+        for (to, line) in self.heads.iter_mut().zip(lines) {
+            *to = line.head;
+        }
+        let n = registers.len().min(self.registers.len());
+        self.registers[..n].copy_from_slice(&registers[..n]);
+        self.rng = rng;
+    }
+
+    pub(super) fn restore(
+        &self,
+        lfos: &mut [Lfo],
+        latches: &mut [Latch],
+        lines: &mut [ParamLine],
+        registers: &mut [f64],
+        rng: &mut u32,
+    ) {
+        for (lfo, &(phase, hold)) in lfos.iter_mut().zip(&self.lfos) {
+            lfo.phase = phase;
+            lfo.hold = hold;
+        }
+        for (latch, &value) in latches.iter_mut().zip(&self.latches) {
+            latch.value = value;
+        }
+        for (line, &head) in lines.iter_mut().zip(&self.heads) {
+            line.head = head;
+        }
+        let n = registers.len().min(self.registers.len());
+        registers[..n].copy_from_slice(&self.registers[..n]);
+        *rng = self.rng;
+    }
+}

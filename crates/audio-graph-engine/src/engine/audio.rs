@@ -156,7 +156,8 @@ impl Engine {
             ctx.frames.div_ceil(ctx.resolution.max(1)) as usize,
             ctx.resolution,
             ctx.frames,
-        ) else {
+        )
+        .and_then(|view| view.with_end(ctx.end)) else {
             daw_out.fill(0.0);
             return;
         };

@@ -42,7 +42,7 @@ mod params;
 mod tests;
 
 use audio::Window;
-use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Slot, copy_ring, reorder};
+use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, copy_ring, reorder};
 use notes::{NoteState, key_bit};
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
@@ -98,7 +98,10 @@ pub struct AudioContext<'a> {
     /// the beat.
     pub tempo_bpm: f64,
     pub lanes: &'a [f64],
-    /// Number of lanes per row row.
+    /// The lanes at the end of the block, when the parameter half worked them
+    /// out. See [`ScheduleView::end_row`].
+    pub end: Option<&'a [f64]>,
+    /// Number of lanes per row.
     pub lanes_per_row: usize,
 }
 
@@ -224,6 +227,9 @@ pub struct Engine {
     /// swap allocates nothing.
     order: Vec<usize>,
     rng: u32,
+    /// Where the parameter ops' state is held while the end of a block is
+    /// read. See [`Engine::run_stage_end`].
+    peek: Peek,
 }
 
 impl Default for Engine {
@@ -273,6 +279,7 @@ impl Engine {
             // Any odd seed; the sequence only has to be uncorrelated, not
             // unpredictable.
             rng: 0x2545_F491,
+            peek: Peek::new(),
         }
     }
 
@@ -682,12 +689,9 @@ impl Engine {
             schedule.fill(daw_slots);
             return false;
         }
-        for index in 0..rows {
-            let values = schedule.row_mut(index);
-            let slots = daw_slots.len().min(values.len());
-            values[..slots].copy_from_slice(&daw_slots[..slots]);
-            values[slots..].fill(0.0);
-        }
+        // Every row, the end row included, starts as the DAW's values; the
+        // stages overwrite the lanes the graph drives.
+        schedule.fill(daw_slots);
         self.begin_block(events);
         self.clear_output(daw_out);
         for stage in 0..self.stages() {
@@ -706,6 +710,20 @@ impl Engine {
                     schedule.row_mut(index),
                 );
             }
+            // Before the audio, which is where a sub-plugin reads it.
+            self.run_stage_end(
+                stage,
+                &BlockContext {
+                    sample_rate,
+                    tempo_bpm,
+                    frames: 0,
+                    resolution: schedule.resolution(),
+                    offset: frames,
+                    block: frames,
+                    row: rows as u32,
+                },
+                schedule.end_row_mut(),
+            );
             let view = schedule.view();
             self.run_audio_stage(
                 stage,
@@ -716,6 +734,7 @@ impl Engine {
                     sample_rate,
                     tempo_bpm,
                     lanes: view.rows(),
+                    end: view.end_row(),
                     lanes_per_row: view.lanes(),
                 },
                 daw_in,
