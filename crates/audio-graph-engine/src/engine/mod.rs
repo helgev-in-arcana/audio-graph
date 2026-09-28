@@ -23,16 +23,16 @@ use plugin_host::{Event, NoteEvent};
 
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DSP_VALUES, Detect, Follow,
+    AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, DSP_VALUES, Detect, Follow,
     MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS, MAX_COMPENSATION,
     MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
     MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp,
     NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand, PreparedProgram,
-    Program, RateSpec, Stage, Waveform,
+    Program, QUANTUM_CHOICES, RateSpec, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
-use subhost_adapter::{AudioChunk, AudioInstances, MIN_QUANTUM, ScheduleView, SlotSchedule};
+use subhost_adapter::{AudioChunk, AudioInstances, MIN_RESOLUTION, ScheduleView, SlotSchedule};
 
 mod audio;
 mod lines;
@@ -48,49 +48,57 @@ use notes::{NoteState, key_bit};
 /// Sentinel indicating that no ring buffer currently holds this delay line.
 const NOT_PRESENT: usize = usize::MAX;
 
-/// Context for evaluating one parameter sub-block.
+/// Context for evaluating one parameter row.
 #[derive(Debug, Clone, Copy)]
 pub struct BlockContext {
     pub sample_rate: f64,
     pub tempo_bpm: f64,
     /// Number of audio frames processed during this evaluation. Phases advance
-    /// by this much afterwards, which is what makes the sub-block rate a
-    /// property of the caller rather than of the engine.
+    /// by this much afterwards, which is what makes the row rate a property of
+    /// the caller rather than of the engine.
     pub frames: u32,
-    /// Where this sub-block starts inside the DAW's block.
+    /// The parameter resolution: how many frames a full row covers.
+    ///
+    /// Not always `frames`, because the last row of a block is short whenever
+    /// the block is not a multiple of it. What is counted in rows — a
+    /// parameter delay's length — is counted in full ones.
+    pub resolution: u32,
+    /// Where this row starts inside the DAW's block.
     pub offset: u32,
     /// Frames in the whole DAW block, which is how the audio buffers are
     /// packed. Only [`Op::Follow`] needs it — it is the one parameter op that
     /// reads one. See [`Window`].
     pub block: u32,
-    /// Which sub-block this is, counting from the start of the DAW's block.
+    /// Which row this is, counting from the start of the DAW's block.
     ///
-    /// The same number as the lane grid's row. Carried rather than divided out
-    /// of `offset`, because the last sub-block of a block is short whenever the
-    /// block is not a multiple of the quantum, and because each stage walks the
-    /// sub-blocks from the start again so a counter would not do either.
+    /// Carried rather than divided out of `offset`, because the last row of a
+    /// block is short whenever the block is not a multiple of the resolution,
+    /// and because each stage walks the rows from the start again so a
+    /// counter would not do either.
     pub row: u32,
 }
 
 /// Context for evaluating one whole block of audio.
 ///
 /// The lanes are the same buffer the parameter side fills: one row of values
-/// per sub-block boundary. The audio half reads only its own range of lane
+/// every `resolution` samples. The audio half reads only its own range of lane
 /// numbers out of it — delay times, and the like — and passes the rest through
 /// untouched. It does not know what a parameter is.
 #[derive(Debug, Clone, Copy)]
 pub struct AudioContext<'a> {
     pub frames: u32,
-    /// Sub-block chunk size in frames. Chunk boundaries are computed from it
-    /// the same way the wrapper's slot schedule does, so chunk `i` and lane row
-    /// `i` cover the same samples.
+    /// Sub-block chunk size in frames, for a stage that runs at
+    /// [`Chunking::SubBlock`].
     pub quantum: u32,
+    /// How many frames one lane row covers. Independent of `quantum`: a chunk
+    /// may cover many rows, or sit inside one.
+    pub resolution: u32,
     pub sample_rate: f64,
     /// The host's tempo, for audio ops that follow it — a tremolo synced to
     /// the beat.
     pub tempo_bpm: f64,
     pub lanes: &'a [f64],
-    /// Number of lanes per sub-block row.
+    /// Number of lanes per row row.
     pub lanes_per_row: usize,
 }
 
@@ -99,6 +107,53 @@ impl AudioContext<'_> {
         self.lanes
             .get(row * self.lanes_per_row + lane as usize)
             .copied()
+    }
+
+    /// The row in force at sample `at` of the block.
+    fn row_at(&self, at: usize) -> usize {
+        at / (self.resolution as usize).max(1)
+    }
+
+    /// Frames from `at` to the next row boundary, or to `end`, whichever
+    /// comes first. What an op that follows a lane steps by.
+    fn run_from(&self, at: usize, end: usize) -> usize {
+        let resolution = (self.resolution as usize).max(1);
+        (resolution - at % resolution).min(end - at)
+    }
+}
+
+/// How finely one block is cut, for parameters and for audio.
+///
+/// Two numbers rather than one. A parameter row is where a value is known; a
+/// sub-block is how often a stage caught in an audio feedback loop runs. Tying
+/// them would make an LFO's smoothness cost a call to every synth in the loop,
+/// and a short feedback delay cost an event per row to every sub-plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Granularity {
+    /// Samples per parameter row. See [`subhost_adapter::RESOLUTION_CHOICES`].
+    pub resolution: u32,
+    /// Samples per audio chunk for a stage at [`Chunking::SubBlock`]. See
+    /// [`QUANTUM_CHOICES`].
+    pub quantum: u32,
+}
+
+impl Default for Granularity {
+    fn default() -> Self {
+        Granularity {
+            resolution: subhost_adapter::DEFAULT_RESOLUTION,
+            quantum: DEFAULT_QUANTUM,
+        }
+    }
+}
+
+impl Granularity {
+    /// The sub-block size, held to the offered range. A saved value from
+    /// elsewhere may be anything, and zero would never finish a block.
+    fn quantum(self) -> u32 {
+        self.quantum.clamp(
+            QUANTUM_CHOICES[0],
+            QUANTUM_CHOICES[QUANTUM_CHOICES.len() - 1],
+        )
     }
 }
 
@@ -128,14 +183,14 @@ pub struct Engine {
     chunk_out: Vec<f32>,
     /// What the note half fills in. See [`NoteState`].
     notes: NoteState,
-    /// Where each note buffer stood before each sub-block was appended to it.
+    /// Where each note buffer stood before each row was appended to it.
     ///
-    /// One row per sub-block the schedule can produce, sized in `prepare`. It
+    /// One row per row the schedule can produce, sized in `prepare`. It
     /// is what lets the audio half find its chunk's events in a buffer that
     /// holds the whole block: a chunk covers a contiguous run of rows, so its
     /// events are `note_marks[first] .. note_marks[end]`.
     note_marks: Vec<[u32; MAX_NOTE_BUFS]>,
-    /// How many sub-blocks of the current block the parameter half has run.
+    /// How many rows of the current block the parameter half has run.
     /// Rows past this have stale marks and the buffer's end is the answer.
     note_rows: usize,
     /// The DAW's stream for the block being processed, with every note given
@@ -231,7 +286,7 @@ impl Engine {
         self.program.as_ref().is_some_and(|p| !p.is_empty())
     }
 
-    /// The current program's registers, as the last sub-block left them.
+    /// The current program's registers, as the last row left them.
     ///
     /// Indexed by the registers in [`Program::output_registers`], and only
     /// meaningful for the program that [`Engine::publication`] names: a
@@ -437,12 +492,14 @@ impl Engine {
             buf.events.clear();
         }
         self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
-        // One row per sub-block the schedule can cut the block into, at the
-        // finest quantum it offers, plus one so a chunk ending on the last row
+        // One row per row the schedule can cut the block into, at the finest
+        // resolution it offers, plus one so a chunk ending on the last row
         // still has a row to ask about.
         self.note_marks.clear();
-        self.note_marks
-            .resize(self.stride / MIN_QUANTUM as usize + 2, [0; MAX_NOTE_BUFS]);
+        self.note_marks.resize(
+            self.stride / MIN_RESOLUTION as usize + 2,
+            [0; MAX_NOTE_BUFS],
+        );
         self.note_rows = 0;
         self.notes.dropped = 0;
         self.compensators.clear();
@@ -461,9 +518,9 @@ impl Engine {
     /// carry an id at all.
     ///
     /// This is also where the note buffers are emptied — all but the last
-    /// sub-block of the block that just ended.
+    /// row of the block that just ended.
     ///
-    /// That tail is what the first sub-block of this block reads. A parameter
+    /// That tail is what the first row of this block reads. A parameter
     /// op reads the stream in force at the boundary it has just crossed, and
     /// at the first boundary of a block that stream belongs to the block
     /// before: dropping it would make every controller snap back to its
@@ -547,7 +604,7 @@ impl Engine {
     /// How many stages the active program is cut into.
     ///
     /// A caller that runs audio walks these itself, alternating
-    /// [`run_stage`][Engine::run_stage] over the sub-blocks with
+    /// [`run_stage`][Engine::run_stage] over the rows with
     /// [`run_audio_stage`][Engine::run_audio_stage], because a stage's
     /// parameters may be read off the audio the stage before it made.
     pub fn stages(&self) -> usize {
@@ -578,7 +635,7 @@ impl Engine {
     /// audio feedback delay loops are present.
     ///
     /// Runs after [`begin_block`][Engine::begin_block] and one
-    /// [`run`][Engine::run] per sub-block, in that order. The note buffers are
+    /// [`run`][Engine::run] per row, in that order. The note buffers are
     /// filled by those calls and read here; calling this without them hands
     /// the sub-plugins the previous block's events, or none at all.
     ///
@@ -606,17 +663,17 @@ impl Engine {
         daw_slots: &[f64],
         events: &[Event],
         frames: u32,
-        quantum: u32,
+        granularity: Granularity,
         sample_rate: f64,
         tempo_bpm: f64,
         daw_in: &[f32],
         daw_out: &mut [f32],
         nodes: &mut dyn AudioInstances,
     ) -> bool {
-        if schedule.quantum() != quantum {
-            schedule.set_quantum(quantum);
+        if schedule.resolution() != granularity.resolution {
+            schedule.set_resolution(granularity.resolution);
         }
-        let Ok(blocks) = schedule.begin(frames) else {
+        let Ok(rows) = schedule.begin(frames) else {
             daw_out.fill(0.0);
             return false;
         };
@@ -625,8 +682,8 @@ impl Engine {
             schedule.fill(daw_slots);
             return false;
         }
-        for index in 0..blocks {
-            let values = schedule.block_mut(index);
+        for index in 0..rows {
+            let values = schedule.row_mut(index);
             let slots = daw_slots.len().min(values.len());
             values[..slots].copy_from_slice(&daw_slots[..slots]);
             values[slots..].fill(0.0);
@@ -634,18 +691,19 @@ impl Engine {
         self.begin_block(events);
         self.clear_output(daw_out);
         for stage in 0..self.stages() {
-            for index in 0..blocks {
+            for index in 0..rows {
                 self.run_stage(
                     stage,
                     &BlockContext {
                         sample_rate,
                         tempo_bpm,
                         frames: schedule.frames_of(index),
+                        resolution: schedule.resolution(),
                         offset: schedule.offset(index),
                         block: frames,
                         row: index as u32,
                     },
-                    schedule.block_mut(index),
+                    schedule.row_mut(index),
                 );
             }
             let view = schedule.view();
@@ -653,7 +711,8 @@ impl Engine {
                 stage,
                 &AudioContext {
                     frames,
-                    quantum: view.quantum(),
+                    quantum: granularity.quantum(),
+                    resolution: view.resolution(),
                     sample_rate,
                     tempo_bpm,
                     lanes: view.rows(),

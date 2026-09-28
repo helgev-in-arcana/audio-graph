@@ -81,11 +81,13 @@ pub struct NodeUi<'a> {
     pub inputs: &'a [Option<f64>],
     /// Whether the hosted plugin supports polyphonic parameter modulation.
     pub poly_modulation: bool,
-    /// The sub-block size and the sample rate, which together are the floor a
-    /// delay time cannot go below. The editor shows it and holds the control at
-    /// it; the audio thread applies it again regardless, because these two can
-    /// change while a patch is loaded.
+    /// The sub-block size, the parameter resolution and the sample rate, which
+    /// together are the floors a delay time cannot go below: an audio delay's
+    /// is one sub-block, a parameter delay's one row. The editor shows them and
+    /// holds the control at them; the audio thread applies them again
+    /// regardless, because all three can change while a patch is loaded.
     pub quantum: u32,
+    pub resolution: u32,
     pub sample_rate: f64,
     /// Indexed by instance number, so a plugin node can look itself up.
     pub instances: &'a [InstanceView],
@@ -122,8 +124,8 @@ pub(crate) mod decimals {
     pub(crate) const PLAIN: usize = 3;
     /// A tenth of a decibel is about the smallest change anyone hears.
     pub(crate) const DB: usize = 1;
-    /// A millisecond. The shortest delay is one sub-block, about 0.67 ms at a
-    /// quantum of 32 and 48 kHz, which ten-millisecond steps would hide.
+    /// A millisecond. The shortest audio delay is one sub-block, about 0.67 ms
+    /// at a quantum of 32 and 48 kHz, which ten-millisecond steps would hide.
     pub(crate) const SECONDS: usize = 3;
 }
 

@@ -1,9 +1,9 @@
-//! The parameter half: scalar ops over the register file, one sub-block at a time.
+//! The parameter half: scalar ops over the register file, one row at a time.
 
 use super::*;
 
 impl Engine {
-    /// Every stage's parameter and note ops for one sub-block.
+    /// Every stage's parameter and note ops for one row.
     ///
     /// Overwrites slot table values for lanes driven by the graph.
     ///
@@ -30,11 +30,11 @@ impl Engine {
         }
     }
 
-    /// One stage's parameter and note ops for one sub-block.
+    /// One stage's parameter and note ops for one row.
     ///
-    /// Called once per sub-block, in order, before that stage's audio ops.
+    /// Called once per row, in order, before that stage's audio ops.
     /// What a parameter op reads out of a note buffer is everything the buffer
-    /// holds, which is the stream up to the boundary this sub-block starts on.
+    /// holds, which is the stream up to the boundary this row starts on.
     pub fn run_stage(&mut self, stage: usize, ctx: &BlockContext, slots: &mut [f64]) {
         // Moved out and put back rather than borrowed.
         let Some(program) = self.program.take() else {
@@ -55,9 +55,11 @@ impl Engine {
             0.0
         };
 
-        // Parameter delay distance converted to sub-block taps.
-        let taps_per_second = if ctx.frames > 0 && ctx.sample_rate > 0.0 {
-            ctx.sample_rate / f64::from(ctx.frames)
+        // Parameter delay distance converted to rows. A full row's length
+        // rather than this one's: the last row of a block is short, and a
+        // delay measured against it would jump once per block.
+        let taps_per_second = if ctx.resolution > 0 && ctx.sample_rate > 0.0 {
+            ctx.sample_rate / f64::from(ctx.resolution)
         } else {
             0.0
         };
@@ -163,9 +165,9 @@ impl Engine {
                         .get(buf as usize)
                         .map_or(0, |&w| (w as usize).min(MAX_CHANNELS));
                     let level = self.loudness(buf, width, win, detect);
-                    // One pole per sub-block, which is as often as a parameter
-                    // is allowed to move. `dt` is this sub-block's length, so
-                    // the times mean the same thing at any quantum and any
+                    // One pole per row, which is as often as a parameter
+                    // is allowed to move. `dt` is this row's length, so
+                    // the times mean the same thing at any resolution and any
                     // block size. A time of zero is a coefficient of zero,
                     // which is following exactly.
                     let held = self
@@ -280,7 +282,7 @@ impl Engine {
                     cc,
                     initial,
                 } => {
-                    // The last matching event wins: within one sub-block a
+                    // The last matching event wins: within one row a
                     // controller may move several times, and what the boundary
                     // carries is where it ended up.
                     let latest = self
@@ -370,10 +372,10 @@ impl Engine {
             }
         }
 
-        // Last, so that a reader in *this* sub-block saw the previous one's
-        // stream. A parameter signal has sub-block resolution, so the value it
+        // Last, so that a reader in *this* row saw the previous one's
+        // stream. A parameter signal has the resolution of a row, so the value it
         // wants is the one in effect at the boundary it just crossed, not one
-        // from the middle of the sub-block about to start.
+        // from the middle of the row about to start.
         //
         // The buffers are appended to rather than refilled, so where they
         // stand now is both what this row's ops must skip and where the audio
@@ -447,7 +449,7 @@ impl Engine {
         key_bit(i16::from(key)).is_some_and(|bit| table & bit != 0)
     }
 
-    /// Whether `key` was struck in the sub-block `buf` last carried.
+    /// Whether `key` was struck in the row `buf` last carried.
     fn struck(&self, buf: u16, key: u8) -> bool {
         let table = self
             .notes

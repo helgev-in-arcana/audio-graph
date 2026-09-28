@@ -12,7 +12,7 @@ sub-plugin's own parameters, nesting one plugin's state inside another's, and
 deciding what to do with the sub-plugin's edit notifications.
 
 **Upward.** Nothing here knows what AudioGraph is. The wrapper above decides how
-many slots to publish, how many lanes a sub-block carries and what its saved
+many slots to publish, how many lanes a row carries and what its saved
 document looks like, and hands those in (`SubHostConfig`, `SlotSchedule`,
 `SubHostState`). A different wrapper — a chain, a rack, a bare pair of plugins —
 makes different choices and gets the same crate.
@@ -22,7 +22,8 @@ makes different choices and gets the same crate.
 - Loading, unloading and re-finding sub-plugins, and holding the loaded ones.
 - The slot table: the parameters the wrapper publishes to the DAW, and their
   bindings to sub-plugin parameters.
-- The sub-block schedule those values travel in.
+- The schedule those values travel in: a row of lane values every
+  `resolution` samples.
 - Forwarding the DAW's transport down and combining latency on the way up.
 - Turning slot and lane values into sample-accurate parameter events, merged in
   order with the DAW's own, per chunk.
@@ -99,8 +100,11 @@ processors. `SlotSchedule::new`, `begin`, and `ScheduleView::from_parts` return
 errors for unrepresentable capacities or inconsistent shapes. A block beyond
 the schedule's capacity is rejected instead of partially covered. Zero lanes
 are valid for a host that supplies only incoming events.
-Changing quantum updates the row count without reallocating; callers fill the
-new grid before processing. Existing values are not automatically resampled.
+The schedule is sized for a row per sample, so changing the resolution updates
+the row count without reallocating; callers fill the new grid before
+processing. Existing values are not automatically resampled. The resolution is
+independent of how the caller chunks audio: a call covering part of a block
+sends the rows that start inside it, however many or few that is.
 
 ### One parameter has one effective scheduled input
 

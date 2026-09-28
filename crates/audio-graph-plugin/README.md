@@ -9,7 +9,7 @@ the only crate in the workspace that knows AudioGraph is a product.
   input, an instrument without one — because plugin categories are static while
   the sub-plugin's kind is not.
 - Choosing AudioGraph's numbers: how many slots to publish, how many instances a
-  patch may hold, how many lanes a sub-block carries. They are handed to
+  patch may hold, how many lanes a parameter row carries. They are handed to
   `subhost-adapter` as configuration, which never names one itself.
 - The editor: the node canvas, the slot table, the plugin browser.
 - Connecting `audio-graph-settings` to the host scanner and catalogue, and

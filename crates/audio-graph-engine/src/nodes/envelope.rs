@@ -18,14 +18,14 @@ use crate::port::{Port, PortType};
 /// compressor plugin with a hidden sidechain input — is exactly the invisible
 /// route the canvas exists to replace.
 ///
-/// The reading is per sub-block, because that is what a parameter is: the
+/// The reading is per parameter row, because that is what a parameter is: the
 /// value in force at a boundary. So the attack and release cannot be shorter
-/// than one sub-block, and at the default quantum of 32 that is two thirds of
-/// a millisecond at 48 kHz. Fast enough for a compressor, not for a clipper.
+/// than one row, and at the default resolution of 32 that is two thirds of a
+/// millisecond at 48 kHz. Fast enough for a compressor, not for a clipper.
 ///
 /// There is no latency. The stage holding this runs after the one that made
 /// the audio, and that stage covered the whole block, so the window read for a
-/// sub-block is that sub-block's own.
+/// row is that row's own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvelopeFollower {
     pub detect: Detect,
@@ -125,8 +125,8 @@ impl Node for EnvelopeFollower {
         }
         // What the reading cannot go faster than, and why.
         ui.weak(format!(
-            "moves at most once every {:.2} ms (one sub-block)",
-            cx.quantum as f64 / cx.sample_rate.max(1.0) * 1000.0
+            "moves at most once every {:.2} ms (one parameter row)",
+            cx.resolution as f64 / cx.sample_rate.max(1.0) * 1000.0
         ));
         changed
     }

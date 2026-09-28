@@ -42,11 +42,11 @@ use crate::sockets::{LiveSockets, Socket};
 use crate::state::WrapperState;
 use crate::touched::Touched;
 use audio_graph_engine::NodeId;
-use audio_graph_engine::{Graph, ProgramPublisher, compile};
+use audio_graph_engine::{DEFAULT_QUANTUM, Granularity, Graph, ProgramPublisher, compile};
 use audio_graph_engine::{NodeKind, Plugin, PluginPorts};
 use parking_lot::Mutex;
 use plugin_host::{AudioConfig, MainThread};
-use subhost_adapter::{DEFAULT_QUANTUM, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
+use subhost_adapter::{DEFAULT_RESOLUTION, InstanceIo, ParamTarget, SubHost, SubHostProcessors};
 
 use crate::params::WrapperParams;
 use crate::view::View;
@@ -130,11 +130,15 @@ pub struct Shared {
     patch: Mutex<Patch>,
     audio: Mutex<AudioState>,
     programs: ProgramPublisher,
-    /// Sub-block modulation quantum in samples.
+    /// Sub-block size in samples: how often a stage caught in an audio loop
+    /// runs.
     ///
     /// Stored as a standalone atomic rather than in `MainState` because the audio
     /// thread reads it every block and must not have to acquire a lock to do so.
     quantum: AtomicU32,
+    /// Parameter resolution in samples: how often a parameter value is known.
+    /// An atomic for the same reason as `quantum`.
+    resolution: AtomicU32,
     /// What the DAW is running at, so the editor can show a delay's floor in
     /// seconds. Bits of an `f32`, the same trick `live` uses.
     sample_rate: AtomicU32,
@@ -245,6 +249,7 @@ impl Shared {
             }),
             programs: ProgramPublisher::default(),
             quantum: AtomicU32::new(DEFAULT_QUANTUM),
+            resolution: AtomicU32::new(DEFAULT_RESOLUTION),
             // Until the DAW says otherwise. A wrong rate here only makes the
             // floor shown in the editor wrong, never the audio.
             sample_rate: AtomicU32::new(48_000f32.to_bits()),
@@ -423,6 +428,22 @@ impl Shared {
 
     pub fn set_quantum(&self, quantum: u32) {
         self.quantum.store(quantum, Ordering::Relaxed);
+    }
+
+    pub fn resolution(&self) -> u32 {
+        self.resolution.load(Ordering::Relaxed)
+    }
+
+    pub fn set_resolution(&self, resolution: u32) {
+        self.resolution.store(resolution, Ordering::Relaxed);
+    }
+
+    /// Both ways the block is cut, as the engine takes them.
+    pub fn granularity(&self) -> Granularity {
+        Granularity {
+            resolution: self.resolution(),
+            quantum: self.quantum(),
+        }
     }
 
     /// Ask for the graph's state to be thrown away on the next block.
@@ -1130,6 +1151,7 @@ impl Shared {
         blob.written_by = Some(crate::state::THIS_RELEASE.into());
         blob.graph = graph;
         blob.sub_block = self.quantum();
+        blob.param_resolution = self.resolution();
         drop(state);
         self.write_state(&blob);
     }

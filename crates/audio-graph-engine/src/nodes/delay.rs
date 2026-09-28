@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::graph::LineId;
+#[cfg(feature = "ui")]
+use crate::ir::MAX_DELAY_TAPS;
 use crate::ir::{AudioOp, Op};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, decimals, fallback, line_control};
+use crate::nodes::widgets::{CAUTION, NodeUi, decimals, fallback, line_control};
 use crate::port::{Port, PortType};
 
 /// The write endpoint of a delay line.
@@ -29,8 +31,8 @@ pub struct DelayWrite {
 /// Reads from the designated delay buffer at a specified delay time. Multiple
 /// read nodes can reference the same line for multi-tap delays.
 ///
-/// `time` is in seconds and is clamped at runtime to a minimum floor equal to
-/// one processing quantum (sub-block duration).
+/// `time` is in seconds and is clamped at runtime to a minimum floor: one
+/// sub-block for an audio line, one parameter row for a parameter line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DelayRead {
     pub line: LineId,
@@ -174,8 +176,7 @@ impl Node for DelayRead {
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut NodeUi<'_>) -> bool {
         let mut changed = line_control(ui, &mut self.line);
-        // Minimum delay floor corresponds to one processing quantum in seconds.
-        let floor = cx.quantum as f64 / cx.sample_rate.max(1.0);
+        let floor = self.floor(cx);
         if self.time < floor {
             self.time = floor;
             changed = true;
@@ -192,13 +193,26 @@ impl Node for DelayRead {
         });
         if matches!(self.ty, PortType::Audio { .. }) {
             ui.weak(format!("at least {:.1} ms (one sub-block)", floor * 1000.0));
+        } else {
+            // A parameter line holds a fixed number of rows, so how far back
+            // it reaches is the resolution's doing. Said here rather than
+            // clamped, because the next resolution chosen may reach again.
+            let reach =
+                (MAX_DELAY_TAPS - 1) as f64 * cx.resolution as f64 / cx.sample_rate.max(1.0);
+            if self.max_time > reach {
+                ui.colored_label(CAUTION, format!("reaches {reach:.2} s at this resolution"))
+                    .on_hover_text(
+                        "a parameter delay keeps a fixed number of rows; a coarser \
+                     parameter resolution reaches further back",
+                    );
+            }
         }
         changed
     }
 
     /// The delay time, on the row of the socket that sweeps it.
     ///
-    /// Clamps the delay time to the minimum sub-block quantum duration.
+    /// Holds the delay time at or above [`DelayRead::floor`].
     #[cfg(feature = "ui")]
     fn input_control(
         &mut self,
@@ -210,7 +224,7 @@ impl Node for DelayRead {
         if port != 0 {
             return false;
         }
-        let floor = cx.quantum as f64 / cx.sample_rate.max(1.0);
+        let floor = self.floor(cx);
         let max_time = self.max_time;
         let time = &mut self.time;
         let mut changed = false;
@@ -235,6 +249,17 @@ impl Node for DelayRead {
 
 #[cfg(feature = "ui")]
 impl DelayRead {
+    /// The shortest time this read can be set to, in seconds: one sub-block
+    /// for audio, which is one chunk of the loop it closes, and one parameter
+    /// row for a value.
+    fn floor(&self, cx: &NodeUi<'_>) -> f64 {
+        let samples = match self.ty {
+            PortType::Audio { .. } => cx.quantum,
+            _ => cx.resolution,
+        };
+        f64::from(samples) / cx.sample_rate.max(1.0)
+    }
+
     /// See [`DelayWrite::catalogue_defaults`].
     pub(crate) fn catalogue_defaults() -> Vec<(&'static str, DelayRead)> {
         Vec::new()

@@ -237,6 +237,7 @@ fn a_graph_built_the_way_the_editor_builds_one_drives_a_parameter() {
                 sample_rate: 48_000.0,
                 tempo_bpm: 120.0,
                 frames: 32,
+                resolution: 32,
                 offset: 0,
                 row: 0,
                 block: 32,
@@ -348,6 +349,7 @@ fn a_graph_survives_the_state_round_trip() {
     let params = WrapperParams::new();
     let shared = Shared::new(SubHost::new(Arc::new(SilentHost), SUB_HOST), params.clone());
     shared.set_quantum(64);
+    shared.set_resolution(4);
     {
         let mut state = shared.patch();
         state.graph = Graph::default_patch();
@@ -362,6 +364,7 @@ fn a_graph_survives_the_state_round_trip() {
     let json = params.state.0.read().unwrap().clone();
     let saved: audio_graph_plugin::WrapperState = serde_json::from_str(&json).unwrap();
     assert_eq!(saved.sub_block, 64);
+    assert_eq!(saved.param_resolution, 4);
 
     let restored: Graph = serde_json::from_value(saved.graph.expect("a graph was saved")).unwrap();
     assert_eq!(restored, shared.patch().graph);

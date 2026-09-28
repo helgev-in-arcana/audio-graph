@@ -1,6 +1,6 @@
 use audio_graph_engine::{
-    AudioIn, AudioOut, Engine, Graph, MAX_AUDIO_LANES, MAX_GRAPH_PARAMS, NodeKind, PortType,
-    ProgramPublisher, compile,
+    AudioIn, AudioOut, Engine, Granularity, Graph, MAX_AUDIO_LANES, MAX_GRAPH_PARAMS, NodeKind,
+    PortType, ProgramPublisher, compile,
 };
 use subhost_adapter::{NoInstances, SlotSchedule};
 
@@ -59,7 +59,7 @@ fn note_state_follows_stream_identity_across_coalesced_publications() {
             &[],
             events,
             64,
-            32,
+            Granularity::default(),
             48_000.0,
             120.0,
             &[],
@@ -67,7 +67,7 @@ fn note_state_follows_stream_identity_across_coalesced_publications() {
             &mut NoInstances
         ));
         engine.end_block(&[], &mut Vec::with_capacity(256));
-        [schedule.block(0)[0], schedule.block(0)[1]]
+        [schedule.row(0)[0], schedule.row(0)[1]]
     };
     let on = Event::Note(NoteEvent::NoteOn {
         note_id: Some(17),
@@ -196,7 +196,7 @@ fn repeated_publications_keep_the_delay_audible() {
                 &[],
                 &[],
                 FRAMES,
-                32,
+                Granularity::default(),
                 RATE,
                 120.0,
                 &daw_in,
@@ -298,7 +298,7 @@ fn deleting_a_delay_line_keeps_the_others_audible() {
             &[],
             &[],
             FRAMES,
-            32,
+            Granularity::default(),
             RATE,
             120.0,
             &daw_in,

@@ -23,7 +23,10 @@ mod op;
 
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
-pub use audio_op::{AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, MixIn, Span, Stage};
+pub use audio_op::{
+    AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, MixIn, QUANTUM_CHOICES,
+    Span, Stage,
+};
 pub use note_op::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
     MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteBuf, NoteOp,
@@ -71,11 +74,11 @@ pub const MAX_DSP_STATES: usize = 64;
 pub const DSP_VALUES: usize = 4 * MAX_CHANNELS;
 pub const MAX_DELAY_LINES: usize = 16;
 
-/// How far back a param delay line can read, in sub-blocks.
+/// How far back a param delay line can read, in rows.
 ///
-/// A param line stores one value per sub-block, so this is a time only once the
-/// sample rate and the quantum are known: 4096 sub-blocks is 2.7 s at 48 kHz
-/// with the default quantum of 32, and 1.4 s at the finest quantum of 16. The
+/// A param line stores one value per row, so this is a time only once the
+/// sample rate and the resolution are known: 4096 rows is 2.7 s at 48 kHz
+/// with the default resolution of 32, 1.4 s at 16 and 85 ms at 1. The
 /// ring is preallocated for it, because the audio thread may not allocate and
 /// the alternative — sizing from the longest delay in the graph — would mean a
 /// reallocation every time the user drags the time control.
@@ -84,7 +87,7 @@ pub const MAX_DELAY_TAPS: usize = 4096;
 /// How many *audio* delay lines one program may have.
 ///
 /// Counted apart from [`MAX_DELAY_LINES`] because an audio line costs a ring of
-/// samples rather than a ring of sub-block values.
+/// samples rather than a ring of row values.
 pub const MAX_AUDIO_DELAY_LINES: usize = 8;
 /// How far back an audio delay line may be *asked* to read, in seconds.
 ///
@@ -179,7 +182,7 @@ pub struct Program {
     pub(crate) delay_nodes: Vec<NodeId>,
     /// Audio processing operations in topological execution order.
     pub(crate) audio_ops: Vec<AudioOp>,
-    /// The note half, run once per sub-block ahead of the audio ops.
+    /// The note half, run once per row ahead of the audio ops.
     pub(crate) note_ops: Vec<NoteOp>,
     /// How many note buffers this program uses.
     pub(crate) note_bufs: u16,
@@ -234,9 +237,9 @@ pub struct Program {
     /// outputs were bound.
     ///
     /// The audio thread never reads it. It is kept for whoever has to say what
-    /// a socket is carrying: every register is written once per sub-block and
+    /// a socket is carrying: every register is written once per row and
     /// never reused, so after a block has run, the register named here still
-    /// holds that socket's value from the last sub-block.
+    /// holds that socket's value from the last row.
     pub(crate) output_registers: Vec<((NodeId, u8), Reg)>,
 }
 

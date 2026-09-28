@@ -11,7 +11,7 @@
 //! change turned into a signal, because there is no place for the result to
 //! be.
 //!
-//! These run once per sub-block, before the audio ops of the same sub-block,
+//! These run once per row, before the audio ops of the same row,
 //! so a gate's decision is as current as any other parameter's.
 
 /// An index into the note buffer pool.
@@ -24,7 +24,7 @@ pub const MAX_NOTE_BUFS: usize = 16;
 
 /// How many events one note buffer holds.
 ///
-/// One whole DAW block, plus the last sub-block of the block before it, which
+/// One whole DAW block, plus the last row of the block before it, which
 /// is carried over so a parameter op reading at the first boundary of a block
 /// has the stream that was in force there.
 ///
@@ -89,18 +89,18 @@ pub(crate) enum NoteStreamKind {
 /// One step of the note half of a program.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NoteOp {
-    /// Fill a buffer with what the DAW sent on `bus`, for this sub-block.
+    /// Fill a buffer with what the DAW sent on `bus`, for this row.
     Input { out: NoteBuf, bus: u16 },
     /// Add a control change to a stream when the parameter on `lane` moves.
     ///
     /// `a` is the stream it joins, passed through first; `None` starts a fresh
-    /// one. The generated event is timed at the start of the sub-block, which
+    /// one. The generated event is timed at the start of the row, which
     /// is where the lane's value became true, and is written before the passed
     /// stream so the buffer stays sorted.
     ///
     /// `state` indexes the last value sent. Only a change is emitted — not to
     /// ration events, but because an unchanged controller is not an event.
-    /// A program swap forgets it, so the next sub-block re-sends the current
+    /// A program swap forgets it, so the next row re-sends the current
     /// value; a duplicate CC carrying the value the receiver already has is
     /// not something anyone can hear, and the alternative is carrying the
     /// state across recompiles for no gain.
@@ -115,7 +115,7 @@ pub enum NoteOp {
     /// Copy `a` into `out`, dropping what this node refuses.
     ///
     /// `gate` names the lane carrying the open/shut decision, sampled per
-    /// sub-block the way a mix gain is; below 0.5 the stream is shut. A shut
+    /// row the way a mix gain is; below 0.5 the stream is shut. A shut
     /// gate holds note-ons back and lets everything else through, so a note
     /// already sounding still gets its note-off — blocking everything would
     /// leave a hung note behind whatever threw the gate.
@@ -146,7 +146,7 @@ pub enum NoteOp {
     },
     /// Join the first `count` of `inputs` into `out`, in time order.
     ///
-    /// An event that another input has already put into this sub-block's
+    /// An event that another input has already put into this row's
     /// share of `out` is not put in again. That is what a note split into
     /// two branches and joined back looks like — the same note, id and all,
     /// arriving twice — and passing both would sound it twice and end it

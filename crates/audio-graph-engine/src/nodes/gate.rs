@@ -29,7 +29,7 @@ fn default_fade_ms() -> f64 {
 /// Passes audio through at unity gain (0 dB) when open, or silences it (-100 dB)
 /// when closed. If the control input is unconnected, it defaults to zero (closed).
 ///
-/// The switch itself is a parameter, so it happens at a sub-block boundary; what
+/// The switch itself is a parameter, so it happens at a row boundary; what
 /// the fade times buy is the shape of the crossing, not its timing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Gate {

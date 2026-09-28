@@ -17,9 +17,9 @@ use crate::port::{Port, PortType};
 /// input rather than reading whatever the DAW happened to send: the path is on
 /// the canvas.
 ///
-/// The value follows one sub-block behind the events, which is what a
+/// The value follows one row behind the events, which is what a
 /// parameter signal's resolution means — it carries the value in effect at the
-/// sub-block boundary, being the last message before it. Events reaching a
+/// row boundary, being the last message before it. Events reaching a
 /// sub-plugin keep their own sample offsets and are not delayed by this.
 ///
 /// A controller keeps its position between messages, so a block with no CC in

@@ -15,7 +15,7 @@ const SHAPES: [Waveform; 3] = [Waveform::Sine, Waveform::Triangle, Waveform::Saw
 /// A gain that swings periodically: a tremolo.
 ///
 /// What an LFO wired into a gain almost is, and why it is a node of its own:
-/// a parameter changes only at a sub-block boundary, and at a tremolo's rate a
+/// a parameter changes only at a row boundary, and at a tremolo's rate a
 /// gain stepping every 32 samples buzzes. Here the oscillator runs at the
 /// sample rate. See [`AudioOp::Tremolo`].
 ///

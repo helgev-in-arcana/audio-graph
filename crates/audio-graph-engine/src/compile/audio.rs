@@ -80,6 +80,7 @@ mod tests {
         AudioContext {
             frames,
             quantum: 32,
+            resolution: 32,
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             lanes: &[],

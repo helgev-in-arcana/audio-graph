@@ -54,7 +54,7 @@ pub struct SubHostConfig {
     pub max_instances: usize,
     /// Number of parameter slots published to the host DAW.
     pub slot_count: usize,
-    /// Number of values carried per sub-block in the [`SlotSchedule`][crate::SlotSchedule]: the
+    /// Number of values carried per row in the [`SlotSchedule`][crate::SlotSchedule]: the
     /// slots plus whatever else the caller packs alongside them.
     pub lanes: usize,
     pub target_priority: TargetPriority,
@@ -572,20 +572,22 @@ impl SubHost {
             }
             entry.configure(config)?;
         }
-        // One event per lane per sub-block is the worst a caller can ask for,
-        // plus whatever the DAW sends us. Reserved here because `process` is
-        // not allowed to grow it.
-        let sub_blocks = config
+        // One event per bound parameter per row is the worst a caller can ask
+        // for, plus whatever the DAW sends us. Reserved at activation because
+        // `process` is not allowed to grow it, and per instance because a row
+        // per sample of the finest resolution times every lane would be tens
+        // of megabytes for parameters nothing is bound to.
+        let rows = config
             .max_block_size
-            .div_ceil(crate::schedule::MIN_QUANTUM)
+            .div_ceil(crate::schedule::MIN_RESOLUTION)
             .max(1) as usize;
-        let capacity = self
-            .config
-            .lanes
-            .checked_mul(sub_blocks)
-            .and_then(|n| n.checked_add(INCOMING_EVENT_CAPACITY))
-            .filter(|n| *n <= isize::MAX as usize / size_of::<Event>())
-            .ok_or("event capacity overflow")?;
+        let capacity = |targets: usize| {
+            targets
+                .checked_mul(rows)
+                .and_then(|n| n.checked_add(INCOMING_EVENT_CAPACITY))
+                .filter(|n| *n <= isize::MAX as usize / size_of::<Event>())
+                .ok_or("event capacity overflow")
+        };
 
         let mut processors: Vec<Option<SubHostProcessor>> = Vec::new();
         for instance in 0..self.instances.len() {
@@ -596,6 +598,7 @@ impl SubHost {
             // Before the plugin is borrowed for activation, because this
             // reads both the slot table and the plugin's parameter list.
             let targets = self.targets_for(instance, direct)?;
+            let capacity = capacity(targets.len())?;
             let Some(loaded) = self.at_mut(instance) else {
                 unreachable!("checked just above")
             };
@@ -863,16 +866,20 @@ impl SubHostProcessor {
         let events = slice(events, &chunk);
         let mut next_note = 0;
 
-        for index in 0..slots.blocks() {
-            let offset = slots.offset(index);
-            // Rows outside this chunk are another call's business. The last
-            // chunk of a block is short whenever the block is not a multiple
-            // of the quantum, so `<` on the end is what keeps the boundary row
-            // out of both calls' way rather than in both.
-            if offset < chunk.start || offset >= chunk.end.max(chunk.start.saturating_add(1)) {
-                continue;
-            }
-            let offset = offset - chunk.start;
+        // The rows starting inside this chunk; the rest are another call's
+        // business. Worked out rather than filtered for, because at a fine
+        // resolution a block has a row per sample and a chunk is called many
+        // times per block. A chunk of no samples still owns the row at its
+        // start, which is how a zero-length block gets its values.
+        let resolution = slots.resolution();
+        let first = chunk.start.div_ceil(resolution) as usize;
+        let end = (chunk
+            .end
+            .max(chunk.start.saturating_add(1))
+            .div_ceil(resolution) as usize)
+            .min(slots.row_count());
+        for index in first..end {
+            let offset = slots.offset(index) - chunk.start;
 
             // Anything the DAW sent that lands before this boundary goes
             // first, so the stream stays sorted.
@@ -887,7 +894,7 @@ impl SubHostProcessor {
                 next_note += 1;
             }
 
-            let values = slots.block(index);
+            let values = slots.row(index);
             for (target_index, &(slot, target)) in self.targets.iter().enumerate() {
                 let Some(&normalized) = values.get(slot) else {
                     continue;
@@ -1469,7 +1476,7 @@ mod tests {
         let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
         let blocks = schedule.begin(128).unwrap();
         for i in 0..blocks {
-            schedule.block_mut(i)[0] = i as f64 / 4.0;
+            schedule.row_mut(i)[0] = i as f64 / 4.0;
         }
 
         let input = [0.0f32; 64];
@@ -1495,8 +1502,8 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_slot_is_sent_once_per_sub_block_with_an_offset() {
-        // Sub-block automation changes are dispatched as sample-accurate events across the block.
+    fn a_moving_slot_is_sent_once_per_row_with_an_offset() {
+        // Row-by-row changes are dispatched as sample-accurate events across the block.
         let target = ResolvedTarget {
             instance: 0,
             id: ParamId(3),
@@ -1507,13 +1514,51 @@ mod tests {
         let blocks = schedule.begin(128).unwrap();
         assert_eq!(blocks, 4);
         for i in 0..blocks {
-            schedule.block_mut(i)[0] = i as f64 / 4.0;
+            schedule.row_mut(i)[0] = i as f64 / 4.0;
         }
         run_scheduled(&mut p, &schedule, &[]);
 
         let events = seen.lock().unwrap().clone();
         let offsets: Vec<u32> = events.iter().map(|e| e.sample_offset()).collect();
         assert_eq!(offsets, vec![0, 32, 64, 96]);
+    }
+
+    /// A row finer than the chunk it falls in reaches the sub-plugin at its
+    /// own offset: the resolution is not bounded by how the audio is cut.
+    #[test]
+    fn rows_finer_than_the_chunk_each_keep_their_offset() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+
+        let mut schedule = SlotSchedule::new(LANES, 128, 4).unwrap();
+        let rows = schedule.begin(128).unwrap();
+        for i in 0..rows {
+            schedule.row_mut(i)[0] = i as f64 / rows as f64;
+        }
+
+        let input = [0.0f32; 64];
+        let mut output = [0.0f32; 64];
+        let mut sink = EventSink::new();
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 32, BufferLayout::Planar);
+        p.process(
+            &mut buffers,
+            schedule.view(),
+            &[],
+            64..96,
+            &TimeContext::default(),
+            &mut sink,
+        );
+
+        let offsets: Vec<u32> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.sample_offset())
+            .collect();
+        assert_eq!(offsets, (0..32).step_by(4).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1532,7 +1577,7 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().len(),
             1,
-            "four identical sub-blocks are one event"
+            "four identical rows are one event"
         );
     }
 
@@ -1547,7 +1592,7 @@ mod tests {
         let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
         let blocks = schedule.begin(128).unwrap();
         for i in 0..blocks {
-            schedule.block_mut(i)[0] = i as f64 / 4.0;
+            schedule.row_mut(i)[0] = i as f64 / 4.0;
         }
         let notes = [
             Event::Note(plugin_host::NoteEvent::NoteOn {

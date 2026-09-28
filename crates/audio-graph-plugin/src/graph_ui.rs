@@ -160,10 +160,11 @@ pub struct GraphContext<'a> {
     /// What each param output socket carried at the end of the last block.
     /// Empty until the program on screen is the one being heard.
     pub sockets: &'a [(crate::sockets::Socket, f64)],
-    /// The sub-block size and the sample rate, which together define the minimum
-    /// delay time floor. The editor displays this and restricts control minimums;
-    /// the audio thread also clamps it dynamically.
+    /// The sub-block size, the parameter resolution and the sample rate,
+    /// which together define the delay time floors. The editor displays them
+    /// and restricts control minimums; the audio thread also clamps them.
     pub quantum: u32,
+    pub resolution: u32,
     pub sample_rate: f64,
     /// The last parameter moved in each instance's own window, by instance.
     pub touched: &'a [audio_graph_engine::Touch],
@@ -1266,6 +1267,7 @@ fn node_ui<'a>(
         live: &ctx.live,
         poly_modulation: ctx.poly_modulation,
         quantum: ctx.quantum,
+        resolution: ctx.resolution,
         sample_rate: ctx.sample_rate,
         instances: ctx.instances,
         actions: Vec::new(),
@@ -1408,6 +1410,7 @@ mod tests {
                     live: [0.0; SLOT_COUNT],
                     sockets: &[],
                     quantum: 32,
+                    resolution: 32,
                     sample_rate: 48_000.0,
                 };
                 editor.ui(ui, graph, &context);

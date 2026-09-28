@@ -24,12 +24,25 @@ pub struct MixIn {
     pub gain: f64,
 }
 
+/// Supported sub-block sizes in samples: how long a chunk is when a stage runs
+/// at [`Chunking::SubBlock`], and so the shortest an audio delay can be. Powers
+/// of two, so a block cut into chunks and into parameter rows lines up either
+/// way round.
+///
+/// Nothing to do with how often a parameter moves; that is the parameter
+/// resolution, a separate setting. A sub-block smaller than 16 would call
+/// every sub-plugin in a loop more than 250 times for a 4096-sample block.
+pub const QUANTUM_CHOICES: [u32; 4] = [16, 32, 64, 128];
+
+/// Default sub-block size in samples: about 0.67 ms at 48 kHz.
+pub const DEFAULT_QUANTUM: u32 = 32;
+
 /// Evaluation granularity for audio processing operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Chunking {
     /// Once per block the DAW hands us. Parameter changes still arrive at
-    /// sub-block resolution, as events with an offset — there is no reason to
-    /// call a plugin more often than the DAW does.
+    /// the parameter resolution, as events with an offset — there is no
+    /// reason to call a plugin more often than the DAW does.
     #[default]
     WholeBlock,
     /// Once per sub-block. What the two ends of a delay line need, because a
@@ -85,7 +98,7 @@ pub struct Stage {
     pub audio: Span,
     /// Which note buffers those note ops write, one bit each.
     ///
-    /// The engine records where a buffer stood before each sub-block so the
+    /// The engine records where a buffer stood before each row so the
     /// audio half can find its own rows again. Only the stage that fills a
     /// buffer may write that mark: a later stage passing over the same rows
     /// would overwrite every one of them with the length the buffer finished
@@ -164,12 +177,10 @@ pub enum AudioOp {
     /// Scale a buffer by a gain that slides towards its target instead of
     /// stepping to it.
     ///
-    /// What a [`AudioOp::Mix`] of one cannot do: a mix holds its gain for the
-    /// whole chunk, so a gate switching a loud signal steps the waveform at a
-    /// chunk boundary and clicks. Here the gain moves sample by sample, and
-    /// the target is re-read every sub-block — how often a chunk calls the
-    /// plugins is a cost decision, and the resolution of what the graph says
-    /// is not the same question.
+    /// What a [`AudioOp::Mix`] of one cannot do: a mix holds its gain for a
+    /// whole row, so a gate switching a loud signal steps the waveform at a
+    /// row boundary and clicks. Here the gain moves sample by sample towards
+    /// a target re-read every row.
     ///
     /// `out` may be `a`, which makes it a scaling in place that costs no
     /// buffer. Nothing about the ramp is fixed at compile time except its
@@ -245,7 +256,7 @@ pub enum AudioOp {
     /// cycle of `waveform` at `rate`: a tremolo.
     ///
     /// The oscillator runs at the sample rate rather than being an LFO node
-    /// driving a gain, because a parameter changes only at a sub-block
+    /// driving a gain, because a parameter changes only at a row
     /// boundary and a gain that steps every 32 samples at a tremolo's speed is
     /// audible as a buzz. `state` holds the phase, so it runs on through a
     /// recompile, and the depth it last applied, which is ramped rather than

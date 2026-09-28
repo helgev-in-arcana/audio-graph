@@ -43,6 +43,7 @@ fn ctx(frames: u32) -> BlockContext {
         sample_rate: 48_000.0,
         tempo_bpm: 120.0,
         frames,
+        resolution: frames,
         offset: 0,
         row: 0,
         block: frames,
@@ -64,6 +65,7 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
     AudioContext {
         frames,
         quantum: 32,
+        resolution: 32,
         sample_rate: RATE,
         tempo_bpm: 120.0,
         lanes: &[],
@@ -315,6 +317,7 @@ fn tempo_sync_follows_the_host() {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames: 6000,
+            resolution: 6000,
             offset: 0,
             row: 0,
             block: 6000,
@@ -326,6 +329,7 @@ fn tempo_sync_follows_the_host() {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames: 1,
+            resolution: 1,
             offset: 0,
             row: 0,
             block: 1,
@@ -569,6 +573,7 @@ fn hear(graph: &Graph, events: &[Event], lanes: &[f64]) -> Heard {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
@@ -917,6 +922,7 @@ fn a_controller_is_sent_once_until_it_moves() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
@@ -1093,6 +1099,7 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 16,
+                resolution: 16,
                 offset: index as u32 * 16,
                 row: index as u32,
                 block: 64,
@@ -1106,6 +1113,7 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
         &AudioContext {
             frames: 64,
             quantum: 16,
+            resolution: 16,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
@@ -1231,6 +1239,7 @@ fn a_note_that_reaches_no_plugin_is_reported_ended() {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
@@ -1280,6 +1289,7 @@ fn a_delivered_note_is_reported_only_when_the_plugin_ends_it() {
         &AudioContext {
             frames: 8,
             quantum: 32,
+            resolution: 32,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
@@ -1388,6 +1398,7 @@ fn completion_policy_can_differ_between_instances() {
                 &AudioContext {
                     frames: 8,
                     quantum: 8,
+                    resolution: 8,
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     lanes: &row,
@@ -1432,6 +1443,143 @@ fn completion_policy_can_differ_between_instances() {
     }
 }
 
+/// A row coarser than a sub-block still hands each chunk only its own notes.
+///
+/// A loop runs its instance once a sub-block, and the row a chunk sits in
+/// holds the events of its neighbours too: passing the row on whole would
+/// play every note once per chunk.
+#[test]
+fn a_note_lands_in_one_chunk_when_a_row_spans_several() {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let output = stereo_out(&mut graph);
+    let synth = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                audio_in: vec![2],
+                audio_out: vec![2],
+                audio_out_shown: Vec::new(),
+                accepts_notes: true,
+                ..PluginPorts::default()
+            },
+        }),
+        [0.0, 0.0],
+    );
+    let (write, read) = audio_delay(&mut graph, 16.0);
+    graph.connect(read, 0, synth, 0);
+    graph.connect(notes, 0, synth, 1);
+    graph.connect(synth, 0, write, 0);
+    graph.connect(synth, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    load(&mut engine, &graph);
+    assert_eq!(engine.chunking(), Chunking::SubBlock);
+
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut schedule = SlotSchedule::new(width, 64, 64).unwrap();
+    let mut heard = Heard::default();
+    engine.run_block(
+        &mut schedule,
+        &[],
+        &[note_on(60, 0), note_on(61, 37)],
+        64,
+        Granularity {
+            resolution: 64,
+            quantum: 16,
+        },
+        RATE,
+        120.0,
+        &[0.0; 2 * 64],
+        &mut [0.0; 2 * 64],
+        &mut heard,
+    );
+    assert_eq!(schedule.row_count(), 1, "one row, four chunks");
+    let offsets: Vec<u32> = heard.0[&0].iter().map(Event::sample_offset).collect();
+    assert_eq!(offsets, vec![0, 37], "each note once");
+}
+
+/// A wired gain moves once a parameter row, whatever the audio is cut into.
+///
+/// The resolution alone decides how often a value reaches audio: a stage run
+/// over the whole block still changes its gain every four samples at a
+/// resolution of four, and the sub-block size has no say in it.
+#[test]
+fn a_wired_gain_moves_at_the_resolution_not_the_sub_block() {
+    const BLOCK: u32 = 64;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+
+    let played = |quantum: u32| -> Vec<f32> {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let output = stereo_out(&mut graph);
+        let mix = graph.add(
+            NodeKind::Mix(Mix {
+                channels: 2,
+                inputs: 1,
+                gains: Vec::new(),
+            }),
+            [0.0, 0.0],
+        );
+        // A saw slow enough not to wrap inside the block: every row a new,
+        // lower gain.
+        let lfo = graph.add(
+            NodeKind::Lfo(Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(500.0),
+                phase: 0.0,
+                depth: -3.0,
+                offset: -3.0,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, mix, 0);
+        graph.connect(lfo, 0, mix, 1);
+        graph.connect(mix, 0, output, 0);
+
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.chunking(), Chunking::WholeBlock);
+
+        let mut schedule = SlotSchedule::new(width, BLOCK, 4).unwrap();
+        let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: 4,
+                quantum,
+            },
+            RATE,
+            120.0,
+            &[1.0; 2 * BLOCK as usize],
+            &mut daw_out,
+            &mut Adders,
+        );
+        daw_out.truncate(BLOCK as usize);
+        daw_out
+    };
+
+    let heard = played(32);
+    for row in heard.chunks(4) {
+        assert!(
+            row.iter().all(|&g| g == row[0]),
+            "one gain across a row: {row:?}"
+        );
+    }
+    let steps = heard.chunks(4).map(|row| row[0]).collect::<Vec<_>>();
+    assert!(
+        steps.windows(2).all(|pair| pair[1] < pair[0]),
+        "and a new one at every row: {steps:?}"
+    );
+    assert_eq!(heard, played(16), "the sub-block size has no say");
+    assert_eq!(heard, played(128), "the sub-block size has no say");
+}
+
 /// Each sub-block gets its own events, once. Handing every chunk the whole
 /// block would replay every note once per chunk.
 #[test]
@@ -1464,6 +1612,7 @@ fn a_note_lands_in_one_sub_block_only() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 4,
+                resolution: 4,
                 offset: sub as u32 * 4,
                 row: sub as u32,
                 block: 8,
@@ -1475,6 +1624,7 @@ fn a_note_lands_in_one_sub_block_only() {
         &AudioContext {
             frames: 8,
             quantum: 4,
+            resolution: 4,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &row,
@@ -1543,14 +1693,17 @@ fn notes_are_ingested_once_across_parameter_and_audio_stages() {
         &[],
         &[note_on(60, 0), note_on(61, 37)],
         64,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32,
+        },
         RATE,
         120.0,
         &[0.0; 2 * 64],
         &mut daw_out,
         &mut heard,
     );
-    assert_eq!(schedule.blocks(), 2);
+    assert_eq!(schedule.row_count(), 2);
     assert_eq!(heard.0[&0].len(), 2, "each note once: {:?}", heard.0[&0]);
     let mut ended = Vec::with_capacity(8);
     engine.end_block(&[], &mut ended);
@@ -1565,7 +1718,10 @@ fn notes_are_ingested_once_across_parameter_and_audio_stages() {
         &[],
         &[],
         64,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32,
+        },
         RATE,
         120.0,
         &[0.0; 2 * 64],
@@ -1616,6 +1772,7 @@ fn the_boundary_a_block_starts_on_belongs_to_the_block_before() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &row,
@@ -1682,6 +1839,7 @@ fn a_controller_becomes_a_parameter_at_the_next_boundary() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 8,
+                resolution: 8,
                 offset: index * 8,
                 row: index,
                 block: 16,
@@ -1745,6 +1903,7 @@ fn a_filter_upstream_of_a_cc_in_changes_what_it_reads() {
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     frames: 8,
+                    resolution: 8,
                     offset: index * 8,
                     row: index,
                     block: 16,
@@ -1793,6 +1952,7 @@ fn a_controller_holds_its_position() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 8,
+                resolution: 8,
                 offset: 0,
                 row: 0,
                 block: 8,
@@ -2162,6 +2322,7 @@ impl Keyboard {
                     sample_rate: 48_000.0,
                     tempo_bpm: 120.0,
                     frames,
+                    resolution: frames,
                     offset,
                     row: row as u32,
                     block: frames * 2,
@@ -2898,7 +3059,10 @@ fn run_block_silences_an_empty_engine() {
         &[],
         &[],
         8,
-        32,
+        Granularity {
+            resolution: 32,
+            quantum: 32
+        },
         RATE,
         120.0,
         &[0.0; 16],
@@ -2957,14 +3121,17 @@ fn a_parameter_is_read_off_audio_in_the_sub_block_it_belongs_to() {
             &[],
             &[],
             BLOCK,
-            QUANTUM,
+            Granularity {
+                resolution: QUANTUM,
+                quantum: QUANTUM,
+            },
             RATE,
             120.0,
             &daw_in,
             &mut daw_out,
             &mut nodes,
         );
-        [schedule.block(0)[SINK], schedule.block(1)[SINK]]
+        [schedule.row(0)[SINK], schedule.row(1)[SINK]]
     };
 
     let steady = level(Detect::Peak, 0.0, false);
@@ -3064,6 +3231,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: QUANTUM,
+                resolution: QUANTUM,
                 offset: row as u32 * QUANTUM,
                 row: row as u32,
                 block: BLOCK,
@@ -3071,6 +3239,7 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
             let audio = AudioContext {
                 frames: BLOCK,
                 quantum: QUANTUM,
+                resolution: QUANTUM,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &[],
@@ -3083,7 +3252,10 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                     &[],
                     &[],
                     BLOCK,
-                    QUANTUM,
+                    Granularity {
+                        resolution: QUANTUM,
+                        quantum: QUANTUM,
+                    },
                     RATE,
                     120.0,
                     &daw_in,
@@ -3573,6 +3745,7 @@ fn moving_the_delay_time_does_not_change_how_often_a_plugin_runs() {
             &AudioContext {
                 frames: 128,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
@@ -3646,6 +3819,7 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
             &AudioContext {
                 frames: 128,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
@@ -3773,6 +3947,7 @@ fn a_gate_passes_or_silences_by_its_control() {
             &AudioContext {
                 frames: 8,
                 quantum: 32,
+                resolution: 32,
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
@@ -3835,6 +4010,7 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 16,
+                resolution: 16,
                 offset: index as u32 * 16,
                 row: index as u32,
                 block: 64,
@@ -3847,6 +4023,7 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
         &AudioContext {
             frames: 64,
             quantum: 16,
+            resolution: 16,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &rows,
@@ -3970,6 +4147,7 @@ fn a_driven_gain_socket_interprets_its_value_as_decibels() {
         &AudioContext {
             frames: 8,
             quantum: 8,
+            resolution: 8,
             sample_rate: RATE,
             tempo_bpm: 120.0,
             lanes: &lanes,
@@ -4588,7 +4766,10 @@ fn hear_blocks(
             &[0.0; SLOTS],
             block,
             FRAMES,
-            32,
+            Granularity {
+                resolution: 32,
+                quantum: 32,
+            },
             RATE,
             120.0,
             &[],
