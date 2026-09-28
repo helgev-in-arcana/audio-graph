@@ -53,9 +53,9 @@ pub use scan::{ClassInfo, PluginRef, scan_module, scan_module_as};
 pub use plugin_host_api::{
     AudioBuffers, AudioConfig, AuxBuses, BufferLayout, BusInfo, Capabilities, Event, EventSink,
     HostContext, HostError, IoLayout, MAX_AUX_BUSES, MainThread, MetadataUpdate, NoteDialects,
-    NoteEvent, NoteExpression, NoteId, ParamEvent, ParamFlags, ParamId, ParamInfo, ParamSnapshot,
-    ParamValue, ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor,
-    Target, TimeContext, VoiceInfo, reclaim_main_thread,
+    NoteEvent, NoteExpression, NoteId, ParamEvent, ParamFlags, ParamId, ParamInfo,
+    ParamInterpolation, ParamSnapshot, ParamValue, ProcessStatus, Processor, RestartReason, Result,
+    SubPluginMain, SubPluginProcessor, Target, TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 // Window plumbing a host application needs and that no backend owns.

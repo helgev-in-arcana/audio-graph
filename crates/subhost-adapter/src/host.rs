@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::schedule::ScheduleView;
 use plugin_host::{
     AudioBuffers, AudioConfig, ClassInfo, Event, EventSink, Format, MainThread, ParamEvent,
-    ParamId, ParamInfo, Plugin, ProcessStatus, Processor, SubPluginMain, SubPluginProcessor,
-    Target, TimeContext,
+    ParamId, ParamInfo, ParamInterpolation, Plugin, ProcessStatus, Processor, SubPluginMain,
+    SubPluginProcessor, Target, TimeContext,
 };
 
 use crate::InstanceEventSink;
@@ -611,6 +611,7 @@ impl SubHost {
                 Ok(processor) => {
                     let latency = loaded.plugin.latency_samples();
                     let note_end_ports = loaded.plugin.note_end_ports();
+                    let interpolation = loaded.plugin.capabilities().param_interpolation;
                     let source = loaded.source;
                     self.latencies[instance] = latency;
                     processors.push(Some(SubHostProcessor {
@@ -621,6 +622,7 @@ impl SubHost {
                         note_end_ports,
                         last_sent: vec![f64::NAN; targets.len()],
                         targets,
+                        interpolation,
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }
@@ -814,6 +816,10 @@ pub struct SubHostProcessor {
     /// Cached normalized values previously sent to sub-plugin parameters to deduplicate events.
     /// Initialized to `f64::NAN` so the initial values are always dispatched.
     last_sent: Vec<f64>,
+    /// What the format makes of the samples between two points, which
+    /// decides whether a held value needs a point of its own. Captured at
+    /// activate, with the targets.
+    interpolation: ParamInterpolation,
     /// Reused event buffer. Sized at activate; `process` must not allocate.
     scratch: Vec<Event>,
 }
@@ -895,6 +901,10 @@ impl SubHostProcessor {
             }
 
             let values = slots.row(index);
+            // The row after this one, when this same call will send it. See
+            // the anchor below.
+            let next = (self.interpolation == ParamInterpolation::Linear && index + 1 < end)
+                .then(|| slots.row(index + 1));
             for (target_index, &(slot, target)) in self.targets.iter().enumerate() {
                 let Some(&normalized) = values.get(slot) else {
                     continue;
@@ -902,7 +912,18 @@ impl SubHostProcessor {
                 // Resending would waste the sub-plugin's parameter queue
                 // and, worse, retrigger smoothing on plugins that ramp
                 // towards every incoming point.
-                if self.last_sent[target_index] == normalized {
+                //
+                // Except as an anchor. Where a format draws a line from each
+                // point to the next, a value about to move needs a point
+                // where it still holds, or the line into the next row starts
+                // at whatever row last sent something and a held value
+                // drifts instead of holding. Only within one call: the next
+                // call's line starts from where this one left the parameter,
+                // which is this row's value anyway.
+                let moves_next = next
+                    .and_then(|row| row.get(slot))
+                    .is_some_and(|&after| after != normalized);
+                if self.last_sent[target_index] == normalized && !moves_next {
                     continue;
                 }
                 self.last_sent[target_index] = normalized;
@@ -1254,6 +1275,7 @@ mod tests {
                         processor: Processor::new(Echo),
                         targets: Vec::new(),
                         last_sent: vec![f64::NAN; LANES],
+                        interpolation: ParamInterpolation::Hold,
                         scratch: Vec::with_capacity(8),
                     })
                 })
@@ -1314,6 +1336,7 @@ mod tests {
             processor: Processor::new(Recorder { seen: seen.clone() }),
             targets,
             last_sent: vec![f64::NAN; LANES],
+            interpolation: ParamInterpolation::Hold,
             scratch: Vec::with_capacity(4096),
         };
         (processor, seen)
@@ -1559,6 +1582,96 @@ mod tests {
             .map(|e| e.sample_offset())
             .collect();
         assert_eq!(offsets, (0..32).step_by(4).collect::<Vec<_>>());
+    }
+
+    /// The points one call hands the sub-plugin, as `(offset, value)`.
+    fn points(seen: &std::sync::Mutex<Vec<Event>>) -> Vec<(u32, f64)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match *e {
+                Event::Param(ParamEvent::SetNormalized {
+                    value,
+                    sample_offset,
+                    ..
+                }) => Some((sample_offset, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A value that holds and then moves holds until the row before it
+    /// moves, whichever way the format joins its points.
+    ///
+    /// Where a format draws a line from each point to the next, the held
+    /// value needs a point of its own where the move starts; without it the
+    /// line runs from the last point sent, and a step three rows later
+    /// becomes a ramp across all three. Where the format holds each value,
+    /// that point would be a wasted event.
+    #[test]
+    fn a_held_value_is_anchored_only_where_points_are_joined_by_lines() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+        };
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        schedule.begin(128).unwrap();
+        for (i, value) in [0.5, 0.5, 0.5, 0.8].into_iter().enumerate() {
+            schedule.row_mut(i)[0] = value;
+        }
+
+        let (mut held, seen) = harness(vec![(0, target)]);
+        run_scheduled(&mut held, &schedule, &[]);
+        assert_eq!(points(&seen), vec![(0, 0.5), (96, 0.8)]);
+
+        let (mut joined, seen) = harness(vec![(0, target)]);
+        joined.interpolation = ParamInterpolation::Linear;
+        run_scheduled(&mut joined, &schedule, &[]);
+        assert_eq!(points(&seen), vec![(0, 0.5), (64, 0.5), (96, 0.8)]);
+    }
+
+    /// An anchor is only placed inside the call that moves the value: the
+    /// next call's line already starts from where this one left it.
+    #[test]
+    fn a_move_at_the_start_of_a_call_needs_no_anchor() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+        };
+        let mut schedule = SlotSchedule::new(LANES, 128, 32).unwrap();
+        schedule.begin(128).unwrap();
+        for (i, value) in [0.5, 0.5, 0.5, 0.8].into_iter().enumerate() {
+            schedule.row_mut(i)[0] = value;
+        }
+        let (mut p, seen) = harness(vec![(0, target)]);
+        p.interpolation = ParamInterpolation::Linear;
+
+        let input = [0.0f32; 256];
+        let mut output = [0.0f32; 256];
+        let mut sink = EventSink::new();
+        let mut calls = Vec::new();
+        for chunk in [0..96, 96..128] {
+            let frames = chunk.end - chunk.start;
+            let mut buffers = AudioBuffers::new(
+                &input[..2 * frames as usize],
+                &mut output[..2 * frames as usize],
+                2,
+                2,
+                frames,
+                BufferLayout::Planar,
+            );
+            seen.lock().unwrap().clear();
+            p.process(
+                &mut buffers,
+                schedule.view(),
+                &[],
+                chunk,
+                &TimeContext::default(),
+                &mut sink,
+            );
+            calls.push(points(&seen));
+        }
+        assert_eq!(calls, vec![vec![(0, 0.5)], vec![(0, 0.8)]]);
     }
 
     #[test]

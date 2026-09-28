@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use plugin_host_api::{
     AudioBuffers, AudioConfig, Capabilities, Event, EventSink, HostContext, HostError, MainThread,
-    ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue as ApiParamValue, ProcessStatus,
-    Processor, Result, SubPluginMain, SubPluginProcessor, TimeContext, reclaim_main_thread,
+    ParamFlags, ParamId, ParamInfo, ParamInterpolation, ParamSnapshot, ParamValue as ApiParamValue,
+    ProcessStatus, Processor, Result, SubPluginMain, SubPluginProcessor, TimeContext,
+    reclaim_main_thread,
 };
 use vst3::Steinberg::Vst::{
     IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentHandler, IComponentTrait,
@@ -642,6 +643,7 @@ impl SubPluginMain for Vst3Plugin {
                     .is_some()
             }),
             dynamic_params: false,
+            param_interpolation: ParamInterpolation::Linear,
         }
     }
 

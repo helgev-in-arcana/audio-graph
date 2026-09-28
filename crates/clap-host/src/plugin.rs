@@ -57,9 +57,9 @@ use clap_sys::process::{
 use clap_sys::string_sizes::CLAP_NAME_SIZE;
 use plugin_host_api::{
     AudioBuffers, AudioConfig, BusInfo, Capabilities, Event, EventSink, HostContext, HostError,
-    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot, ParamValue,
-    ProcessStatus, Processor, RestartReason, Result, SubPluginMain, SubPluginProcessor,
-    TimeContext, VoiceInfo, reclaim_main_thread,
+    IoLayout, MainThread, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamInterpolation,
+    ParamSnapshot, ParamValue, ProcessStatus, Processor, RestartReason, Result, SubPluginMain,
+    SubPluginProcessor, TimeContext, VoiceInfo, reclaim_main_thread,
 };
 
 use crate::events::{InputEvents, OutputEvents, to_transport};
@@ -704,6 +704,7 @@ impl SubPluginMain for ClapPlugin {
             // CLAP plugins may add and remove parameters and tell the host
             // through `clap.params`, which `tick` acts on.
             dynamic_params: true,
+            param_interpolation: ParamInterpolation::Hold,
         }
     }
 

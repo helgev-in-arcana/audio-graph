@@ -25,8 +25,8 @@ pub use events::{
 };
 pub use ownership::{MainThread, Processor, reclaim_main_thread};
 pub use params::{
-    BusInfo, Capabilities, IoLayout, NoteDialects, ParamFlags, ParamId, ParamInfo, ParamSnapshot,
-    ParamValue, VoiceInfo,
+    BusInfo, Capabilities, IoLayout, NoteDialects, ParamFlags, ParamId, ParamInfo,
+    ParamInterpolation, ParamSnapshot, ParamValue, VoiceInfo,
 };
 pub use traits::{
     HostContext, MetadataUpdate, ProcessStatus, RestartReason, SubPluginMain, SubPluginProcessor,
