@@ -31,6 +31,7 @@ fn config() -> AudioConfig {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     }
 }
 

@@ -41,6 +41,9 @@ pub struct SubHost {
     /// [`SubHost::reread_latencies`]. Callers that run instances in parallel
     /// need these to line the paths up.
     latencies: Vec<u32>,
+    /// The finest parameter resolution the next activation must carry. See
+    /// [`SubHost::set_resolution`].
+    resolution: u32,
 }
 
 /// Resource limits and parameter conflict policy for a sub-host.
@@ -80,6 +83,7 @@ impl SubHost {
             config,
             context,
             latencies: Vec::new(),
+            resolution: crate::schedule::DEFAULT_RESOLUTION,
         }
     }
 
@@ -543,6 +547,26 @@ impl SubHost {
     /// because whether a sidechain is switched on depends on whether anything
     /// was wired to it. An instance `io` does not mention is activated with
     /// `config` as it stands.
+    /// The finest parameter resolution the processors of the next
+    /// [`activate`][Self::activate] will be driven at.
+    ///
+    /// What sizes their event buffers: a moving parameter is one point per
+    /// row, so a resolution of one sample needs thirty-two times the room of
+    /// one of thirty-two. Sized for what is asked rather than for the finest
+    /// on offer, because that is tens of megabytes an instance for a setting
+    /// most patches never choose. A processor handed a finer schedule than
+    /// this refuses the call.
+    pub fn set_resolution(&mut self, resolution: u32) {
+        self.resolution = resolution.clamp(
+            crate::schedule::MIN_RESOLUTION,
+            *crate::schedule::RESOLUTION_CHOICES.last().unwrap(),
+        );
+    }
+
+    pub fn resolution(&self) -> u32 {
+        self.resolution
+    }
+
     pub fn activate(
         &mut self,
         config: AudioConfig,
@@ -574,20 +598,18 @@ impl SubHost {
         }
         // One event per bound parameter per row, and one more for the end of
         // the block, is the worst a caller can ask for, plus whatever the DAW
-        // sends us. Reserved at activation because
-        // `process` is not allowed to grow it, and per instance because a row
-        // per sample of the finest resolution times every lane would be tens
-        // of megabytes for parameters nothing is bound to.
-        let rows = config
-            .max_block_size
-            .div_ceil(crate::schedule::MIN_RESOLUTION)
-            .max(1) as usize
-            + 1;
+        // sends us. Reserved at activation, in the backend and here, because
+        // `process` is not allowed to grow it, and per instance because every
+        // lane times every row would be room for parameters nothing is bound
+        // to.
+        let rows = config.max_block_size.div_ceil(self.resolution).max(1) as usize + 1;
         let capacity = |targets: usize| {
             targets
                 .checked_mul(rows)
                 .and_then(|n| n.checked_add(INCOMING_EVENT_CAPACITY))
-                .filter(|n| *n <= isize::MAX as usize / size_of::<Event>())
+                .filter(|n| {
+                    *n <= isize::MAX as usize / size_of::<Event>() && *n <= i32::MAX as usize
+                })
                 .ok_or("event capacity overflow")
         };
 
@@ -605,9 +627,12 @@ impl SubHost {
                 unreachable!("checked just above")
             };
             // Apply per-instance bus configuration overrides if specified.
-            let config = match io.iter().find(|e| e.instance as usize == instance) {
-                Some(entry) => entry.configure(config)?,
-                None => config,
+            let config = AudioConfig {
+                max_input_events: capacity as u32,
+                ..match io.iter().find(|e| e.instance as usize == instance) {
+                    Some(entry) => entry.configure(config)?,
+                    None => config,
+                }
             };
             match loaded.plugin.activate(config) {
                 Ok(processor) => {
@@ -625,6 +650,7 @@ impl SubHost {
                         last_sent: vec![f64::NAN; targets.len()],
                         targets,
                         interpolation,
+                        resolution: self.resolution,
                         scratch: Vec::with_capacity(capacity),
                     }));
                 }
@@ -822,6 +848,9 @@ pub struct SubHostProcessor {
     /// decides whether a held value needs a point of its own. Captured at
     /// activate, with the targets.
     interpolation: ParamInterpolation,
+    /// The finest resolution the event buffers were sized for. See
+    /// [`SubHost::set_resolution`].
+    resolution: u32,
     /// Reused event buffer. Sized at activate; `process` must not allocate.
     scratch: Vec<Event>,
 }
@@ -860,6 +889,7 @@ impl SubHostProcessor {
             || chunk.end > slots.frames()
             || slots.frames() > self.config.max_block_size
             || slots.lanes() != self.lanes
+            || slots.resolution() < self.resolution
             || !events.is_sorted_by_key(Event::sample_offset)
             || events.iter().any(|e| e.sample_offset() >= slots.frames())
         {
@@ -1298,6 +1328,7 @@ mod tests {
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
             offline: true,
+            ..Default::default()
         }
     }
 
@@ -1334,6 +1365,7 @@ mod tests {
                         targets: Vec::new(),
                         last_sent: vec![f64::NAN; LANES],
                         interpolation: ParamInterpolation::Hold,
+                        resolution: 1,
                         scratch: Vec::with_capacity(8),
                     })
                 })
@@ -1395,6 +1427,7 @@ mod tests {
             targets,
             last_sent: vec![f64::NAN; LANES],
             interpolation: ParamInterpolation::Hold,
+            resolution: 1,
             scratch: Vec::with_capacity(4096),
         };
         (processor, seen)
@@ -1744,6 +1777,37 @@ mod tests {
             points(&seen),
             vec![(0, 0.5), (96, 0.5), (127, last(0.5, 0.8)), (0, 0.8)]
         );
+    }
+
+    /// A schedule finer than the processor was sized for is refused whole,
+    /// rather than sent until the plugin's buffers run out part way through.
+    #[test]
+    fn a_schedule_finer_than_the_activation_is_refused() {
+        let target = ResolvedTarget {
+            instance: 0,
+            id: ParamId(3),
+        };
+        let (mut p, seen) = harness(vec![(0, target)]);
+        p.resolution = 32;
+        let mut schedule = SlotSchedule::new(LANES, 128, 4).unwrap();
+        schedule.begin(128).unwrap();
+        let input = [0.0f32; 256];
+        let mut output = [1.0f32; 256];
+        let mut buffers = AudioBuffers::new(&input, &mut output, 2, 2, 128, BufferLayout::Planar);
+        let status = p.process(
+            &mut buffers,
+            schedule.view(),
+            &[],
+            0..128,
+            &TimeContext::default(),
+            &mut EventSink::new(),
+        );
+        assert_eq!(status, ProcessStatus::Error);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing reached the plugin"
+        );
+        assert!(output.iter().all(|&s| s == 0.0));
     }
 
     /// An anchor is only placed inside the call that moves the value: the

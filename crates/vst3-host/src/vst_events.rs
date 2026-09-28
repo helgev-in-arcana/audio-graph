@@ -18,7 +18,7 @@ use vst3::Steinberg::Vst::{
 
 use crate::midi_map::{self, MidiMap};
 use crate::param_map::ParamMap;
-use crate::process_io::{EventList, ParameterChanges};
+use crate::process_io::{EventList, InputChanges};
 
 /// Fill VST3's input containers from the core's event stream.
 ///
@@ -27,11 +27,14 @@ use crate::process_io::{EventList, ParameterChanges};
 /// here without touching `IEditController` (see [`crate::param_map`]).
 /// `midi` says which parameter each MIDI controller stands for, which in VST3
 /// is the only route a controller has (see [`crate::midi_map`]).
+///
+/// Finishes `changes`: whatever was added before this call goes in with the
+/// stream, and nothing can be added after it.
 pub fn fill_inputs(
     events: &[ApiEvent],
     map: &ParamMap,
     midi: &MidiMap,
-    changes: &ComWrapper<ParameterChanges>,
+    changes: &ComWrapper<InputChanges>,
     list: &ComWrapper<EventList>,
 ) {
     for event in events {
@@ -46,6 +49,7 @@ pub fn fill_inputs(
             }
         }
     }
+    changes.finish();
 }
 
 /// The controller number, channel and normalised value of a MIDI controller
@@ -78,7 +82,7 @@ fn fill_controller(
     controller: u16,
     channel: i16,
     value: f64,
-    changes: &ComWrapper<ParameterChanges>,
+    changes: &ComWrapper<InputChanges>,
 ) {
     // No mapping means the plugin does not answer to this controller. Nothing
     // to approximate: there is no other door.
@@ -88,7 +92,7 @@ fn fill_controller(
     changes.add_point(id, event.sample_offset() as i32, value.clamp(0.0, 1.0));
 }
 
-fn fill_param(event: &ParamEvent, map: &ParamMap, changes: &ComWrapper<ParameterChanges>) {
+fn fill_param(event: &ParamEvent, map: &ParamMap, changes: &ComWrapper<InputChanges>) {
     match *event {
         ParamEvent::SetValue {
             id,
@@ -338,7 +342,7 @@ mod tests {
 
     #[test]
     fn set_value_reaches_the_change_list() {
-        let changes = ParameterChanges::new(4, 4);
+        let changes = InputChanges::new(4, 4);
         let list = EventList::new(4);
         fill_inputs(
             &[ApiEvent::Param(ParamEvent::SetValue {
@@ -369,7 +373,7 @@ mod tests {
         }];
         // A cutoff whose plain range is logarithmic in its normalized one.
         let map = ParamMap::build(&params, |_, n| 20.0 * 1000f64.powf(n));
-        let changes = ParameterChanges::new(4, 4);
+        let changes = InputChanges::new(4, 4);
         let list = EventList::new(4);
         let set = |id, value| {
             ApiEvent::Param(ParamEvent::SetNormalized {
@@ -393,7 +397,7 @@ mod tests {
     /// reaches a VST3 plugin by no path at all.
     #[test]
     fn a_controller_arrives_as_the_parameter_it_is_mapped_to() {
-        let changes = ParameterChanges::new(4, 4);
+        let changes = InputChanges::new(4, 4);
         let list = EventList::new(4);
         let midi = MidiMap::from_assignments(&[(0, 64, 900), (0, midi_map::PITCH_BEND, 901)]);
         fill_inputs(
@@ -427,7 +431,7 @@ mod tests {
     /// parameter for it would drive something the user never touched.
     #[test]
     fn an_unmapped_controller_is_dropped() {
-        let changes = ParameterChanges::new(4, 4);
+        let changes = InputChanges::new(4, 4);
         let list = EventList::new(4);
         fill_inputs(
             &[ApiEvent::Note(NoteEvent::Cc {
@@ -451,7 +455,7 @@ mod tests {
         // Multiple parameter points across a block must land in a single queue
         // with their sample offsets preserved — collapsing them to the block start
         // would make a fast LFO sound stepped.
-        let changes = ParameterChanges::new(4, 64);
+        let changes = InputChanges::new(4, 64);
         let list = EventList::new(4);
         let events: Vec<ApiEvent> = (0..8)
             .map(|i| {
@@ -478,7 +482,7 @@ mod tests {
         // Flattening would overwrite the parameter and destroy whatever value
         // the user had automated, which is worse than the modulation not
         // applying at all.
-        let changes = ParameterChanges::new(4, 4);
+        let changes = InputChanges::new(4, 4);
         let list = EventList::new(4);
         fill_inputs(
             &[ApiEvent::Param(ParamEvent::Modulate {
@@ -498,7 +502,7 @@ mod tests {
     #[test]
     fn notes_convert_with_their_identity_intact() {
         let list = EventList::new(4);
-        let changes = ParameterChanges::new(1, 1);
+        let changes = InputChanges::new(1, 1);
         fill_inputs(
             &[ApiEvent::Note(NoteEvent::NoteOn {
                 note_id: Some(42),

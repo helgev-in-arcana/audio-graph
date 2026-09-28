@@ -106,6 +106,12 @@ processing. Existing values are not automatically resampled. The resolution is
 independent of how the caller chunks audio: a call covering part of a block
 sends the rows that start inside it, however many or few that is.
 
+The event buffers are the exception to sizing for the finest resolution: a row
+per sample for every bound parameter is tens of megabytes an instance. They are
+sized at activate for the resolution set with `SubHost::set_resolution`, and a
+processor handed a finer schedule refuses the call. A caller changing the
+resolution activates again, which is a restart for the sub-plugins.
+
 ### One parameter has one effective scheduled input
 
 `SubHostConfig::target_priority` selects `PreferDirect`, `PreferSlots`, or

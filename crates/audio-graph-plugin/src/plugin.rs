@@ -367,6 +367,7 @@ impl Wrapper {
             // trades accuracy for latency to keep up with a sound card is
             // entitled to know when it no longer has to.
             offline: config.process_mode == ProcessMode::Offline,
+            ..Default::default()
         };
         if let Err(error) = self.shared.activate(audio_config) {
             log::warn!("audio-graph: sub-plugin failed to activate: {error}");
@@ -476,6 +477,7 @@ impl Wrapper {
         // the input through would be exactly the invisible route the graph
         // exists to make visible. The graph runs either way; a plugin node with
         // no plugin behind it produces silence, which `NoInstances` is.
+        let granularity = self.shared.granularity(state.resolution);
         let processor = state.processor.as_mut();
 
         self.params.slot_values(&mut self.daw_slots);
@@ -551,7 +553,7 @@ impl Wrapper {
             &self.daw_slots,
             &self.events,
             frames,
-            self.shared.granularity(),
+            granularity,
             transport.sample_rate as f64,
             transport.tempo.unwrap_or(120.0),
             &self.input_scratch[..(total_in as u32 * frames).max(1) as usize],

@@ -18,7 +18,9 @@ mod ownership;
 mod params;
 mod traits;
 
-pub use buffers::{AudioBuffers, AudioConfig, AuxBuses, BufferLayout, MAX_AUX_BUSES};
+pub use buffers::{
+    AudioBuffers, AudioConfig, AuxBuses, BufferLayout, DEFAULT_MAX_INPUT_EVENTS, MAX_AUX_BUSES,
+};
 pub use events::{
     Event, EventSink, NoteEvent, NoteExpression, NoteId, ParamEvent, Target, TimeContext,
     note_id_from_wire, note_id_to_wire,

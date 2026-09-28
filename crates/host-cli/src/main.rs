@@ -752,6 +752,7 @@ fn run_one_block(plugin: &mut Plugin) -> Result<(), String> {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     };
     let frames = 64u32;
     let mut processor = plugin.activate(config).map_err(|e| e.to_string())?;
@@ -992,6 +993,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
                 aux_inputs: Default::default(),
                 aux_outputs: Default::default(),
                 offline: true,
+                ..Default::default()
             };
             let processor = plugin
                 .activate(config)
@@ -1030,6 +1032,7 @@ fn probe_editor(path: &str, class_id: &str, name: &str, reverse: bool) -> Result
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: false,
+        ..Default::default()
     };
     let processor = sub.activate(config, &[], &[])?;
 
@@ -3066,6 +3069,7 @@ fn cmd_editor(args: &[String]) -> Result<(), String> {
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
             offline: false,
+            ..Default::default()
         },
         &[],
         &[],
@@ -3133,19 +3137,6 @@ fn cmd_resolution(args: &[String]) -> Result<(), String> {
         sub.capabilities(0).param_interpolation
     );
 
-    let mut processors = sub.activate(
-        plugin_host::AudioConfig {
-            sample_rate: 48_000.0,
-            max_block_size: MAX_BLOCK,
-            input_channels: 2,
-            output_channels: 2,
-            aux_inputs: Default::default(),
-            aux_outputs: Default::default(),
-            offline: true,
-        },
-        &[],
-        &[],
-    )?;
     let input = vec![0.0f32; 2 * MAX_BLOCK as usize];
     let mut output = vec![0.0f32; 2 * MAX_BLOCK as usize];
     let mut sink = EventSink::with_capacity(4096);
@@ -3156,9 +3147,30 @@ fn cmd_resolution(args: &[String]) -> Result<(), String> {
     let value = |row: usize, lane: usize| ((row as f64 * 0.013) + lane as f64 * 0.1).fract();
 
     let mut failed = Vec::new();
-    for block in [512, MAX_BLOCK] {
-        for resolution in RESOLUTION_CHOICES {
-            schedule.set_resolution(resolution);
+    for resolution in RESOLUTION_CHOICES {
+        // What the wrapper does when the setting moves: activate again, with
+        // room for this resolution's events.
+        sub.set_resolution(resolution);
+        // Between activations, as the wrapper's tick does: a plugin that
+        // asked for a restart while it ran has to be heard and read again
+        // first.
+        plugin_host::pump_events();
+        sub.tick_editors();
+        sub.refresh_metadata()?;
+        let mut processors = sub.activate(
+            plugin_host::AudioConfig {
+                sample_rate: 48_000.0,
+                max_block_size: MAX_BLOCK,
+                input_channels: 2,
+                output_channels: 2,
+                offline: true,
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )?;
+        schedule.set_resolution(resolution);
+        for block in [512, MAX_BLOCK] {
             let mut status = ProcessStatus::Continue;
             let mut rows = 0;
             let mut row = 0usize;
@@ -3208,12 +3220,12 @@ fn cmd_resolution(args: &[String]) -> Result<(), String> {
                 "ok"
             };
             println!(
-                "  block {block:>4}, resolution {resolution:>3}: {rows:>4} rows, up to {:>5} points per call  {verdict}",
+                "  resolution {resolution:>3}, block {block:>4}: {rows:>4} rows, up to {:>5} points per call  {verdict}",
                 moving.len() * (rows + 1)
             );
         }
+        processors.deactivate();
     }
-    processors.deactivate();
     sub.unload_all();
     if failed.is_empty() {
         println!("every resolution fits");
@@ -3264,6 +3276,7 @@ fn cmd_live(args: &[String]) -> Result<(), String> {
             aux_inputs: Default::default(),
             aux_outputs: Default::default(),
             offline: false,
+            ..Default::default()
         },
         &[],
         &[],

@@ -117,6 +117,10 @@ Both backends validate `AudioConfig` at activation and check every `AudioBuffers
 view against that configuration before constructing native pointers. Mismatched
 blocks return `Error` with cleared audio; zero-frame blocks do not call native DSP.
 
+`AudioConfig::max_input_events` is the caller's bound on the events one
+`process` call is handed. Backends reserve their input buffers for it at
+activation and reject a longer batch whole, before any of it reaches the plugin.
+
 Prepare `EventSink::with_capacity` off the audio thread. `push` never grows it;
 failure is sticky in `overflowed()` until the caller clears the collection interval.
 Backends append call-relative events and propagate native output capacity loss.

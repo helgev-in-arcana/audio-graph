@@ -622,6 +622,9 @@ fn run(shared: &Arc<Shared>, status: &Status, owner: usize, commands: Vec<Comman
             }
             Command::SetResolution(resolution) => {
                 shared.set_resolution(resolution);
+                // Reactivates the sub-plugins with room for the new
+                // resolution's events; see `Shared::publish`.
+                shared.publish_graph();
                 shared.store_state();
                 status.set(format!("parameter resolution {resolution} samples"));
             }

@@ -99,7 +99,21 @@ pub struct AudioConfig {
     pub aux_outputs: AuxBuses,
     /// True when the host is rendering faster than real time.
     pub offline: bool,
+    /// The most events one `process` call will be handed, parameter changes
+    /// and notes together.
+    ///
+    /// The caller's number, because only the caller knows how dense its
+    /// stream is: a host sending a point per sample for eight parameters
+    /// needs thirty thousand where one forwarding a DAW's automation needs a
+    /// few hundred. The backend reserves its input buffers for exactly this
+    /// at activation and treats a call carrying more as an error.
+    pub max_input_events: u32,
 }
+
+/// [`AudioConfig::max_input_events`] for a caller with no particular
+/// stream in mind: a block's worth of parameter points for a few dozen
+/// parameters, and notes besides.
+pub const DEFAULT_MAX_INPUT_EVENTS: u32 = 8192;
 
 impl AudioConfig {
     /// Reject dimensions that cannot be represented by the native processing APIs.
@@ -110,6 +124,11 @@ impl AudioConfig {
         if self.max_block_size == 0 || self.max_block_size > i32::MAX as u32 {
             return Err(crate::HostError::InvalidState(
                 "invalid maximum block size".into(),
+            ));
+        }
+        if self.max_input_events > i32::MAX as u32 {
+            return Err(crate::HostError::InvalidState(
+                "invalid input event capacity".into(),
             ));
         }
         for (main, aux) in [
@@ -160,6 +179,7 @@ impl Default for AudioConfig {
             aux_inputs: AuxBuses::default(),
             aux_outputs: AuxBuses::default(),
             offline: false,
+            max_input_events: DEFAULT_MAX_INPUT_EVENTS,
         }
     }
 }

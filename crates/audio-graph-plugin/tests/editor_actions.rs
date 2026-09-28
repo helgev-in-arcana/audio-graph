@@ -102,6 +102,7 @@ fn the_editors_actions_work_against_an_installed_plugin() {
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     });
 
     // Clicking an entry in the plugin list.
@@ -406,6 +407,7 @@ fn a_plugin_node_discovers_its_sockets_and_its_parameter_socket_drives_something
         aux_inputs: Default::default(),
         aux_outputs: Default::default(),
         offline: true,
+        ..Default::default()
     });
 
     // The canvas adds the node first and the plugin arrives afterwards, so the

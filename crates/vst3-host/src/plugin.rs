@@ -57,17 +57,15 @@ use crate::midi_map::MidiMap;
 use crate::module::{Module, ModuleInner};
 use crate::param_map::ParamMap;
 use crate::param_sync::ParamFeedback;
-use crate::process_io::{EventList, ParameterChanges};
+use crate::process_io::{EventList, InputChanges, ParameterChanges};
 use crate::stream::MemoryStream;
 use crate::util::{from_char16, to_char16};
 use crate::vst_events;
 
-/// Per-block capacity limits for pre-allocated processing containers.
-///
-/// Fixed rather than derived because they must be decided before any audio runs,
-/// and the sub-block quantiser bounds how many points a block can ever carry: at
-/// 16-sample sub-blocks a 4096-sample block yields 256 updates per parameter at
-/// most.
+/// Per-block capacity limits for the containers the host fills on its own
+/// account: how many distinct parameters one call can touch, and the plugin's
+/// output. What a caller hands `process` is sized by the caller, through
+/// [`AudioConfig::max_input_events`].
 const MAX_PARAM_QUEUES: usize = 512;
 const MAX_POINTS_PER_PARAM: usize = 512;
 const MAX_EVENTS_PER_BLOCK: usize = 2048;
@@ -963,7 +961,7 @@ pub struct Vst3Processor {
     processor: ComPtr<IAudioProcessor>,
     config: AudioConfig,
 
-    input_changes: ComWrapper<ParameterChanges>,
+    input_changes: ComWrapper<InputChanges>,
     output_changes: ComWrapper<ParameterChanges>,
     input_events: ComWrapper<EventList>,
     output_events: ComWrapper<EventList>,
@@ -1007,9 +1005,14 @@ impl Vst3Processor {
         Vst3Processor {
             processor: instance.get().processor.clone(),
             config,
-            input_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
+            // The caller's points, and room for the queued edits that go in
+            // ahead of them.
+            input_changes: InputChanges::new(
+                MAX_PARAM_QUEUES,
+                config.max_input_events as usize + MAX_PARAM_QUEUES,
+            ),
             output_changes: ParameterChanges::new(MAX_PARAM_QUEUES, MAX_POINTS_PER_PARAM),
-            input_events: EventList::new(MAX_EVENTS_PER_BLOCK),
+            input_events: EventList::new(config.max_input_events as usize),
             output_events: EventList::new(MAX_EVENTS_PER_BLOCK),
             input_ptrs: vec![std::ptr::null_mut(); config.total_input_channels() as usize],
             output_ptrs: vec![std::ptr::null_mut(); config.total_output_channels() as usize],
@@ -1038,7 +1041,11 @@ impl SubPluginProcessor for Vst3Processor {
         context: &TimeContext,
         out_events: &mut EventSink,
     ) -> ProcessStatus {
-        if !buffers.matches_config(&self.config) {
+        // More events than the caller said it would send would not fit, and
+        // a prefix of them is not what the caller asked for either.
+        if !buffers.matches_config(&self.config)
+            || events.len() > self.config.max_input_events as usize
+        {
             buffers.clear_output();
             return ProcessStatus::Error;
         }
