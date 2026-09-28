@@ -1624,13 +1624,13 @@ fn a_note_lands_in_one_chunk_when_a_row_spans_several() {
     assert_eq!(offsets, vec![0, 37], "each note once");
 }
 
-/// A wired gain moves once a parameter row, whatever the audio is cut into.
+/// A wired gain moves every sample, whatever the audio is cut into.
 ///
-/// The resolution alone decides how often a value reaches audio: a stage run
-/// over the whole block still changes its gain every four samples at a
-/// resolution of four, and the sub-block size has no say in it.
+/// It follows its lane's line from each row's value to the next, so a stage
+/// run over the whole block still moves its gain sample by sample, and the
+/// sub-block size has no say in it.
 #[test]
-fn a_wired_gain_moves_at_the_resolution_not_the_sub_block() {
+fn a_wired_gain_moves_every_sample_whatever_the_sub_block() {
     const BLOCK: u32 = 64;
     let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
 
@@ -1689,16 +1689,9 @@ fn a_wired_gain_moves_at_the_resolution_not_the_sub_block() {
     };
 
     let heard = played(32);
-    for row in heard.chunks(4) {
-        assert!(
-            row.iter().all(|&g| g == row[0]),
-            "one gain across a row: {row:?}"
-        );
-    }
-    let steps = heard.chunks(4).map(|row| row[0]).collect::<Vec<_>>();
     assert!(
-        steps.windows(2).all(|pair| pair[1] < pair[0]),
-        "and a new one at every row: {steps:?}"
+        heard.windows(2).all(|pair| pair[1] < pair[0]),
+        "a new, lower gain on every sample: {heard:?}"
     );
     assert_eq!(heard, played(16), "the sub-block size has no say");
     assert_eq!(heard, played(128), "the sub-block size has no say");
@@ -3937,6 +3930,10 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
             let swept = (block - 4).max(0) as f64 * 4.0 + row as f64;
             lanes[row * lanes_per_row + lane] = seconds(300.0 - swept * 8.0);
         }
+        // Where the next block's first row will be, which is where the last
+        // row's line runs to.
+        let mut end = vec![0.0f64; lanes_per_row];
+        end[lane] = seconds(300.0 - (block - 3).max(0) as f64 * 4.0 * 8.0);
         let mut daw_out = vec![0.0f32; 2 * 128];
         engine.run_audio(
             &AudioContext {
@@ -3946,7 +3943,7 @@ fn sweeping_the_delay_time_moves_the_pitch_without_a_step() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 lanes: &lanes,
-                end: None,
+                end: Some(&end),
                 lanes_per_row,
             },
             &daw_in,
@@ -5212,5 +5209,76 @@ fn a_parameter_delay_reaches_as_far_at_any_resolution() {
         arrival(1),
         Some(expected),
         "one sample a row reaches as far"
+    );
+}
+
+/// A wired gain crosses a block boundary as smoothly as a row boundary.
+///
+/// The last row's line runs to the value the next block starts on, so the
+/// gain there moves by one sample's worth like everywhere else. Held for the
+/// row and stepped, it would jump by a whole row's worth at every block.
+#[test]
+fn a_wired_gain_meets_the_next_block_where_it_left_off() {
+    const BLOCK: u32 = 256;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let input = stereo_in(&mut graph);
+    let output = stereo_out(&mut graph);
+    let mix = graph.add(
+        NodeKind::Mix(Mix {
+            channels: 2,
+            inputs: 1,
+            gains: Vec::new(),
+        }),
+        [0.0, 0.0],
+    );
+    let lfo = graph.add(
+        NodeKind::Lfo(Lfo {
+            waveform: Waveform::Saw,
+            rate: Rate::Hz(20.0),
+            phase: 0.0,
+            depth: -3.0,
+            offset: -3.0,
+        }),
+        [0.0, 0.0],
+    );
+    graph.connect(input, 0, mix, 0);
+    graph.connect(lfo, 0, mix, 1);
+    graph.connect(mix, 0, output, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(BLOCK, &[2]);
+    load(&mut engine, &graph);
+    let mut schedule = SlotSchedule::new(width, BLOCK, 128).unwrap();
+    let mut heard = Vec::new();
+    for _ in 0..3 {
+        let mut daw_out = vec![0.0f32; 2 * BLOCK as usize];
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            BLOCK,
+            Granularity {
+                resolution: 128,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[1.0; 2 * BLOCK as usize],
+            &mut daw_out,
+            &mut Adders,
+        );
+        heard.extend_from_slice(&daw_out[..BLOCK as usize]);
+    }
+    let steps: Vec<f32> = heard.windows(2).map(|pair| pair[0] - pair[1]).collect();
+    let (least, most) = steps
+        .iter()
+        .fold((f32::MAX, 0.0f32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+    assert!(least > 0.0, "the gain falls on every sample");
+    // Not exactly as much: a saw in decibels is a curve in linear gain. A
+    // step would be a row's worth — over a hundred times one sample's.
+    assert!(
+        most < least * 1.5,
+        "and by about as much on each, block boundaries included: {least}..{most}"
     );
 }

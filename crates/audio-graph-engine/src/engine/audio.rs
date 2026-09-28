@@ -402,27 +402,36 @@ impl Engine {
                     }
                     let width = program.buffers[*out as usize] as usize;
                     for (n, input) in inputs.iter().enumerate() {
-                        // A gain per row the chunk covers: a wired gain moves
-                        // as often as any other parameter, however the audio
-                        // is chunked.
+                        // A wired gain follows its lane's line a row at a
+                        // time, however the audio is chunked. Drawn between
+                        // linear gains rather than decibels: cheaper per
+                        // sample, and over one row the two are the same move.
                         let mut at = start;
                         while at < start + frames {
                             let seg = ctx.run_from(at, start + frames);
-                            let gain = input
-                                .lane
-                                .and_then(|lane| ctx.lane(ctx.row_at(at), lane))
-                                .map(|db| db_to_linear(db) as f32)
-                                .unwrap_or(input.gain as f32);
+                            let (line, from_gain, to_gain) =
+                                match input.lane.and_then(|lane| ctx.lane_line(at, lane)) {
+                                    Some(line) => {
+                                        (Some(line), db_to_linear(line.from), db_to_linear(line.to))
+                                    }
+                                    None => (None, input.gain, input.gain),
+                                };
                             let done = at - start;
                             for ch in 0..width.min(MAX_CHANNELS) {
                                 let from = self.at(input.buf, ch, win) + done;
                                 let to = self.at(*out, ch, win) + done;
-                                if from == to && gain == 1.0 {
+                                if from == to && from_gain == 1.0 && to_gain == 1.0 {
                                     // Already in place and unchanged: unity
                                     // gain on the destination buffer.
                                     continue;
                                 }
                                 for i in 0..seg {
+                                    let gain = match line {
+                                        Some(line) => {
+                                            from_gain + (to_gain - from_gain) * line.along(at + i)
+                                        }
+                                        None => from_gain,
+                                    } as f32;
                                     let value = self.pool[from + i] * gain;
                                     if n == 0 {
                                         self.pool[to + i] = value;
@@ -528,10 +537,10 @@ impl Engine {
                     time,
                     max_time,
                 } => {
-                    // The row in force at the chunk's last sample, because
+                    // Where the lane is at the chunk's last sample, because
                     // that is where the read's sweep lands.
                     let seconds = lane
-                        .and_then(|lane| ctx.lane(ctx.row_at(start + frames.max(1) - 1), lane))
+                        .and_then(|lane| ctx.lane_value(start + frames.max(1) - 1, lane))
                         .unwrap_or(*time)
                         .max(0.0);
                     let width = program.buffers[*out as usize] as usize;
@@ -629,22 +638,24 @@ impl Engine {
             Waveform::Random => Waveform::Sine,
             other => other,
         };
-        let mut target = depth.clamp(0.0, 1.0);
+        let target = depth.clamp(0.0, 1.0);
+        if !started {
+            from = target;
+        }
         let mut done = 0usize;
         while done < win.frames {
             let at = win.start + done;
             let seg = ctx.run_from(at, win.start + win.frames);
-            if let Some(value) = lane.and_then(|lane| ctx.lane(ctx.row_at(at), lane)) {
-                target = value.clamp(0.0, 1.0);
-            }
-            if !started && done == 0 {
-                from = target;
-            }
+            // A wired depth follows its lane's line. A set one slides from the
+            // depth last applied to the one set across the segment, so a
+            // recompile that changes it does not click; the oscillator never
+            // stops either way.
+            let line = lane.and_then(|lane| ctx.lane_line(at, lane));
             for i in 0..seg {
-                // The depth slides to its target across the segment; the
-                // oscillator never stops.
-                let t = (i + 1) as f64 / seg as f64;
-                let d = from + (target - from) * t;
+                let d = match line {
+                    Some(line) => line.at(at + i).clamp(0.0, 1.0),
+                    None => from + (target - from) * (i + 1) as f64 / seg as f64,
+                };
                 let shape = wave
                     .shape((phase + step * i as f64).rem_euclid(1.0))
                     .unwrap_or(0.0);
@@ -656,7 +667,10 @@ impl Engine {
                 }
             }
             phase = (phase + step * seg as f64).rem_euclid(1.0);
-            from = target;
+            from = match line {
+                Some(line) => line.at(at + seg).clamp(0.0, 1.0),
+                None => target,
+            };
             done += seg;
         }
         if let Some(held) = self.dsp.get_mut(state) {

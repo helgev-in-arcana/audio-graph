@@ -185,10 +185,11 @@ pub enum AudioOp {
     /// Scale a buffer by a gain that slides towards its target instead of
     /// stepping to it.
     ///
-    /// What a [`AudioOp::Mix`] of one cannot do: a mix holds its gain for a
-    /// whole row, so a gate switching a loud signal steps the waveform at a
-    /// row boundary and clicks. Here the gain moves sample by sample towards
-    /// a target re-read every row.
+    /// What a [`AudioOp::Mix`] of one cannot do: a mix draws its gain from row
+    /// to row, so a gate switching a loud signal is crossed in one row —
+    /// however long the resolution makes that, which at one sample is a
+    /// click. Here the gain moves at its own rise and fall times towards a
+    /// target re-read every row.
     ///
     /// `out` may be `a`, which makes it a scaling in place that costs no
     /// buffer. Nothing about the ramp is fixed at compile time except its
@@ -264,9 +265,9 @@ pub enum AudioOp {
     /// cycle of `waveform` at `rate`: a tremolo.
     ///
     /// The oscillator runs at the sample rate rather than being an LFO node
-    /// driving a gain, because a parameter changes only at a row
-    /// boundary and a gain that steps every 32 samples at a tremolo's speed is
-    /// audible as a buzz. `state` holds the phase, so it runs on through a
+    /// driving a gain, because a parameter is known only at row boundaries,
+    /// and a gain drawn in straight lines between them turns a corner every
+    /// 32 samples, which at a tremolo's speed is audible as a buzz. `state` holds the phase, so it runs on through a
     /// recompile, and the depth it last applied, which is ramped rather than
     /// stepped when the lane moves it. `lane` carries the depth when its
     /// socket is wired; without one, `depth` is the whole story.

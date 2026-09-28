@@ -117,6 +117,60 @@ impl AudioContext<'_> {
         let resolution = (self.resolution as usize).max(1);
         (resolution - at % resolution).min(end - at)
     }
+
+    /// A lane across the row sample `at` falls in, as a line.
+    ///
+    /// A row's value is where the lane stands at the row's start, and the next
+    /// row's — the block's end, for the last row — is where it is going, so a
+    /// control read off the line moves every sample and arrives on each row's
+    /// value on time. Held for the row and stepped instead, a gain moving at a
+    /// coarse resolution would be heard as a staircase. Where there is nothing
+    /// to go to, the line is flat.
+    fn lane_line(&self, at: usize, lane: u16) -> Option<LaneLine> {
+        let row = self.row_at(at);
+        let from = self.lane(row, lane)?;
+        let to = self
+            .lane(row + 1, lane)
+            .or_else(|| self.end.and_then(|end| end.get(lane as usize).copied()))
+            .unwrap_or(from);
+        let resolution = (self.resolution as usize).max(1);
+        let start = row * resolution;
+        Some(LaneLine {
+            from,
+            to,
+            start,
+            frames: resolution
+                .min((self.frames as usize).saturating_sub(start))
+                .max(1),
+        })
+    }
+
+    /// The lane's value at sample `at`, off [`lane_line`][Self::lane_line].
+    fn lane_value(&self, at: usize, lane: u16) -> Option<f64> {
+        self.lane_line(at, lane).map(|line| line.at(at))
+    }
+}
+
+/// One row of a lane, drawn from where the row starts to where the next one
+/// does. See [`AudioContext::lane_line`].
+#[derive(Debug, Clone, Copy)]
+struct LaneLine {
+    from: f64,
+    to: f64,
+    /// The row's first sample, and how many it covers.
+    start: usize,
+    frames: usize,
+}
+
+impl LaneLine {
+    /// How far along the row sample `at` is, 0 at its start.
+    fn along(&self, at: usize) -> f64 {
+        at.saturating_sub(self.start) as f64 / self.frames as f64
+    }
+
+    fn at(&self, at: usize) -> f64 {
+        self.from + (self.to - self.from) * self.along(at)
+    }
 }
 
 /// How finely one block is cut, for parameters and for audio.
