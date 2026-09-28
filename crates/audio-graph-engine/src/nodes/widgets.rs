@@ -148,11 +148,25 @@ pub(crate) fn fallback(
                 let opacity = ui.opacity();
                 ui.disable();
                 ui.set_opacity(opacity);
+                // Every state, not just `noninteractive`: a disabled widget
+                // keeps its sense, so it is still drawn as inactive or hovered.
+                // The stroke keeps its width so the text sits where it would
+                // with the frame.
                 let widgets = &mut ui.visuals_mut().widgets;
-                widgets.noninteractive.fg_stroke = widgets.inactive.fg_stroke;
-                widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
-                widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
-                widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                let text = widgets.inactive.fg_stroke;
+                for state in [
+                    &mut widgets.noninteractive,
+                    &mut widgets.inactive,
+                    &mut widgets.hovered,
+                    &mut widgets.active,
+                    &mut widgets.open,
+                ] {
+                    state.fg_stroke = text;
+                    state.bg_fill = egui::Color32::TRANSPARENT;
+                    state.weak_bg_fill = egui::Color32::TRANSPARENT;
+                    state.bg_stroke.color = egui::Color32::TRANSPARENT;
+                    state.expansion = 0.0;
+                }
                 add(ui, &mut live);
             });
             out.response.on_hover_text(hover);
@@ -319,4 +333,58 @@ pub(crate) fn shorten(text: &str) -> String {
         return text.to_string();
     }
     text.chars().take(15).collect::<String>() + "\u{2026}"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether any rectangle the frame painted can be seen.
+    fn paints_a_box(connected: bool, live: Option<f64>, hovered: bool) -> bool {
+        let ctx = egui::Context::default();
+        let mut value = 0.25;
+        let mut shapes = Vec::new();
+        // Two frames with the pointer where the control is: a widget's
+        // hovered look is decided from the frame before.
+        for _ in 0..2 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            };
+            if hovered {
+                input
+                    .events
+                    .push(egui::Event::PointerMoved(egui::pos2(20.0, 15.0)));
+            }
+            let output = ctx.run_ui(input, |ui| {
+                fallback(ui, connected, live, &mut value, |ui, v| {
+                    ui.add(egui::DragValue::new(v).speed(0.01)).changed()
+                });
+            });
+            shapes = output.shapes.clone();
+            output.drop_without_applying_deltas();
+        }
+        shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Rect(rect) => {
+                rect.fill != egui::Color32::TRANSPARENT
+                    || (rect.stroke.width > 0.0 && rect.stroke.color != egui::Color32::TRANSPARENT)
+            }
+            _ => false,
+        })
+    }
+
+    /// A control showing its socket's value has no box around it, hovered or
+    /// not: the missing box is what says it cannot be edited.
+    #[test]
+    fn a_control_showing_its_socket_has_no_box() {
+        assert!(
+            paints_a_box(false, None, false),
+            "an editable control has one"
+        );
+        assert!(!paints_a_box(true, Some(0.5), false));
+        assert!(!paints_a_box(true, Some(0.5), true));
+    }
 }
