@@ -125,8 +125,6 @@ pub(crate) mod decimals {
     /// A millisecond. The shortest delay is one sub-block, about 0.67 ms at a
     /// quantum of 32 and 48 kHz, which ten-millisecond steps would hide.
     pub(crate) const SECONDS: usize = 3;
-    /// A hundredth of a beat.
-    pub(crate) const BEATS: usize = 2;
 }
 
 /// Colour for a warning that is not an error: a control that still works, but

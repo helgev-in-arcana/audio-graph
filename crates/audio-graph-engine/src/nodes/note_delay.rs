@@ -90,8 +90,10 @@ impl Node for MidiDelay {
                     .speed(0.01)
                     .range(0.0..=60.0)
                     .clamp_existing_to_range(false)
+                    // A beat count is a plain number here. Beats are better
+                    // set as a fraction, which this control is not.
                     .fixed_decimals(if beats {
-                        decimals::BEATS
+                        decimals::PLAIN
                     } else {
                         decimals::SECONDS
                     })
