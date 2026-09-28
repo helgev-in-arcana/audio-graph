@@ -5,7 +5,7 @@ pub use crate::ir::MathOp;
 use crate::ir::{Op, Operand};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo, fallback};
+use crate::nodes::widgets::{NodeUi, combo, decimals, fallback};
 use crate::port::Port;
 
 /// Performs a mathematical operation on two parameter inputs.
@@ -65,7 +65,12 @@ impl Node for Math {
             return false;
         }
         fallback(ui, connected, cx.input(port), &mut self.b, |ui, b| {
-            ui.add(egui::DragValue::new(b).speed(0.01)).changed()
+            ui.add(
+                egui::DragValue::new(b)
+                    .speed(0.01)
+                    .fixed_decimals(decimals::PLAIN),
+            )
+            .changed()
         })
     }
 }

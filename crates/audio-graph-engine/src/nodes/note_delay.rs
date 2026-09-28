@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback};
+use crate::nodes::widgets::{NodeUi, decimals, fallback};
 use crate::nodes::{Node, NoteDelay};
 use crate::port::{Port, PortType};
 
@@ -90,6 +90,11 @@ impl Node for MidiDelay {
                     .speed(0.01)
                     .range(0.0..=60.0)
                     .clamp_existing_to_range(false)
+                    .fixed_decimals(if beats {
+                        decimals::BEATS
+                    } else {
+                        decimals::SECONDS
+                    })
                     .suffix(if beats { " beats" } else { " s" }),
             )
             .changed()

@@ -4,7 +4,7 @@ use crate::compile::{CompileError, ParamCx};
 use crate::ir::{Op, Operand};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback};
+use crate::nodes::widgets::{NodeUi, decimals, fallback};
 use crate::port::Port;
 
 /// How many values one switch may choose between. A `Mix`'s ceiling, for a
@@ -237,9 +237,14 @@ impl Node for Switch {
             cx.input(port),
             &mut self.values[index],
             |ui, value| {
-                ui.add_sized(size, egui::DragValue::new(value).speed(0.01))
-                    .on_hover_text("the value this row outputs while its socket is unwired")
-                    .changed()
+                ui.add_sized(
+                    size,
+                    egui::DragValue::new(value)
+                        .speed(0.01)
+                        .fixed_decimals(decimals::PLAIN),
+                )
+                .on_hover_text("the value this row outputs while its socket is unwired")
+                .changed()
             },
         );
         changed

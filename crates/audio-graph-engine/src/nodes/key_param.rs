@@ -4,7 +4,7 @@ use crate::compile::{CompileError, ParamCx};
 use crate::ir::{Op, Operand};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo, fallback, key_control};
+use crate::nodes::widgets::{NodeUi, combo, decimals, fallback, key_control};
 use crate::port::{Port, PortType};
 
 /// How many values one key parameter may choose between. A `Mix`'s ceiling, for
@@ -244,7 +244,14 @@ impl Node for KeyParam {
             connected,
             cx.input(port),
             &mut self.values[index],
-            |ui, value| ui.add(egui::DragValue::new(value).speed(0.01)).changed(),
+            |ui, value| {
+                ui.add(
+                    egui::DragValue::new(value)
+                        .speed(0.01)
+                        .fixed_decimals(decimals::PLAIN),
+                )
+                .changed()
+            },
         );
         // In `Toggle` only the first key does anything — one key is the point
         // of that mode — so the rest are greyed rather than hidden, which would

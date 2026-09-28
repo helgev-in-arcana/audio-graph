@@ -110,6 +110,25 @@ impl NodeUi<'_> {
     }
 }
 
+/// How many decimal places a number is shown with, by unit.
+///
+/// Fixed rather than left to `DragValue`, which picks them from the drag speed:
+/// a value that moves under a wired socket would otherwise change width as it
+/// crosses a round number.
+pub(crate) mod decimals {
+    /// A plain number, most often 0..1. Three is the fewest that tell every
+    /// step of a 7-bit MIDI controller apart: with two, 63/127 and 64/127 both
+    /// read 0.50.
+    pub(crate) const PLAIN: usize = 3;
+    /// A tenth of a decibel is about the smallest change anyone hears.
+    pub(crate) const DB: usize = 1;
+    /// A millisecond. The shortest delay is one sub-block, about 0.67 ms at a
+    /// quantum of 32 and 48 kHz, which ten-millisecond steps would hide.
+    pub(crate) const SECONDS: usize = 3;
+    /// A hundredth of a beat.
+    pub(crate) const BEATS: usize = 2;
+}
+
 /// Colour for a warning that is not an error: a control that still works, but
 /// not the way the patch implies.
 pub(crate) const CAUTION: egui::Color32 = egui::Color32::from_rgb(200, 140, 60);
@@ -211,7 +230,11 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
             *slot = shown.clamp(1, slots) - 1;
             changed = true;
         }
-        ui.label(format!("{:.3}", cx.live.get(*slot).copied().unwrap_or(0.0)));
+        ui.label(format!(
+            "{:.*}",
+            decimals::PLAIN,
+            cx.live.get(*slot).copied().unwrap_or(0.0)
+        ));
     });
     match cx.bindings.iter().find(|(i, _, _)| i == slot) {
         Some((_, name, true)) => {

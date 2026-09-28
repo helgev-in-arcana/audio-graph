@@ -4,7 +4,7 @@ use crate::compile::{AudioCx, CompileError, ParamCx};
 use crate::ir::{AudioOp, Buf, MixIn};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, fallback};
+use crate::nodes::widgets::{NodeUi, decimals, fallback};
 use crate::port::{Port, PortType};
 
 /// Convert a decibel value to a linear amplitude multiplier.
@@ -186,6 +186,7 @@ impl Node for Mix {
                     // The range is for dragging. A wired gain is applied
                     // unclamped, so that is how it is shown.
                     .clamp_existing_to_range(false)
+                    .fixed_decimals(decimals::DB)
                     .suffix(" dB"),
             )
             .changed()
