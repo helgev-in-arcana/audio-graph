@@ -23,11 +23,18 @@ Program {
             1,
         ),
     ],
-    audio_ring_len: [],
-    audio_rings: [],
-    audio_ring_seconds: [],
-    audio_delay_nodes: [],
-    delay_nodes: [],
+    audio_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    param_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
     audio_ops: [
         Input {
             out: 0,

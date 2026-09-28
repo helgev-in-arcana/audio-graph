@@ -21,7 +21,7 @@ mod stages;
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
 
 use crate::graph::{Graph, LineId, NodeId};
-use crate::ir::{MAX_NOTE_BUFS, NoteOp, Op, Program, Stage};
+use crate::ir::{MAX_NOTE_BUFS, NoteOp, Op, Program, Rings, Stage};
 use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,14 +209,19 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         buffers: audio.buffers,
         stages: program_stages,
         latency: audio.latency,
-        delay_nodes: lines.iter().map(|l| l.writer).collect(),
-        audio_delay_nodes: audio.delay_nodes,
-        audio_ring_seconds: audio.ring_seconds,
-        // Filled in on the main thread by `Program::size_rings`, which is the
-        // only side that knows the sample rate and the only side allowed to
-        // allocate.
-        audio_ring_len: Vec::new(),
-        audio_rings: Vec::new(),
+        // The lengths and the rings are filled in on the main thread by
+        // `Program::size_rings`, which is the only side that knows the sample
+        // rate and the only side allowed to allocate.
+        audio_lines: Rings {
+            nodes: audio.delay_nodes,
+            seconds: audio.ring_seconds,
+            ..Rings::default()
+        },
+        param_lines: Rings {
+            nodes: lines.iter().map(|l| l.writer).collect(),
+            seconds: param.ring_seconds,
+            ..Rings::default()
+        },
         lfo_nodes: param.lfo_nodes,
         latch_nodes: param.latch_nodes,
         dsp_nodes: audio.dsp_nodes,
@@ -580,7 +585,7 @@ mod tests {
         graph.connect(scale, 0, out, 0);
 
         let program = compile(&graph, SLOTS).expect("a delay is a graph cut, not an edge");
-        assert_eq!(program.delay_nodes, vec![write]);
+        assert_eq!(program.param_lines.nodes, vec![write]);
         assert!(
             program
                 .ops

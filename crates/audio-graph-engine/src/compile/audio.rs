@@ -1309,7 +1309,12 @@ mod tests {
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
         handoff.send(Box::new(
-            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+            crate::ir::PreparedProgram::prepare(
+                compile(&graph, SLOTS).unwrap(),
+                48_000.0,
+                &Default::default(),
+            )
+            .0,
         ));
         assert!(engine.adopt_handoff(&handoff));
 
@@ -1339,7 +1344,12 @@ mod tests {
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
         handoff.send(Box::new(
-            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+            crate::ir::PreparedProgram::prepare(
+                compile(&graph, SLOTS).unwrap(),
+                48_000.0,
+                &Default::default(),
+            )
+            .0,
         ));
         assert!(engine.adopt_handoff(&handoff));
 
@@ -1377,7 +1387,12 @@ mod tests {
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
         handoff.send(Box::new(
-            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+            crate::ir::PreparedProgram::prepare(
+                compile(&graph, SLOTS).unwrap(),
+                48_000.0,
+                &Default::default(),
+            )
+            .0,
         ));
         assert!(engine.adopt_handoff(&handoff));
 
@@ -1428,7 +1443,12 @@ mod tests {
         engine.prepare(8, &[2]);
         let handoff = crate::Handoff::new();
         handoff.send(Box::new(
-            crate::ir::PreparedProgram::prepare(compile(&graph, SLOTS).unwrap(), 48_000.0, &[]).0,
+            crate::ir::PreparedProgram::prepare(
+                compile(&graph, SLOTS).unwrap(),
+                48_000.0,
+                &Default::default(),
+            )
+            .0,
         ));
         assert!(engine.adopt_handoff(&handoff));
 

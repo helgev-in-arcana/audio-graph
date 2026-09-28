@@ -28,13 +28,22 @@ Program {
             2,
         ),
     ],
-    audio_ring_len: [],
-    audio_rings: [],
-    audio_ring_seconds: [],
-    audio_delay_nodes: [],
-    delay_nodes: [
-        0,
-    ],
+    audio_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    param_lines: Rings {
+        nodes: [
+            0,
+        ],
+        seconds: [
+            2.0,
+        ],
+        len: [],
+        rings: [],
+    },
     audio_ops: [],
     note_ops: [],
     note_bufs: 0,

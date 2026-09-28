@@ -16,19 +16,20 @@ use super::*;
 ///
 /// `head` comes in pointing into the old ring and goes out pointing into the
 /// new one.
-pub(super) fn copy_ring(
-    from: &[f32],
+pub(super) fn copy_ring<T: Copy>(
+    from: &[T],
     from_len: usize,
-    to: &mut [f32],
+    to: &mut [T],
     to_len: usize,
     head: &mut usize,
+    channels: usize,
 ) {
     if from_len == 0 || to_len == 0 {
         *head = 0;
         return;
     }
     let keep = from_len.min(to_len);
-    for ch in 0..MAX_CHANNELS {
+    for ch in 0..channels {
         let (src, dst) = (ch * from_len, ch * to_len);
         for i in 0..keep {
             // `keep` samples ending at the old head, laid down ending at the
@@ -50,9 +51,55 @@ pub(super) trait Slot {
     fn clear(&mut self);
 }
 
-/// One parameter delay line: `MAX_DELAY_TAPS` sub-blocks of history.
+/// A line whose ring the main thread sizes and the program carries in. See
+/// [`Rings`].
+pub(super) trait Ring: Slot {
+    type Sample: Copy;
+    /// Samples the ring holds per sample of delay.
+    const CHANNELS: usize;
+    /// The ring, how many samples per channel it holds, and where the next
+    /// write goes.
+    fn parts(&mut self) -> (&mut Vec<Self::Sample>, &mut usize, &mut usize);
+}
+
+/// Swaps in the rings a new program carries for its lines, keeping what still
+/// fits of each line's history, and retires the lines past its count.
+///
+/// A line whose program brings no ring keeps its own, unless its length no
+/// longer matches: then it has none until one arrives, which is silence
+/// rather than a read past the end.
+pub(super) fn adopt_rings<L: Ring>(held: &mut [L], next: &mut Rings<L::Sample>) {
+    let count = next.nodes.len().min(held.len());
+    for (line, held) in held.iter_mut().enumerate() {
+        let (ring, len, head) = held.parts();
+        if line >= count {
+            *len = 0;
+            continue;
+        }
+        let want = next.len.get(line).copied().unwrap_or(0);
+        match next.rings.get_mut(line) {
+            Some(fresh) if !fresh.is_empty() => {
+                std::mem::swap(ring, fresh);
+                // Carry over what will still fit, most recent samples last.
+                copy_ring(fresh, *len, ring, want, head, L::CHANNELS);
+                *len = want;
+            }
+            _ if *len != want => *len = 0,
+            _ => {}
+        }
+    }
+}
+
+/// One parameter delay line: a value per sample of delay, as far back as its
+/// reads asked to reach.
+///
+/// Per sample rather than per row, so how far back it reaches is the node's
+/// `max_time` whatever the resolution, and so a delay of one resolution means
+/// the same time at another.
 pub(super) struct ParamLine {
     pub(super) ring: Vec<f64>,
+    /// Samples in `ring`, or zero while the line has none.
+    pub(super) len: usize,
     pub(super) head: usize,
     node: u32,
 }
@@ -60,10 +107,27 @@ pub(super) struct ParamLine {
 impl ParamLine {
     pub(super) fn new() -> ParamLine {
         ParamLine {
-            ring: vec![0.0; MAX_DELAY_TAPS],
+            ring: Vec::new(),
+            len: 0,
             head: 0,
             node: u32::MAX,
         }
+    }
+}
+
+impl Ring for ParamLine {
+    type Sample = f64;
+    const CHANNELS: usize = 1;
+    fn parts(&mut self) -> (&mut Vec<f64>, &mut usize, &mut usize) {
+        (&mut self.ring, &mut self.len, &mut self.head)
+    }
+}
+
+impl Ring for AudioLine {
+    type Sample = f32;
+    const CHANNELS: usize = MAX_CHANNELS;
+    fn parts(&mut self) -> (&mut Vec<f32>, &mut usize, &mut usize) {
+        (&mut self.ring, &mut self.len, &mut self.head)
     }
 }
 
@@ -74,6 +138,8 @@ impl Slot for ParamLine {
     fn set_node(&mut self, node: u32) {
         self.node = node;
     }
+    /// Emptied where it stands. `len` still describes the ring, which a new
+    /// line either reuses or has replaced by one of its own.
     fn clear(&mut self) {
         self.ring.fill(0.0);
         self.head = 0;

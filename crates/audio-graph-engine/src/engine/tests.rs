@@ -43,7 +43,6 @@ fn ctx(frames: u32) -> BlockContext {
         sample_rate: 48_000.0,
         tempo_bpm: 120.0,
         frames,
-        resolution: frames,
         offset: 0,
         row: 0,
         block: frames,
@@ -77,7 +76,9 @@ fn audio_ctx(frames: u32) -> AudioContext<'static> {
 fn load(engine: &mut Engine, graph: &Graph) {
     let handoff = Handoff::new();
     let program = compile(graph, SLOTS).unwrap();
-    handoff.send(Box::new(PreparedProgram::prepare(program, RATE, &[]).0));
+    handoff.send(Box::new(
+        PreparedProgram::prepare(program, RATE, &Default::default()).0,
+    ));
     assert!(engine.adopt_handoff(&handoff));
 }
 
@@ -318,7 +319,6 @@ fn tempo_sync_follows_the_host() {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames: 6000,
-            resolution: 6000,
             offset: 0,
             row: 0,
             block: 6000,
@@ -330,7 +330,6 @@ fn tempo_sync_follows_the_host() {
             sample_rate: 48_000.0,
             tempo_bpm: 120.0,
             frames: 1,
-            resolution: 1,
             offset: 0,
             row: 0,
             block: 1,
@@ -414,7 +413,6 @@ fn the_end_of_a_block_is_where_the_next_one_starts_and_nothing_moves_to_find_it(
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     frames: RESOLUTION,
-                    resolution: RESOLUTION,
                     offset: index % (BLOCK / RESOLUTION) * RESOLUTION,
                     block: BLOCK,
                     row: index % (BLOCK / RESOLUTION),
@@ -1222,7 +1220,6 @@ fn a_generator_follows_its_lane_inside_a_whole_block_chunk() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 16,
-                resolution: 16,
                 offset: index as u32 * 16,
                 row: index as u32,
                 block: 64,
@@ -1739,7 +1736,6 @@ fn a_note_lands_in_one_sub_block_only() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 4,
-                resolution: 4,
                 offset: sub as u32 * 4,
                 row: sub as u32,
                 block: 8,
@@ -1968,7 +1964,6 @@ fn a_controller_becomes_a_parameter_at_the_next_boundary() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 8,
-                resolution: 8,
                 offset: index * 8,
                 row: index,
                 block: 16,
@@ -2032,7 +2027,6 @@ fn a_filter_upstream_of_a_cc_in_changes_what_it_reads() {
                     sample_rate: RATE,
                     tempo_bpm: 120.0,
                     frames: 8,
-                    resolution: 8,
                     offset: index * 8,
                     row: index,
                     block: 16,
@@ -2081,7 +2075,6 @@ fn a_controller_holds_its_position() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 8,
-                resolution: 8,
                 offset: 0,
                 row: 0,
                 block: 8,
@@ -2451,7 +2444,6 @@ impl Keyboard {
                     sample_rate: 48_000.0,
                     tempo_bpm: 120.0,
                     frames,
-                    resolution: frames,
                     offset,
                     row: row as u32,
                     block: frames * 2,
@@ -3360,7 +3352,6 @@ fn the_all_stages_helpers_differ_only_where_a_level_reaches_audio() {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: QUANTUM,
-                resolution: QUANTUM,
                 offset: row as u32 * QUANTUM,
                 row: row as u32,
                 block: BLOCK,
@@ -4144,7 +4135,6 @@ fn gated_block(engine: &mut Engine, control: [f64; 4]) -> Vec<f32> {
                 sample_rate: RATE,
                 tempo_bpm: 120.0,
                 frames: 16,
-                resolution: 16,
                 offset: index as u32 * 16,
                 row: index as u32,
                 block: 64,
@@ -4312,16 +4302,16 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     graph.connect(read, 0, output, 0);
 
     let mut program = compile(&graph, SLOTS).unwrap();
-    let sized = program.size_rings(RATE, &[]);
+    let sized = program.size_rings(RATE, &Default::default());
     // 0.05 s at 48 kHz, plus the interpolator's headroom.
-    assert_eq!(program.audio_ring_len, vec![2404]);
-    assert_eq!(program.audio_rings[0].len(), MAX_CHANNELS * 2404);
+    assert_eq!(program.audio_lines.len, vec![2404]);
+    assert_eq!(program.audio_lines.rings[0].len(), MAX_CHANNELS * 2404);
 
     // Publishing again with nothing changed hands over no ring at all.
     let mut again = compile(&graph, SLOTS).unwrap();
     let sized_again = again.size_rings(RATE, &sized);
     assert!(
-        again.audio_rings[0].is_empty(),
+        again.audio_lines.rings[0].is_empty(),
         "an unchanged line is left alone"
     );
     assert_eq!(sized_again, sized);
@@ -4349,9 +4339,9 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     }
     let mut wider = compile(&graph, SLOTS).unwrap();
     wider.size_rings(RATE, &sized);
-    assert_eq!(wider.audio_ring_len, vec![9604]);
+    assert_eq!(wider.audio_lines.len, vec![9604]);
     assert!(
-        !wider.audio_rings[0].is_empty(),
+        !wider.audio_lines.rings[0].is_empty(),
         "a changed line gets a new ring"
     );
     let handoff = Handoff::new();
@@ -5148,5 +5138,79 @@ fn a_fine_resolution_does_not_crowd_the_notes_out() {
         seen.iter()
             .any(|e| matches!(e, Event::Note(NoteEvent::NoteOff { key: 60, .. }))),
         "the note is let go"
+    );
+}
+
+/// A parameter delay delays by its time, whatever the resolution.
+///
+/// Its ring holds a value per sample of delay, as far back as the node asked
+/// to reach, so half a second is half a second at a resolution of one sample
+/// as at thirty-two — rather than a fixed number of rows, which at one
+/// sample a row would reach less than a tenth of a second.
+#[test]
+fn a_parameter_delay_reaches_as_far_at_any_resolution() {
+    const BLOCK: u32 = 512;
+    const DELAY: f64 = 0.5;
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut graph = Graph::new();
+    let slot = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+    let write = graph.add(
+        NodeKind::DelayWrite(DelayWrite {
+            line: 0,
+            ty: PortType::Param,
+        }),
+        [0.0, 0.0],
+    );
+    let read = graph.add(
+        NodeKind::DelayRead(DelayRead {
+            line: 0,
+            ty: PortType::Param,
+            max_time: 1.0,
+            time: DELAY,
+        }),
+        [0.0, 0.0],
+    );
+    let sink = param_sink(&mut graph);
+    graph.connect(slot, 0, write, 0);
+    graph.connect(read, 0, sink, 0);
+
+    let arrival = |resolution: u32| -> Option<u32> {
+        let mut engine = Engine::new();
+        engine.prepare(BLOCK, &[]);
+        load(&mut engine, &graph);
+        let mut schedule = SlotSchedule::new(width, BLOCK, resolution).unwrap();
+        let mut daw = [0.0; SLOTS];
+        for block in 0..60u32 {
+            // A step on the first sample of the second block.
+            daw[0] = if block >= 1 { 1.0 } else { 0.0 };
+            engine.run_block(
+                &mut schedule,
+                &daw,
+                &[],
+                BLOCK,
+                Granularity {
+                    resolution,
+                    quantum: 32,
+                },
+                RATE,
+                120.0,
+                &[],
+                &mut [],
+                &mut subhost_adapter::NoInstances,
+            );
+            if let Some(row) = (0..schedule.row_count()).find(|&row| schedule.row(row)[SINK] > 0.5)
+            {
+                return Some(block * BLOCK + schedule.offset(row));
+            }
+        }
+        None
+    };
+
+    let expected = BLOCK + (DELAY * RATE) as u32;
+    assert_eq!(arrival(32), Some(expected));
+    assert_eq!(
+        arrival(1),
+        Some(expected),
+        "one sample a row reaches as far"
     );
 }

@@ -25,10 +25,10 @@ use crate::handoff::Handoff;
 use crate::ir::{
     AudioMathOp, AudioOp, Buf, CC_INTERVAL, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, DSP_VALUES,
     Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS,
-    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_TAPS, MAX_DSP_STATES,
-    MAX_LATCHES, MAX_LFOS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS,
-    MAX_REGISTERS, MathOp, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand,
-    PreparedProgram, Program, QUANTUM_CHOICES, RateSpec, Stage, Waveform,
+    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
+    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp,
+    NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand, PreparedProgram,
+    Program, QUANTUM_CHOICES, RateSpec, Rings, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -42,7 +42,7 @@ mod params;
 mod tests;
 
 use audio::Window;
-use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, copy_ring, reorder};
+use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, adopt_rings, reorder};
 use notes::{NoteState, key_bit};
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
@@ -57,12 +57,6 @@ pub struct BlockContext {
     /// by this much afterwards, which is what makes the row rate a property of
     /// the caller rather than of the engine.
     pub frames: u32,
-    /// The parameter resolution: how many frames a full row covers.
-    ///
-    /// Not always `frames`, because the last row of a block is short whenever
-    /// the block is not a multiple of it. What is counted in rows — a
-    /// parameter delay's length — is counted in full ones.
-    pub resolution: u32,
     /// Where this row starts inside the DAW's block.
     pub offset: u32,
     /// Frames in the whole DAW block, which is how the audio buffers are
@@ -352,11 +346,11 @@ impl Engine {
         reorder(&mut self.lfos, &mut self.order, &next.lfo_nodes);
         reorder(&mut self.latches, &mut self.order, &next.latch_nodes);
         reorder(&mut self.dsp, &mut self.order, &next.dsp_nodes);
-        reorder(&mut self.lines, &mut self.order, &next.delay_nodes);
+        reorder(&mut self.lines, &mut self.order, &next.param_lines.nodes);
         reorder(
             &mut self.audio_lines,
             &mut self.order,
-            &next.audio_delay_nodes,
+            &next.audio_lines.nodes,
         );
         // When ring lengths change, new buffers provided by the main thread are swapped in.
         let next = self
@@ -364,22 +358,8 @@ impl Engine {
             .as_mut()
             .expect("take reported a swap")
             .program_mut();
-        for line in 0..next.audio_delay_nodes.len().min(MAX_AUDIO_DELAY_LINES) {
-            let len = next.audio_ring_len.get(line).copied().unwrap_or(0);
-            let held = &mut self.audio_lines[line];
-            if next.audio_rings.get(line).is_some_and(|r| !r.is_empty()) {
-                std::mem::swap(&mut held.ring, &mut next.audio_rings[line]);
-                // Carry over what will still fit, most recent samples last.
-                let from = &next.audio_rings[line];
-                copy_ring(from, held.len, &mut held.ring, len, &mut held.head);
-                held.len = len;
-            } else if held.len != len {
-                held.len = 0;
-            }
-        }
-        for line in next.audio_delay_nodes.len()..MAX_AUDIO_DELAY_LINES {
-            self.audio_lines[line].len = 0;
-        }
+        adopt_rings(&mut self.audio_lines, &mut next.audio_lines);
+        adopt_rings(&mut self.lines, &mut next.param_lines);
         true
     }
 
@@ -702,7 +682,6 @@ impl Engine {
                         sample_rate,
                         tempo_bpm,
                         frames: schedule.frames_of(index),
-                        resolution: schedule.resolution(),
                         offset: schedule.offset(index),
                         block: frames,
                         row: index as u32,
@@ -717,7 +696,6 @@ impl Engine {
                     sample_rate,
                     tempo_bpm,
                     frames: 0,
-                    resolution: schedule.resolution(),
                     offset: frames,
                     block: frames,
                     row: rows as u32,

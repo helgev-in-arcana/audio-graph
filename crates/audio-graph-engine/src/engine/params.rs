@@ -138,15 +138,6 @@ impl Engine {
             0.0
         };
 
-        // Parameter delay distance converted to rows. A full row's length
-        // rather than this one's: the last row of a block is short, and a
-        // delay measured against it would jump once per block.
-        let taps_per_second = if ctx.resolution > 0 && ctx.sample_rate > 0.0 {
-            ctx.sample_rate / f64::from(ctx.resolution)
-        } else {
-            0.0
-        };
-
         for op in &program.ops[stage.params.range()] {
             match *op {
                 Op::DelayRead {
@@ -160,25 +151,34 @@ impl Engine {
                         Some(reg) => self.registers[reg as usize].max(0.0),
                         None => time,
                     };
-                    let index = line as usize;
-                    self.registers[out as usize] = if index < self.lines.len() {
-                        let taps = (time * taps_per_second)
-                            .round()
-                            .clamp(1.0, (MAX_DELAY_TAPS - 1) as f64)
-                            as usize;
-                        let head = self.lines[index].head;
-                        let at = (head + MAX_DELAY_TAPS - taps) % MAX_DELAY_TAPS;
-                        self.lines[index].ring[at]
-                    } else {
-                        0.0
+                    self.registers[out as usize] = match self.lines.get(line as usize) {
+                        Some(held) if held.len > 1 && held.ring.len() >= held.len => {
+                            // At least one sample back, which is the last
+                            // sample the previous row wrote: this row's own
+                            // write comes after every read, and a read that
+                            // could see it would close a loop with no delay.
+                            let back = (time * ctx.sample_rate)
+                                .round()
+                                .clamp(1.0, (held.len - 1) as f64)
+                                as usize;
+                            held.ring[(held.head + held.len - back) % held.len]
+                        }
+                        _ => 0.0,
                     };
                 }
                 Op::DelayWrite { line, a } => {
-                    let index = line as usize;
-                    if index < self.lines.len() {
-                        let head = self.lines[index].head;
-                        self.lines[index].ring[head] = self.registers[a as usize];
-                        self.lines[index].head = (head + 1) % MAX_DELAY_TAPS;
+                    // The row's value, over every sample the row covers: a
+                    // read a row's length back and one a sample back then
+                    // agree on what that row was.
+                    let value = self.registers[a as usize];
+                    if let Some(held) = self.lines.get_mut(line as usize)
+                        && held.len > 1
+                        && held.ring.len() >= held.len
+                    {
+                        for i in 0..ctx.frames as usize {
+                            held.ring[(held.head + i) % held.len] = value;
+                        }
+                        held.head = (held.head + ctx.frames as usize) % held.len;
                     }
                 }
                 Op::Const { out, value } => self.registers[out as usize] = value,

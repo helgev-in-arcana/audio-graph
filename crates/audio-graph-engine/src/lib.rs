@@ -39,9 +39,9 @@ pub use graph::{Graph, LineId, Link, Node, NodeId};
 pub use handoff::Handoff;
 pub use ir::{
     AudioMathOp, AudioOp, Buf, Chunking, DEFAULT_QUANTUM, Detect, Follow, MAX_AUDIO_DELAY_LINES,
-    MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES,
-    MAX_DELAY_TAPS, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand,
-    PreparedProgram, Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg, Waveform,
+    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_SECONDS,
+    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, PreparedProgram,
+    Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
     AudioIn, AudioMath, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower,

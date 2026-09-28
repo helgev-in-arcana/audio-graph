@@ -217,10 +217,12 @@ pub enum Op {
     /// Read from a parameter delay line, `time` seconds back.
     ///
     /// When `time_reg` is present, its value overrides `time`.
-    /// The delay duration is clamped at run time to at least one row: a
-    /// read that could see the current row's own write would close a loop
-    /// with no delay in it. The compiler cannot do the clamping — the floor
-    /// depends on the sample rate and the quantum, and it knows neither.
+    /// The delay is clamped at run time to at least one sample, which reads
+    /// the previous row: a read that could see the current row's own write
+    /// would close a loop with no delay in it. And to at most what the line's
+    /// ring holds, which is the reads' longest `max_time` — a length in
+    /// samples, so the compiler, which does not know the sample rate, cannot
+    /// do either.
     DelayRead {
         out: Reg,
         line: u16,

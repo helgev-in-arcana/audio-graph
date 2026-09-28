@@ -2,11 +2,18 @@ Program {
     ops: [],
     registers: 0,
     outputs: [],
-    audio_ring_len: [],
-    audio_rings: [],
-    audio_ring_seconds: [],
-    audio_delay_nodes: [],
-    delay_nodes: [],
+    audio_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    param_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
     audio_ops: [
         Silence {
             out: 0,

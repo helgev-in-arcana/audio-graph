@@ -20,9 +20,9 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_DELAY_SECONDS, MAX_AUDIO_LANES,
-    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
-    MAX_DSP_STATES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
+    AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
+    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_SECONDS, MAX_DSP_STATES,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -62,6 +62,9 @@ pub(crate) struct ParamCx<'a> {
     /// Register → the stage whose ops write it, which is the stage of the node
     /// that allocated it.
     reg_stage: Vec<u32>,
+    /// Line index → the furthest a parameter read of it asked to reach, in
+    /// seconds. See [`ParamCx::want_ring`].
+    ring_seconds: Vec<f64>,
     lfo_nodes: Vec<NodeId>,
     latch_nodes: Vec<NodeId>,
     param_targets: Vec<ParamTarget>,
@@ -82,6 +85,8 @@ pub(crate) struct ParamHalf {
     /// [`ParamCx::emit_follow`].
     pub follows: Vec<(usize, (NodeId, u8))>,
     pub registers: usize,
+    /// Line index → the furthest a parameter read of it asked to reach.
+    pub ring_seconds: Vec<f64>,
     /// Sorted by the stage that writes each register, then by lane.
     pub outputs: Vec<(u16, Reg)>,
     /// One per stage: where its lanes sit in `outputs`.
@@ -114,6 +119,7 @@ impl<'a> ParamCx<'a> {
             follows: Vec::new(),
             outputs: Vec::new(),
             reg_stage: Vec::new(),
+            ring_seconds: vec![0.0; lines.len()],
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             param_targets: Vec::new(),
@@ -163,6 +169,7 @@ impl<'a> ParamCx<'a> {
             follows: self.follows,
             ops: self.ops,
             registers: self.next_reg,
+            ring_seconds: self.ring_seconds,
             outputs: self.outputs,
             output_spans,
             lfo_nodes: self.lfo_nodes,
@@ -311,6 +318,16 @@ impl<'a> ParamCx<'a> {
             .iter()
             .position(|l| l.id == line)
             .expect("collect_lines saw every delay node") as u16
+    }
+
+    /// Asks that parameter line `index`'s ring reach `seconds` back.
+    ///
+    /// Several reads may share a line, and the ring has to reach the furthest
+    /// of them. See [`AudioCx::want_ring`], which does the same for audio.
+    pub(crate) fn want_ring(&mut self, index: u16, seconds: f64) {
+        if let Some(slot) = self.ring_seconds.get_mut(index as usize) {
+            *slot = slot.max(seconds.clamp(0.0, MAX_DELAY_SECONDS));
+        }
     }
 
     pub(crate) fn check_slot(&self, slot: usize) -> Result<(), CompileError> {
@@ -964,7 +981,7 @@ impl<'a> AudioCx<'a> {
     /// ring has to be long enough for the furthest of them.
     pub(crate) fn want_ring(&mut self, index: u16, seconds: f64) {
         let slot = &mut self.ring_seconds[index as usize];
-        *slot = slot.max(seconds.clamp(0.0, MAX_AUDIO_DELAY_SECONDS));
+        *slot = slot.max(seconds.clamp(0.0, MAX_DELAY_SECONDS));
     }
 }
 

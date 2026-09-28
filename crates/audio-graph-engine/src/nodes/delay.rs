@@ -8,12 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
 use crate::graph::LineId;
-#[cfg(feature = "ui")]
-use crate::ir::MAX_DELAY_TAPS;
 use crate::ir::{AudioOp, Op};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{CAUTION, NodeUi, decimals, fallback, line_control};
+use crate::nodes::widgets::{NodeUi, decimals, fallback, line_control};
 use crate::port::{Port, PortType};
 
 /// The write endpoint of a delay line.
@@ -138,6 +136,7 @@ impl Node for DelayRead {
             }
             return Ok(());
         }
+        cx.want_ring(line, self.max_time);
         let out = cx.alloc()?;
         cx.emit(Op::DelayRead {
             out,
@@ -193,19 +192,6 @@ impl Node for DelayRead {
         });
         if matches!(self.ty, PortType::Audio { .. }) {
             ui.weak(format!("at least {:.1} ms (one sub-block)", floor * 1000.0));
-        } else {
-            // A parameter line holds a fixed number of rows, so how far back
-            // it reaches is the resolution's doing. Said here rather than
-            // clamped, because the next resolution chosen may reach again.
-            let reach =
-                (MAX_DELAY_TAPS - 1) as f64 * cx.resolution as f64 / cx.sample_rate.max(1.0);
-            if self.max_time > reach {
-                ui.colored_label(CAUTION, format!("reaches {reach:.2} s at this resolution"))
-                    .on_hover_text(
-                        "a parameter delay keeps a fixed number of rows; a coarser \
-                     parameter resolution reaches further back",
-                    );
-            }
         }
         changed
     }
