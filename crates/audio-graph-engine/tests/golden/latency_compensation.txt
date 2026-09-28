@@ -90,4 +90,5 @@ Program {
     lfo_nodes: [],
     dsp_nodes: [],
     note_delay_nodes: [],
+    output_registers: [],
 }

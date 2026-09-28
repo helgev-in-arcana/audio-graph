@@ -75,18 +75,21 @@ impl Node for MidiDelay {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port != 1 {
             return false;
         }
         let beats = self.beats;
-        let time = &mut self.time;
-        fallback(ui, connected, |ui| {
+        fallback(ui, connected, cx.input(port), &mut self.time, |ui, time| {
+            // A wired time is floored at zero and has no ceiling, so it is
+            // shown the same way; the range is only for dragging.
+            *time = time.max(0.0);
             ui.add(
                 egui::DragValue::new(time)
                     .speed(0.01)
                     .range(0.0..=60.0)
+                    .clamp_existing_to_range(false)
                     .suffix(if beats { " beats" } else { " s" }),
             )
             .changed()

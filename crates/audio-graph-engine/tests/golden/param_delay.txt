@@ -71,4 +71,27 @@ Program {
     lfo_nodes: [],
     dsp_nodes: [],
     note_delay_nodes: [],
+    output_registers: [
+        (
+            (
+                2,
+                0,
+            ),
+            0,
+        ),
+        (
+            (
+                3,
+                0,
+            ),
+            1,
+        ),
+        (
+            (
+                1,
+                0,
+            ),
+            2,
+        ),
+    ],
 }

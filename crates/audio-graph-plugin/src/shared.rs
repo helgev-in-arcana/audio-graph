@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::config::SLOT_COUNT;
 use crate::notification::{ErrorSource, Notifications, note_loss_message};
+use crate::sockets::{LiveSockets, Socket};
 use crate::state::WrapperState;
 use crate::touched::Touched;
 use audio_graph_engine::NodeId;
@@ -152,6 +153,9 @@ pub struct Shared {
     /// because the DAW's parameter value does not move when the graph is what
     /// is driving the slot.
     live: [AtomicU32; SLOT_COUNT],
+    /// What each param socket carried at the end of the last block, for the
+    /// controls a wired socket stands in for.
+    sockets: LiveSockets,
     params: Arc<WrapperParams>,
     /// The last document this instance saved or retained without interpreting.
     ///
@@ -246,6 +250,7 @@ impl Shared {
             sample_rate: AtomicU32::new(48_000f32.to_bits()),
             latency: AtomicU32::new(0),
             live: array::from_fn(|_| AtomicU32::new(0)),
+            sockets: LiveSockets::default(),
             params,
             last_written: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -468,6 +473,17 @@ impl Shared {
         array::from_fn(|i| f32::from_bits(self.live[i].load(Ordering::Relaxed)))
     }
 
+    /// Report what every param socket carried in the block just run.
+    /// Audio thread; lock-free and allocation-free.
+    pub fn report_sockets(&self, publication: u64, registers: &[f64]) {
+        self.sockets.report(publication, registers);
+    }
+
+    /// What each param output socket carried at the end of the last block.
+    pub fn live_sockets(&self) -> Vec<(Socket, f64)> {
+        self.sockets.read()
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
@@ -687,6 +703,17 @@ impl Shared {
         compiled
     }
 
+    /// Hands `program` to the audio thread, and tells the editor which of its
+    /// registers is which socket.
+    fn hand_over(&self, program: audio_graph_engine::Program) -> u64 {
+        self.sockets.publishing(program.output_registers());
+        let publication = self
+            .programs
+            .publish(program, f64::from(self.sample_rate()));
+        self.sockets.published(publication);
+        publication
+    }
+
     fn publish(&self, force_rebind: bool) -> Result<(), String> {
         let mut program = self.compile_program()?;
         let rebuild = {
@@ -698,8 +725,7 @@ impl Shared {
         };
         if !rebuild {
             self.latency.store(program.latency(), Ordering::Relaxed);
-            self.programs
-                .publish(program, f64::from(self.sample_rate()));
+            self.hand_over(program);
             return Ok(());
         }
 
@@ -722,9 +748,7 @@ impl Shared {
             program = self.compile_program()?;
         }
         self.latency.store(program.latency(), Ordering::Relaxed);
-        let publication = self
-            .programs
-            .publish(program, f64::from(self.sample_rate()));
+        let publication = self.hand_over(program);
         let (processor, result) = match activated {
             Ok(processor) => (processor, Ok(())),
             Err(error) => (None, Err(error)),

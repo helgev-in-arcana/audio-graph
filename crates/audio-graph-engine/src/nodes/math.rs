@@ -59,13 +59,12 @@ impl Node for Math {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port != 1 {
             return false;
         }
-        let b = &mut self.b;
-        fallback(ui, connected, |ui| {
+        fallback(ui, connected, cx.input(port), &mut self.b, |ui, b| {
             ui.add(egui::DragValue::new(b).speed(0.01)).changed()
         })
     }

@@ -118,6 +118,47 @@ fn the_daws_automation_can_be_read_shaped_and_written_back() {
     assert!((slots[SINK] - 0.4).abs() < 1e-12);
 }
 
+/// What a socket carries can be read back after the block, through the
+/// register the program names for it.
+///
+/// The editor shows a wired control's value this way; a map that pointed at
+/// the wrong register would show one socket's number on another.
+#[test]
+fn a_sockets_value_is_readable_through_its_register() {
+    let mut graph = Graph::new();
+    let input = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+    let b = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
+    let half = graph.add(
+        NodeKind::Math(Math {
+            op: MathOp::Multiply,
+            b: 1.0,
+        }),
+        [0.0, 0.0],
+    );
+    let out = param_sink(&mut graph);
+    graph.connect(input, 0, half, 0);
+    graph.connect(b, 0, half, 1);
+    graph.connect(half, 0, out, 0);
+
+    let mut engine = Engine::new();
+    load(&mut engine, &graph);
+    let map = compile(&graph, SLOTS).unwrap().output_registers().to_vec();
+    let carried = |engine: &Engine, node: NodeId| {
+        let &(_, reg) = map
+            .iter()
+            .find(|&&(socket, _)| socket == (node, 0))
+            .unwrap();
+        engine.registers()[reg as usize]
+    };
+
+    let mut slots = lanes();
+    slots[3] = 0.8;
+    engine.run(&ctx(32), &mut slots);
+    assert_eq!(carried(&engine, input), 0.8);
+    assert_eq!(carried(&engine, b), 0.5);
+    assert!((carried(&engine, half) - 0.4).abs() < 1e-12);
+}
+
 /// The parameter half's switch: one value below the threshold, another at
 /// it and above.
 #[test]

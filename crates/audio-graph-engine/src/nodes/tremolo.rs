@@ -109,16 +109,21 @@ impl Node for Tremolo {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         if port != 1 {
             return false;
         }
-        let depth = &mut self.depth;
-        fallback(ui, connected, |ui| {
-            ui.add(egui::DragValue::new(depth).speed(0.01).range(0.0..=1.0))
-                .changed()
-        })
+        fallback(
+            ui,
+            connected,
+            cx.input(port),
+            &mut self.depth,
+            |ui, depth| {
+                ui.add(egui::DragValue::new(depth).speed(0.01).range(0.0..=1.0))
+                    .changed()
+            },
+        )
     }
 }
 

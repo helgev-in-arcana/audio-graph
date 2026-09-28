@@ -75,6 +75,10 @@ pub struct NodeUi<'a> {
     pub bindings: &'a [(usize, String, bool)],
     /// Live normalized parameter values for each slot.
     pub live: &'a [f32],
+    /// What is arriving at each of this node's input sockets, by port: `None`
+    /// for an empty socket, and for one whose value the editor has not heard
+    /// back yet.
+    pub inputs: &'a [Option<f64>],
     /// Whether the hosted plugin supports polyphonic parameter modulation.
     pub poly_modulation: bool,
     /// The sub-block size and the sample rate, which together are the floor a
@@ -99,6 +103,11 @@ impl NodeUi<'_> {
     pub fn act(&mut self, action: NodeAction) {
         self.actions.push(action);
     }
+
+    /// What is arriving at input `port`, if it is wired and has been heard.
+    pub fn input(&self, port: u8) -> Option<f64> {
+        self.inputs.get(port as usize).copied().flatten()
+    }
 }
 
 /// Colour for a warning that is not an error: a control that still works, but
@@ -111,17 +120,45 @@ pub(crate) const CAUTION: egui::Color32 = egui::Color32::from_rgb(200, 140, 60);
 /// input is unconnected" — but that is a thing to read rather than a thing to
 /// see. Greying the control out says it in the place it applies, and the hover
 /// says why.
-pub(crate) fn fallback<R>(
+///
+/// Once the socket's value has been heard, the control shows that instead of
+/// `value`, drawn by `add` so it keeps the control's own format and width. It
+/// loses its frame rather than its colour: a greyed number is hard to read
+/// while it moves, and the missing box is what says it cannot be edited. `add`
+/// works on a copy there, so the stored value is left for when the link goes.
+pub(crate) fn fallback(
     ui: &mut egui::Ui,
     connected: bool,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    let out = ui.add_enabled_ui(!connected, add);
-    if connected {
-        out.response
-            .on_hover_text("driven by what is wired into this socket");
+    live: Option<f64>,
+    value: &mut f64,
+    add: impl FnOnce(&mut egui::Ui, &mut f64) -> bool,
+) -> bool {
+    let hover = "driven by what is wired into this socket";
+    match (connected, live) {
+        (false, _) => add(ui, value),
+        (true, None) => {
+            let out = ui.add_enabled_ui(false, |ui| add(ui, value));
+            out.response.on_hover_text(hover);
+            out.inner
+        }
+        (true, Some(mut live)) => {
+            let out = ui.scope(|ui| {
+                // Disabled for the input it would otherwise take, at full
+                // opacity for the colour it would otherwise lose.
+                let opacity = ui.opacity();
+                ui.disable();
+                ui.set_opacity(opacity);
+                let widgets = &mut ui.visuals_mut().widgets;
+                widgets.noninteractive.fg_stroke = widgets.inactive.fg_stroke;
+                widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+                widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                add(ui, &mut live);
+            });
+            out.response.on_hover_text(hover);
+            false
+        }
     }
-    out.inner
 }
 
 /// Which delay line a half belongs to.

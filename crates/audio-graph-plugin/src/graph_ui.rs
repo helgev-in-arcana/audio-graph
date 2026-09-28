@@ -157,6 +157,9 @@ pub struct GraphContext<'a> {
     pub error: Option<String>,
     /// The value each slot currently has after the graph has had its say.
     pub live: [f32; SLOT_COUNT],
+    /// What each param output socket carried at the end of the last block.
+    /// Empty until the program on screen is the one being heard.
+    pub sockets: &'a [(crate::sockets::Socket, f64)],
     /// The sub-block size and the sample rate, which together define the minimum
     /// delay time floor. The editor displays this and restricts control minimums;
     /// the audio thread also clamps it dynamically.
@@ -472,7 +475,7 @@ impl GraphEditor {
         // and only the wrapper knows what that is.
         let title = graph.nodes[index]
             .kind
-            .ui_title(&node_ui(ctx, self.learning));
+            .ui_title(&node_ui(ctx, self.learning, &[]));
 
         let zoom = self.zoom;
         let width = NODE_WIDTH * zoom;
@@ -532,6 +535,17 @@ impl GraphEditor {
         let connected: Vec<bool> = (0..inputs.len())
             .map(|i| graph.source_of(id, i as u8).is_some())
             .collect();
+        // And what each of them is carrying: the value at the other end of the
+        // link, which is exactly what the node reads in place of its own.
+        let arriving: Vec<Option<f64>> = (0..inputs.len())
+            .map(|i| {
+                let from = graph.source_of(id, i as u8)?;
+                ctx.sockets
+                    .iter()
+                    .find(|&&(socket, _)| socket == from)
+                    .map(|&(_, value)| value)
+            })
+            .collect();
 
         // What the node's own controls asked the wrapper for, and which socket
         // the user asked to take away. Both are carried out after the closure
@@ -585,7 +599,7 @@ impl GraphEditor {
                             outcome.changed = true;
                         }
                     }
-                    let mut cx = node_ui(ctx, self.learning);
+                    let mut cx = node_ui(ctx, self.learning, &arriving);
                     outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
                     actions.append(&mut cx.actions);
                     // The name fills what the buttons left, laid out the
@@ -628,7 +642,7 @@ impl GraphEditor {
                         outcome.changed = true;
                     }
                 }
-                let mut cx = node_ui(ctx, self.learning);
+                let mut cx = node_ui(ctx, self.learning, &arriving);
                 let changed = graph.nodes[index].kind.controls(ui, &mut cx);
                 actions.append(&mut cx.actions);
                 changed
@@ -661,7 +675,7 @@ impl GraphEditor {
                             if remove_button(ui, port.remove, "remove this output") {
                                 dropped_output = Some(i as u8);
                             }
-                            let mut cx = node_ui(ctx, self.learning);
+                            let mut cx = node_ui(ctx, self.learning, &arriving);
                             outcome.changed |=
                                 graph.nodes[index].kind.output_control(ui, i as u8, &mut cx);
                             actions.append(&mut cx.actions);
@@ -731,7 +745,7 @@ impl GraphEditor {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.label(port.name.as_ref());
-                                    let mut cx = node_ui(ctx, self.learning);
+                                    let mut cx = node_ui(ctx, self.learning, &arriving);
                                     outcome.changed |= graph.nodes[index]
                                         .kind
                                         .input_control(ui, i as u8, wired, &mut cx);
@@ -1238,8 +1252,13 @@ fn plugin_row(ui: &mut egui::Ui, entry: &PluginEntry) -> RowHit {
 /// what those controls asked the wrapper to do and every caller drains its own
 /// — a node's title bar, its body and each of its socket rows are three
 /// separate asks.
-fn node_ui<'a>(ctx: &'a GraphContext<'a>, learning: Option<(usize, u32)>) -> NodeUi<'a> {
+fn node_ui<'a>(
+    ctx: &'a GraphContext<'a>,
+    learning: Option<(usize, u32)>,
+    inputs: &'a [Option<f64>],
+) -> NodeUi<'a> {
     NodeUi {
+        inputs,
         touched: ctx.touched,
         learning,
         slot_count: SLOT_COUNT,
@@ -1387,6 +1406,7 @@ mod tests {
                     poly_modulation: false,
                     error: None,
                     live: [0.0; SLOT_COUNT],
+                    sockets: &[],
                     quantum: 32,
                     sample_rate: 48_000.0,
                 };

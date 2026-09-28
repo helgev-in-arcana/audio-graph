@@ -230,7 +230,7 @@ impl Node for KeyParam {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         let Some(index) = usize::from(port).checked_sub(1) else {
             return false;
@@ -239,10 +239,13 @@ impl Node for KeyParam {
             return false;
         }
         self.values.resize(self.keys.len(), 0.0);
-        let mut changed = fallback(ui, connected, |ui| {
-            ui.add(egui::DragValue::new(&mut self.values[index]).speed(0.01))
-                .changed()
-        });
+        let mut changed = fallback(
+            ui,
+            connected,
+            cx.input(port),
+            &mut self.values[index],
+            |ui, value| ui.add(egui::DragValue::new(value).speed(0.01)).changed(),
+        );
         // In `Toggle` only the first key does anything — one key is the point
         // of that mode — so the rest are greyed rather than hidden, which would
         // make switching modes look like it lost them.

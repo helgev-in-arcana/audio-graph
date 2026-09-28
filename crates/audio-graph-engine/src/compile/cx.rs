@@ -84,6 +84,7 @@ pub(crate) struct ParamHalf {
     pub latch_nodes: Vec<NodeId>,
     pub param_targets: Vec<ParamTarget>,
     pub audio_lanes: Vec<((NodeId, u8), u16)>,
+    pub reg_of: Vec<((NodeId, u8), Reg)>,
 }
 
 impl<'a> ParamCx<'a> {
@@ -146,6 +147,7 @@ impl<'a> ParamCx<'a> {
             latch_nodes: self.latch_nodes,
             param_targets: self.param_targets,
             audio_lanes: self.audio_lanes,
+            reg_of: self.reg_of,
         }
     }
 

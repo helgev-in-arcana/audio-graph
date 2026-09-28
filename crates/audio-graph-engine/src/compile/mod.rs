@@ -220,6 +220,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         latch_nodes: param.latch_nodes,
         dsp_nodes: audio.dsp_nodes,
         note_delay_nodes: notes.delay_nodes,
+        output_registers: param.reg_of,
     })
 }
 

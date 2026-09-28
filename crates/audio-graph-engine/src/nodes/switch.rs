@@ -182,7 +182,7 @@ impl Node for Switch {
         ui: &mut egui::Ui,
         port: u8,
         connected: bool,
-        _cx: &mut NodeUi<'_>,
+        cx: &mut NodeUi<'_>,
     ) -> bool {
         let Some(index) = usize::from(port).checked_sub(1) else {
             return false;
@@ -231,14 +231,17 @@ impl Node for Switch {
             }
         }
         ui.label("→");
-        changed |= fallback(ui, connected, |ui| {
-            ui.add_sized(
-                size,
-                egui::DragValue::new(&mut self.values[index]).speed(0.01),
-            )
-            .on_hover_text("the value this row outputs while its socket is unwired")
-            .changed()
-        });
+        changed |= fallback(
+            ui,
+            connected,
+            cx.input(port),
+            &mut self.values[index],
+            |ui, value| {
+                ui.add_sized(size, egui::DragValue::new(value).speed(0.01))
+                    .on_hover_text("the value this row outputs while its socket is unwired")
+                    .changed()
+            },
+        );
         changed
     }
 

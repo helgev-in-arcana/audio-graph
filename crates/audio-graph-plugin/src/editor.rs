@@ -306,6 +306,7 @@ impl WrapperEditor {
         // and needs no particular thread. What must not happen inline is the
         // *consequence* of an edit — see `GraphEdit::Publish`.
         let touched = self.shared.touched().snapshot();
+        let sockets = self.shared.live_sockets();
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
@@ -314,6 +315,7 @@ impl WrapperEditor {
             poly_modulation: self.view.poly_modulation,
             error: patch.compile_error.clone(),
             live: self.shared.live_slots(),
+            sockets: &sockets,
             quantum: self.shared.quantum(),
             sample_rate: self.shared.sample_rate() as f64,
             touched: &touched,

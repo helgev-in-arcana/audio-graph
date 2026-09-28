@@ -596,6 +596,8 @@ impl Wrapper {
         // being the answer the moment the graph drives a slot.
         self.shared
             .report_slots(self.schedule.block(self.schedule.blocks() - 1));
+        self.shared
+            .report_sockets(self.engine.publication(), self.engine.registers());
 
         let status = if self.engine.has_audio() {
             ApiStatus::Continue

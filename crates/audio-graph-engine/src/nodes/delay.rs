@@ -219,7 +219,7 @@ impl Node for DelayRead {
             changed = true;
         }
         changed
-            | fallback(ui, connected, |ui| {
+            | fallback(ui, connected, cx.input(port), time, |ui, time| {
                 ui.add(
                     egui::DragValue::new(time)
                         .speed(0.001)

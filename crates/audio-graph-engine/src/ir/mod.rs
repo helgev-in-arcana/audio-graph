@@ -230,6 +230,14 @@ pub struct Program {
     /// Note delay index → the node whose queue it is, carried across a swap
     /// so the notes in flight are not lost to a recompile.
     pub(crate) note_delay_nodes: Vec<NodeId>,
+    /// Param output socket → the register holding its value, in the order the
+    /// outputs were bound.
+    ///
+    /// The audio thread never reads it. It is kept for whoever has to say what
+    /// a socket is carrying: every register is written once per sub-block and
+    /// never reused, so after a block has run, the register named here still
+    /// holds that socket's value from the last sub-block.
+    pub(crate) output_registers: Vec<((NodeId, u8), Reg)>,
 }
 
 /// A compiled program prepared for its publisher's receiving engine and sample
@@ -401,6 +409,7 @@ impl Program {
             latch_nodes: Vec::new(),
             dsp_nodes: Vec::new(),
             note_delay_nodes: Vec::new(),
+            output_registers: Vec::new(),
         }
     }
 
@@ -471,6 +480,13 @@ impl Program {
 
     pub fn latency(&self) -> u32 {
         self.latency
+    }
+
+    /// Every param output socket this program computes, with the register
+    /// holding its value. See [`Engine::registers`][crate::Engine::registers]
+    /// for where to read it.
+    pub fn output_registers(&self) -> &[((NodeId, u8), Reg)] {
+        &self.output_registers
     }
 }
 
