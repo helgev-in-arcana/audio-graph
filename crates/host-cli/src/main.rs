@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         "graph" => cmd_graph(rest),
         "chain" => cmd_chain(rest),
         "instrument" => cmd_instrument(rest),
+        "tremolo" => cmd_tremolo(rest),
         "sidechain" => cmd_sidechain(rest),
         "aux" => cmd_aux(rest),
         "delay" => cmd_delay(rest),
@@ -151,6 +152,10 @@ fn usage() {
   host-cli instrument <WRAPPER.vst3> <SYNTH> <A> <B>
                                     check notes reach the instrument the graph
                                     points at, and only that one
+  host-cli tremolo <WRAPPER.vst3> <SYNTH>
+                                    check a held key switch cuts a synth's note
+                                    into steps, as a MIDI tremolo and as an
+                                    audio tremolo
   host-cli sidechain <WRAPPER.vst3> <COMP> <SYNTH> <SC_PARAM_ID>
                                     check a compressor inside the graph ducks
                                     against another node's audio
@@ -1753,6 +1758,195 @@ fn cmd_instrument(args: &[String]) -> Result<(), String> {
     }
 
     println!("notes reach the instrument the graph points at, and only that one");
+    Ok(())
+}
+
+/// A key switch held over a held note, through a MIDI tremolo into a synth,
+/// and through the synth into an audio tremolo.
+///
+/// What the engine's own tests cannot show is a real plugin hearing one note
+/// struck again under the same id after its note-off. Each step's sounding
+/// part is measured on its own: a synth that ignored the second strike would
+/// be silent from the second step on. The audio tremolo's cuts are measured
+/// too, and must be silent whatever the synth's release, since they are cut
+/// after it.
+fn cmd_tremolo(args: &[String]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use audio_graph_engine::{
+        AudioTremolo, Beats, Graph, KeySwitchMode, MidiTremolo, NoteMute, Plugin as PluginNode,
+        PluginPorts, Ratio, TremoloKeys, TremoloRow,
+    };
+
+    let wrapper = args.first().ok_or("expected the wrapper's path")?;
+    let synth = args.get(1).ok_or("expected an instrument plugin")?;
+
+    const BLOCK: u32 = 512;
+    const SWITCH: u8 = 24;
+    let sample_rate = 48_000.0;
+    // A quarter of a beat at the renderer's 120 bpm, sounding for half of it.
+    let step = 6_000usize;
+    let steps = 12;
+    let start = 4_800usize;
+    let held = steps * step;
+    let frames = start + held + 24_000;
+    let silence = wav::Audio::silence(sample_rate, 2, frames);
+    let mut events = render::note(SWITCH as i16, start, held);
+    events.extend(render::note(60, start, held));
+    events.sort_by_key(|(at, _)| *at);
+
+    let (class, loaded) = render::load(Path::new(synth), None, Arc::new(host::CliHost::new()))
+        .map_err(|e| e.to_string())?;
+    let mut ports = PluginPorts::from_layout(&loaded.io_layout(), 0);
+    drop(loaded);
+    // Notes in, sound out. A synth with an audio input of its own would put
+    // that socket first, ahead of the notes.
+    ports.audio_in.clear();
+    if !ports.accepts_notes {
+        return Err(format!("{} takes no notes", short(synth)));
+    }
+
+    let (_class, mut probe) =
+        render::load(Path::new(wrapper), None, Arc::new(host::CliHost::new()))
+            .map_err(|e| e.to_string())?;
+    run_one_block(&mut probe)?;
+    let baseline = probe.save_state().map_err(|e| e.to_string())?;
+    drop(probe);
+    let baseline_json = read_wrapper_state(&baseline)?;
+
+    let keys = TremoloKeys {
+        mode: KeySwitchMode::Hold,
+        rows: vec![TremoloRow {
+            key: SWITCH,
+            step: Beats::new(1, 4),
+        }],
+        stop_key: SWITCH - 1,
+        share: Ratio::EVEN,
+    };
+    let run = |graph: Graph| -> Result<wav::Audio, String> {
+        let mut value: serde_json::Value = serde_json::from_str(&baseline_json)
+            .map_err(|e| format!("wrapper state is not JSON: {e}"))?;
+        value["sub_plugins"] = serde_json::json!([{
+            "instance": 0,
+            "reference": {
+                "format": class.format.tag(),
+                "plugin_id": class.id,
+                "path_hint": synth,
+                "display_name": class.name,
+            }
+        }]);
+        value["sub_plugin"] = serde_json::Value::Null;
+        value["sub_state"] = serde_json::Value::Null;
+        value["graph"] = serde_json::to_value(graph).map_err(|e| e.to_string())?;
+        let state = edit_wrapper_state(&baseline, &value.to_string())?;
+        Ok(render::render_with_state(
+            Path::new(wrapper),
+            None,
+            Some(&state),
+            &silence,
+            BLOCK,
+            &events,
+        )?
+        .audio)
+    };
+    let synth_node = || {
+        NodeKind::Plugin(PluginNode {
+            instance: 0,
+            ports: ports.clone(),
+        })
+    };
+    let out_node = || {
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        })
+    };
+
+    // RMS of the left channel over each step's sounding and cut parts, kept
+    // clear of the edges: 5 ms of fade, and a synth's attack.
+    let measure = |audio: &wav::Audio| -> Vec<(f32, f32)> {
+        let left = &audio.samples[..audio.frames];
+        let rms = |from: usize, to: usize| {
+            let part = &left[from..to];
+            (part.iter().map(|s| s * s).sum::<f32>() / part.len() as f32).sqrt()
+        };
+        (0..steps)
+            .map(|k| {
+                let at = start + k * step;
+                let half = step / 2;
+                (rms(at + 480, at + half), rms(at + half + 480, at + step))
+            })
+            .collect()
+    };
+    let show = |name: &str, parts: &[(f32, f32)]| {
+        println!("{name}");
+        for (k, (sound, cut)) in parts.iter().enumerate() {
+            println!("  step {k:>2}: sounding {sound:.6}  cut {cut:.6}");
+        }
+    };
+
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [40.0, 40.0]);
+    let tremolo = graph.add(
+        NodeKind::MidiTremolo(MidiTremolo {
+            keys: keys.clone(),
+            mute_keys: true,
+        }),
+        [220.0, 40.0],
+    );
+    let player = graph.add(synth_node(), [440.0, 40.0]);
+    let out = graph.add(out_node(), [660.0, 40.0]);
+    graph.connect(notes, 0, tremolo, 0);
+    graph.connect(tremolo, 0, player, 0);
+    graph.connect(player, 0, out, 0);
+    let midi = measure(&run(graph)?);
+    show("notes -> MIDI Tremolo -> synth", &midi);
+
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [40.0, 40.0]);
+    let mute = graph.add(
+        NodeKind::NoteMute(NoteMute { keys: vec![SWITCH] }),
+        [220.0, 40.0],
+    );
+    let player = graph.add(synth_node(), [440.0, 40.0]);
+    let cut = graph.add(
+        NodeKind::AudioTremolo(AudioTremolo {
+            channels: 2,
+            keys,
+            fade_in_ms: 5.0,
+            fade_out_ms: 5.0,
+        }),
+        [660.0, 40.0],
+    );
+    let out = graph.add(out_node(), [880.0, 40.0]);
+    graph.connect(notes, 0, mute, 0);
+    graph.connect(mute, 0, player, 0);
+    graph.connect(player, 0, cut, 0);
+    graph.connect(notes, 0, cut, 1);
+    graph.connect(cut, 0, out, 0);
+    let audio = measure(&run(graph)?);
+    show("notes -> synth -> Audio Tremolo", &audio);
+
+    let first = midi[0].0;
+    if first < 1e-4 {
+        return Err(format!(
+            "{} was silent on the first strike; load a patch that sounds",
+            short(synth)
+        ));
+    }
+    if let Some(k) = (1..steps).find(|&k| midi[k].0 < first * 0.1) {
+        return Err(format!(
+            "step {k} of the MIDI tremolo is silent: the synth did not hear the note struck again"
+        ));
+    }
+    let loud = audio.iter().map(|p| p.0).fold(0.0f32, f32::max);
+    if let Some(k) = (0..steps).find(|&k| audio[k].1 > loud * 1e-3) {
+        return Err(format!(
+            "step {k}'s cut in the audio tremolo is not silent ({:.6})",
+            audio[k].1
+        ));
+    }
+    println!("every step struck again, and every audio cut silent");
     Ok(())
 }
 
