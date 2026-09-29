@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::compile::{CompileError, ParamCx};
 pub use crate::ir::Waveform;
 use crate::ir::{Op, RateSpec};
-use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{NodeUi, combo, rate_control};
+use crate::nodes::{Beats, Node};
 use crate::port::Port;
 
 /// A free-running or tempo-synced oscillator.
@@ -26,7 +26,7 @@ pub struct Lfo {
 pub enum Rate {
     Hz(f64),
     /// One cycle per this many beats, following the host's tempo.
-    Beats(f64),
+    Beats(Beats),
 }
 
 impl Node for Lfo {
@@ -52,7 +52,9 @@ impl Node for Lfo {
             rate: match self.rate {
                 Rate::Hz(hz) => RateSpec::Hz(hz.max(0.0)),
                 // Zero beats per cycle is treated as a stationary (zero frequency) LFO.
-                Rate::Beats(beats) if beats > 0.0 => RateSpec::CyclesPerBeat(1.0 / beats),
+                Rate::Beats(beats) if beats.value() > 0.0 => {
+                    RateSpec::CyclesPerBeat(1.0 / beats.value())
+                }
                 Rate::Beats(_) => RateSpec::CyclesPerBeat(0.0),
             },
             offset_phase: self.phase.rem_euclid(1.0),

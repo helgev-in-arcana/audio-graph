@@ -972,7 +972,7 @@ mod tests {
         let lfo = graph.add(
             NodeKind::Lfo(Lfo {
                 waveform: Waveform::Triangle,
-                rate: Rate::Beats(2.0),
+                rate: Rate::Beats(crate::nodes::Beats::new(2, 1)),
                 phase: 0.25,
                 depth: 0.5,
                 offset: 0.5,

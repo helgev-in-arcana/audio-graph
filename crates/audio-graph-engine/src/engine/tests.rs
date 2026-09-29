@@ -299,7 +299,7 @@ fn tempo_sync_follows_the_host() {
         NodeKind::Lfo(Lfo {
             waveform: Waveform::Saw,
             // One cycle per beat: at 120 bpm that is 2 Hz.
-            rate: Rate::Beats(1.0),
+            rate: Rate::Beats(crate::nodes::Beats::ONE),
             phase: 0.0,
             depth: 0.5,
             offset: 0.5,
@@ -4850,7 +4850,12 @@ fn a_merge_of_one_stream_is_no_op_at_all() {
 
 fn midi_delay(graph: &mut Graph, time: f64, beats: bool) -> NodeId {
     graph.add(
-        NodeKind::MidiDelay(crate::nodes::MidiDelay { time, beats }),
+        NodeKind::MidiDelay(crate::nodes::MidiDelay {
+            seconds: time,
+            // The synced times the tests use are all whole 64ths of a beat.
+            beats: crate::nodes::Beats::new((time * 64.0).round() as u32, 64),
+            sync: beats,
+        }),
         [0.0, 0.0],
     )
 }
@@ -4940,14 +4945,14 @@ fn a_midi_delay_hands_the_stream_on_later() {
         reports[0]
     );
 
-    // A hundredth of a beat at 120 bpm is 240 samples.
+    // A 64th of a beat at 120 bpm is 375 samples.
     let mut engine = Engine::new();
     engine.prepare(64, &[]);
-    load(&mut engine, &delayed_synth(0.01, true));
+    load(&mut engine, &delayed_synth(1.0 / 64.0, true));
     let mut blocks = vec![Vec::new(); 6];
     blocks[0] = vec![note_on(64, 0)];
     let (heard, _) = hear_blocks(&mut engine, 0, &blocks);
-    assert_eq!(notes_only(&heard), vec![(240, "on", 64)]);
+    assert_eq!(notes_only(&heard), vec![(375, "on", 64)]);
 }
 
 /// Shortening the time with a note in flight does not let its note-off

@@ -14,7 +14,7 @@
 //! learns any of that; it is handed a `Ui` the right size and a [`NodeUi`] of
 //! facts about the world outside the graph.
 
-use crate::nodes::Rate;
+use crate::nodes::{Beats, Rate};
 
 /// Standard width of a node's body in canvas units.
 ///
@@ -292,7 +292,7 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
             changed = true;
         }
         if ui.selectable_label(synced, "beats").clicked() && !synced {
-            *rate = Rate::Beats(1.0);
+            *rate = Rate::Beats(Beats::ONE);
             changed = true;
         }
         match rate {
@@ -307,17 +307,52 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
                     .changed();
             }
             Rate::Beats(beats) => {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(beats)
-                            .speed(0.05)
-                            .range(0.03125..=64.0),
-                    )
-                    .on_hover_text("beats per cycle")
-                    .changed();
+                changed |= beats_control(ui, beats);
             }
         }
     });
+    changed
+}
+
+/// A length in beats as numerator, denominator and triplet, laid out inline
+/// for the caller's row.
+///
+/// The denominator is a dropdown rather than a number to drag: the list is
+/// short, and dragging through 3, 5, 6 and 7 to get from 4 to 8 would offer
+/// values that are not note lengths. The triplet sits beside it as "3", the
+/// way a score marks one.
+pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(&mut beats.num)
+                .speed(0.1)
+                .range(1..=Beats::MAX_NUM),
+        )
+        .on_hover_text("beats")
+        .changed();
+    ui.label("/");
+    egui::ComboBox::from_id_salt(ui.id().with("den"))
+        .selected_text(beats.den.to_string())
+        .width(ui.spacing().interact_size.x)
+        .show_ui(ui, |ui| {
+            for den in Beats::DENOMINATORS {
+                if ui
+                    .selectable_label(beats.den == den, den.to_string())
+                    .clicked()
+                {
+                    beats.den = den;
+                    changed = true;
+                }
+            }
+        });
+    if ui
+        .selectable_label(beats.triplet, "3")
+        .on_hover_text("triplet: three in the space of two")
+        .clicked()
+    {
+        beats.triplet = !beats.triplet;
+        changed = true;
+    }
     changed
 }
 
@@ -397,6 +432,35 @@ mod tests {
             }
             _ => false,
         })
+    }
+
+    /// A synced rate at its widest still fits on one row of a node, where the
+    /// LFO puts it.
+    #[test]
+    fn a_fraction_of_a_beat_fits_a_node() {
+        let ctx = egui::Context::default();
+        let mut rate = Rate::Beats(Beats {
+            num: Beats::MAX_NUM,
+            den: 64,
+            triplet: true,
+        });
+        let mut width = f32::INFINITY;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 100.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            width = ui
+                .horizontal(|ui| rate_control(ui, &mut rate))
+                .response
+                .rect
+                .width();
+        });
+        output.drop_without_applying_deltas();
+        assert!(width <= NODE_WIDTH, "{width} wide");
     }
 
     /// A control showing its socket's value has no box around it, hovered or
