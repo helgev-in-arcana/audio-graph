@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::NoteBuf;
+use crate::ir::{NoteBuf, TremoloSpec};
 
 /// An index into the audio buffer pool.
 pub type Buf = u16;
@@ -260,6 +260,28 @@ pub enum AudioOp {
         b: Option<Buf>,
         op: AudioMathOp,
         state: u16,
+    },
+    /// Cut `a` into steps while a key in `spec` has started a tremolo: the
+    /// gain is 1 in the sounding part of each step and 0 in the rest, and 1
+    /// whenever no tremolo is running.
+    ///
+    /// The keys are read off `notes`, the stream wired into the node, by the
+    /// same clock a [`NoteOp::Tremolo`][crate::ir::NoteOp::Tremolo] runs, so a
+    /// part and its audio set the same way are cut on the same samples. With
+    /// nothing wired there, nothing starts a tremolo and the audio passes.
+    ///
+    /// The gain does not jump: it slides at a fixed rate, all the way across
+    /// in `fade_in` seconds going up and `fade_out` going down. A step shorter
+    /// than its fades never reaches the ends, which is the cost of not
+    /// clicking. `state` holds the clock and the gain, and survives a swap.
+    Tremolo {
+        out: Buf,
+        a: Buf,
+        notes: Option<NoteBuf>,
+        state: u16,
+        spec: TremoloSpec,
+        fade_in: f64,
+        fade_out: f64,
     },
     /// Advance an audio delay line's write head over silence.
     ///

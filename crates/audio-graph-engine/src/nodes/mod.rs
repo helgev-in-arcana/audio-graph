@@ -16,6 +16,7 @@ pub mod widgets;
 
 mod audio_io;
 mod audio_math;
+mod audio_tremolo;
 mod beats;
 mod cc_in;
 mod constant;
@@ -27,6 +28,7 @@ mod key_split;
 mod key_switch;
 mod lfo;
 mod math;
+mod midi_tremolo;
 mod mix;
 mod note_delay;
 mod note_filter;
@@ -38,12 +40,15 @@ mod note_mute;
 mod param_to_cc;
 mod plugin;
 mod range_map;
+mod ratio;
 mod slot;
 mod switch;
+mod tremolo;
 mod unknown;
 
 pub use audio_io::{AudioIn, AudioOut};
 pub use audio_math::AudioMath;
+pub use audio_tremolo::AudioTremolo;
 pub use beats::Beats;
 pub use cc_in::CcIn;
 pub use constant::Constant;
@@ -55,6 +60,7 @@ pub use key_split::KeySplit;
 pub use key_switch::{KeySwitch, KeySwitchMode};
 pub use lfo::{Lfo, Rate};
 pub use math::Math;
+pub use midi_tremolo::MidiTremolo;
 pub use mix::{Mix, db_to_linear, linear_to_db};
 pub use note_delay::MidiDelay;
 pub use note_filter::{FilterMode, NoteFilter};
@@ -66,8 +72,10 @@ pub use note_mute::NoteMute;
 pub use param_to_cc::ParamToCc;
 pub use plugin::{ParamPort, Plugin, PluginPorts};
 pub use range_map::RangeMap;
+pub use ratio::Ratio;
 pub use slot::SlotIn;
 pub use switch::Switch;
+pub use tremolo::{TremoloKeys, TremoloRow};
 pub use unknown::Unknown;
 
 use serde::{Deserialize, Serialize};
@@ -170,6 +178,14 @@ pub(crate) trait Node {
     /// come in, and how long they wait — see
     /// [`NoteOp::Delay`][crate::ir::NoteOp::Delay].
     fn note_delay(&self, port: u8) -> Option<NoteDelay> {
+        let _ = port;
+        None
+    }
+
+    /// For a node that cuts notes into a tremolo: where the notes leaving
+    /// output `port` come in, and how they are cut — see
+    /// [`NoteOp::Tremolo`][crate::ir::NoteOp::Tremolo].
+    fn note_tremolo(&self, port: u8) -> Option<NoteTremolo> {
         let _ = port;
         None
     }
@@ -335,6 +351,16 @@ pub(crate) struct NoteDelay {
     pub time: f64,
     pub beats: bool,
 }
+
+/// What a node that cuts notes into a tremolo says about one of its outputs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoteTremolo {
+    /// The note input the cut stream comes in through.
+    pub input: u8,
+    pub spec: crate::ir::TremoloSpec,
+    /// Whether the keys that steer it are taken out of the stream.
+    pub mute: bool,
+}
 use crate::port::Port;
 
 /// One node's identity and settings.
@@ -373,6 +399,8 @@ pub enum NodeKind {
     NoteFilter(NoteFilter),
     NoteMerge(NoteMerge),
     MidiDelay(MidiDelay),
+    MidiTremolo(MidiTremolo),
+    AudioTremolo(AudioTremolo),
     ParamToCc(ParamToCc),
     CcIn(CcIn),
     DelayRead(DelayRead),
@@ -426,6 +454,8 @@ macro_rules! for_kind {
             NodeKind::NoteFilter($node) => $body,
             NodeKind::NoteMerge($node) => $body,
             NodeKind::MidiDelay($node) => $body,
+            NodeKind::MidiTremolo($node) => $body,
+            NodeKind::AudioTremolo($node) => $body,
             NodeKind::ParamToCc($node) => $body,
             NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
@@ -467,6 +497,11 @@ impl NodeKind {
     /// [`Node::note_passthrough`].
     pub(crate) fn note_passthrough(&self, port: u8) -> Option<u8> {
         for_kind!(self, node => node.note_passthrough(port))
+    }
+
+    /// How output `port` cuts its notes — see [`Node::note_tremolo`].
+    pub(crate) fn note_tremolo(&self, port: u8) -> Option<NoteTremolo> {
+        for_kind!(self, node => node.note_tremolo(port))
     }
 
     /// How output `port` delays its notes — see [`Node::note_delay`].
@@ -686,6 +721,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
     take(
         &mut out,
         NodeGroup::Audio,
+        AudioTremolo::catalogue_defaults(),
+        NodeKind::AudioTremolo,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
         Plugin::catalogue_defaults(),
         NodeKind::Plugin,
     );
@@ -749,6 +790,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
         NodeGroup::Note,
         MidiDelay::catalogue_defaults(),
         NodeKind::MidiDelay,
+    );
+    take(
+        &mut out,
+        NodeGroup::Note,
+        MidiTremolo::catalogue_defaults(),
+        NodeKind::MidiTremolo,
     );
     take(
         &mut out,

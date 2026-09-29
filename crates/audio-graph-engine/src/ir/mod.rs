@@ -20,6 +20,7 @@
 mod audio_op;
 mod note_op;
 mod op;
+mod tremolo;
 
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
 
@@ -31,6 +32,8 @@ pub use note_op::{
     ALL_CHANNELS, ALL_CONTROLLERS, CC_INTERVAL, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
     MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteBuf, NoteOp,
 };
+
+pub use tremolo::{MAX_TREMOLO_ROWS, MAX_TREMOLOS, TREMOLO_NOTES, TremoloSpec};
 
 pub use op::{Detect, Follow, MathOp, Op, Operand, RateSpec, Reg, Waveform};
 use subhost_adapter::{InstanceIo, ParamTarget};
@@ -295,6 +298,10 @@ pub struct Program {
     /// Note delay index → the node whose queue it is, carried across a swap
     /// so the notes in flight are not lost to a recompile.
     pub(crate) note_delay_nodes: Vec<NodeId>,
+    /// Tremolo index → the node whose clock and notes it is, the MIDI
+    /// tremolos first and then the audio ones. Carried across a swap so a
+    /// recompile neither moves the grid nor drops a note being cut.
+    pub(crate) tremolo_nodes: Vec<NodeId>,
     /// Param output socket → the register holding its value, in the order the
     /// outputs were bound.
     ///
@@ -456,6 +463,7 @@ impl Program {
             latch_nodes: Vec::new(),
             dsp_nodes: Vec::new(),
             note_delay_nodes: Vec::new(),
+            tremolo_nodes: Vec::new(),
             output_registers: Vec::new(),
         }
     }

@@ -1,5 +1,6 @@
 //! The note half: what each note buffer holds and what it amounts to.
 
+use super::tremolo::TremoloLine;
 use super::*;
 
 /// Two disjoint `&mut` into one pool, for an op that copies between buffers.
@@ -180,6 +181,9 @@ pub(super) struct NoteState {
     pub(super) streams: [Option<NoteStream>; MAX_NOTE_BUFS],
     /// One queue per note delay index of the current program.
     pub(super) delays: Vec<NoteDelayLine>,
+    /// One per tremolo index of the current program, the audio half's
+    /// included: they are read by the same clock.
+    pub(super) tremolos: Vec<TremoloLine>,
     /// Last value each controller-generating op sent, or NaN before its first.
     /// Forgotten on a program swap; see [`NoteOp::Emit`].
     pub(super) emitted: Vec<f64>,
@@ -196,6 +200,7 @@ impl NoteState {
             bufs: (0..MAX_NOTE_BUFS).map(|_| NoteBuf::new()).collect(),
             streams: [None; MAX_NOTE_BUFS],
             delays: (0..MAX_NOTE_DELAYS).map(|_| NoteDelayLine::new()).collect(),
+            tremolos: (0..MAX_TREMOLOS).map(|_| TremoloLine::new()).collect(),
             emitted: vec![f64::NAN; MAX_NOTE_EMITS],
             dropped: 0,
         }
@@ -436,6 +441,30 @@ impl NoteState {
                         *due -= frames;
                     }
                     line.last = line.last.saturating_sub(frames);
+                    self.follow_notes(out, base[out as usize]);
+                }
+                NoteOp::Tremolo {
+                    a,
+                    out,
+                    state,
+                    spec,
+                    mute,
+                } => {
+                    let Some(line) = self.tremolos.get_mut(state as usize) else {
+                        continue;
+                    };
+                    let from = base[a as usize];
+                    let (source, dest) = index_two(&mut self.bufs, a as usize, out as usize);
+                    line.run_notes(
+                        &spec,
+                        mute,
+                        &source.events[from.min(source.events.len())..],
+                        &mut dest.events,
+                        &mut self.dropped,
+                        (start, frames),
+                        (sample_rate, tempo_bpm),
+                        ledger,
+                    );
                     self.follow_notes(out, base[out as usize]);
                 }
                 NoteOp::Merge { inputs, count, out } => {

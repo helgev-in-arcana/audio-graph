@@ -44,11 +44,11 @@ pub use ir::{
     Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioMath, AudioOut, Beats, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower,
-    FilterMode, Gate, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math,
-    MidiDelay, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn, NoteMerge, NoteMute,
-    ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, Unknown,
-    db_to_linear, linear_to_db,
+    AudioIn, AudioMath, AudioOut, AudioTremolo, Beats, CcIn, Constant, DelayRead, DelayWrite,
+    EnvelopeFollower, FilterMode, Gate, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode,
+    Lfo, Math, MidiDelay, MidiTremolo, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn,
+    NoteMerge, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, Ratio, SlotIn,
+    Switch, TremoloKeys, TremoloRow, Unknown, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{

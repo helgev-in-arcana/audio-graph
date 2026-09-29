@@ -14,7 +14,7 @@
 //! learns any of that; it is handed a `Ui` the right size and a [`NodeUi`] of
 //! facts about the world outside the graph.
 
-use crate::nodes::{Beats, Rate};
+use crate::nodes::{Beats, Rate, Ratio};
 
 /// Standard width of a node's body in canvas units.
 ///
@@ -259,7 +259,11 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
 pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(label);
+        // An empty label still costs a gap of item spacing, which a row that
+        // is only a key and its setting cannot spare.
+        if !label.is_empty() {
+            ui.label(label);
+        }
         let mut value = i32::from(*key);
         if ui
             .add(egui::DragValue::new(&mut value).range(0..=127))
@@ -353,6 +357,32 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
         beats.triplet = !beats.triplet;
         changed = true;
     }
+    changed
+}
+
+/// A [`Ratio`] as two whole numbers either side of a colon, laid out inline
+/// for the caller's row.
+///
+/// A share may be zero, which leaves the whole to the other part; the two
+/// may not both be, since that is no ratio at all.
+pub(crate) fn ratio_control(ui: &mut egui::Ui, ratio: &mut Ratio) -> bool {
+    let first_floor = u32::from(ratio.second == 0);
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(&mut ratio.first)
+                .speed(0.1)
+                .range(first_floor..=Ratio::MAX),
+        )
+        .changed();
+    ui.label(":");
+    let second_floor = u32::from(ratio.first == 0);
+    changed |= ui
+        .add(
+            egui::DragValue::new(&mut ratio.second)
+                .speed(0.1)
+                .range(second_floor..=Ratio::MAX),
+        )
+        .changed();
     changed
 }
 

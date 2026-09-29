@@ -117,6 +117,7 @@ Program {
     lfo_nodes: [],
     dsp_nodes: [],
     note_delay_nodes: [],
+    tremolo_nodes: [],
     output_registers: [
         (
             (

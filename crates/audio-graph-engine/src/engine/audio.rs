@@ -1,6 +1,7 @@
 //! The audio half: the buffer pool, sub-plugin calls and delay lines.
 
 use super::*;
+use crate::ir::TremoloSpec;
 
 /// Where one chunk of a block sits inside the buffer pool.
 ///
@@ -561,6 +562,32 @@ impl Engine {
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
                 }
+                AudioOp::Tremolo {
+                    out,
+                    a,
+                    notes,
+                    state,
+                    spec,
+                    fade_in,
+                    fade_out,
+                } => {
+                    let heard = notes.map(|buf| {
+                        (
+                            buf,
+                            self.note_slice(buf, (first_row, end_row), start..start + frames),
+                        )
+                    });
+                    let width = (program.buffers[*out as usize] as usize).min(MAX_CHANNELS);
+                    self.tremolo(
+                        (*out, *a, width),
+                        heard,
+                        *state as usize,
+                        spec,
+                        (*fade_in, *fade_out),
+                        win,
+                        ctx,
+                    );
+                }
                 AudioOp::Math {
                     out,
                     a,
@@ -582,6 +609,75 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// One chunk of an [`AudioOp::Tremolo`], a sample at a time: the clock
+    /// looks at each sample before the keys struck on it, as the note half's
+    /// does.
+    #[allow(clippy::too_many_arguments)]
+    fn tremolo(
+        &mut self,
+        (out, a, width): (Buf, Buf, usize),
+        heard: Option<(u16, std::ops::Range<usize>)>,
+        state: usize,
+        spec: &TremoloSpec,
+        (fade_in, fade_out): (f64, f64),
+        win: Window,
+        ctx: &AudioContext<'_>,
+    ) {
+        let rate = ctx.sample_rate.max(1.0);
+        // A fade of under a sample is a step, and a slide that covers the
+        // whole way in one sample is one.
+        let up = 1.0 / (fade_in * rate).max(1.0);
+        let down = 1.0 / (fade_out * rate).max(1.0);
+        let mut reads = [0usize; MAX_CHANNELS];
+        let mut writes = [0usize; MAX_CHANNELS];
+        for ch in 0..width {
+            reads[ch] = self.at(a, ch, win);
+            writes[ch] = self.at(out, ch, win);
+        }
+        let NoteState { bufs, tremolos, .. } = &mut self.notes;
+        let Some(line) = tremolos.get_mut(state) else {
+            return;
+        };
+        let events: &[Event] = match heard {
+            Some((buf, range)) => &bufs[buf as usize].events[range],
+            None => &[],
+        };
+        let pool = &mut self.pool;
+
+        line.clock.follow(ctx.tempo_bpm, rate);
+        let mut gain = line.gain;
+        let mut next = 0;
+        for i in 0..win.frames {
+            let at = (win.start + i) as u32;
+            line.clock.edge(spec, rate);
+            while let Some(event) = events.get(next)
+                && event.sample_offset() <= at
+            {
+                next += 1;
+                let (key, on) = match *event {
+                    Event::Note(NoteEvent::NoteOn { key, .. }) => (key, true),
+                    Event::Note(NoteEvent::NoteOff { key, .. }) => (key, false),
+                    _ => continue,
+                };
+                if spec.steers(key) {
+                    line.clock.switch(spec, key, on);
+                }
+            }
+            let target = if line.clock.sounding() { 1.0 } else { 0.0 };
+            gain = if gain < target {
+                (gain + up).min(target)
+            } else {
+                (gain - down).max(target)
+            };
+            let g = gain as f32;
+            for ch in 0..width {
+                pool[writes[ch] + i] = pool[reads[ch] + i] * g;
+            }
+            line.clock.tick();
+        }
+        line.gain = gain;
     }
 
     /// One chunk of an [`AudioOp::Math`], channel by channel.
