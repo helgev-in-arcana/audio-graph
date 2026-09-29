@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, decimals, fallback};
-use crate::nodes::{Node, NoteDelay};
+use crate::nodes::widgets::{NodeUi, beats_control, decimals, fallback};
+use crate::nodes::{Beats, Node, NoteDelay};
 use crate::port::{Port, PortType};
 
 /// Holds a note stream back by a time, in seconds or in beats of the host's
@@ -19,10 +19,12 @@ use crate::port::{Port, PortType};
 /// changes with notes in flight.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MidiDelay {
-    /// Seconds, or beats when `beats` is set.
-    pub time: f64,
-    #[serde(default)]
-    pub beats: bool,
+    /// The time while `sync` is off.
+    pub seconds: f64,
+    /// The time while `sync` is on. Both are kept, so turning sync on to try
+    /// it and off again gives back the time that was there.
+    pub beats: Beats,
+    pub sync: bool,
 }
 
 impl Node for MidiDelay {
@@ -49,8 +51,12 @@ impl Node for MidiDelay {
         (port == 0).then_some(NoteDelay {
             input: 0,
             time_input: 1,
-            time: self.time,
-            beats: self.beats,
+            time: if self.sync {
+                self.beats.value()
+            } else {
+                self.seconds
+            },
+            beats: self.sync,
         })
     }
 
@@ -59,10 +65,10 @@ impl Node for MidiDelay {
         let mut changed = false;
         ui.horizontal(|ui| {
             changed |= ui
-                .selectable_label(self.beats, "sync")
+                .selectable_label(self.sync, "sync")
                 .on_hover_text("count the time in beats of the host's tempo")
                 .clicked()
-                .then(|| self.beats = !self.beats)
+                .then(|| self.sync = !self.sync)
                 .is_some();
         });
         changed
@@ -80,8 +86,20 @@ impl Node for MidiDelay {
         if port != 1 {
             return false;
         }
-        let beats = self.beats;
-        fallback(ui, connected, cx.input(port), &mut self.time, |ui, time| {
+        if self.sync && !connected {
+            let mut changed = false;
+            ui.horizontal(|ui| changed = beats_control(ui, &mut self.beats));
+            return changed;
+        }
+        // What a wired socket carries is a plain number of beats, which no
+        // fraction need spell, so a synced time shows as one while wired.
+        let sync = self.sync;
+        let mut shown = if sync {
+            self.beats.value()
+        } else {
+            self.seconds
+        };
+        let changed = fallback(ui, connected, cx.input(port), &mut shown, |ui, time| {
             // A wired time is floored at zero and has no ceiling, so it is
             // shown the same way; the range is only for dragging.
             *time = time.max(0.0);
@@ -90,17 +108,19 @@ impl Node for MidiDelay {
                     .speed(0.01)
                     .range(0.0..=60.0)
                     .clamp_existing_to_range(false)
-                    // A beat count is a plain number here. Beats are better
-                    // set as a fraction, which this control is not.
-                    .fixed_decimals(if beats {
+                    .fixed_decimals(if sync {
                         decimals::PLAIN
                     } else {
                         decimals::SECONDS
                     })
-                    .suffix(if beats { " beats" } else { " s" }),
+                    .suffix(if sync { " beats" } else { " s" }),
             )
             .changed()
-        })
+        });
+        if changed && !sync {
+            self.seconds = shown;
+        }
+        changed
     }
 }
 
@@ -110,8 +130,10 @@ impl MidiDelay {
         vec![(
             "MIDI Delay",
             MidiDelay {
-                time: 0.5,
-                beats: true,
+                seconds: 0.25,
+                // Half a beat is 0.25 s at 120 bpm.
+                beats: Beats::new(1, 2),
+                sync: true,
             },
         )]
     }

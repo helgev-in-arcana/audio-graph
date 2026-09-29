@@ -87,7 +87,9 @@ impl Node for Tremolo {
             waveform: self.waveform,
             rate: match self.rate {
                 Rate::Hz(hz) => RateSpec::Hz(hz.max(0.0)),
-                Rate::Beats(beats) if beats > 0.0 => RateSpec::CyclesPerBeat(1.0 / beats),
+                Rate::Beats(beats) if beats.value() > 0.0 => {
+                    RateSpec::CyclesPerBeat(1.0 / beats.value())
+                }
                 Rate::Beats(_) => RateSpec::CyclesPerBeat(0.0),
             },
         });

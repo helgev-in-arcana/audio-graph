@@ -113,7 +113,10 @@ fn default_patch() {
 #[test]
 fn lfo_into_a_parameter() {
     let mut graph = Graph::new();
-    let osc = graph.add(lfo(Rate::Beats(4.0)), [0.0, 0.0]);
+    let osc = graph.add(
+        lfo(Rate::Beats(audio_graph_engine::Beats::new(4, 1))),
+        [0.0, 0.0],
+    );
     let out = param_sink(&mut graph);
     graph.connect(osc, 0, out, 0);
     check("lfo_into_a_parameter", &graph);

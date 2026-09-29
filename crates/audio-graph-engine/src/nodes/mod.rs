@@ -16,6 +16,7 @@ pub mod widgets;
 
 mod audio_io;
 mod audio_math;
+mod beats;
 mod cc_in;
 mod constant;
 mod delay;
@@ -44,6 +45,7 @@ mod unknown;
 
 pub use audio_io::{AudioIn, AudioOut};
 pub use audio_math::AudioMath;
+pub use beats::Beats;
 pub use cc_in::CcIn;
 pub use constant::Constant;
 pub use delay::{DelayRead, DelayWrite};

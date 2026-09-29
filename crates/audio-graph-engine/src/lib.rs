@@ -44,7 +44,7 @@ pub use ir::{
     Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg, Waveform,
 };
 pub use nodes::{
-    AudioIn, AudioMath, AudioOut, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower,
+    AudioIn, AudioMath, AudioOut, Beats, CcIn, Constant, DelayRead, DelayWrite, EnvelopeFollower,
     FilterMode, Gate, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, Lfo, Math,
     MidiDelay, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn, NoteMerge, NoteMute,
     ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, SlotIn, Switch, Tremolo, Unknown,
