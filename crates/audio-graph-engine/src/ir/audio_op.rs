@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{NoteBuf, RateSpec, Waveform};
+use crate::ir::NoteBuf;
 
 /// An index into the audio buffer pool.
 pub type Buf = u16;
@@ -260,25 +260,6 @@ pub enum AudioOp {
         b: Option<Buf>,
         op: AudioMathOp,
         state: u16,
-    },
-    /// Scale a buffer by a gain that swings between 1 and `1 - depth`, one
-    /// cycle of `waveform` at `rate`: a tremolo.
-    ///
-    /// The oscillator runs at the sample rate rather than being an LFO node
-    /// driving a gain, because a parameter is known only at row boundaries,
-    /// and a gain drawn in straight lines between them turns a corner every
-    /// 32 samples, which at a tremolo's speed is audible as a buzz. `state` holds the phase, so it runs on through a
-    /// recompile, and the depth it last applied, which is ramped rather than
-    /// stepped when the lane moves it. `lane` carries the depth when its
-    /// socket is wired; without one, `depth` is the whole story.
-    Tremolo {
-        out: Buf,
-        a: Buf,
-        state: u16,
-        lane: Option<u16>,
-        depth: f64,
-        waveform: Waveform,
-        rate: RateSpec,
     },
     /// Advance an audio delay line's write head over silence.
     ///

@@ -4703,65 +4703,6 @@ fn the_sample_by_sample_ops_do_what_they_say() {
     );
 }
 
-fn tremolo_patch(depth: f64) -> Graph {
-    let mut graph = Graph::new();
-    let input = stereo_in(&mut graph);
-    let output = stereo_out(&mut graph);
-    let tremolo = graph.add(
-        NodeKind::Tremolo(crate::nodes::Tremolo {
-            channels: 2,
-            waveform: Waveform::Sine,
-            // 480 samples a cycle at 48 kHz.
-            rate: Rate::Hz(100.0),
-            depth,
-        }),
-        [0.0, 0.0],
-    );
-    graph.connect(input, 0, tremolo, 0);
-    graph.connect(tremolo, 0, output, 0);
-    graph
-}
-
-/// At full depth the gain swings all the way to silence and back once a
-/// cycle; at none it leaves the signal alone.
-#[test]
-fn a_tremolo_swings_the_gain_by_its_depth() {
-    let mut engine = Engine::new();
-    engine.prepare(128, &[2]);
-    load(&mut engine, &tremolo_patch(1.0));
-    let heard = play(&mut engine, 0, 8, |_| 1.0);
-    let cycle = &heard[..480];
-    let low = cycle.iter().fold(1.0f32, |m, v| m.min(*v));
-    let high = cycle.iter().fold(0.0f32, |m, v| m.max(*v));
-    assert!(low < 0.01 && high > 0.99, "swung between {low} and {high}");
-
-    let mut engine = Engine::new();
-    engine.prepare(128, &[2]);
-    load(&mut engine, &tremolo_patch(0.0));
-    let heard = play(&mut engine, 0, 4, |_| 0.7);
-    assert!(heard.iter().all(|v| (v - 0.7).abs() < 1e-6));
-}
-
-/// A recompile does not restart the oscillator: the output across a swap is
-/// the output with no swap at all. Restarting it would jump the gain on every
-/// drag of every control.
-#[test]
-fn a_recompile_does_not_restart_the_tremolo() {
-    let graph = tremolo_patch(0.8);
-    let mut straight = Engine::new();
-    straight.prepare(128, &[2]);
-    load(&mut straight, &graph);
-    let expected = play(&mut straight, 0, 6, |_| 1.0);
-
-    let mut swapped = Engine::new();
-    swapped.prepare(128, &[2]);
-    load(&mut swapped, &graph);
-    let mut heard = play(&mut swapped, 0, 3, |_| 1.0);
-    load(&mut swapped, &graph);
-    heard.extend(play(&mut swapped, 3 * 128, 3, |_| 1.0));
-    assert_eq!(heard, expected);
-}
-
 /// A stream split and joined again comes out whole: each note once, in time
 /// order, and what both branches carried — the pedal — once. A repeat within
 /// one stream is that stream's own, and is kept.

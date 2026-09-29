@@ -561,27 +561,6 @@ impl Engine {
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
                 }
-                AudioOp::Tremolo {
-                    out,
-                    a,
-                    state,
-                    lane,
-                    depth,
-                    waveform,
-                    rate,
-                } => {
-                    let width = (program.buffers[*out as usize] as usize).min(MAX_CHANNELS);
-                    self.tremolo(
-                        *out,
-                        *a,
-                        *state as usize,
-                        (*lane, *depth),
-                        (*waveform, *rate),
-                        width,
-                        win,
-                        ctx,
-                    );
-                }
                 AudioOp::Math {
                     out,
                     a,
@@ -602,81 +581,6 @@ impl Engine {
                     );
                 }
             }
-        }
-    }
-
-    /// One chunk of an [`AudioOp::Tremolo`].
-    ///
-    /// The state holds the phase in value 0, the depth last applied in value
-    /// 1, and in value 2 whether it has ever run: a tremolo loaded at full
-    /// depth starts at full depth rather than fading in from none.
-    #[allow(clippy::too_many_arguments)]
-    fn tremolo(
-        &mut self,
-        out: Buf,
-        a: Buf,
-        state: usize,
-        (lane, depth): (Option<u16>, f64),
-        (waveform, rate): (Waveform, RateSpec),
-        width: usize,
-        win: Window,
-        ctx: &AudioContext<'_>,
-    ) {
-        let Some(held) = self.dsp.get(state) else {
-            return;
-        };
-        let (mut phase, mut from, started) =
-            (held.values[0], held.values[1], held.values[2] != 0.0);
-        let hz = match rate {
-            RateSpec::Hz(hz) => hz,
-            RateSpec::CyclesPerBeat(cpb) => cpb * ctx.tempo_bpm / 60.0,
-        };
-        let step = hz.max(0.0) / ctx.sample_rate.max(1.0);
-        // A random level held per cycle is a stepped gain — a click at every
-        // step — so a tremolo reads it as the sine instead.
-        let wave = match waveform {
-            Waveform::Random => Waveform::Sine,
-            other => other,
-        };
-        let target = depth.clamp(0.0, 1.0);
-        if !started {
-            from = target;
-        }
-        let mut done = 0usize;
-        while done < win.frames {
-            let at = win.start + done;
-            let seg = ctx.run_from(at, win.start + win.frames);
-            // A wired depth follows its lane's line. A set one slides from the
-            // depth last applied to the one set across the segment, so a
-            // recompile that changes it does not click; the oscillator never
-            // stops either way.
-            let line = lane.and_then(|lane| ctx.lane_line(at, lane));
-            for i in 0..seg {
-                let d = match line {
-                    Some(line) => line.at(at + i).clamp(0.0, 1.0),
-                    None => from + (target - from) * (i + 1) as f64 / seg as f64,
-                };
-                let shape = wave
-                    .shape((phase + step * i as f64).rem_euclid(1.0))
-                    .unwrap_or(0.0);
-                let gain = (1.0 - d * (1.0 - shape) * 0.5) as f32;
-                for ch in 0..width {
-                    let src = self.at(a, ch, win) + done + i;
-                    let dst = self.at(out, ch, win) + done + i;
-                    self.pool[dst] = self.pool[src] * gain;
-                }
-            }
-            phase = (phase + step * seg as f64).rem_euclid(1.0);
-            from = match line {
-                Some(line) => line.at(at + seg).clamp(0.0, 1.0),
-                None => target,
-            };
-            done += seg;
-        }
-        if let Some(held) = self.dsp.get_mut(state) {
-            held.values[0] = phase;
-            held.values[1] = from;
-            held.values[2] = 1.0;
         }
     }
 

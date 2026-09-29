@@ -3331,7 +3331,7 @@ fn cmd_live(args: &[String]) -> Result<(), String> {
 /// Each chain ends at the audio output, because a node nothing depends on is
 /// not compiled and would have no value to show.
 fn live_patch() -> audio_graph_engine::Graph {
-    use audio_graph_engine::{Graph, Lfo, Math, MathOp, Rate, Switch, Tremolo, Waveform};
+    use audio_graph_engine::{Graph, Lfo, Math, MathOp, Rate, Switch, Waveform};
 
     let lfo = |hz: f64, depth: f64, offset: f64| {
         NodeKind::Lfo(Lfo {
@@ -3349,15 +3349,6 @@ fn live_patch() -> audio_graph_engine::Graph {
             channels: 2,
         }),
         [40.0, 40.0],
-    );
-    let tremolo = graph.add(
-        NodeKind::Tremolo(Tremolo {
-            channels: 2,
-            waveform: Waveform::Sine,
-            rate: Rate::Hz(4.0),
-            depth: 0.5,
-        }),
-        [300.0, 40.0],
     );
     let mix = graph.add(
         NodeKind::Mix(Mix {
@@ -3394,9 +3385,7 @@ fn live_patch() -> audio_graph_engine::Graph {
     let short = graph.add(lfo(0.2, 0.05, 0.1), [40.0, 460.0]);
     let gain = graph.add(lfo(0.3, 20.0, -20.0), [300.0, 320.0]);
 
-    graph.connect(input, 0, tremolo, 0);
-    graph.connect(fast, 0, tremolo, 1);
-    graph.connect(tremolo, 0, mix, 0);
+    graph.connect(input, 0, mix, 0);
     graph.connect(fast, 0, math, 0);
     graph.connect(slow, 0, math, 1);
     graph.connect(math, 0, mix, 1);

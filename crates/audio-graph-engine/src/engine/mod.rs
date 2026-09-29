@@ -88,8 +88,7 @@ pub struct AudioContext<'a> {
     /// may cover many rows, or sit inside one.
     pub resolution: u32,
     pub sample_rate: f64,
-    /// The host's tempo, for audio ops that follow it — a tremolo synced to
-    /// the beat.
+    /// The host's tempo, for audio ops that count in beats.
     pub tempo_bpm: f64,
     pub lanes: &'a [f64],
     /// The lanes at the end of the block, when the parameter half worked them
