@@ -99,7 +99,7 @@ impl TremoloKeys {
         for (index, row) in self.rows.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 changed |= key_control(ui, "", &mut row.key);
-                changed |= beats_control(ui, &mut row.step);
+                changed |= beats_control(ui, ("step", index), &mut row.step);
                 // The last row keeps its button greyed rather than losing
                 // it, as a router's last way does.
                 if ui

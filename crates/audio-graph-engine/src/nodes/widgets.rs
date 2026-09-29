@@ -311,7 +311,7 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
                     .changed();
             }
             Rate::Beats(beats) => {
-                changed |= beats_control(ui, beats);
+                changed |= beats_control(ui, "rate", beats);
             }
         }
     });
@@ -325,7 +325,26 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
 /// short, and dragging through 3, 5, 6 and 7 to get from 4 to 8 would offer
 /// values that are not note lengths. The triplet sits beside it as "3", the
 /// way a score marks one.
-pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
+///
+/// `id_salt` tells this control's list apart from any other drawn in the
+/// same node, and must differ between them. It cannot come from `ui.id()`:
+/// sibling `Ui`s — the rows of a node, each laid out with `ui.horizontal` —
+/// share that id, and rows sharing a list's id share its open state and its
+/// clicks, so only the last row's list could be opened.
+pub(crate) fn beats_control(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    beats: &mut Beats,
+) -> bool {
+    beats_parts(ui, id_salt, beats).0
+}
+
+/// [`beats_control`], and where its denominator's button is.
+fn beats_parts(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    beats: &mut Beats,
+) -> (bool, egui::Rect) {
     let mut changed = ui
         .add(
             egui::DragValue::new(&mut beats.num)
@@ -335,7 +354,7 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
         .on_hover_text("beats")
         .changed();
     ui.label("/");
-    egui::ComboBox::from_id_salt(ui.id().with("den"))
+    let den = egui::ComboBox::from_id_salt(ui.id().with(("beats-den", id_salt)))
         .selected_text(beats.den.to_string())
         .width(ui.spacing().interact_size.x)
         .show_ui(ui, |ui| {
@@ -348,7 +367,9 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
                     changed = true;
                 }
             }
-        });
+        })
+        .response
+        .rect;
     if ui
         .selectable_label(beats.triplet, "3")
         .on_hover_text("triplet: three in the space of two")
@@ -357,7 +378,7 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
         beats.triplet = !beats.triplet;
         changed = true;
     }
-    changed
+    (changed, den)
 }
 
 /// A [`Ratio`] as two whole numbers either side of a colon, laid out inline
@@ -491,6 +512,49 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         assert!(width <= NODE_WIDTH, "{width} wide");
+    }
+
+    /// Each of several rows of beats opens its own denominator list: rows
+    /// laid out side by side in one node share the `Ui` id their widgets
+    /// would otherwise be named from.
+    #[test]
+    fn each_row_of_beats_opens_its_own_list() {
+        let ctx = egui::Context::default();
+        let mut rows = [Beats::new(1, 4), Beats::new(1, 8)];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        // Returns where the first row's denominator button is.
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut first = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                for (index, beats) in rows.iter_mut().enumerate() {
+                    let den = ui.horizontal(|ui| beats_parts(ui, index, beats).1).inner;
+                    if index == 0 {
+                        first = den;
+                    }
+                }
+            });
+            output.drop_without_applying_deltas();
+            first
+        };
+        let at = frame(Vec::new()).center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(vec![button(false)]);
+        frame(Vec::new());
+        assert!(
+            ctx.any_popup_open(),
+            "the first row's list did not stay open"
+        );
     }
 
     /// A control showing its socket's value has no box around it, hovered or
