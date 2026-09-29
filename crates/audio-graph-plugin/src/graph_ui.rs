@@ -557,11 +557,40 @@ impl GraphEditor {
 
         let response = frame.show(&mut child, |ui| {
             ui.set_width(width - 2.0 * margin);
-            // The whole bar is laid out right to left, so it reads name ·
-            // GUI · always on · x on screen. The buttons are placed first and
-            // the name takes what is left, because the other way round a
-            // plugin called "audio-graph CLAP test plugin" pushed every button
-            // off the node.
+            let plugin = matches!(
+                graph.nodes[index].kind,
+                audio_graph_engine::NodeKind::Plugin(_)
+            );
+            let mut controls = |ui: &mut egui::Ui| {
+                // Only worth offering where it changes anything: a node
+                // with no output is already compiled.
+                if !outputs.is_empty() {
+                    let on = &mut graph.nodes[index].always_on;
+                    // Framed in both states. A `toggle_value` that is off
+                    // draws as bare text, which does not read as a control
+                    // until the pointer hovers over it.
+                    if ui
+                        .add(
+                            egui::Button::new("always on")
+                                .small()
+                                .selected(*on)
+                                .frame(true)
+                                .frame_when_inactive(true),
+                        )
+                        .on_hover_text(
+                            "run this node even with nothing wired to its output \
+                             — for analysers",
+                        )
+                        .clicked()
+                    {
+                        *on = !*on;
+                        outcome.changed = true;
+                    }
+                }
+                let mut cx = node_ui(ctx, self.learning, &arriving);
+                outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
+                actions.append(&mut cx.actions);
+            };
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Delete sits on the outside because it is the one that
@@ -574,43 +603,11 @@ impl GraphEditor {
                     {
                         outcome.remove = true;
                     }
-                    // Only worth offering where it changes anything: a node
-                    // with no output is already compiled.
-                    if !outputs.is_empty() {
-                        let on = &mut graph.nodes[index].always_on;
-                        // Framed in both states. A `toggle_value` that is off
-                        // draws as bare text, which in a title bar beside a
-                        // node's name is not something anybody reads as a
-                        // control until they happen to hover it.
-                        if ui
-                            .add(
-                                egui::Button::new("always on")
-                                    .small()
-                                    .selected(*on)
-                                    .frame(true)
-                                    .frame_when_inactive(true),
-                            )
-                            .on_hover_text(
-                                "run this node even with nothing wired to its output \
-                                 — for analysers",
-                            )
-                            .clicked()
-                        {
-                            *on = !*on;
-                            outcome.changed = true;
-                        }
+                    if !plugin {
+                        controls(ui);
                     }
-                    let mut cx = node_ui(ctx, self.learning, &arriving);
-                    outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
-                    actions.append(&mut cx.actions);
-                    // The name fills what the buttons left, laid out the
-                    // other way round again so it starts at the node's left
-                    // edge instead of hugging them.
-                    //
-                    // Truncated rather than wrapped: a plugin name that grew
-                    // the title bar to two lines would move every socket on
-                    // the node down with it, and the full name is a hover
-                    // away.
+                    // Truncation keeps the drag handle one line tall; the
+                    // tooltip retains the full name.
                     let rest = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
                     ui.allocate_ui_with_layout(
                         rest,
@@ -626,6 +623,13 @@ impl GraphEditor {
                     );
                 });
             });
+            if plugin {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        controls(ui);
+                    });
+                });
+            }
             ui.separator();
 
             // The node's own settings sit directly under the title, and
