@@ -272,9 +272,39 @@ pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool 
             *key = value.clamp(0, 127) as u8;
             changed = true;
         }
-        ui.weak(key_name(*key));
+        key_name_label(ui, *key);
     });
     changed
+}
+
+/// A key's name at the width of the widest one, so whatever follows it on
+/// the row lines up from row to row. Names run from two characters (`C3`)
+/// to four (`C#-1`), and the four-character ones sit in the bottom two
+/// octaves, where key switches are put.
+fn key_name_label(ui: &mut egui::Ui, key: u8) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().weak_text_color();
+    // Measured rather than counted: in a proportional font a digit and a
+    // sharp are not the same width. The layouts are cached by egui, so
+    // measuring all of them each frame costs a lookup each.
+    let width = ui.fonts_mut(|fonts| {
+        (0..128u8)
+            .map(|k| {
+                fonts
+                    .layout_no_wrap(key_name(k), font.clone(), color)
+                    .size()
+                    .x
+            })
+            .fold(0.0f32, f32::max)
+    });
+    let height = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| ui.weak(key_name(key)),
+    );
 }
 
 /// A MIDI key as a note name, with 60 as C3 — one of the several conventions in
@@ -554,6 +584,33 @@ mod tests {
         assert!(
             ctx.any_popup_open(),
             "the first row's list did not stay open"
+        );
+    }
+
+    /// A key's name takes the same width whatever the key, so what follows
+    /// it lines up from row to row.
+    #[test]
+    fn every_key_name_takes_the_same_width() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let mut widths = Vec::new();
+        let output = ctx.run_ui(input, |ui| {
+            // Two characters, three, and four.
+            for mut key in [60u8, 24, 13] {
+                let row = ui.horizontal(|ui| key_control(ui, "", &mut key));
+                widths.push(row.response.rect.width());
+            }
+        });
+        output.drop_without_applying_deltas();
+        assert!(
+            widths.iter().all(|&w| (w - widths[0]).abs() < 0.01),
+            "{widths:?}"
         );
     }
 
