@@ -1,6 +1,7 @@
 //! The audio half: the buffer pool, sub-plugin calls and delay lines.
 
 use super::*;
+use crate::ir::TremoloSpec;
 
 /// Where one chunk of a block sits inside the buffer pool.
 ///
@@ -564,20 +565,25 @@ impl Engine {
                 AudioOp::Tremolo {
                     out,
                     a,
+                    notes,
                     state,
-                    lane,
-                    depth,
-                    waveform,
-                    rate,
+                    spec,
+                    fade_in,
+                    fade_out,
                 } => {
+                    let heard = notes.map(|buf| {
+                        (
+                            buf,
+                            self.note_slice(buf, (first_row, end_row), start..start + frames),
+                        )
+                    });
                     let width = (program.buffers[*out as usize] as usize).min(MAX_CHANNELS);
                     self.tremolo(
-                        *out,
-                        *a,
+                        (*out, *a, width),
+                        heard,
                         *state as usize,
-                        (*lane, *depth),
-                        (*waveform, *rate),
-                        width,
+                        spec,
+                        (*fade_in, *fade_out),
                         win,
                         ctx,
                     );
@@ -605,79 +611,73 @@ impl Engine {
         }
     }
 
-    /// One chunk of an [`AudioOp::Tremolo`].
-    ///
-    /// The state holds the phase in value 0, the depth last applied in value
-    /// 1, and in value 2 whether it has ever run: a tremolo loaded at full
-    /// depth starts at full depth rather than fading in from none.
+    /// One chunk of an [`AudioOp::Tremolo`], a sample at a time: the clock
+    /// looks at each sample before the keys struck on it, as the note half's
+    /// does.
     #[allow(clippy::too_many_arguments)]
     fn tremolo(
         &mut self,
-        out: Buf,
-        a: Buf,
+        (out, a, width): (Buf, Buf, usize),
+        heard: Option<(u16, std::ops::Range<usize>)>,
         state: usize,
-        (lane, depth): (Option<u16>, f64),
-        (waveform, rate): (Waveform, RateSpec),
-        width: usize,
+        spec: &TremoloSpec,
+        (fade_in, fade_out): (f64, f64),
         win: Window,
         ctx: &AudioContext<'_>,
     ) {
-        let Some(held) = self.dsp.get(state) else {
+        let rate = ctx.sample_rate.max(1.0);
+        // A fade of under a sample is a step, and a slide that covers the
+        // whole way in one sample is one.
+        let up = 1.0 / (fade_in * rate).max(1.0);
+        let down = 1.0 / (fade_out * rate).max(1.0);
+        let mut reads = [0usize; MAX_CHANNELS];
+        let mut writes = [0usize; MAX_CHANNELS];
+        for ch in 0..width {
+            reads[ch] = self.at(a, ch, win);
+            writes[ch] = self.at(out, ch, win);
+        }
+        let NoteState { bufs, tremolos, .. } = &mut self.notes;
+        let Some(line) = tremolos.get_mut(state) else {
             return;
         };
-        let (mut phase, mut from, started) =
-            (held.values[0], held.values[1], held.values[2] != 0.0);
-        let hz = match rate {
-            RateSpec::Hz(hz) => hz,
-            RateSpec::CyclesPerBeat(cpb) => cpb * ctx.tempo_bpm / 60.0,
+        let events: &[Event] = match heard {
+            Some((buf, range)) => &bufs[buf as usize].events[range],
+            None => &[],
         };
-        let step = hz.max(0.0) / ctx.sample_rate.max(1.0);
-        // A random level held per cycle is a stepped gain — a click at every
-        // step — so a tremolo reads it as the sine instead.
-        let wave = match waveform {
-            Waveform::Random => Waveform::Sine,
-            other => other,
-        };
-        let target = depth.clamp(0.0, 1.0);
-        if !started {
-            from = target;
-        }
-        let mut done = 0usize;
-        while done < win.frames {
-            let at = win.start + done;
-            let seg = ctx.run_from(at, win.start + win.frames);
-            // A wired depth follows its lane's line. A set one slides from the
-            // depth last applied to the one set across the segment, so a
-            // recompile that changes it does not click; the oscillator never
-            // stops either way.
-            let line = lane.and_then(|lane| ctx.lane_line(at, lane));
-            for i in 0..seg {
-                let d = match line {
-                    Some(line) => line.at(at + i).clamp(0.0, 1.0),
-                    None => from + (target - from) * (i + 1) as f64 / seg as f64,
+        let pool = &mut self.pool;
+
+        line.clock.follow(ctx.tempo_bpm, rate);
+        let mut gain = line.gain;
+        let mut next = 0;
+        for i in 0..win.frames {
+            let at = (win.start + i) as u32;
+            line.clock.edge(spec, rate);
+            while let Some(event) = events.get(next)
+                && event.sample_offset() <= at
+            {
+                next += 1;
+                let (key, on) = match *event {
+                    Event::Note(NoteEvent::NoteOn { key, .. }) => (key, true),
+                    Event::Note(NoteEvent::NoteOff { key, .. }) => (key, false),
+                    _ => continue,
                 };
-                let shape = wave
-                    .shape((phase + step * i as f64).rem_euclid(1.0))
-                    .unwrap_or(0.0);
-                let gain = (1.0 - d * (1.0 - shape) * 0.5) as f32;
-                for ch in 0..width {
-                    let src = self.at(a, ch, win) + done + i;
-                    let dst = self.at(out, ch, win) + done + i;
-                    self.pool[dst] = self.pool[src] * gain;
+                if spec.steers(key) {
+                    line.clock.switch(spec, key, on);
                 }
             }
-            phase = (phase + step * seg as f64).rem_euclid(1.0);
-            from = match line {
-                Some(line) => line.at(at + seg).clamp(0.0, 1.0),
-                None => target,
+            let target = if line.clock.sounding() { 1.0 } else { 0.0 };
+            gain = if gain < target {
+                (gain + up).min(target)
+            } else {
+                (gain - down).max(target)
             };
-            done += seg;
+            let g = gain as f32;
+            for ch in 0..width {
+                pool[writes[ch] + i] = pool[reads[ch] + i] * g;
+            }
+            line.clock.tick();
         }
-        if let Some(held) = self.dsp.get_mut(state) {
-            held.values[0] = phase;
-            held.values[1] = from;
-            held.values[2] = 1.0;
-        }
+        line.gain = gain;
     }
 
     /// One chunk of an [`AudioOp::Math`], channel by channel.

@@ -14,7 +14,7 @@
 //! learns any of that; it is handed a `Ui` the right size and a [`NodeUi`] of
 //! facts about the world outside the graph.
 
-use crate::nodes::{Beats, Rate};
+use crate::nodes::{Beats, Rate, Ratio};
 
 /// Standard width of a node's body in canvas units.
 ///
@@ -259,7 +259,11 @@ pub(crate) fn slot_picker(ui: &mut egui::Ui, slot: &mut usize, cx: &NodeUi<'_>) 
 pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.label(label);
+        // An empty label still costs a gap of item spacing, which a row that
+        // is only a key and its setting cannot spare.
+        if !label.is_empty() {
+            ui.label(label);
+        }
         let mut value = i32::from(*key);
         if ui
             .add(egui::DragValue::new(&mut value).range(0..=127))
@@ -268,9 +272,39 @@ pub(crate) fn key_control(ui: &mut egui::Ui, label: &str, key: &mut u8) -> bool 
             *key = value.clamp(0, 127) as u8;
             changed = true;
         }
-        ui.weak(key_name(*key));
+        key_name_label(ui, *key);
     });
     changed
+}
+
+/// A key's name at the width of the widest one, so whatever follows it on
+/// the row lines up from row to row. Names run from two characters (`C3`)
+/// to four (`C#-1`), and the four-character ones sit in the bottom two
+/// octaves, where key switches are put.
+fn key_name_label(ui: &mut egui::Ui, key: u8) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().weak_text_color();
+    // Measured rather than counted: in a proportional font a digit and a
+    // sharp are not the same width. The layouts are cached by egui, so
+    // measuring all of them each frame costs a lookup each.
+    let width = ui.fonts_mut(|fonts| {
+        (0..128u8)
+            .map(|k| {
+                fonts
+                    .layout_no_wrap(key_name(k), font.clone(), color)
+                    .size()
+                    .x
+            })
+            .fold(0.0f32, f32::max)
+    });
+    let height = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| ui.weak(key_name(key)),
+    );
 }
 
 /// A MIDI key as a note name, with 60 as C3 — one of the several conventions in
@@ -307,7 +341,7 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
                     .changed();
             }
             Rate::Beats(beats) => {
-                changed |= beats_control(ui, beats);
+                changed |= beats_control(ui, "rate", beats);
             }
         }
     });
@@ -321,7 +355,26 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
 /// short, and dragging through 3, 5, 6 and 7 to get from 4 to 8 would offer
 /// values that are not note lengths. The triplet sits beside it as "3", the
 /// way a score marks one.
-pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
+///
+/// `id_salt` tells this control's list apart from any other drawn in the
+/// same node, and must differ between them. It cannot come from `ui.id()`:
+/// sibling `Ui`s — the rows of a node, each laid out with `ui.horizontal` —
+/// share that id, and rows sharing a list's id share its open state and its
+/// clicks, so only the last row's list could be opened.
+pub(crate) fn beats_control(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    beats: &mut Beats,
+) -> bool {
+    beats_parts(ui, id_salt, beats).0
+}
+
+/// [`beats_control`], and where its denominator's button is.
+fn beats_parts(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    beats: &mut Beats,
+) -> (bool, egui::Rect) {
     let mut changed = ui
         .add(
             egui::DragValue::new(&mut beats.num)
@@ -331,7 +384,7 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
         .on_hover_text("beats")
         .changed();
     ui.label("/");
-    egui::ComboBox::from_id_salt(ui.id().with("den"))
+    let den = egui::ComboBox::from_id_salt(ui.id().with(("beats-den", id_salt)))
         .selected_text(beats.den.to_string())
         .width(ui.spacing().interact_size.x)
         .show_ui(ui, |ui| {
@@ -344,7 +397,9 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
                     changed = true;
                 }
             }
-        });
+        })
+        .response
+        .rect;
     if ui
         .selectable_label(beats.triplet, "3")
         .on_hover_text("triplet: three in the space of two")
@@ -353,6 +408,32 @@ pub(crate) fn beats_control(ui: &mut egui::Ui, beats: &mut Beats) -> bool {
         beats.triplet = !beats.triplet;
         changed = true;
     }
+    (changed, den)
+}
+
+/// A [`Ratio`] as two whole numbers either side of a colon, laid out inline
+/// for the caller's row.
+///
+/// A share may be zero, which leaves the whole to the other part; the two
+/// may not both be, since that is no ratio at all.
+pub(crate) fn ratio_control(ui: &mut egui::Ui, ratio: &mut Ratio) -> bool {
+    let first_floor = u32::from(ratio.second == 0);
+    let mut changed = ui
+        .add(
+            egui::DragValue::new(&mut ratio.first)
+                .speed(0.1)
+                .range(first_floor..=Ratio::MAX),
+        )
+        .changed();
+    ui.label(":");
+    let second_floor = u32::from(ratio.first == 0);
+    changed |= ui
+        .add(
+            egui::DragValue::new(&mut ratio.second)
+                .speed(0.1)
+                .range(second_floor..=Ratio::MAX),
+        )
+        .changed();
     changed
 }
 
@@ -461,6 +542,76 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         assert!(width <= NODE_WIDTH, "{width} wide");
+    }
+
+    /// Each of several rows of beats opens its own denominator list: rows
+    /// laid out side by side in one node share the `Ui` id their widgets
+    /// would otherwise be named from.
+    #[test]
+    fn each_row_of_beats_opens_its_own_list() {
+        let ctx = egui::Context::default();
+        let mut rows = [Beats::new(1, 4), Beats::new(1, 8)];
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        // Returns where the first row's denominator button is.
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut first = egui::Rect::NOTHING;
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                for (index, beats) in rows.iter_mut().enumerate() {
+                    let den = ui.horizontal(|ui| beats_parts(ui, index, beats).1).inner;
+                    if index == 0 {
+                        first = den;
+                    }
+                }
+            });
+            output.drop_without_applying_deltas();
+            first
+        };
+        let at = frame(Vec::new()).center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(vec![button(false)]);
+        frame(Vec::new());
+        assert!(
+            ctx.any_popup_open(),
+            "the first row's list did not stay open"
+        );
+    }
+
+    /// A key's name takes the same width whatever the key, so what follows
+    /// it lines up from row to row.
+    #[test]
+    fn every_key_name_takes_the_same_width() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let mut widths = Vec::new();
+        let output = ctx.run_ui(input, |ui| {
+            // Two characters, three, and four.
+            for mut key in [60u8, 24, 13] {
+                let row = ui.horizontal(|ui| key_control(ui, "", &mut key));
+                widths.push(row.response.rect.width());
+            }
+        });
+        output.drop_without_applying_deltas();
+        assert!(
+            widths.iter().all(|&w| (w - widths[0]).abs() < 0.01),
+            "{widths:?}"
+        );
     }
 
     /// A control showing its socket's value has no box around it, hovered or

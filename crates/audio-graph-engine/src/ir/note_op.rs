@@ -14,6 +14,8 @@
 //! These run once per row, before the audio ops of the same row,
 //! so a gate's decision is as current as any other parameter's.
 
+use super::TremoloSpec;
+
 /// An index into the note buffer pool.
 pub type NoteBuf = u16;
 
@@ -96,6 +98,7 @@ pub(crate) enum NoteStreamKind {
         count: u8,
     },
     Delay,
+    Tremolo,
 }
 
 /// One step of the note half of a program.
@@ -193,5 +196,25 @@ pub enum NoteOp {
         lane: Option<u16>,
         time: f64,
         beats: bool,
+    },
+    /// Cut `a` into steps while a key in `spec` has started a tremolo, and
+    /// strike each held note again at every step: what cutting a part up by
+    /// hand, note by note, would give.
+    ///
+    /// Only the playing is cut. A note struck in the cut part of a step waits
+    /// for the next step; one struck in the sounding part sounds at once. A
+    /// note-off ends the note however far through a step it comes, so the
+    /// tremolo never plays a note longer than the player held it.
+    ///
+    /// The keys in `spec` steer rather than sound, and with `mute` they are
+    /// taken out of the stream. `state` indexes what the node keeps — the
+    /// clock and the notes it is cutting — which survives a program swap; see
+    /// [`TremoloSpec`] for why the audio half runs the same clock.
+    Tremolo {
+        a: NoteBuf,
+        out: NoteBuf,
+        state: u16,
+        spec: TremoloSpec,
+        mute: bool,
     },
 }

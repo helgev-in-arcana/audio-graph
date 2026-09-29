@@ -19,7 +19,7 @@ use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
     ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
-    MAX_NOTE_EMITS, NoteBuf, NoteOp, NoteStream, NoteStreamKind, Span,
+    MAX_NOTE_EMITS, MAX_TREMOLOS, NoteBuf, NoteOp, NoteStream, NoteStreamKind, Span,
 };
 use crate::nodes::NodeKind;
 
@@ -71,6 +71,9 @@ pub(crate) struct Notes {
     states: u16,
     /// Note delay index → the node whose queue it is.
     pub delay_nodes: Vec<NodeId>,
+    /// Tremolo index → the node, for the MIDI tremolos. The audio half books
+    /// its own after these.
+    pub tremolo_nodes: Vec<NodeId>,
 }
 
 impl Notes {
@@ -104,6 +107,7 @@ pub(crate) fn compile_notes(
         pending: Vec::new(),
         states: 0,
         delay_nodes: Vec::new(),
+        tremolo_nodes: Vec::new(),
     };
 
     // Once per stage rather than once through: a stage's ops have to be
@@ -161,7 +165,8 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
             | NoteOp::Filter { out, .. }
             | NoteOp::Emit { out, .. }
             | NoteOp::Merge { out, .. }
-            | NoteOp::Delay { out, .. } => out,
+            | NoteOp::Delay { out, .. }
+            | NoteOp::Tremolo { out, .. } => out,
         };
         notes.streams[usize::from(out)].kind = NoteStreamKind::Empty;
         notes.stages.remove(op);
@@ -262,6 +267,38 @@ fn route(
                 node: id,
                 port: delay.time_input,
                 wants: Wants::Time,
+            });
+            notes.outputs.push(((id, port), out));
+            continue;
+        }
+
+        if let Some(tremolo) = kind.note_tremolo(port) {
+            let Some(a) = notes.source_of(graph, id, tremolo.input) else {
+                continue;
+            };
+            if notes.tremolo_nodes.len() >= MAX_TREMOLOS {
+                return Err(CompileError::TooLarge {
+                    what: "tremolos",
+                    limit: MAX_TREMOLOS,
+                });
+            }
+            let state = notes.tremolo_nodes.len() as u16;
+            notes.tremolo_nodes.push(id);
+            let out = alloc_buf(
+                notes,
+                NoteStream {
+                    node: id,
+                    port,
+                    source: Some(a),
+                    kind: NoteStreamKind::Tremolo,
+                },
+            )?;
+            notes.ops.push(NoteOp::Tremolo {
+                a,
+                out,
+                state,
+                spec: tremolo.spec,
+                mute: tremolo.mute,
             });
             notes.outputs.push(((id, port), out));
             continue;

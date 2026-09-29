@@ -23,6 +23,9 @@ pub(crate) struct Audio {
     pub delay_nodes: Vec<NodeId>,
     /// DSP state index → the node that took it out.
     pub dsp_nodes: Vec<NodeId>,
+    /// Tremolo index → the node, for the audio tremolos. Numbered after the
+    /// note half's, which come first in the table they share.
+    pub tremolo_nodes: Vec<NodeId>,
     /// Audio line index → the longest any read on it asks for, in seconds.
     /// What the main thread sizes the ring from.
     pub ring_seconds: Vec<f64>,
@@ -790,7 +793,8 @@ mod tests {
                     | NoteOp::Filter { out, .. }
                     | NoteOp::Emit { out, .. }
                     | NoteOp::Merge { out, .. }
-                    | NoteOp::Delay { out, .. } => *out == want,
+                    | NoteOp::Delay { out, .. }
+                    | NoteOp::Tremolo { out, .. } => *out == want,
                 })
                 .copied()
                 .expect("every note buffer a program names is written by an op");
@@ -798,7 +802,7 @@ mod tests {
             at = match op {
                 NoteOp::Filter { a, .. } => Some(a),
                 NoteOp::Emit { a, .. } => a,
-                NoteOp::Delay { a, .. } => Some(a),
+                NoteOp::Delay { a, .. } | NoteOp::Tremolo { a, .. } => Some(a),
                 NoteOp::Input { .. } | NoteOp::Merge { .. } => None,
             };
         }
@@ -822,7 +826,8 @@ mod tests {
                 NoteOp::Input { .. }
                 | NoteOp::Emit { .. }
                 | NoteOp::Merge { .. }
-                | NoteOp::Delay { .. } => None,
+                | NoteOp::Delay { .. }
+                | NoteOp::Tremolo { .. } => None,
             })
             .collect()
     }

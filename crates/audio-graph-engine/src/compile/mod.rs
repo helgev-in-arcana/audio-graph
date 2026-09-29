@@ -185,7 +185,8 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     | NoteOp::Emit { out, .. }
                     | NoteOp::Filter { out, .. }
                     | NoteOp::Merge { out, .. }
-                    | NoteOp::Delay { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
+                    | NoteOp::Delay { out, .. }
+                    | NoteOp::Tremolo { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
                 })
                 .fold(0, |mask, bit| mask | bit),
             chunking,
@@ -226,6 +227,12 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         latch_nodes: param.latch_nodes,
         dsp_nodes: audio.dsp_nodes,
         note_delay_nodes: notes.delay_nodes,
+        tremolo_nodes: notes
+            .tremolo_nodes
+            .iter()
+            .chain(&audio.tremolo_nodes)
+            .copied()
+            .collect(),
         output_registers: param.reg_of,
     })
 }

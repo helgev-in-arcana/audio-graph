@@ -26,9 +26,9 @@ use crate::ir::{
     AudioMathOp, AudioOp, Buf, CC_INTERVAL, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, DSP_VALUES,
     Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS,
     MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
-    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MathOp,
-    NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand, PreparedProgram,
-    Program, QUANTUM_CHOICES, RateSpec, Rings, Stage, Waveform,
+    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MAX_TREMOLOS,
+    MathOp, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand,
+    PreparedProgram, Program, QUANTUM_CHOICES, RateSpec, Rings, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
@@ -40,6 +40,7 @@ mod notes;
 mod params;
 #[cfg(test)]
 mod tests;
+mod tremolo;
 
 use audio::Window;
 use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, adopt_rings, reorder};
@@ -88,8 +89,7 @@ pub struct AudioContext<'a> {
     /// may cover many rows, or sit inside one.
     pub resolution: u32,
     pub sample_rate: f64,
-    /// The host's tempo, for audio ops that follow it — a tremolo synced to
-    /// the beat.
+    /// The host's tempo, for audio ops that count in beats.
     pub tempo_bpm: f64,
     pub lanes: &'a [f64],
     /// The lanes at the end of the block, when the parameter half worked them
@@ -321,6 +321,7 @@ impl Engine {
                     .max(MAX_LATCHES)
                     .max(MAX_DSP_STATES)
                     .max(MAX_NOTE_DELAYS)
+                    .max(MAX_TREMOLOS)
                     .max(MAX_DELAY_LINES)
                     .max(MAX_AUDIO_DELAY_LINES)
             ],
@@ -389,6 +390,16 @@ impl Engine {
             &mut self.notes.delays,
             &mut self.order,
             &next.note_delay_nodes,
+        );
+        for line in &mut self.notes.tremolos {
+            if !next.tremolo_nodes.contains(&line.node()) {
+                line.release(&mut self.ledger);
+            }
+        }
+        reorder(
+            &mut self.notes.tremolos,
+            &mut self.order,
+            &next.tremolo_nodes,
         );
         let remap = self.notes.adopt(&next.note_streams);
         for marks in self.note_marks.iter_mut().take(self.note_rows) {
@@ -460,6 +471,8 @@ impl Engine {
         // A latch nothing has set reads as NaN, which is what a fresh program
         // leaves behind; see `adopt`.
         self.latches.iter_mut().for_each(Slot::clear);
+        // A latched tremolo is a latch too.
+        self.notes.tremolos.iter_mut().for_each(Slot::clear);
         self.forget_audio();
     }
 
@@ -490,6 +503,10 @@ impl Engine {
         // What was in flight is not coming; the ledger is settled by the
         // caller.
         self.notes.delays.iter_mut().for_each(Slot::clear);
+        self.notes
+            .tremolos
+            .iter_mut()
+            .for_each(tremolo::TremoloLine::forget_notes);
     }
 
     /// The parameter half: what a modulator has been carrying between blocks.

@@ -88,7 +88,7 @@ impl Node for MidiDelay {
         }
         if self.sync && !connected {
             let mut changed = false;
-            ui.horizontal(|ui| changed = beats_control(ui, &mut self.beats));
+            ui.horizontal(|ui| changed = beats_control(ui, "time", &mut self.beats));
             return changed;
         }
         // What a wired socket carries is a plain number of beats, which no

@@ -4703,65 +4703,6 @@ fn the_sample_by_sample_ops_do_what_they_say() {
     );
 }
 
-fn tremolo_patch(depth: f64) -> Graph {
-    let mut graph = Graph::new();
-    let input = stereo_in(&mut graph);
-    let output = stereo_out(&mut graph);
-    let tremolo = graph.add(
-        NodeKind::Tremolo(crate::nodes::Tremolo {
-            channels: 2,
-            waveform: Waveform::Sine,
-            // 480 samples a cycle at 48 kHz.
-            rate: Rate::Hz(100.0),
-            depth,
-        }),
-        [0.0, 0.0],
-    );
-    graph.connect(input, 0, tremolo, 0);
-    graph.connect(tremolo, 0, output, 0);
-    graph
-}
-
-/// At full depth the gain swings all the way to silence and back once a
-/// cycle; at none it leaves the signal alone.
-#[test]
-fn a_tremolo_swings_the_gain_by_its_depth() {
-    let mut engine = Engine::new();
-    engine.prepare(128, &[2]);
-    load(&mut engine, &tremolo_patch(1.0));
-    let heard = play(&mut engine, 0, 8, |_| 1.0);
-    let cycle = &heard[..480];
-    let low = cycle.iter().fold(1.0f32, |m, v| m.min(*v));
-    let high = cycle.iter().fold(0.0f32, |m, v| m.max(*v));
-    assert!(low < 0.01 && high > 0.99, "swung between {low} and {high}");
-
-    let mut engine = Engine::new();
-    engine.prepare(128, &[2]);
-    load(&mut engine, &tremolo_patch(0.0));
-    let heard = play(&mut engine, 0, 4, |_| 0.7);
-    assert!(heard.iter().all(|v| (v - 0.7).abs() < 1e-6));
-}
-
-/// A recompile does not restart the oscillator: the output across a swap is
-/// the output with no swap at all. Restarting it would jump the gain on every
-/// drag of every control.
-#[test]
-fn a_recompile_does_not_restart_the_tremolo() {
-    let graph = tremolo_patch(0.8);
-    let mut straight = Engine::new();
-    straight.prepare(128, &[2]);
-    load(&mut straight, &graph);
-    let expected = play(&mut straight, 0, 6, |_| 1.0);
-
-    let mut swapped = Engine::new();
-    swapped.prepare(128, &[2]);
-    load(&mut swapped, &graph);
-    let mut heard = play(&mut swapped, 0, 3, |_| 1.0);
-    load(&mut swapped, &graph);
-    heard.extend(play(&mut swapped, 3 * 128, 3, |_| 1.0));
-    assert_eq!(heard, expected);
-}
-
 /// A stream split and joined again comes out whole: each note once, in time
 /// order, and what both branches carried — the pedal — once. A repeat within
 /// one stream is that stream's own, and is kept.
@@ -5286,4 +5227,335 @@ fn a_wired_gain_meets_the_next_block_where_it_left_off() {
         most < least * 1.5,
         "and by about as much on each, block boundaries included: {least}..{most}"
     );
+}
+
+/// A tremolo on key 24, one step every 32nd of a beat — 750 samples at 120
+/// bpm — sounding for the first half of each.
+fn tremolo_keys(mode: crate::nodes::KeySwitchMode) -> crate::nodes::TremoloKeys {
+    crate::nodes::TremoloKeys {
+        mode,
+        rows: vec![crate::nodes::TremoloRow {
+            key: 24,
+            step: crate::nodes::Beats::new(1, 32),
+        }],
+        stop_key: 23,
+        share: crate::nodes::Ratio::EVEN,
+    }
+}
+
+/// MIDI in → a MIDI tremolo → a synth, the synth wired to the output.
+fn tremolo_synth(mode: crate::nodes::KeySwitchMode) -> Graph {
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+    let tremolo = graph.add(
+        NodeKind::MidiTremolo(crate::nodes::MidiTremolo {
+            keys: tremolo_keys(mode),
+            mute_keys: true,
+        }),
+        [0.0, 0.0],
+    );
+    let synth = note_plugin(&mut graph, 0);
+    let out = stereo_out(&mut graph);
+    graph.connect(notes, 0, tremolo, 0);
+    graph.connect(tremolo, 0, synth, 0);
+    graph.connect(synth, 0, out, 0);
+    graph
+}
+
+/// Events at absolute sample positions, dealt into 64-frame blocks the way
+/// [`hear_blocks`] takes them, over `blocks` blocks.
+fn in_blocks(events: &[Event], blocks: usize) -> Vec<Vec<Event>> {
+    let mut out = vec![Vec::new(); blocks];
+    for event in events {
+        let at = event.sample_offset();
+        out[at as usize / 64].push(event.at_offset(at % 64));
+    }
+    out
+}
+
+/// A held key switch cuts a held note into steps from the moment it is
+/// struck: the note stops for the second half of every step and is struck
+/// again at the start of the next, and the switch itself is not heard.
+#[test]
+fn a_midi_tremolo_cuts_a_held_note_into_steps() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Hold),
+    );
+    let events = [
+        note_on(24, 10),
+        note_on(60, 20),
+        note_off(60, 1900),
+        note_off(24, 2000),
+    ];
+    let (heard, _) = hear_blocks(&mut engine, 0, &in_blocks(&events, 40));
+    assert_eq!(
+        notes_only(&heard),
+        vec![
+            (20, "on", 60),
+            (385, "off", 60),
+            (760, "on", 60),
+            (1135, "off", 60),
+            (1510, "on", 60),
+            (1885, "off", 60),
+        ],
+        "the release at 1900 fell in a cut, where the note had already ended"
+    );
+}
+
+/// A note struck in the cut part of a step waits for the next step; one
+/// struck in the sounding part sounds at once; and a release ends the note
+/// wherever in a step it comes.
+#[test]
+fn a_note_struck_in_a_cut_waits_for_the_next_step() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Hold),
+    );
+    let events = [
+        note_on(24, 0),
+        note_on(60, 400),
+        note_on(62, 800),
+        note_off(60, 1000),
+        note_off(62, 1000),
+    ];
+    let (heard, _) = hear_blocks(&mut engine, 0, &in_blocks(&events, 30));
+    assert_eq!(
+        notes_only(&heard),
+        vec![
+            (750, "on", 60),
+            (800, "on", 62),
+            (1000, "off", 60),
+            (1000, "off", 62),
+        ]
+    );
+}
+
+/// A latched tremolo runs on after its key is let go and stops at the stop
+/// key. What was sounding then plays on to its release; what was cut stays
+/// cut.
+#[test]
+fn a_latched_tremolo_runs_until_the_stop_key() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Select),
+    );
+    let events = [
+        note_on(24, 0),
+        note_off(24, 10),
+        note_on(60, 20),
+        // Stopped in the sounding part of the third step.
+        note_on(23, 1600),
+        note_off(23, 1610),
+        note_off(60, 2000),
+    ];
+    let (heard, _) = hear_blocks(&mut engine, 0, &in_blocks(&events, 40));
+    assert_eq!(
+        notes_only(&heard),
+        vec![
+            (20, "on", 60),
+            (375, "off", 60),
+            (750, "on", 60),
+            (1125, "off", 60),
+            (1500, "on", 60),
+            (2000, "off", 60),
+        ]
+    );
+
+    // Stopped in a cut instead, the note does not come back.
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Select),
+    );
+    let events = [
+        note_on(24, 0),
+        note_on(60, 20),
+        note_on(23, 1200),
+        note_off(60, 2000),
+    ];
+    let (heard, _) = hear_blocks(&mut engine, 0, &in_blocks(&events, 40));
+    assert_eq!(
+        notes_only(&heard),
+        vec![
+            (20, "on", 60),
+            (375, "off", 60),
+            (750, "on", 60),
+            (1125, "off", 60),
+        ]
+    );
+}
+
+/// A note waiting in a cut is still the player's: it is not reported ended
+/// in the block it arrived in, as a note no plugin heard would be, but once
+/// its release comes.
+#[test]
+fn a_note_waiting_in_a_cut_is_not_reported_ended() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Hold),
+    );
+    // Struck at 400 and let go at 500, both in the first step's cut.
+    let events = [note_on(24, 0), note_on(60, 400), note_off(60, 500)];
+    let (heard, reports) = hear_blocks(&mut engine, 0, &in_blocks(&events, 10));
+    assert!(notes_only(&heard).is_empty(), "{:?}", notes_only(&heard));
+    assert!(reports[6].is_empty(), "reported while waiting: {reports:?}");
+    assert_eq!(reports[7].len(), 1, "reported at its release: {reports:?}");
+}
+
+/// A recompile moves neither the grid nor a note that is cut: the stream
+/// across a swap is the stream with no swap at all.
+#[test]
+fn a_recompile_keeps_the_tremolo_where_it_was() {
+    let graph = tremolo_synth(crate::nodes::KeySwitchMode::Hold);
+    let events = [note_on(24, 0), note_on(60, 0), note_off(60, 2500)];
+    let blocks = in_blocks(&events, 45);
+
+    let mut straight = Engine::new();
+    straight.prepare(64, &[]);
+    load(&mut straight, &graph);
+    let (expected, _) = hear_blocks(&mut straight, 0, &blocks);
+
+    let mut swapped = Engine::new();
+    swapped.prepare(64, &[]);
+    load(&mut swapped, &graph);
+    // Swapped at sample 448, with the note cut.
+    let (mut heard, _) = hear_blocks(&mut swapped, 0, &blocks[..7]);
+    load(&mut swapped, &graph);
+    heard.extend(hear_blocks(&mut swapped, 7, &blocks[7..]).0);
+    assert_eq!(notes_only(&heard), notes_only(&expected));
+}
+
+/// The MIDI and the audio tremolo, set alike and fed the same keys, cut on
+/// the same samples: a part and its audio can be cut together.
+#[test]
+fn the_midi_and_the_audio_tremolo_cut_on_the_same_samples() {
+    let mut graph = tremolo_synth(crate::nodes::KeySwitchMode::Hold);
+    let notes = graph
+        .nodes
+        .iter()
+        .find(|n| matches!(n.kind, NodeKind::NoteIn))
+        .unwrap()
+        .id;
+    let input = stereo_in(&mut graph);
+    let cut = graph.add(
+        NodeKind::AudioTremolo(crate::nodes::AudioTremolo {
+            channels: 2,
+            keys: tremolo_keys(crate::nodes::KeySwitchMode::Hold),
+            // Hard, so the cut is a sample and not a slope.
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
+        }),
+        [0.0, 0.0],
+    );
+    let out = stereo_out(&mut graph);
+    graph.connect(input, 0, cut, 0);
+    graph.connect(notes, 0, cut, 1);
+    graph.connect(cut, 0, out, 0);
+
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    load(&mut engine, &graph);
+    let events = [
+        note_on(24, 10),
+        note_on(60, 20),
+        note_off(60, 1900),
+        note_off(24, 2000),
+    ];
+    let blocks = in_blocks(&events, 40);
+    let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+    let mut schedule = SlotSchedule::new(width, 64, 32).unwrap();
+    let mut heard = Heard::default();
+    let mut notes_at = Vec::new();
+    let mut level = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        heard.0.clear();
+        let mut daw_out = vec![0.0f32; 2 * 64];
+        engine.run_block(
+            &mut schedule,
+            &[0.0; SLOTS],
+            block,
+            64,
+            Granularity {
+                resolution: 32,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[1.0; 2 * 64],
+            &mut daw_out,
+            &mut heard,
+        );
+        for event in heard.0.get(&0).into_iter().flatten() {
+            notes_at.push((index * 64 + event.sample_offset() as usize, *event));
+        }
+        level.extend_from_slice(&daw_out[..64]);
+    }
+
+    // Where the audio falls silent and comes back, read off the level.
+    let mut edges = Vec::new();
+    for at in 1..level.len() {
+        if level[at] != level[at - 1] {
+            edges.push((at, if level[at] > 0.5 { "on" } else { "off" }));
+        }
+    }
+    // The note's first strike is the player's, not the grid's.
+    let midi: Vec<_> = notes_only(&notes_at)
+        .into_iter()
+        .skip(1)
+        .map(|(at, what, _)| (at, what))
+        .collect();
+    assert_eq!(&edges[..midi.len()], &midi[..]);
+    // The audio goes on being cut after the note is let go, and passes
+    // once the key is.
+    assert_eq!(level[1950], 0.0);
+    assert!(level[2000..].iter().all(|&v| v == 1.0));
+}
+
+/// A latched tremolo is a setting, like a latched key switch: a transport
+/// jump leaves it running, from the jump, and only the editor's Reset stops
+/// it.
+#[test]
+fn only_an_explicit_reset_stops_a_latched_tremolo() {
+    let mut engine = Engine::new();
+    engine.prepare(64, &[]);
+    load(
+        &mut engine,
+        &tremolo_synth(crate::nodes::KeySwitchMode::Select),
+    );
+    hear_blocks(&mut engine, 0, &in_blocks(&[note_on(24, 0)], 2));
+    engine.reset();
+    let (heard, _) = hear_blocks(
+        &mut engine,
+        0,
+        &in_blocks(&[note_on(60, 0), note_off(60, 1000)], 20),
+    );
+    assert_eq!(
+        notes_only(&heard),
+        vec![
+            (0, "on", 60),
+            (375, "off", 60),
+            (750, "on", 60),
+            (1000, "off", 60)
+        ],
+        "the grid starts again where playback does"
+    );
+
+    let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+    engine.reset_everything(&mut ended);
+    let (heard, _) = hear_blocks(
+        &mut engine,
+        0,
+        &in_blocks(&[note_on(60, 0), note_off(60, 1000)], 20),
+    );
+    assert_eq!(notes_only(&heard), vec![(0, "on", 60), (1000, "off", 60)]);
 }

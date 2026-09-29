@@ -22,7 +22,7 @@ use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
     AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
     MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_SECONDS, MAX_DSP_STATES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, NoteBuf, Op, Reg, Span,
+    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, MAX_TREMOLOS, NoteBuf, Op, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -564,6 +564,7 @@ pub(crate) struct AudioCx<'a> {
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
     dsp_nodes: Vec<NodeId>,
+    tremolo_nodes: Vec<NodeId>,
 
     notes: &'a Notes,
 }
@@ -602,6 +603,7 @@ impl<'a> AudioCx<'a> {
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
             dsp_nodes: Vec::new(),
+            tremolo_nodes: Vec::new(),
             notes,
         }
     }
@@ -683,10 +685,25 @@ impl<'a> AudioCx<'a> {
             spans: self.spans,
             delay_nodes: self.delay_nodes,
             dsp_nodes: self.dsp_nodes,
+            tremolo_nodes: self.tremolo_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
             latency: self.latency,
         }
+    }
+
+    /// Books this node a tremolo's state, numbered after the MIDI tremolos'
+    /// because both halves share one table — see [`AudioOp::Tremolo`].
+    pub(crate) fn tremolo_state(&mut self) -> Result<u16, CompileError> {
+        let index = self.notes.tremolo_nodes.len() + self.tremolo_nodes.len();
+        if index >= MAX_TREMOLOS {
+            return Err(CompileError::TooLarge {
+                what: "tremolos",
+                limit: MAX_TREMOLOS,
+            });
+        }
+        self.tremolo_nodes.push(self.id);
+        Ok(index as u16)
     }
 
     /// Books this node a DSP state, which survives a program swap — see
