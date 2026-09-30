@@ -601,6 +601,7 @@ impl Wrapper {
             .report_slots(self.schedule.row(self.schedule.row_count() - 1));
         self.shared
             .report_sockets(self.engine.publication(), self.engine.registers());
+        self.shared.report_granular(&self.engine);
 
         let status = if self.engine.has_audio() {
             ApiStatus::Continue

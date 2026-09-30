@@ -308,6 +308,8 @@ impl WrapperEditor {
         // *consequence* of an edit — see `GraphEdit::Publish`.
         let touched = self.shared.touched().snapshot();
         let sockets = self.shared.live_sockets();
+        let granular = self.shared.live_granular();
+        Shared::sync_granular(&mut patch.graph, &granular);
         let context = GraphContext {
             plugins: &self.entries,
             instances: &self.view.instances,
@@ -317,6 +319,7 @@ impl WrapperEditor {
             error: patch.compile_error.clone(),
             live: self.shared.live_slots(),
             sockets: &sockets,
+            granular: &granular,
             quantum: self.shared.quantum(),
             resolution: self.shared.resolution(),
             sample_rate: self.shared.sample_rate() as f64,

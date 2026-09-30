@@ -19,7 +19,7 @@ mod audio_math;
 mod audio_tremolo;
 mod granular;
 pub use crate::ir::KeyTrigger;
-pub use granular::Granular;
+pub use granular::{Granular, GranularAction, GranularBand, GranularKey, GranularMode};
 mod beats;
 mod cc_in;
 mod constant;
@@ -232,6 +232,11 @@ pub(crate) trait Node {
     #[cfg(feature = "ui")]
     fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         let _ = (ui, cx);
+        false
+    }
+
+    #[cfg(feature = "ui")]
+    fn after_inputs(&mut self, _ui: &mut egui::Ui, _cx: &mut widgets::NodeUi<'_>) -> bool {
         false
     }
 
@@ -557,6 +562,11 @@ impl NodeKind {
     #[cfg(feature = "ui")]
     pub fn controls(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
         for_kind!(self, node => node.controls(ui, cx))
+    }
+
+    #[cfg(feature = "ui")]
+    pub fn after_inputs(&mut self, ui: &mut egui::Ui, cx: &mut widgets::NodeUi<'_>) -> bool {
+        for_kind!(self, node => node.after_inputs(ui, cx))
     }
 
     /// The title as the canvas shows it — see [`Node::ui_title`].

@@ -348,6 +348,15 @@ impl Engine {
         self.program.as_ref().is_some_and(|p| !p.is_empty())
     }
 
+    pub fn granular_statuses(
+        &self,
+    ) -> impl Iterator<Item = (crate::NodeId, crate::GranularStatus)> + '_ {
+        self.granular
+            .iter()
+            .filter(|state| state.node() != u32::MAX)
+            .map(|state| (state.node(), state.status()))
+    }
+
     /// The current program's registers, as the last row left them.
     ///
     /// Indexed by the registers in [`Program::output_registers`], and only
@@ -500,7 +509,9 @@ impl Engine {
     /// Nothing on the wire caused this, so the DAW has no reason to think the
     /// notes it asked for are over. It is told, through `ended`.
     pub fn reset_everything(&mut self, ended: &mut Vec<Ended>) {
-        self.granular.iter_mut().for_each(Slot::clear);
+        self.granular
+            .iter_mut()
+            .for_each(GranularState::reset_performance);
         self.ledger.end_all(ended);
         self.forget_notes();
         self.forget_params();

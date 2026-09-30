@@ -1,7 +1,7 @@
 use audio_graph_engine::{
-    AudioIn, AudioOut, Beats, Constant, Engine, Granular, Granularity, Graph, KeyParam,
-    KeyParamMode, KeyTrigger, MAX_AUDIO_LANES, MAX_GRAPH_PARAMS, NodeKind, ProgramPublisher,
-    compile,
+    AudioIn, AudioOut, Constant, Engine, Granular, GranularAction, GranularBand, GranularKey,
+    GranularMode, Granularity, Graph, KeyParam, KeyParamMode, KeyTrigger, MAX_AUDIO_LANES,
+    MAX_GRAPH_PARAMS, NodeKind, ProgramPublisher, compile,
 };
 use plugin_host::{Event, NoteEvent};
 use subhost_adapter::{NoInstances, SlotSchedule};
@@ -73,12 +73,18 @@ impl Rig {
         let node = graph.add(
             NodeKind::Granular(Granular {
                 capacity: 0.128,
-                history: 0.032,
-                block: Beats::new(1, 64),
+                history: 8.0 / 125.0,
+                block: 1.0 / 64.0,
                 size: 1.0,
                 interval: 0.5,
                 wet: 1.0,
-                latch: true,
+                output_keys: vec![
+                    GranularKey {
+                        mode: GranularMode::Select,
+                        ..GranularKey::new(26, GranularAction::Play)
+                    },
+                    GranularKey::new(27, GranularAction::Stop),
+                ],
                 ..Granular::default()
             }),
             [0.0; 2],
@@ -267,33 +273,42 @@ fn recording_and_playback_follow_the_node_when_other_granular_nodes_are_removed(
 }
 
 #[test]
-fn a_velocity_split_operates_record_and_play_without_sharing_their_releases() {
+fn a_velocity_restrike_replaces_the_output_band_and_the_first_off_releases_it() {
     let mut rig = Rig::new();
     let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
         unreachable!()
     };
-    node.record_key = KeyTrigger::Velocity {
-        key: 24,
-        min: 1,
-        max: 63,
-    };
-    node.play_key = KeyTrigger::Velocity {
-        key: 24,
-        min: 64,
-        max: 127,
-    };
-    node.latch = false;
+    node.set_value(GranularAction::Wet(0.0));
+    node.output_keys.push(GranularKey {
+        key: 40,
+        mode: GranularMode::Hold,
+        velocity: true,
+        bands: vec![
+            GranularBand {
+                end: 63,
+                action: GranularAction::Wet(0.25),
+            },
+            GranularBand {
+                end: 127,
+                action: GranularAction::Wet(1.0),
+            },
+        ],
+    });
     rig.publish();
-    rig.run(&[0.5; 32], &[note(true, 24, 0, 0.25)]);
-    let output = rig.run(
-        &[0.0; 32],
-        &[note(true, 24, 0, 1.0), note(false, 24, 0, 0.0)],
-    );
-    assert!(output[8..].iter().any(|&x| x > 0.1));
-    rig.run(&[0.0; 32], &[note(false, 24, 0, 0.0)]);
+    rig.record();
+    let quiet = rig.run(&[0.0; 32], &[note(true, 40, 0, 0.25)]);
+    assert!(quiet[8..].iter().all(|&x| x <= 0.126));
+    assert!(quiet[8..].iter().any(|&x| x > 0.05));
+    let loud = rig.run(&[0.0; 32], &[note(true, 40, 0, 1.0)]);
+    assert!(loud[8..].iter().any(|&x| x > 0.4));
+    rig.run(&[0.0; 32], &[note(false, 40, 0, 0.0)]);
     assert!(rig.run(&[0.0; 32], &[]).iter().all(|&x| x == 0.0));
+    assert!(
+        rig.run(&[0.0; 32], &[note(false, 40, 0, 0.0)])
+            .iter()
+            .all(|&x| x == 0.0)
+    );
 }
-
 #[test]
 fn key_parameter_selection_uses_each_events_velocity_and_receipt_order() {
     let mut rig = Rig::new();
@@ -326,34 +341,53 @@ fn key_parameter_selection_uses_each_events_velocity_and_receipt_order() {
         [0.0; 2],
     );
     rig.graph.connect(notes, 0, selector, 0);
-    rig.graph.connect(selector, 0, rig.node, 5);
+    let output = rig
+        .graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, NodeKind::AudioOut(_)))
+        .unwrap()
+        .id;
+    let gate = rig.graph.add(
+        NodeKind::Gate(audio_graph_engine::Gate {
+            channels: 2,
+            threshold: 0.5,
+            invert: false,
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
+        }),
+        [0.0; 2],
+    );
+    rig.graph.connect(rig.input, 0, gate, 0);
+    rig.graph.connect(selector, 0, gate, 1);
+    rig.graph.connect(gate, 0, output, 0);
     rig.publish();
-    rig.record();
+
     rig.run(
-        &[0.0; 16],
+        &[0.5; 16],
         &[
             note(true, 40, 1, 1.0),
             note(true, 40, 2, 0.1),
             note(true, 60, 3, 1.0),
         ],
     );
-    assert!(rig.run(&[0.0; 16], &[]).iter().all(|&x| x == 0.0));
+    assert!(rig.run(&[0.5; 16], &[]).iter().all(|&x| x == 0.0));
     rig.run(
-        &[0.0; 16],
+        &[0.5; 16],
         &[note(true, 40, 1, 0.1), note(true, 40, 2, 1.0)],
     );
-    assert!(rig.run(&[0.0; 16], &[]).iter().any(|&x| x > 0.1));
+    assert!(rig.run(&[0.5; 16], &[]).iter().any(|&x| x > 0.1));
     let NodeKind::KeyParam(node) = &mut rig.graph.node_mut(selector).unwrap().kind else {
         unreachable!()
     };
     node.mode = KeyParamMode::Toggle;
     rig.publish();
     rig.run(
-        &[0.0; 16],
+        &[0.5; 16],
         &[note(true, 40, 1, 0.1), note(true, 40, 2, 0.1)],
     );
     assert!(
-        rig.run(&[0.0; 16], &[]).iter().any(|&x| x > 0.1),
+        rig.run(&[0.5; 16], &[]).iter().any(|&x| x > 0.1),
         "two toggles retain the selected value"
     );
 }
@@ -363,13 +397,138 @@ fn invalid_settings_are_rejected_and_saved_graphs_round_trip() {
     let mut rig = Rig::new();
     let saved = serde_json::to_string(&rig.graph).unwrap();
     let restored: Graph = serde_json::from_str(&saved).unwrap();
-    assert_eq!(
-        compile(&restored, 0).unwrap(),
-        compile(&rig.graph, 0).unwrap()
-    );
+    assert_eq!(serde_json::to_string(&restored).unwrap(), saved);
+    assert!(compile(&restored, 0).is_ok());
     let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
         unreachable!()
     };
-    node.history = f64::NAN;
+    node.capacity = f64::NAN;
     assert!(compile(&rig.graph, 0).is_err());
+}
+
+#[test]
+fn held_wet_assignments_restore_without_stopping_latched_playback() {
+    let mut rig = Rig::new();
+    let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
+        unreachable!()
+    };
+    node.output_keys.extend([
+        GranularKey::new(40, GranularAction::Wet(0.0)),
+        GranularKey::new(41, GranularAction::Wet(1.0)),
+    ]);
+    rig.publish();
+    rig.record();
+    rig.run(&[0.0; 16], &[note(true, 40, 0, 1.0)]);
+    assert!(rig.run(&[0.0; 16], &[]).iter().all(|&x| x == 0.0));
+    assert!(
+        rig.run(&[0.0; 16], &[note(true, 41, 0, 1.0)])
+            .iter()
+            .any(|&x| x > 0.1)
+    );
+    rig.run(&[0.0; 16], &[note(false, 41, 0, 0.0)]);
+    assert!(rig.run(&[0.0; 16], &[]).iter().all(|&x| x == 0.0));
+    assert!(
+        rig.run(&[0.0; 16], &[note(false, 40, 0, 0.0)])
+            .iter()
+            .any(|&x| x > 0.1)
+    );
+}
+
+#[test]
+fn wet_socket_overrides_midi_clamps_values_and_restores_the_unwired_control() {
+    let mut rig = Rig::new();
+    let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
+        unreachable!()
+    };
+    node.output_keys
+        .push(GranularKey::new(40, GranularAction::Wet(0.0)));
+    let control = rig
+        .graph
+        .add(NodeKind::Constant(Constant { value: 0.4 }), [0.0; 2]);
+    rig.graph.connect(control, 0, rig.node, 2);
+    rig.publish();
+    rig.record();
+    let output = rig.run(&[0.0; 32], &[note(true, 40, 0, 1.0)]);
+    assert!(output.iter().all(|&value| value.abs() <= 0.20001));
+    assert!(output.iter().any(|&value| value > 0.15));
+    for (value, audible) in [(2.0, true), (-1.0, false)] {
+        let NodeKind::Constant(constant) = &mut rig.graph.node_mut(control).unwrap().kind else {
+            unreachable!()
+        };
+        constant.value = value;
+        rig.publish();
+        rig.run(&[0.0; 32], &[]);
+        let output = rig.run(&[0.0; 32], &[]);
+        assert!(
+            output
+                .iter()
+                .all(|&value| value.is_finite() && value.abs() <= 0.50001)
+        );
+        assert_eq!(output.iter().any(|&value| value > 0.35), audible);
+        if !audible {
+            assert!(output.iter().all(|&value| value == 0.0));
+        }
+    }
+    rig.graph
+        .links
+        .retain(|link| !(link.to == rig.node && link.to_port == 2));
+    rig.publish();
+    assert!(rig.run(&[0.0; 32], &[]).iter().all(|&value| value == 0.0));
+    assert!(
+        rig.run(&[0.0; 32], &[note(false, 40, 0, 0.0)])
+            .iter()
+            .any(|&value| value > 0.35)
+    );
+    let NodeKind::Granular(node) = &rig.graph.node(rig.node).unwrap().kind else {
+        unreachable!()
+    };
+    assert_eq!(node.wet, 1.0);
+}
+
+#[test]
+fn midi_selection_is_saved_as_the_base_and_stale_reports_cannot_undo_ui_edits() {
+    let mut rig = Rig::new();
+    let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
+        unreachable!()
+    };
+    node.output_keys.push(GranularKey {
+        mode: GranularMode::Select,
+        ..GranularKey::new(40, GranularAction::Wet(0.0))
+    });
+    node.output_keys
+        .push(GranularKey::new(41, GranularAction::Wet(1.0)));
+    rig.publish();
+    rig.record();
+    rig.run(
+        &[0.0; 16],
+        &[note(true, 40, 0, 1.0), note(true, 41, 1, 1.0)],
+    );
+    let (_, status) = rig.engine.granular_statuses().next().unwrap();
+    assert_eq!(status.selected[3], Some(0.0));
+    let NodeKind::Granular(node) = &mut rig.graph.node_mut(rig.node).unwrap().kind else {
+        unreachable!()
+    };
+    node.sync_selection(&status);
+    assert_eq!(node.wet, 0.0);
+    let mut restored: Granular =
+        serde_json::from_value(serde_json::to_value(&*node).unwrap()).unwrap();
+    assert_eq!(restored.wet, 0.0);
+    assert_ne!(restored.revisions, node.revisions);
+    restored.wet = 0.5;
+    restored.sync_selection(&status);
+    assert_eq!(restored.wet, 0.5);
+    node.set_value(GranularAction::Wet(0.5));
+    node.sync_selection(&status);
+    assert_eq!(node.wet, 0.5);
+    rig.publish();
+    assert!(rig.run(&[0.0; 16], &[]).iter().any(|&v| v > 0.35));
+    rig.run(&[0.0; 16], &[note(false, 41, 0, 0.0)]);
+    let output = rig.run(&[0.0; 32], &[]);
+    assert!(output.iter().any(|&v| v > 0.15));
+    assert!(output.iter().all(|&v| v <= 0.25001));
+    rig.run(&[0.0; 16], &[note(true, 40, 0, 1.0)]);
+    assert!(rig.run(&[0.0; 16], &[]).iter().all(|&v| v == 0.0));
+    rig.engine.reset_everything(&mut Vec::new());
+    let (_, status) = rig.engine.granular_statuses().next().unwrap();
+    assert_eq!(status.selected[3], Some(0.0));
 }

@@ -124,7 +124,8 @@ pub enum AudioOp {
         notes: Option<NoteBuf>,
         state: u16,
         spec: super::GranularSpec,
-        params: [super::GranularParam; 4],
+        params: [f64; 4],
+        wet_lane: Option<u16>,
     },
     /// Copy host audio input bus into a buffer.
     Input { out: Buf, bus: u16 },

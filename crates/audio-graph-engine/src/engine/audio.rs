@@ -569,6 +569,7 @@ impl Engine {
                     state,
                     spec,
                     params,
+                    wet_lane,
                 } => {
                     let range = notes.map(|buf| {
                         (
@@ -594,20 +595,18 @@ impl Engine {
                             && event.sample_offset() as usize <= at
                         {
                             if let Event::Note(note) = event {
-                                line.event(note, spec);
+                                line.event(note, spec, ctx.tempo_bpm);
                             }
                             next += 1;
                         }
                         let values = std::array::from_fn(|p| {
-                            let value = params[p]
-                                .lane
-                                .and_then(|lane| ctx.lane_value(at, lane))
-                                .unwrap_or(params[p].value);
-                            let value = if value.is_finite() {
-                                value
+                            let driven = if p == 3 {
+                                wet_lane.and_then(|lane| ctx.lane_value(at, lane))
                             } else {
-                                params[p].value
+                                None
                             };
+                            let value = driven.unwrap_or_else(|| line.parameter(p, params[p]));
+                            let value = if value.is_finite() { value } else { params[p] };
                             match p {
                                 0 | 1 => value.clamp(0.05, 1.0),
                                 _ => value.clamp(0.0, 1.0),

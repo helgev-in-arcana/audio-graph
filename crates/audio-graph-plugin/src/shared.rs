@@ -164,6 +164,7 @@ pub struct Shared {
     /// What each param socket carried at the end of the last block, for the
     /// controls a wired socket stands in for.
     sockets: LiveSockets,
+    granular: crate::granular_status::LiveGranular,
     params: Arc<WrapperParams>,
     /// The last document this instance saved or retained without interpreting.
     ///
@@ -225,7 +226,7 @@ impl Shared {
         params: Arc<WrapperParams>,
         touched: Arc<Touched>,
     ) -> Arc<Shared> {
-        Arc::new(Shared {
+        let shared = Arc::new(Shared {
             processing_error: AtomicU64::new(0),
             touched,
             note_losses: array::from_fn(|_| AtomicU64::new(0)),
@@ -261,6 +262,7 @@ impl Shared {
             latency: AtomicU32::new(0),
             live: array::from_fn(|_| AtomicU32::new(0)),
             sockets: LiveSockets::default(),
+            granular: crate::granular_status::LiveGranular::default(),
             params,
             last_written: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -268,7 +270,9 @@ impl Shared {
             posted: Mutex::new(Vec::new()),
             editor_open: AtomicBool::new(false),
             reset_wanted: AtomicBool::new(false),
-        })
+        });
+        *shared.params.state.1.write().unwrap() = Arc::downgrade(&shared);
+        shared
     }
 
     /// # Panics
@@ -511,6 +515,36 @@ impl Shared {
         self.sockets.read()
     }
 
+    pub fn report_granular(&self, engine: &audio_graph_engine::Engine) {
+        self.granular
+            .report(engine.publication(), engine.granular_statuses());
+    }
+
+    pub fn live_granular(
+        &self,
+    ) -> Vec<(
+        audio_graph_engine::NodeId,
+        audio_graph_engine::GranularStatus,
+    )> {
+        self.granular.read()
+    }
+
+    pub(crate) fn sync_granular(
+        graph: &mut Graph,
+        statuses: &[(
+            audio_graph_engine::NodeId,
+            audio_graph_engine::GranularStatus,
+        )],
+    ) {
+        for (id, status) in statuses {
+            if let Some(node) = graph.node_mut(*id)
+                && let NodeKind::Granular(node) = &mut node.kind
+            {
+                node.sync_selection(status);
+            }
+        }
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
@@ -714,7 +748,8 @@ impl Shared {
 
     fn compile_program(&self) -> Result<audio_graph_engine::Program, String> {
         let graph = {
-            let patch = self.patch();
+            let mut patch = self.patch();
+            Self::sync_granular(&mut patch.graph, &self.live_granular());
             if patch.restore_error.is_some() {
                 return Ok(audio_graph_engine::Program::empty());
             }
@@ -738,6 +773,7 @@ impl Shared {
             .programs
             .publish(program, f64::from(self.sample_rate()));
         self.sockets.published(publication);
+        self.granular.expect(publication);
         publication
     }
 
@@ -1157,7 +1193,11 @@ impl Shared {
         if self.restore_error().is_some() {
             return;
         }
-        let graph = serde_json::to_value(&self.patch().graph).ok();
+        let graph = {
+            let mut patch = self.patch();
+            Self::sync_granular(&mut patch.graph, &self.live_granular());
+            serde_json::to_value(&patch.graph).ok()
+        };
         let mut state = self.main();
         let mut blob = WrapperState::default();
         blob.set_sub_host_state(state.host.save_state());
@@ -1168,6 +1208,23 @@ impl Shared {
         blob.param_resolution = self.resolution();
         drop(state);
         self.write_state(&blob);
+    }
+
+    pub(crate) fn state_for_save(&self, stored: &str) -> String {
+        let mut patch = self.patch();
+        if patch.restore_error.is_some() || self.last_written.lock().as_deref() != Some(stored) {
+            return stored.to_owned();
+        }
+        let statuses = self.live_granular();
+        if statuses.is_empty() {
+            return stored.to_owned();
+        }
+        Self::sync_granular(&mut patch.graph, &statuses);
+        let Ok(mut state) = serde_json::from_str::<WrapperState>(stored) else {
+            return stored.to_owned();
+        };
+        state.graph = serde_json::to_value(&patch.graph).ok();
+        serde_json::to_string(&state).unwrap_or_else(|_| stored.to_owned())
     }
 
     fn write_state(&self, state: &WrapperState) {
@@ -1408,6 +1465,51 @@ mod tests {
         assert!(
             shared.state_is_unseen(),
             "a blob written from outside is the user's project and has to be read"
+        );
+    }
+    #[test]
+    fn granular_select_is_persisted_without_an_editor_or_a_subsequent_ui_edit() {
+        use audio_graph_engine::{Granular, GranularAction, GranularStatus};
+        use nice_plug::params::persist::PersistentField;
+        let shared = shared();
+        let mut graph = Graph::new();
+        let node = Granular::default();
+        let mut status = GranularStatus {
+            revisions: node.revisions,
+            ..Default::default()
+        };
+        let id = graph.add(NodeKind::Granular(node), [0.0; 2]);
+        shared.restore_graph(graph);
+        shared.store_state();
+        shared.granular.expect(1);
+        status.selected[3] = Some(0.125);
+        shared.granular.report(1, [(id, status)].into_iter());
+        let saved = shared.params.state.map(Clone::clone);
+        let state: WrapperState = serde_json::from_str(&saved).unwrap();
+        let graph: Graph = serde_json::from_value(state.graph.unwrap()).unwrap();
+        let NodeKind::Granular(node) = &graph.node(id).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(node.wet, 0.125);
+        assert!(!shared.state_is_unseen());
+        {
+            let mut patch = shared.patch();
+            let NodeKind::Granular(node) = &mut patch.graph.node_mut(id).unwrap().kind else {
+                unreachable!()
+            };
+            node.set_value(GranularAction::Wet(0.75));
+        }
+        let saved = shared.params.state.map(Clone::clone);
+        let state: WrapperState = serde_json::from_str(&saved).unwrap();
+        let graph: Graph = serde_json::from_value(state.graph.unwrap()).unwrap();
+        let NodeKind::Granular(node) = &graph.node(id).unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(node.wet, 0.75);
+        *shared.params.state.0.write().unwrap() = "unreadable incoming state".into();
+        assert_eq!(
+            shared.params.state.map(Clone::clone),
+            "unreadable incoming state"
         );
     }
 }

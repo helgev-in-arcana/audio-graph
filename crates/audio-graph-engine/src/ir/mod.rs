@@ -21,8 +21,9 @@ mod audio_op;
 mod granular;
 mod keys;
 pub use granular::{
-    GranularParam, GranularSpec, MAX_GRAINS, MAX_GRANULAR_SECONDS, MAX_GRANULAR_SLICES,
-    MAX_GRANULARS, MIN_GRANULAR_BLOCK_SECONDS,
+    GranularAction, GranularBinding, GranularMode, GranularSpec, GranularStatus, MAX_GRAINS,
+    MAX_GRANULAR_BINDINGS, MAX_GRANULAR_SECONDS, MAX_GRANULAR_SLICES, MAX_GRANULARS,
+    MIN_GRANULAR_BLOCK_SECONDS,
 };
 pub use keys::KeyTrigger;
 mod note_op;

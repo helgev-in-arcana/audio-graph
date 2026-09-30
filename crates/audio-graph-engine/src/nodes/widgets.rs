@@ -111,6 +111,7 @@ pub struct Touch {
 /// that is a node's business, and leaving it out is what keeps this crate from
 /// needing to know what a plugin format is.
 pub struct NodeUi<'a> {
+    pub granular_status: Option<crate::ir::GranularStatus>,
     /// How many slots the wrapper has, so a slot picker cannot point past the
     /// table.
     pub slot_count: usize,

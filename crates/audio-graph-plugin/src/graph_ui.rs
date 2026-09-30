@@ -160,6 +160,7 @@ pub struct GraphContext<'a> {
     /// What each param output socket carried at the end of the last block.
     /// Empty until the program on screen is the one being heard.
     pub sockets: &'a [(crate::sockets::Socket, f64)],
+    pub granular: &'a [(NodeId, audio_graph_engine::GranularStatus)],
     /// The sub-block size, the parameter resolution and the sample rate,
     /// which together define the delay time floors. The editor displays them
     /// and restricts control minimums; the audio thread also clamps them.
@@ -476,7 +477,7 @@ impl GraphEditor {
         // and only the wrapper knows what that is.
         let title = graph.nodes[index]
             .kind
-            .ui_title(&node_ui(ctx, self.learning, &[]));
+            .ui_title(&node_ui(ctx, self.learning, &[], id));
 
         let zoom = self.zoom;
         let width = NODE_WIDTH * zoom;
@@ -587,7 +588,7 @@ impl GraphEditor {
                         outcome.changed = true;
                     }
                 }
-                let mut cx = node_ui(ctx, self.learning, &arriving);
+                let mut cx = node_ui(ctx, self.learning, &arriving, id);
                 outcome.changed |= graph.nodes[index].kind.title_controls(ui, &mut cx);
                 actions.append(&mut cx.actions);
             };
@@ -647,7 +648,7 @@ impl GraphEditor {
                         outcome.changed = true;
                     }
                 }
-                let mut cx = node_ui(ctx, self.learning, &arriving);
+                let mut cx = node_ui(ctx, self.learning, &arriving, id);
                 let changed = graph.nodes[index].kind.controls(ui, &mut cx);
                 actions.append(&mut cx.actions);
                 changed
@@ -680,7 +681,7 @@ impl GraphEditor {
                             if remove_button(ui, port.remove, "remove this output") {
                                 dropped_output = Some(i as u8);
                             }
-                            let mut cx = node_ui(ctx, self.learning, &arriving);
+                            let mut cx = node_ui(ctx, self.learning, &arriving, id);
                             outcome.changed |=
                                 graph.nodes[index].kind.output_control(ui, i as u8, &mut cx);
                             actions.append(&mut cx.actions);
@@ -750,7 +751,7 @@ impl GraphEditor {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.label(port.name.as_ref());
-                                    let mut cx = node_ui(ctx, self.learning, &arriving);
+                                    let mut cx = node_ui(ctx, self.learning, &arriving, id);
                                     outcome.changed |= graph.nodes[index]
                                         .kind
                                         .input_control(ui, i as u8, wired, &mut cx);
@@ -763,6 +764,9 @@ impl GraphEditor {
                     .rect;
                 input_rows.push(row.center().y);
             }
+            let mut cx = node_ui(ctx, self.learning, &arriving, id);
+            outcome.changed |= graph.nodes[index].kind.after_inputs(ui, &mut cx);
+            actions.append(&mut cx.actions);
 
             // The last row, under the sockets it makes more of, and left
             // against the edge its sockets are on.
@@ -1261,8 +1265,14 @@ fn node_ui<'a>(
     ctx: &'a GraphContext<'a>,
     learning: Option<(usize, u32)>,
     inputs: &'a [Option<f64>],
+    id: NodeId,
 ) -> NodeUi<'a> {
     NodeUi {
+        granular_status: ctx
+            .granular
+            .iter()
+            .find(|(node, _)| *node == id)
+            .map(|(_, status)| *status),
         inputs,
         touched: ctx.touched,
         learning,
@@ -1355,6 +1365,166 @@ mod tests {
     use super::*;
     use audio_graph_engine::NodeKind;
 
+    #[test]
+    fn granular_sections_follow_io_and_key_rows_fit_the_node() {
+        use audio_graph_engine::{
+            Granular, GranularAction, GranularBand, GranularKey, GranularMode,
+        };
+        fn labels(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<(String, Rect)>) {
+            fn visit(shape: &egui::epaint::Shape, out: &mut Vec<(String, Rect)>) {
+                match shape {
+                    egui::epaint::Shape::Text(text) => {
+                        out.push((text.galley.job.text.clone(), shape.visual_bounding_rect()))
+                    }
+                    egui::epaint::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            visit(shape, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in shapes {
+                visit(&shape.shape, out);
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut graph = Graph::new();
+        let mut node = Granular::default();
+        node.output_keys
+            .push(GranularKey::new(40, GranularAction::Interval(0.0625)));
+        node.output_keys.push(GranularKey {
+            key: 41,
+            mode: GranularMode::Hold,
+            velocity: true,
+            bands: vec![
+                GranularBand {
+                    end: 9,
+                    action: GranularAction::Interval(0.25),
+                },
+                GranularBand {
+                    end: 99,
+                    action: GranularAction::Size(0.5),
+                },
+                GranularBand {
+                    end: 127,
+                    action: GranularAction::Position(0.0),
+                },
+            ],
+        });
+        graph.add(NodeKind::Granular(node), [10.0, 10.0]);
+        let mut editor = GraphEditor::default();
+        let mut drawn = Vec::new();
+        for zoom in [0.5, 1.0, 2.0] {
+            editor.zoom = zoom;
+            for _ in 0..2 {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(900.0, 2000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        editor.ui(
+                            ui,
+                            &mut graph,
+                            &GraphContext {
+                                plugins: &[],
+                                instances: &[],
+                                free_instance: Some(0),
+                                bindings: &[],
+                                poly_modulation: false,
+                                error: None,
+                                live: [0.0; SLOT_COUNT],
+                                sockets: &[],
+                                granular: &[],
+                                quantum: 32,
+                                resolution: 32,
+                                sample_rate: 48_000.0,
+                                touched: &[],
+                            },
+                        );
+                    },
+                );
+                drawn.clear();
+                labels(&output.shapes, &mut drawn);
+                output.drop_without_applying_deltas();
+            }
+            let rect = |name| {
+                drawn
+                    .iter()
+                    .find(|(label, _)| label == name)
+                    .unwrap_or_else(|| panic!("missing {name}: {drawn:?}"))
+                    .1
+            };
+            let order = [
+                "Audio Out",
+                "Audio In",
+                "Keys",
+                "Dry / Wet",
+                "Record",
+                "Output control",
+                "Play",
+            ];
+            for pair in order.windows(2) {
+                assert!(rect(pair[0]).top() < rect(pair[1]).top(), "{pair:?}");
+            }
+            for removed in [
+                "Capacity (s)",
+                "History (beats)",
+                "Block size (beats)",
+                "Size / block",
+                "Interval / block",
+                "Slice position",
+            ] {
+                assert!(
+                    !drawn.iter().any(|(label, _)| label == removed),
+                    "removed parameter row {removed}"
+                );
+            }
+            let left = rect("Input control").left();
+            for column in [["1", "10", "100"], ["9", "99", "127"]] {
+                let center = rect(column[0]).center().x;
+                for label in column {
+                    assert!(
+                        (rect(label).center().x - center).abs() <= 1.0 + zoom,
+                        "velocity column {column:?}"
+                    );
+                }
+            }
+            let deletes: Vec<_> = drawn
+                .iter()
+                .filter(|(text, r)| text == "x" && r.top() >= rect_for_start(&drawn))
+                .collect();
+            assert!(deletes.len() >= 6);
+            let edge = deletes[0].1.right();
+            assert!(
+                deletes
+                    .iter()
+                    .all(|(_, r)| (r.right() - edge).abs() <= 1.0 + zoom),
+                "delete buttons must share their right edge"
+            );
+            for (label, rect) in &drawn {
+                if rect.top() >= rect_for_start(&drawn) {
+                    assert!(
+                        rect.right() <= left + (NODE_WIDTH - 20.0) * zoom + 2.0,
+                        "{label}: {rect:?}, left={left}"
+                    );
+                }
+            }
+        }
+        fn rect_for_start(drawn: &[(String, Rect)]) -> f32 {
+            drawn
+                .iter()
+                .find(|(text, _)| text == "Input control")
+                .unwrap()
+                .1
+                .top()
+        }
+    }
+
     /// One egui context, one canvas, and a clock — a canvas that can be driven
     /// without a window.
     ///
@@ -1413,6 +1583,7 @@ mod tests {
                     error: None,
                     live: [0.0; SLOT_COUNT],
                     sockets: &[],
+                    granular: &[],
                     quantum: 32,
                     resolution: 32,
                     sample_rate: 48_000.0,
@@ -1572,5 +1743,131 @@ mod tests {
         canvas.touched = vec![Touch { edit: 7, param: 3 }];
         canvas.frame(Vec::new());
         assert_eq!(params(&canvas).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod granular_popup_tests {
+    use audio_graph_engine::{Granular, NodeKind, NodeUi};
+
+    fn settings(node: &NodeKind) -> &Granular {
+        let NodeKind::Granular(node) = node else {
+            unreachable!()
+        };
+        node
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        node: &mut NodeKind,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let mut cx = NodeUi {
+                    granular_status: None,
+                    slot_count: 0,
+                    bindings: &[],
+                    live: &[],
+                    inputs: &[],
+                    poly_modulation: false,
+                    quantum: 32,
+                    resolution: 32,
+                    sample_rate: 48000.0,
+                    instances: &[],
+                    touched: &[],
+                    learning: None,
+                    actions: Vec::new(),
+                };
+                node.title_controls(ui, &mut cx);
+            },
+        );
+        fn visit(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.job.text.clone(), shape.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut labels = Vec::new();
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut labels);
+        }
+        output.drop_without_applying_deltas();
+        labels
+    }
+
+    fn click(ctx: &egui::Context, node: &mut NodeKind, pos: egui::Pos2) {
+        frame(ctx, node, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            frame(
+                ctx,
+                node,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        frame(ctx, node, vec![]);
+    }
+
+    #[test]
+    fn settings_popup_keeps_inside_edits_and_closes_on_outside_click() {
+        let ctx = egui::Context::default();
+        let mut node = NodeKind::Granular(Granular::default());
+        let find = |labels: &[(String, egui::Rect)], label: &str| {
+            labels
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("missing {label}: {labels:?}"))
+                .1
+                .center()
+        };
+        let labels = frame(&ctx, &mut node, vec![]);
+        assert!(!labels.iter().any(|(text, _)| text == "Granular settings"));
+        click(&ctx, &mut node, find(&labels, "⚙"));
+        let labels = frame(&ctx, &mut node, vec![]);
+        for label in [
+            "Capacity (s)",
+            "History (beats)",
+            "Block size (beats)",
+            "Loop recording",
+            "Update on wrap",
+            "Size / block",
+            "Interval / block",
+            "Slice position",
+            "Dry / Wet",
+        ] {
+            find(&labels, label);
+        }
+        click(&ctx, &mut node, find(&labels, "Presets"));
+        let labels = frame(&ctx, &mut node, vec![]);
+        let revision = settings(&node).revisions[6];
+        click(&ctx, &mut node, find(&labels, "1/3"));
+        assert_eq!(settings(&node).history, 1.0 / 3.0);
+        assert_ne!(settings(&node).revisions[6], revision);
+        let labels = frame(&ctx, &mut node, vec![]);
+        find(&labels, "Granular settings");
+        click(&ctx, &mut node, egui::pos2(850.0, 650.0));
+        let labels = frame(&ctx, &mut node, vec![]);
+        assert!(!labels.iter().any(|(text, _)| text == "Granular settings"));
+        assert_eq!(settings(&node).history, 1.0 / 3.0);
     }
 }

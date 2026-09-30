@@ -7,6 +7,7 @@
 
 mod config;
 mod editor;
+mod granular_status;
 mod graph_ui;
 mod host_context;
 mod notification;

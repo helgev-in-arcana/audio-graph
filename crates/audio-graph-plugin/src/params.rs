@@ -16,7 +16,10 @@ use nice_plug::prelude::*;
 /// A string rather than a struct because the payload includes the sub-plugin's
 /// opaque chunk, and nice-plug persists fields as JSON strings.
 #[derive(Default)]
-pub struct PersistedState(pub std::sync::RwLock<String>);
+pub struct PersistedState(
+    pub std::sync::RwLock<String>,
+    pub(crate) std::sync::RwLock<std::sync::Weak<crate::shared::Shared>>,
+);
 
 impl<'a> PersistentField<'a, String> for PersistedState {
     fn set(&self, new_value: String) {
@@ -27,7 +30,11 @@ impl<'a> PersistentField<'a, String> for PersistedState {
     where
         F: Fn(&String) -> R,
     {
-        f(&self.0.read().unwrap())
+        let stored = self.0.read().unwrap().clone();
+        let owner = self.1.read().unwrap().upgrade();
+        let snapshot =
+            owner.map_or_else(|| stored.clone(), |shared| shared.state_for_save(&stored));
+        f(&snapshot)
     }
 }
 

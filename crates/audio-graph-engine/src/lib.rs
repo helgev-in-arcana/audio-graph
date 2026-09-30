@@ -38,18 +38,19 @@ pub use engine::{AudioContext, BlockContext, Engine, Granularity};
 pub use graph::{Graph, LineId, Link, Node, NodeId};
 pub use handoff::Handoff;
 pub use ir::{
-    AudioMathOp, AudioOp, Buf, Chunking, DEFAULT_QUANTUM, Detect, Follow, MAX_AUDIO_DELAY_LINES,
-    MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES, MAX_DELAY_SECONDS,
-    MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp, Op, Operand, PreparedProgram,
-    Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg, Waveform,
+    AudioMathOp, AudioOp, Buf, Chunking, DEFAULT_QUANTUM, Detect, Follow, GranularStatus,
+    MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES, MAX_BUFFERS, MAX_CHANNELS, MAX_DELAY_LINES,
+    MAX_DELAY_SECONDS, MAX_GRANULARS, MAX_GRAPH_PARAMS, MAX_LFOS, MAX_REGISTERS, MathOp, NoteOp,
+    Op, Operand, PreparedProgram, Program, ProgramPublisher, QUANTUM_CHOICES, RateSpec, Reg,
+    Waveform,
 };
 pub use nodes::{
     AudioIn, AudioMath, AudioOut, AudioTremolo, Beats, CcIn, Constant, DelayRead, DelayWrite,
-    EnvelopeFollower, FilterMode, Gate, Granular, KeyParam, KeyParamMode, KeySplit, KeySwitch,
-    KeySwitchMode, KeyTrigger, Lfo, Math, MidiDelay, MidiTremolo, Mix, NodeKind, NoteFilter,
-    NoteFollow, NoteGate, NoteIn, NoteMerge, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts,
-    RangeMap, Rate, Ratio, SlotIn, Switch, TremoloKeys, TremoloRow, Unknown, db_to_linear,
-    linear_to_db,
+    EnvelopeFollower, FilterMode, Gate, Granular, GranularAction, GranularBand, GranularKey,
+    GranularMode, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode, KeyTrigger, Lfo,
+    Math, MidiDelay, MidiTremolo, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn,
+    NoteMerge, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, Ratio, SlotIn,
+    Switch, TremoloKeys, TremoloRow, Unknown, db_to_linear, linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{
