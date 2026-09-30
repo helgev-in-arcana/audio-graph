@@ -26,29 +26,50 @@ use crate::port::PortType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
+    InvalidSetting {
+        what: &'static str,
+    },
     /// A link chain that comes back to where it started.
-    Cycle { node: NodeId },
+    Cycle {
+        node: NodeId,
+    },
     /// More registers, LFOs or delay lines than the audio thread has room for.
-    TooLarge { what: &'static str, limit: usize },
+    TooLarge {
+        what: &'static str,
+        limit: usize,
+    },
     /// A slot index is outside the configured slot table range.
-    BadSlot { node: NodeId, slot: usize },
+    BadSlot {
+        node: NodeId,
+        slot: usize,
+    },
     /// A link whose ends carry different things. `connect` and `prune` both
     /// refuse to make one, so reaching here means a hand-edited or
     /// future-versioned patch.
-    TypeMismatch { node: NodeId, port: u8 },
+    TypeMismatch {
+        node: NodeId,
+        port: u8,
+    },
     /// Two writers on one delay line. Which one wins would otherwise depend on
     /// node creation order.
-    DuplicateDelayWrite { line: LineId },
+    DuplicateDelayWrite {
+        line: LineId,
+    },
     /// A delay line whose two halves disagree about what they carry.
-    DelayTypeMismatch { line: LineId },
+    DelayTypeMismatch {
+        line: LineId,
+    },
     /// A node kind the compiler does not emit code for yet. What is left
     /// behind this is note delay lines and a plugin's own note output.
-    NotYet { what: &'static str },
+    NotYet {
+        what: &'static str,
+    },
 }
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CompileError::InvalidSetting { what } => write!(f, "invalid {what}"),
             CompileError::Cycle { node } => {
                 write!(f, "the graph loops back on itself at node {node}")
             }
@@ -216,6 +237,11 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         audio_lines: Rings {
             nodes: audio.delay_nodes,
             seconds: audio.ring_seconds,
+            ..Rings::default()
+        },
+        granular_lines: Rings {
+            nodes: audio.granular_nodes,
+            seconds: audio.granular_seconds,
             ..Rings::default()
         },
         param_lines: Rings {
@@ -716,6 +742,7 @@ mod tests {
             | Op::NoteFollow { .. }
             | Op::Follow { .. }
             | Op::KeyHeld { .. }
+            | Op::KeySelect { .. }
             | Op::KeyStep { .. }
             | Op::KeyLatch { .. }
             | Op::Latch { .. }
@@ -762,7 +789,10 @@ mod tests {
             | Op::NoteCc { out, .. }
             | Op::LatchIs { out, .. }
             | Op::DelayRead { out, .. } => Some(out),
-            Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,
+            Op::DelayWrite { .. }
+            | Op::KeyStep { .. }
+            | Op::KeyLatch { .. }
+            | Op::KeySelect { .. } => None,
         }
     }
 }

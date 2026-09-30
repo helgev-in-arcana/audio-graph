@@ -16,6 +16,51 @@
 
 use crate::nodes::{Beats, Rate, Ratio};
 
+pub(crate) fn key_trigger_control(
+    ui: &mut egui::Ui,
+    label: &str,
+    trigger: &mut crate::ir::KeyTrigger,
+) -> bool {
+    use crate::ir::KeyTrigger;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let mut key = trigger.key();
+        changed |= key_control(ui, label, &mut key);
+        match trigger {
+            KeyTrigger::Key(value) | KeyTrigger::Velocity { key: value, .. } => *value = key,
+        }
+        let text = match *trigger {
+            KeyTrigger::Key(_) => "vel".to_owned(),
+            KeyTrigger::Velocity { min, max, .. } => format!("v{min}–{max}"),
+        };
+        ui.menu_button(text, |ui| {
+            let mut enabled = matches!(trigger, KeyTrigger::Velocity { .. });
+            if ui.checkbox(&mut enabled, "velocity range").changed() {
+                *trigger = if enabled {
+                    KeyTrigger::Velocity {
+                        key,
+                        min: 1,
+                        max: 127,
+                    }
+                } else {
+                    KeyTrigger::Key(key)
+                };
+                changed = true;
+            }
+            if let KeyTrigger::Velocity { min, max, .. } = trigger {
+                ui.horizontal(|ui| {
+                    changed |= ui.add(egui::DragValue::new(min).range(1..=*max)).changed();
+                    ui.label("to");
+                    changed |= ui
+                        .add(egui::DragValue::new(max).range(*min..=127))
+                        .changed();
+                });
+            }
+        });
+    });
+    changed
+}
+
 /// Standard width of a node's body in canvas units.
 ///
 /// Here rather than in the editor because a node's controls are laid out against
@@ -476,6 +521,42 @@ pub(crate) fn shorten(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn velocity_key_rows_fit_with_a_label_or_a_parameter_value() {
+        use super::*;
+        let ctx = egui::Context::default();
+        let mut widths = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                for label in ["record", ""] {
+                    let mut key = crate::ir::KeyTrigger::Velocity {
+                        key: 13,
+                        min: 100,
+                        max: 127,
+                    };
+                    let row = ui.horizontal(|ui| {
+                        if label.is_empty() {
+                            ui.add(egui::DragValue::new(&mut 1000.0));
+                        }
+                        key_trigger_control(ui, label, &mut key);
+                    });
+                    widths.push(row.response.rect.width());
+                }
+            },
+        );
+        output.drop_without_applying_deltas();
+        assert!(
+            widths.iter().all(|&width| width <= NODE_WIDTH),
+            "{widths:?}"
+        );
+    }
     use super::*;
 
     /// Whether any rectangle the frame painted can be seen.

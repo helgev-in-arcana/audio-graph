@@ -90,6 +90,13 @@ pub enum Op {
         buf: u16,
         key: u8,
     },
+    KeySelect {
+        state: u16,
+        buf: u16,
+        keys: [super::KeyTrigger; 8],
+        count: u8,
+        cycle: bool,
+    },
     /// Advances latch `state` to the next of `count` positions when `key` is
     /// struck, wrapping around. One key cycling a switch, which with `count` of
     /// 2 is a plain toggle.

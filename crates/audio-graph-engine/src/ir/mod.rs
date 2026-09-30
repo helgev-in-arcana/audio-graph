@@ -18,6 +18,13 @@
 //! rewrite.
 
 mod audio_op;
+mod granular;
+mod keys;
+pub use granular::{
+    GranularParam, GranularSpec, MAX_GRAINS, MAX_GRANULAR_SECONDS, MAX_GRANULAR_SLICES,
+    MAX_GRANULARS, MIN_GRANULAR_BLOCK_SECONDS,
+};
+pub use keys::KeyTrigger;
 mod note_op;
 mod op;
 mod tremolo;
@@ -179,6 +186,7 @@ impl<T: Copy + Default> Rings<T> {
 /// What [`Program::size_rings`] decided, per kind of line.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct RingSizes {
+    granular: Vec<(NodeId, usize)>,
     audio: Vec<(NodeId, usize)>,
     params: Vec<(NodeId, usize)>,
 }
@@ -242,6 +250,7 @@ pub struct Program {
     pub(crate) outputs: Vec<(u16, Reg)>,
     /// The audio delay lines, numbered among themselves.
     pub(crate) audio_lines: Rings<f32>,
+    pub(crate) granular_lines: Rings<f32>,
     /// The parameter delay lines, numbered as the compiler numbered every
     /// line; an audio line's entry asks for no ring.
     pub(crate) param_lines: Rings<f64>,
@@ -364,6 +373,9 @@ impl PreparedProgram {
 
     pub(crate) fn carry_pending_rings(&mut self, pending: &mut Self) {
         self.program
+            .granular_lines
+            .carry(&mut pending.program.granular_lines);
+        self.program
             .audio_lines
             .carry(&mut pending.program.audio_lines);
         self.program
@@ -458,6 +470,7 @@ impl Program {
             stages: Vec::new(),
             latency: 0,
             audio_lines: Rings::default(),
+            granular_lines: Rings::default(),
             param_lines: Rings::default(),
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
@@ -483,6 +496,11 @@ impl Program {
         let ceiling = (MAX_DELAY_SECONDS * sample_rate.max(1.0)) as usize;
         let samples = |seconds: f64| (seconds.max(0.0) * sample_rate).ceil() as usize;
         RingSizes {
+            granular: self.granular_lines.size(
+                MAX_CHANNELS,
+                |seconds| (seconds * sample_rate.max(1.0)).ceil().max(4.0) as usize,
+                &previous.granular,
+            ),
             // Four samples over what was asked for: the read pointer is
             // fractional and the interpolator looks two samples past it.
             audio: self.audio_lines.size(

@@ -286,7 +286,7 @@ fn a_project_with_an_unreadable_node_opens_with_a_warning() {
 
     let mut saved: WrapperState =
         serde_json::from_str(&wrapper.wrapper_params().state.0.read().unwrap()).unwrap();
-    let future_node = serde_json::json!({"Granular": {"grains": 8}});
+    let future_node = serde_json::json!({"FutureAudioNode": {"grains": 8}});
     let graph = saved.graph.as_mut().unwrap();
     graph["nodes"]
         .as_array_mut()

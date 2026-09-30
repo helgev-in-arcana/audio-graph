@@ -17,6 +17,8 @@ use crate::compile::{AudioCx, CompileError, Line};
 
 /// The audio half of a `Program`.
 pub(crate) struct Audio {
+    pub granular_nodes: Vec<NodeId>,
+    pub granular_seconds: Vec<f64>,
     pub ops: Vec<AudioOp>,
     /// Audio line index → its `DelayWrite` node, so a program swap can carry
     /// the ring contents over.
@@ -1074,7 +1076,7 @@ mod tests {
         let key = graph.add(
             NodeKind::KeyParam(KeyParam {
                 mode: KeyParamMode::Select,
-                keys: vec![24, 25],
+                keys: vec![24.into(), 25.into()],
                 values: vec![0.0, 1.0],
                 mute_keys: true,
             }),
@@ -1103,7 +1105,7 @@ mod tests {
         let key = graph.add(
             NodeKind::KeyParam(KeyParam {
                 mode: KeyParamMode::Select,
-                keys: vec![24, 25],
+                keys: vec![24.into(), 25.into()],
                 values: vec![0.0, 1.0],
                 mute_keys: false,
             }),

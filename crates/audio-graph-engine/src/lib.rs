@@ -45,10 +45,11 @@ pub use ir::{
 };
 pub use nodes::{
     AudioIn, AudioMath, AudioOut, AudioTremolo, Beats, CcIn, Constant, DelayRead, DelayWrite,
-    EnvelopeFollower, FilterMode, Gate, KeyParam, KeyParamMode, KeySplit, KeySwitch, KeySwitchMode,
-    Lfo, Math, MidiDelay, MidiTremolo, Mix, NodeKind, NoteFilter, NoteFollow, NoteGate, NoteIn,
-    NoteMerge, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts, RangeMap, Rate, Ratio, SlotIn,
-    Switch, TremoloKeys, TremoloRow, Unknown, db_to_linear, linear_to_db,
+    EnvelopeFollower, FilterMode, Gate, Granular, KeyParam, KeyParamMode, KeySplit, KeySwitch,
+    KeySwitchMode, KeyTrigger, Lfo, Math, MidiDelay, MidiTremolo, Mix, NodeKind, NoteFilter,
+    NoteFollow, NoteGate, NoteIn, NoteMerge, NoteMute, ParamPort, ParamToCc, Plugin, PluginPorts,
+    RangeMap, Rate, Ratio, SlotIn, Switch, TremoloKeys, TremoloRow, Unknown, db_to_linear,
+    linear_to_db,
 };
 #[cfg(feature = "ui")]
 pub use nodes::{

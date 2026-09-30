@@ -2641,7 +2641,7 @@ fn a_key_parameter_toggles_between_two_values() {
     let key = graph.add(
         NodeKind::KeyParam(KeyParam {
             mode: KeyParamMode::Toggle,
-            keys: vec![24, 25],
+            keys: vec![24.into(), 25.into()],
             values: vec![0.2, 0.8],
             mute_keys: true,
         }),
@@ -2687,7 +2687,7 @@ fn a_key_parameter_selects_by_the_last_key_struck() {
     let key = graph.add(
         NodeKind::KeyParam(KeyParam {
             mode: KeyParamMode::Select,
-            keys: vec![24, 25, 26],
+            keys: vec![24.into(), 25.into(), 26.into()],
             values: vec![0.25, 0.5, 1.0],
             mute_keys: true,
         }),
@@ -2736,7 +2736,7 @@ fn a_key_parameter_with_no_notes_wired_stays_put() {
     let key = graph.add(
         NodeKind::KeyParam(KeyParam {
             mode: KeyParamMode::Select,
-            keys: vec![24, 25],
+            keys: vec![24.into(), 25.into()],
             values: vec![0.25, 0.75],
             mute_keys: true,
         }),
@@ -2773,7 +2773,7 @@ fn a_key_parameter_value_can_be_a_signal() {
     let key = graph.add(
         NodeKind::KeyParam(KeyParam {
             mode: KeyParamMode::Select,
-            keys: vec![24, 25],
+            keys: vec![24.into(), 25.into()],
             values: vec![0.25, 0.75],
             mute_keys: true,
         }),
@@ -4555,7 +4555,9 @@ fn an_unreadable_node_compiles_as_if_absent() {
     let mut graph = Graph::new();
     let constant = graph.add(NodeKind::Constant(Constant { value: 0.5 }), [0.0, 0.0]);
     let unknown = graph.add(
-        NodeKind::Unknown(crate::nodes::Unknown(serde_json::json!({"Granular": {}}))),
+        NodeKind::Unknown(crate::nodes::Unknown(
+            serde_json::json!({"FutureAudioNode": {}}),
+        )),
         [0.0, 0.0],
     );
     let add = graph.add(

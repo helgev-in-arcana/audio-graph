@@ -562,6 +562,70 @@ impl Engine {
                 AudioOp::DelaySilence { line } => {
                     self.delay_silence(*line as usize, frames);
                 }
+                AudioOp::Granular {
+                    out,
+                    a,
+                    notes,
+                    state,
+                    spec,
+                    params,
+                } => {
+                    let range = notes.map(|buf| {
+                        (
+                            buf,
+                            self.note_slice(buf, (first_row, end_row), start..start + frames),
+                        )
+                    });
+                    let width = program.buffers[*out as usize] as usize;
+                    let input: [usize; 2] = std::array::from_fn(|ch| {
+                        a.map_or(0, |buf| self.at(buf, ch.min(width - 1), win))
+                    });
+                    let output: [usize; 2] =
+                        std::array::from_fn(|ch| self.at(*out, ch.min(width - 1), win));
+                    let line = &mut self.granular[*state as usize];
+                    line.configure(spec, *notes, ctx.sample_rate.max(1.0));
+                    let events = range.map_or(&[][..], |(buf, range)| {
+                        &self.notes.bufs[buf as usize].events[range]
+                    });
+                    let mut next = 0;
+                    for i in 0..frames {
+                        let at = start + i;
+                        while let Some(event) = events.get(next)
+                            && event.sample_offset() as usize <= at
+                        {
+                            if let Event::Note(note) = event {
+                                line.event(note, spec);
+                            }
+                            next += 1;
+                        }
+                        let values = std::array::from_fn(|p| {
+                            let value = params[p]
+                                .lane
+                                .and_then(|lane| ctx.lane_value(at, lane))
+                                .unwrap_or(params[p].value);
+                            let value = if value.is_finite() {
+                                value
+                            } else {
+                                params[p].value
+                            };
+                            match p {
+                                0 | 1 => value.clamp(0.05, 1.0),
+                                _ => value.clamp(0.0, 1.0),
+                            }
+                        });
+                        let dry = std::array::from_fn(|ch| {
+                            if a.is_some() {
+                                self.pool[input[ch] + i]
+                            } else {
+                                0.0
+                            }
+                        });
+                        let result = line.tick(dry, spec, values, ctx.tempo_bpm);
+                        for ch in 0..width {
+                            self.pool[output[ch] + i] = result[ch];
+                        }
+                    }
+                }
                 AudioOp::Tremolo {
                     out,
                     a,

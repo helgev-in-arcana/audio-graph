@@ -47,6 +47,12 @@ Program {
         len: [],
         rings: [],
     },
+    granular_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
     param_lines: Rings {
         nodes: [],
         seconds: [],

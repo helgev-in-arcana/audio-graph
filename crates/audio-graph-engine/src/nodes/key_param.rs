@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
 use crate::ir::{Op, Operand};
-use crate::nodes::Node;
 #[cfg(feature = "ui")]
-use crate::nodes::widgets::{NodeUi, combo, decimals, fallback, key_control};
+use crate::nodes::widgets::{NodeUi, combo, decimals, fallback, key_trigger_control};
+use crate::nodes::{KeyTrigger, Node};
 use crate::port::{Port, PortType};
 
 /// How many values one key parameter may choose between. A `Mix`'s ceiling, for
@@ -64,7 +64,7 @@ impl KeyParamMode {
 pub struct KeyParam {
     pub mode: KeyParamMode,
     /// One key per value, in socket order.
-    pub keys: Vec<u8>,
+    pub keys: Vec<KeyTrigger>,
     /// The number each value socket falls back to while it is unwired.
     /// Missing entries are 0.0.
     #[serde(default)]
@@ -121,11 +121,31 @@ impl Node for KeyParam {
         }
         self.keys
             .iter()
-            .filter(|&&key| key < 128)
-            .fold(0u128, |mask, &key| mask | (1u128 << key))
+            .map(|key| key.key())
+            .filter(|&key| key < 128)
+            .fold(0u128, |mask, key| mask | (1u128 << key))
     }
 
     fn compile(&self, cx: &mut ParamCx) -> Result<(), CompileError> {
+        if self.keys.len() > 8 {
+            return Err(CompileError::TooLarge {
+                what: "key parameter values",
+                limit: 8,
+            });
+        }
+        if self.keys.iter().any(|key| !key.valid())
+            || (0..self.keys.len()).any(|i| {
+                (i + 1..self.keys.len()).any(|j| {
+                    (matches!(self.keys[i], KeyTrigger::Velocity { .. })
+                        || matches!(self.keys[j], KeyTrigger::Velocity { .. }))
+                        && self.keys[i].overlaps(self.keys[j])
+                })
+            })
+        {
+            return Err(CompileError::InvalidSetting {
+                what: "key parameter velocity ranges",
+            });
+        }
         // Each value, as a register or as the number on its row.
         let value = |cx: &ParamCx, index: usize| match cx.input(KeyParam::value_port(index)) {
             Some(reg) => Operand::Reg(reg),
@@ -146,24 +166,15 @@ impl Node for KeyParam {
         // not connected to.
         let position = if let Some(buf) = cx.note_source_of(0) {
             let state = cx.latch()?;
-            match self.mode {
-                KeyParamMode::Toggle => cx.emit(Op::KeyStep {
-                    state,
-                    buf,
-                    key: self.keys[0],
-                    count: self.keys.len() as u16,
+            cx.emit(Op::KeySelect {
+                state,
+                buf,
+                keys: std::array::from_fn(|i| {
+                    self.keys.get(i).copied().unwrap_or(KeyTrigger::Key(0))
                 }),
-                KeyParamMode::Select => {
-                    for (index, &key) in self.keys.iter().enumerate() {
-                        cx.emit(Op::KeyLatch {
-                            state,
-                            buf,
-                            key,
-                            value: index as f64,
-                        });
-                    }
-                }
-            }
+                count: self.keys.len() as u8,
+                cycle: self.mode == KeyParamMode::Toggle,
+            });
             let position = cx.alloc()?;
             cx.emit(Op::Latch {
                 out: position,
@@ -257,7 +268,9 @@ impl Node for KeyParam {
         // of that mode — so the rest are greyed rather than hidden, which would
         // make switching modes look like it lost them.
         let live = self.mode != KeyParamMode::Toggle || index == 0;
-        let out = ui.add_enabled_ui(live, |ui| key_control(ui, "", &mut self.keys[index]));
+        let out = ui.add_enabled_ui(live, |ui| {
+            key_trigger_control(ui, "", &mut self.keys[index])
+        });
         if !live {
             out.response
                 .on_hover_text("Toggle moves on from one key — the first value's");
@@ -275,8 +288,11 @@ impl Node for KeyParam {
     fn add_input(&mut self) {
         // A semitone up from the last: a bank of key switches is a run of
         // adjacent keys far more often than it is not.
-        let next = self.keys.last().map_or(24, |k| k.saturating_add(1));
-        self.keys.push(next);
+        let next = self
+            .keys
+            .last()
+            .map_or(24, |k| k.key().saturating_add(1).min(127));
+        self.keys.push(next.into());
         self.values.resize(self.keys.len(), 0.0);
     }
 
@@ -307,7 +323,7 @@ impl KeyParam {
             "Key Param Select",
             KeyParam {
                 mode: KeyParamMode::Select,
-                keys: vec![24, 25],
+                keys: vec![24.into(), 25.into()],
                 values: vec![0.0, 1.0],
                 mute_keys: true,
             },

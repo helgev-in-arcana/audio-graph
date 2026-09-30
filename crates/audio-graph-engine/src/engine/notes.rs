@@ -66,6 +66,7 @@ pub(super) struct NoteBuf {
     /// parameter half walks the rows, plus the last row of the block
     /// before it. See [`NoteState`] and [`Engine::note_marks`].
     pub(super) events: Vec<Event>,
+    pub(super) row_start: usize,
     /// Which keys are down, one bit each.
     pub(super) held: u128,
     /// Which keys were struck in the row this buffer last carried, so an
@@ -83,6 +84,7 @@ impl NoteBuf {
     pub(super) fn new() -> NoteBuf {
         NoteBuf {
             events: Vec::with_capacity(NOTE_BUF_CAPACITY),
+            row_start: 0,
             held: 0,
             struck: 0,
             count: 0,
@@ -95,6 +97,7 @@ impl NoteBuf {
 
     /// Forget what is being played, without touching what is in the buffer.
     pub(super) fn silence(&mut self) {
+        self.row_start = self.events.len();
         self.held = 0;
         self.struck = 0;
         self.count = 0;
@@ -528,6 +531,7 @@ impl NoteState {
             return;
         };
         let events = &buf.events[from.min(buf.events.len())..];
+        buf.row_start = from.min(buf.events.len());
         let mut struck = 0u128;
         let mut held = buf.held;
         let mut count = buf.count;

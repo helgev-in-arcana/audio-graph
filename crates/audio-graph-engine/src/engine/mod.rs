@@ -35,6 +35,8 @@ use crate::notes::{Ended, NoteLedger};
 use subhost_adapter::{AudioChunk, AudioInstances, MIN_RESOLUTION, ScheduleView, SlotSchedule};
 
 mod audio;
+mod granular;
+use granular::GranularState;
 mod lines;
 mod notes;
 mod params;
@@ -262,6 +264,7 @@ pub struct Engine {
     daw_inputs: Vec<u16>,
     /// One per audio delay line, each ring as long as its node asked for.
     audio_lines: Vec<AudioLine>,
+    granular: Vec<GranularState>,
     /// Rings for latency compensation, one per compensated path.
     compensators: Vec<f32>,
     compensator_heads: Vec<usize>,
@@ -290,6 +293,9 @@ impl Engine {
     pub fn new() -> Engine {
         Engine {
             program: None,
+            granular: (0..crate::ir::MAX_GRANULARS)
+                .map(|_| GranularState::new())
+                .collect(),
             registers: vec![0.0; MAX_REGISTERS],
             lfos: (0..MAX_LFOS).map(|_| Lfo::new()).collect(),
             lines: (0..MAX_DELAY_LINES).map(|_| ParamLine::new()).collect(),
@@ -402,6 +408,15 @@ impl Engine {
             &next.tremolo_nodes,
         );
         let remap = self.notes.adopt(&next.note_streams);
+        for state in &mut self.granular {
+            if let Some(old) = state.note_source {
+                let new = remap.iter().position(|from| *from == Some(old as usize));
+                if new.is_none() {
+                    state.release_keys();
+                }
+                state.note_source = new.map(|index| index as u16);
+            }
+        }
         for marks in self.note_marks.iter_mut().take(self.note_rows) {
             let previous = *marks;
             *marks = remap.map(|from| from.map_or(0, |index| previous[index]));
@@ -411,6 +426,11 @@ impl Engine {
         reorder(&mut self.lfos, &mut self.order, &next.lfo_nodes);
         reorder(&mut self.latches, &mut self.order, &next.latch_nodes);
         reorder(&mut self.dsp, &mut self.order, &next.dsp_nodes);
+        reorder(
+            &mut self.granular,
+            &mut self.order,
+            &next.granular_lines.nodes,
+        );
         reorder(&mut self.lines, &mut self.order, &next.param_lines.nodes);
         reorder(
             &mut self.audio_lines,
@@ -425,6 +445,21 @@ impl Engine {
             .program_mut();
         adopt_rings(&mut self.audio_lines, &mut next.audio_lines);
         adopt_rings(&mut self.lines, &mut next.param_lines);
+        for (index, state) in self.granular.iter_mut().enumerate() {
+            if index >= next.granular_lines.nodes.len() {
+                continue;
+            }
+            let len = next.granular_lines.len[index];
+            let fresh = &mut next.granular_lines.rings[index];
+            if !fresh.is_empty() {
+                std::mem::swap(&mut state.ring, fresh);
+                state.capacity = len;
+                state.clear();
+            } else if state.capacity != len {
+                state.capacity = 0;
+                state.clear();
+            }
+        }
         true
     }
 
@@ -465,6 +500,7 @@ impl Engine {
     /// Nothing on the wire caused this, so the DAW has no reason to think the
     /// notes it asked for are over. It is told, through `ended`.
     pub fn reset_everything(&mut self, ended: &mut Vec<Ended>) {
+        self.granular.iter_mut().for_each(Slot::clear);
         self.ledger.end_all(ended);
         self.forget_notes();
         self.forget_params();
@@ -490,6 +526,9 @@ impl Engine {
     /// it. The ledger is the caller's to settle, because how the DAW hears
     /// about it is the one thing the three entry points disagree on.
     fn forget_notes(&mut self) {
+        self.granular
+            .iter_mut()
+            .for_each(GranularState::release_keys);
         self.translated.clear();
         for buf in &mut self.notes.bufs {
             buf.silence();
@@ -523,6 +562,9 @@ impl Engine {
     /// exactly where a read a fraction of a ring behind it will find them, so
     /// a reset would be heard as the tail carrying on.
     fn forget_audio(&mut self) {
+        self.granular
+            .iter_mut()
+            .for_each(GranularState::transport_reset);
         self.pool.fill(0.0);
         self.compensators.fill(0.0);
         self.compensator_heads.iter_mut().for_each(|h| *h = 0);
@@ -599,6 +641,7 @@ impl Engine {
                 None => pool.events.len(),
             };
             pool.events.drain(..spent);
+            pool.row_start = pool.row_start.saturating_sub(spent);
         }
         self.note_rows = 0;
         self.translated.clear();

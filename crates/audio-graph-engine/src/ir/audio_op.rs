@@ -118,6 +118,14 @@ pub struct Stage {
 /// One step of the audio half of a program.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AudioOp {
+    Granular {
+        out: Buf,
+        a: Option<Buf>,
+        notes: Option<NoteBuf>,
+        state: u16,
+        spec: super::GranularSpec,
+        params: [super::GranularParam; 4],
+    },
     /// Copy host audio input bus into a buffer.
     Input { out: Buf, bus: u16 },
     /// Copy buffer contents to a host audio output bus.

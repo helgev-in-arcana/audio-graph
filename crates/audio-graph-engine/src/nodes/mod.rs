@@ -17,6 +17,9 @@ pub mod widgets;
 mod audio_io;
 mod audio_math;
 mod audio_tremolo;
+mod granular;
+pub use crate::ir::KeyTrigger;
+pub use granular::Granular;
 mod beats;
 mod cc_in;
 mod constant;
@@ -401,6 +404,7 @@ pub enum NodeKind {
     MidiDelay(MidiDelay),
     MidiTremolo(MidiTremolo),
     AudioTremolo(AudioTremolo),
+    Granular(Granular),
     ParamToCc(ParamToCc),
     CcIn(CcIn),
     DelayRead(DelayRead),
@@ -456,6 +460,7 @@ macro_rules! for_kind {
             NodeKind::MidiDelay($node) => $body,
             NodeKind::MidiTremolo($node) => $body,
             NodeKind::AudioTremolo($node) => $body,
+            NodeKind::Granular($node) => $body,
             NodeKind::ParamToCc($node) => $body,
             NodeKind::CcIn($node) => $body,
             NodeKind::DelayRead($node) => $body,
@@ -727,6 +732,12 @@ pub fn catalogue() -> Vec<(NodeGroup, &'static str, NodeKind)> {
     take(
         &mut out,
         NodeGroup::Audio,
+        Granular::catalogue_defaults(),
+        NodeKind::Granular,
+    );
+    take(
+        &mut out,
+        NodeGroup::Audio,
         Plugin::catalogue_defaults(),
         NodeKind::Plugin,
     );
@@ -902,7 +913,7 @@ mod tests {
 
         let param = KeyParam {
             mode: KeyParamMode::Select,
-            keys: vec![24],
+            keys: vec![24.into()],
             values: vec![0.0],
             mute_keys: true,
         };

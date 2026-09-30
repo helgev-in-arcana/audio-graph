@@ -316,6 +316,44 @@ impl Engine {
                         *latch = self.registers[out as usize];
                     }
                 }
+                Op::KeySelect {
+                    state,
+                    buf,
+                    keys,
+                    count,
+                    cycle,
+                } => {
+                    let keys = &keys[..usize::from(count).min(keys.len())];
+                    if let (Some(source), Some(latch)) = (
+                        self.notes.bufs.get(buf as usize),
+                        self.latches.get_mut(state as usize),
+                    ) {
+                        for event in &source.events[source.row_start.min(source.events.len())..] {
+                            let Event::Note(NoteEvent::NoteOn { key, velocity, .. }) = *event
+                            else {
+                                continue;
+                            };
+                            if cycle {
+                                if keys
+                                    .first()
+                                    .is_some_and(|trigger| trigger.matches(key, velocity))
+                                {
+                                    let at = if latch.value.is_nan() {
+                                        0.0
+                                    } else {
+                                        latch.value
+                                    };
+                                    latch.value = (at + 1.0).rem_euclid(keys.len() as f64);
+                                }
+                            } else if let Some(index) = keys
+                                .iter()
+                                .rposition(|trigger| trigger.matches(key, velocity))
+                            {
+                                latch.value = index as f64;
+                            }
+                        }
+                    }
+                }
                 Op::KeyStep {
                     state,
                     buf,

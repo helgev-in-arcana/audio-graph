@@ -565,6 +565,8 @@ pub(crate) struct AudioCx<'a> {
     ring_seconds: Vec<f64>,
     dsp_nodes: Vec<NodeId>,
     tremolo_nodes: Vec<NodeId>,
+    granular_nodes: Vec<NodeId>,
+    granular_seconds: Vec<f64>,
 
     notes: &'a Notes,
 }
@@ -604,6 +606,8 @@ impl<'a> AudioCx<'a> {
             ring_seconds: Vec::new(),
             dsp_nodes: Vec::new(),
             tremolo_nodes: Vec::new(),
+            granular_nodes: Vec::new(),
+            granular_seconds: Vec::new(),
             notes,
         }
     }
@@ -679,6 +683,8 @@ impl<'a> AudioCx<'a> {
             .map(|out| ((out.node, out.port), out.buf))
             .collect();
         Audio {
+            granular_nodes: self.granular_nodes,
+            granular_seconds: self.granular_seconds,
             instances: self.instances,
             sockets,
             ops: self.ops,
@@ -703,6 +709,19 @@ impl<'a> AudioCx<'a> {
             });
         }
         self.tremolo_nodes.push(self.id);
+        Ok(index as u16)
+    }
+
+    pub(crate) fn granular_state(&mut self, seconds: f64) -> Result<u16, CompileError> {
+        let index = self.granular_nodes.len();
+        if index >= crate::ir::MAX_GRANULARS {
+            return Err(CompileError::TooLarge {
+                what: "granular nodes",
+                limit: crate::ir::MAX_GRANULARS,
+            });
+        }
+        self.granular_nodes.push(self.id);
+        self.granular_seconds.push(seconds);
         Ok(index as u16)
     }
 

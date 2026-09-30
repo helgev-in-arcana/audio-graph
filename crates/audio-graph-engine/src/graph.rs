@@ -993,7 +993,7 @@ mod tests {
         let saved = serde_json::json!({
             "nodes": [
                 {"id": 0, "pos": [0.0, 0.0], "kind": {"Constant": {"value": 0.5}}},
-                {"id": 1, "pos": [10.0, 0.0], "kind": {"Granular": {"grains": 8}}},
+                {"id": 1, "pos": [10.0, 0.0], "kind": {"FutureAudioNode": {"grains": 8}}},
                 {"id": 2, "pos": [20.0, 0.0], "kind": {"Lfo": {"waveform": 12}}},
             ],
             "links": [{"from": 0, "from_port": 0, "to": 1, "to_port": 3}],
