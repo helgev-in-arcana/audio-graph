@@ -1224,9 +1224,9 @@ dependencies = [
 
 [[package]]
 name = "nice-plug"
-version = "0.3.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7591aebd56600bede2cf1e4559d16c29309429bb9999511539c39fc830b7e2fe"
+checksum = "3f47be74bed3e8aa17bb055d4ff89af1fb016aa0d2756cd9b6c029a3743676a5"
 dependencies = [
  "anyhow",
  "anymap3",
@@ -1240,7 +1240,7 @@ dependencies = [
  "libc",
  "nice-assert-no-alloc",
  "nice-log",
- "nice-plug-core",
+ "nice-plug-core 0.4.2",
  "nice-plug-derive",
  "objc2 0.6.4",
  "parking_lot",
@@ -1249,6 +1249,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "try-lock",
  "vst3",
  "widestring",
  "windows",
@@ -1266,12 +1267,33 @@ dependencies = [
  "crossbeam-utils",
  "dpi",
  "midi-consts",
+ "nice-plug-derive",
+ "parking_lot",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "nice-plug-core"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8fe3f3e395c1140d7519a78069b59b2e3bf6da2b904d0c54ad7ab49a60ba09"
+dependencies = [
+ "atomic_float",
+ "atomic_refcell",
+ "bitflags 2.13.1",
+ "crossbeam-utils",
+ "dpi",
+ "midi-consts",
  "nice-assert-no-alloc",
  "nice-plug-derive",
  "parking_lot",
  "raw-window-handle",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -1295,7 +1317,7 @@ dependencies = [
  "crossbeam",
  "egui",
  "egui-baseview",
- "nice-plug-core",
+ "nice-plug-core 0.3.0",
  "parking_lot",
  "raw-window-handle",
  "serde",
@@ -2366,6 +2388,12 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "unicode-general-category"
