@@ -5581,6 +5581,113 @@ mod key_param_characterization {
         (graph, key)
     }
 
+    /// A one-value key bank preserves every upstream parameter row even when
+    /// its note input is gated in a later audio-dependent stage.
+    #[test]
+    fn a_single_wired_value_keeps_its_rows_across_a_note_stage_boundary() {
+        let (mut graph, key) = patch(KeyParamMode::Select, vec![24], vec![0.0]);
+        let notes = graph.source_of(key, 0).unwrap().0;
+        let audio = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0; 2],
+        );
+        let follower = graph.add(
+            NodeKind::EnvelopeFollower(EnvelopeFollower::default()),
+            [0.0; 2],
+        );
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0; 2],
+        );
+        let lfo = graph.add(
+            NodeKind::Lfo(Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(RATE / 64.0),
+                phase: 0.0,
+                depth: 0.5,
+                offset: 0.5,
+            }),
+            [0.0; 2],
+        );
+        graph.connect(audio, 0, follower, 0);
+        graph.connect(follower, 0, gate, 1);
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(gate, 0, key, 0);
+        graph.connect(lfo, 0, key, 1);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.stages(), 2);
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, 64, 16).unwrap();
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            64,
+            Granularity {
+                resolution: 16,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[0.0; 128],
+            &mut [0.0; 128],
+            &mut Adders,
+        );
+        let values: Vec<_> = (0..4).map(|row| schedule.row(row)[SINK]).collect();
+        assert_eq!(values, [0.0, 0.25, 0.5, 0.75]);
+    }
+
+    /// A single wired row still records key selection, so regrowing the bank
+    /// cannot revive a position selected before that key was struck.
+    #[test]
+    fn a_single_wired_value_still_updates_the_latch_before_regrowing() {
+        let (mut graph, key) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 26, 27],
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+        let bank = graph.node(key).unwrap().kind.clone();
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0; 2]);
+        graph.connect(signal, 0, key, 1);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+        slots[3] = 0.65;
+        keyboard.pending.push(note_on(27, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.4);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.keys.truncate(1);
+        settings.values.truncate(1);
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 3.0);
+        keyboard.pending.push(note_on(24, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 0.0);
+
+        graph.node_mut(key).unwrap().kind = bank;
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 0.0);
+    }
+
     /// The last matching socket wins within a row, including duplicate keys;
     /// keys outside the MIDI mask never choose a socket.
     #[test]

@@ -170,9 +170,16 @@ impl Node for KeyParam {
             return Ok(());
         }
         if let Some(buf) = cx.note_source_of(0) {
-            let inputs = (0..self.keys.len()).map(|index| value(cx, index)).collect();
+            let inputs: Box<[Operand]> =
+                (0..self.keys.len()).map(|index| value(cx, index)).collect();
             let state = cx.latch()?;
             let out = cx.alloc()?;
+            // A sole wired value keeps its source's row schedule even when
+            // notes put this node in a later stage.
+            let output = match inputs.as_ref() {
+                [Operand::Reg(reg)] => *reg,
+                _ => out,
+            };
             cx.emit_custom(
                 KeyParamKernel {
                     mode: self.mode,
@@ -185,7 +192,7 @@ impl Node for KeyParam {
                     notes: Some(buf),
                 },
             );
-            cx.bind_output(0, out);
+            cx.bind_output(0, output);
             return Ok(());
         }
 
