@@ -35,6 +35,8 @@ use crate::notes::{Ended, NoteLedger};
 use subhost_adapter::{AudioChunk, AudioInstances, MIN_RESOLUTION, ScheduleView, SlotSchedule};
 
 mod audio;
+#[cfg(test)]
+mod custom_tests;
 mod lines;
 mod notes;
 mod param_context;
