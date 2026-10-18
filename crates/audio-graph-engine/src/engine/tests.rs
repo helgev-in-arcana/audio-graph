@@ -6034,6 +6034,226 @@ mod audio_note_characterization {
         }
     }
 
+    /// Disconnecting an audio input silences the output and pauses the tremolo's clock and unfinished fade.
+    #[test]
+    fn an_audio_tremolo_resumes_its_clock_after_reconnecting_audio() {
+        let mut graph = audio_patch(false);
+        let cut = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::AudioTremolo(_)))
+            .unwrap()
+            .id;
+        let (input, port) = graph.source_of(cut, 0).unwrap();
+        let mut reference = Engine::new();
+        let mut disconnected = Engine::new();
+        for engine in [&mut reference, &mut disconnected] {
+            engine.prepare(96, &[2]);
+            load(engine, &graph);
+            render(engine, 0, &[64; 7], &[note_on(24, 13), note_off(24, 31)]);
+        }
+
+        graph.disconnect(cut, 0);
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.custom_audio.len(), 1);
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Custom { .. }))
+        );
+        load(&mut disconnected, &graph);
+        assert!(
+            render(&mut disconnected, 448, &[64], &[])
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+
+        graph.connect(input, port, cut, 0);
+        load(&mut disconnected, &graph);
+        let expected = render(&mut reference, 512, &[64; 16], &[]);
+        assert!(expected.contains(&0.0), "the retained pattern is active");
+        assert!(
+            expected.iter().any(|&sample| sample != 0.0),
+            "the retained pattern also opens the gate"
+        );
+        assert_eq!(
+            render(&mut disconnected, 512, &[64; 16], &[]),
+            expected,
+            "the disconnected interval does not advance the clock or reset the fade"
+        );
+    }
+
+    /// A wired delay time is read anew each row, overrides the setting, and floors negative seconds at zero.
+    #[test]
+    fn a_midi_delay_uses_each_rows_wired_time() {
+        const FRAMES: u32 = 256;
+        const RESOLUTION: u32 = 32;
+        let mut graph = delayed_synth(1.0, false);
+        let delay = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::MidiDelay(_)))
+            .unwrap()
+            .id;
+        let time = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        graph.connect(time, 0, delay, 1);
+        let program = compile(&graph, SLOTS).unwrap();
+        let time_lane = program.custom_notes[0].parameters[0].lane.unwrap() as usize;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, FRAMES, RESOLUTION).unwrap();
+        schedule.begin(FRAMES).unwrap();
+        schedule.fill(&[0.0; SLOTS]);
+        let mut engine = Engine::new();
+        engine.prepare(FRAMES, &[]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.stages(), 1);
+        engine.begin_block(&[
+            note_on(60, 0),
+            note_off(60, 4),
+            note_on(62, 32),
+            note_off(62, 36),
+            note_on(64, 160),
+            note_off(64, 164),
+        ]);
+        for (row, time) in [-0.5, 0.002, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0]
+            .into_iter()
+            .enumerate()
+        {
+            let slots = schedule.row_mut(row);
+            slots[0] = time;
+            engine.run(
+                &BlockContext {
+                    frames: RESOLUTION,
+                    offset: row as u32 * RESOLUTION,
+                    row: row as u32,
+                    block: FRAMES,
+                    ..ctx(RESOLUTION)
+                },
+                slots,
+            );
+            assert_eq!(slots[time_lane], time, "the lane retains physical units");
+        }
+        let mut heard = Heard::default();
+        engine.run_audio(
+            &AudioContext {
+                frames: FRAMES,
+                quantum: RESOLUTION,
+                resolution: RESOLUTION,
+                lanes: schedule.rows(),
+                lanes_per_row: width,
+                ..audio_ctx(FRAMES)
+            },
+            &[],
+            &mut [0.0; 2 * FRAMES as usize],
+            &mut heard,
+        );
+        let events: Vec<_> = heard.0[&0]
+            .iter()
+            .map(|&event| (event.sample_offset() as usize, event))
+            .collect();
+        assert_eq!(
+            notes_only(&events),
+            [
+                (0, "on", 60),
+                (4, "off", 60),
+                (128, "on", 62),
+                (132, "off", 62),
+                (208, "on", 64),
+                (212, "off", 64),
+            ]
+        );
+        assert_eq!(engine.notes_dropped(), 0);
+    }
+
+    /// Delayed notes update followers on the next row and retain held keys when recompilation renumbers their stream.
+    #[test]
+    fn delayed_note_followers_survive_stream_remapping() {
+        const FRAMES: u32 = 128;
+        const RESOLUTION: u32 = 32;
+        for what in [Follow::Gate, Follow::HeldKeys] {
+            let mut graph = Graph::new();
+            let input = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+            let delay = midi_delay(&mut graph, seconds(64.0), false);
+            let follow = graph.add(NodeKind::NoteFollow(NoteFollow { what }), [0.0, 0.0]);
+            let scale = if what == Follow::HeldKeys { 8.0 } else { 1.0 };
+            let map = graph.add(
+                NodeKind::RangeMap(RangeMap {
+                    in_lo: 0.0,
+                    in_hi: scale,
+                    out_lo: 0.0,
+                    out_hi: 1.0,
+                    clamp: true,
+                }),
+                [0.0, 0.0],
+            );
+            let sink = param_sink(&mut graph);
+            graph.connect(input, 0, delay, 0);
+            graph.connect(delay, 0, follow, 0);
+            graph.connect(follow, 0, map, 0);
+            graph.connect(map, 0, sink, 0);
+            let stream_index = |program: &Program| {
+                program
+                    .note_streams
+                    .iter()
+                    .position(|stream| stream.node == delay && stream.port == 0)
+                    .unwrap()
+            };
+            let original_stream = stream_index(&compile(&graph, SLOTS).unwrap());
+            let mut engine = Engine::new();
+            engine.prepare(FRAMES, &[]);
+            load(&mut engine, &graph);
+            let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+            let mut schedule = SlotSchedule::new(width, FRAMES, RESOLUTION).unwrap();
+            let mut run = |engine: &mut Engine, events: &[Event]| {
+                engine.run_block(
+                    &mut schedule,
+                    &[],
+                    events,
+                    FRAMES,
+                    Granularity {
+                        resolution: RESOLUTION,
+                        quantum: RESOLUTION,
+                    },
+                    RATE,
+                    120.0,
+                    &[],
+                    &mut [],
+                    &mut subhost_adapter::NoInstances,
+                );
+                engine.end_block([], &mut Vec::with_capacity(MAX_LIVE_NOTES));
+                (0..schedule.row_count())
+                    .map(|row| schedule.row(row)[SINK] * scale)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                run(&mut engine, &[note_on(60, 0), note_on(64, 32)]),
+                [0.0, 0.0, 0.0, 1.0],
+                "{what:?}: each delayed event is visible at the following row boundary"
+            );
+
+            let other_input = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+            let other_follow = graph.add(
+                NodeKind::NoteFollow(NoteFollow { what: Follow::Gate }),
+                [0.0, 0.0],
+            );
+            graph.connect(other_input, 0, other_follow, 0);
+            graph.node_mut(other_follow).unwrap().always_on = true;
+            graph.nodes.rotate_right(2);
+            let next = compile(&graph, SLOTS).unwrap();
+            assert_ne!(stream_index(&next), original_stream);
+            load(&mut engine, &graph);
+            let held = if what == Follow::HeldKeys { 2.0 } else { 1.0 };
+            assert_eq!(
+                run(&mut engine, &[note_off(60, 0), note_off(64, 32)]),
+                [held, held, held, 1.0],
+                "{what:?}: recompilation preserves the stream until its delayed releases arrive"
+            );
+            assert_eq!(run(&mut engine, &[]), [0.0; 4]);
+            assert_eq!(engine.notes_dropped(), 0);
+        }
+    }
+
     /// Replaced pending programs cannot discard a running delay's queued events or note ownership.
     #[test]
     fn coalesced_delay_publications_preserve_notes_in_flight() {

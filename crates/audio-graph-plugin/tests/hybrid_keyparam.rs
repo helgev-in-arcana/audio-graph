@@ -1,7 +1,8 @@
 mod harness;
 
 use audio_graph_engine::{
-    AudioIn, AudioOut, Constant, Graph, KeyParam, KeyParamMode, Mix, NodeId, NodeKind, db_to_linear,
+    AudioIn, AudioOut, Beats, Constant, Graph, KeyParam, KeyParamMode, MidiDelay, Mix, NodeId,
+    NodeKind, db_to_linear,
 };
 use audio_graph_plugin::{Wrapper, WrapperKind};
 use harness::{Block, Daw, LIVE, fx_layout};
@@ -160,4 +161,85 @@ fn a_key_parameter_preset_starts_a_new_instance_on_its_first_value() {
     strike(&mut daw, 61);
     heard(&mut restored, &mut daw, param, -6.0);
     restored.deactivate();
+}
+
+/// A reset releases a queued note's DAW voice and prevents its later delivery to a key parameter.
+#[test]
+fn resetting_a_midi_delay_discards_pending_notes_and_releases_their_voices() {
+    let _thread = plugin_host::init_thread().unwrap();
+    let (mut wrapper, param) = playing(KeyParamMode::Select);
+    const FRAMES: usize = 64;
+    {
+        let mut patch = wrapper.shared().patch();
+        let notes = patch
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::NoteIn))
+            .unwrap()
+            .id;
+        let delay = patch.graph.add(
+            NodeKind::MidiDelay(MidiDelay {
+                seconds: (4 * FRAMES) as f64 / f64::from(LIVE.sample_rate),
+                beats: Beats::new(1, 1),
+                sync: false,
+            }),
+            [0.0; 2],
+        );
+        patch.graph.connect(notes, 0, delay, 0);
+        patch.graph.connect(delay, 0, param, 0);
+    }
+    publish(&wrapper);
+    let value = |wrapper: &Wrapper| {
+        wrapper
+            .shared()
+            .live_sockets()
+            .into_iter()
+            .find_map(|(socket, value)| (socket == (param, 0)).then_some(value))
+            .unwrap()
+    };
+    let mut daw = Daw::playing();
+    daw.incoming.push(NoteEvent::NoteOn {
+        timing: 0,
+        voice_id: Some(42),
+        channel: 0,
+        note: 61,
+        velocity: 1.0,
+    });
+    let mut block = Block::silent(FRAMES);
+    block.process(&mut wrapper, &mut daw);
+    assert_eq!(value(&wrapper), -12.0);
+    assert!(
+        daw.outgoing.is_empty(),
+        "the queued note still owns its voice"
+    );
+
+    wrapper.shared().request_reset();
+    block.process(&mut wrapper, &mut daw);
+    assert!(matches!(
+        daw.outgoing.as_slice(),
+        [NoteEvent::VoiceTerminated {
+            voice_id: Some(42),
+            channel: 0,
+            note: 61,
+            ..
+        }]
+    ));
+    daw.outgoing.clear();
+    for _ in 0..6 {
+        block.process(&mut wrapper, &mut daw);
+        assert_eq!(value(&wrapper), -12.0, "the discarded note must not arrive");
+    }
+    assert!(daw.outgoing.is_empty(), "the voice is released only once");
+
+    strike(&mut daw, 61);
+    for _ in 0..6 {
+        block.process(&mut wrapper, &mut daw);
+    }
+    assert_eq!(
+        value(&wrapper),
+        -6.0,
+        "fresh notes still traverse the delay"
+    );
+    wrapper.deactivate();
 }

@@ -318,45 +318,56 @@ fn custom_kernels_follow_program_ownership_without_audio_thread_allocations() {
 }
 
 fn audio_note_program() -> Program {
+    audio_note_program_with_pairs(1)
+}
+
+fn audio_note_program_with_pairs(pairs: usize) -> Program {
     use crate::nodes::{
         AudioIn, AudioOut, AudioTremolo, Beats, KeySwitchMode, MidiDelay, Ratio, TremoloKeys,
         TremoloRow,
     };
 
     let mut graph = Graph::new();
-    let audio = graph.add(
+    let mut audio = graph.add(
         NodeKind::AudioIn(AudioIn {
             bus: 0,
             channels: 2,
         }),
         [0.0; 2],
     );
-    let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
-    let delay = graph.add(
-        NodeKind::MidiDelay(MidiDelay {
-            seconds: 0.001,
-            beats: Beats::new(1, 64),
-            sync: false,
-        }),
-        [0.0; 2],
-    );
-    let cut = graph.add(
-        NodeKind::AudioTremolo(AudioTremolo {
-            channels: 2,
-            keys: TremoloKeys {
-                mode: KeySwitchMode::Select,
-                rows: vec![TremoloRow {
-                    key: 24,
-                    step: Beats::new(1, 32),
-                }],
-                stop_key: 23,
-                share: Ratio::EVEN,
-            },
-            fade_in_ms: 2.0,
-            fade_out_ms: 3.0,
-        }),
-        [0.0; 2],
-    );
+    let mut notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    for _ in 0..pairs {
+        let delay = graph.add(
+            NodeKind::MidiDelay(MidiDelay {
+                seconds: 0.001,
+                beats: Beats::new(1, 64),
+                sync: false,
+            }),
+            [0.0; 2],
+        );
+        let cut = graph.add(
+            NodeKind::AudioTremolo(AudioTremolo {
+                channels: 2,
+                keys: TremoloKeys {
+                    mode: KeySwitchMode::Select,
+                    rows: vec![TremoloRow {
+                        key: 24,
+                        step: Beats::new(1, 32),
+                    }],
+                    stop_key: 23,
+                    share: Ratio::EVEN,
+                },
+                fade_in_ms: 2.0,
+                fade_out_ms: 3.0,
+            }),
+            [0.0; 2],
+        );
+        graph.connect(audio, 0, cut, 0);
+        graph.connect(notes, 0, delay, 0);
+        graph.connect(delay, 0, cut, 1);
+        audio = cut;
+        notes = delay;
+    }
     let out = graph.add(
         NodeKind::AudioOut(AudioOut {
             bus: 0,
@@ -364,10 +375,7 @@ fn audio_note_program() -> Program {
         }),
         [0.0; 2],
     );
-    graph.connect(audio, 0, cut, 0);
-    graph.connect(notes, 0, delay, 0);
-    graph.connect(delay, 0, cut, 1);
-    graph.connect(cut, 0, out, 0);
+    graph.connect(audio, 0, out, 0);
     compile(&graph, 0).unwrap()
 }
 
@@ -590,6 +598,140 @@ fn assert_probe_states(
         assert_eq!(state.processed, processed);
         assert_eq!(state.reset, reason);
     }
+}
+
+/// Reordering same-kind runtimes preserves each node's state, applies its new settings, and retires boxes off-thread.
+#[test]
+fn reordered_audio_and_note_kernels_keep_state_by_node_identity() {
+    fn program(record: &Arc<DropRecord>, settings: [usize; 4]) -> Program {
+        let mut program = audio_note_program_with_pairs(2);
+        assert_eq!(program.custom_audio.len(), 2);
+        assert_eq!(program.custom_notes.len(), 2);
+        for (audio, setting) in program.custom_audio.iter_mut().zip(settings[..2].iter()) {
+            *audio = crate::ir::CustomAudio::new(
+                audio.node,
+                ProbeKernel::<0> {
+                    setting: *setting,
+                    record: Arc::clone(record),
+                },
+            );
+        }
+        for (note, setting) in program.custom_notes.iter_mut().zip(settings[2..].iter()) {
+            *note = crate::ir::CustomNote::new(
+                note.node,
+                std::mem::take(&mut note.parameters),
+                ProbeKernel::<0> {
+                    setting: *setting,
+                    record: Arc::clone(record),
+                },
+            );
+            for stream in &mut program.note_streams {
+                if stream.node == note.node {
+                    stream.kind = crate::ir::NoteStreamKind::Custom(note.processor.kind());
+                }
+            }
+        }
+        program
+    }
+
+    fn assert_states<T: crate::ir::RuntimeEntry>(
+        entries: &mut [T],
+        expected: [(crate::ir::NodeId, usize); 2],
+    ) {
+        assert_eq!(entries.len(), expected.len());
+        for (entry, (node, processed)) in entries.iter_mut().zip(expected) {
+            assert_eq!(entry.node(), node);
+            let state = entry
+                .runtime()
+                .state_mut()
+                .downcast_ref::<ProbeState>()
+                .unwrap();
+            assert_eq!(state.processed, processed);
+            assert_eq!(state.reset, None);
+        }
+    }
+
+    let record = DropRecord::new();
+    let publisher = ProgramPublisher::default();
+    let first = program(&record, [1, 5, 2, 7]);
+    let audio_nodes = [first.custom_audio[0].node, first.custom_audio[1].node];
+    let note_nodes = [first.custom_notes[0].node, first.custom_notes[1].node];
+    publisher.publish(first, 48_000.0);
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    let mut block = AudioBlock::new();
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_states(
+                    &mut engine.custom_audio,
+                    [(audio_nodes[0], 64), (audio_nodes[1], 320)],
+                );
+                assert_states(
+                    &mut engine.notes.custom,
+                    [(note_nodes[0], 128), (note_nodes[1], 448)],
+                );
+            })
+            .join()
+            .unwrap();
+    });
+
+    let mut next = program(&record, [11, 13, 17, 19]);
+    next.custom_audio.reverse();
+    next.custom_notes.reverse();
+    for op in &mut next.audio_ops {
+        if let crate::ir::AudioOp::Custom { index, .. } = op {
+            *index = 1 - *index;
+        }
+    }
+    for op in &mut next.note_ops {
+        if let crate::ir::NoteOp::Custom { index, .. } = op {
+            *index = 1 - *index;
+        }
+    }
+    publisher.publish(next, 48_000.0);
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    assert_states(
+                        &mut engine.custom_audio,
+                        [(audio_nodes[1], 320), (audio_nodes[0], 64)],
+                    );
+                    assert_states(
+                        &mut engine.notes.custom,
+                        [(note_nodes[1], 448), (note_nodes[0], 128)],
+                    );
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_states(
+                    &mut engine.custom_audio,
+                    [(audio_nodes[1], 1152), (audio_nodes[0], 768)],
+                );
+                assert_states(
+                    &mut engine.notes.custom,
+                    [(note_nodes[1], 1664), (note_nodes[0], 1216)],
+                );
+            })
+            .join()
+            .unwrap();
+    });
+    record.assert_drops(0);
+    publisher.reclaim();
+    record.assert_drops(0);
+    let (released, counts) = measured(|| engine.release());
+    assert_eq!(counts, Allocations::default());
+    drop(released);
+    record.assert_drops(8);
+    drop(engine);
+    record.assert_drops(16);
 }
 
 /// Unregistered kernel types keep state only across matching node and kind, take new settings, and die on the publisher thread.

@@ -112,3 +112,81 @@ pub(crate) struct AudioEvalContext<'a> {
     pub sample_rate: f64,
     pub tempo: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every buffer ordering confines copies and writes to the selected channel windows.
+    #[test]
+    fn audio_windows_preserve_stride_gaps_and_neighboring_buffers() {
+        const CHANNELS: usize = 3;
+        const STRIDE: usize = 5;
+        const FRAMES: usize = 2;
+        for (input, output) in [(2, 2), (2, 20), (20, 2)] {
+            let original: Vec<f32> = (0..40).map(|i| i as f32 + 0.25).collect();
+            let mut pool = original.clone();
+            let mut expected = original.clone();
+            {
+                let mut io = AudioIo::new(&mut pool, input, output, CHANNELS, STRIDE, FRAMES);
+                let samples: &mut dyn AudioSamples = match &mut io {
+                    AudioIo::InPlace(samples) => samples,
+                    AudioIo::Separate(samples) => samples,
+                };
+                assert_eq!(samples.channels(), CHANNELS);
+                assert_eq!(samples.frames(), FRAMES);
+                samples.passthrough();
+                for channel in 0..CHANNELS {
+                    for frame in 0..FRAMES {
+                        let at = channel * STRIDE + frame;
+                        assert_eq!(samples.read(channel, frame), original[input + at]);
+                        expected[output + at] = original[input + at];
+                    }
+                }
+            }
+            assert_eq!(pool, expected, "passthrough: {input} -> {output}");
+            {
+                let mut io = AudioIo::new(&mut pool, input, output, CHANNELS, STRIDE, FRAMES);
+                let samples: &mut dyn AudioSamples = match &mut io {
+                    AudioIo::InPlace(samples) => samples,
+                    AudioIo::Separate(samples) => samples,
+                };
+                for channel in 0..CHANNELS {
+                    for frame in 0..FRAMES {
+                        let at = channel * STRIDE + frame;
+                        let value = -samples.read(channel, frame);
+                        samples.write(channel, frame, value);
+                        expected[output + at] = value;
+                        assert_eq!(
+                            samples.read(channel, frame),
+                            if input == output { value } else { -value }
+                        );
+                    }
+                }
+            }
+            assert_eq!(pool, expected, "read/write: {input} -> {output}");
+        }
+    }
+
+    /// Zero-channel views borrow empty slices and leave the pool untouched in every ordering.
+    #[test]
+    fn zero_channel_audio_is_empty() {
+        for (input, output) in [(0, 0), (0, 4), (4, 0)] {
+            let mut pool = [1.0, 2.0, 3.0, 4.0];
+            match AudioIo::new(&mut pool, input, output, 0, 8, 3) {
+                AudioIo::InPlace(mut samples) => {
+                    assert_eq!(samples.channels(), 0);
+                    assert!(samples.output.is_empty());
+                    samples.passthrough();
+                }
+                AudioIo::Separate(mut samples) => {
+                    assert_eq!(samples.channels(), 0);
+                    assert!(samples.input.is_empty());
+                    assert!(samples.output.output.is_empty());
+                    samples.passthrough();
+                }
+            }
+            assert_eq!(pool, [1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+}
