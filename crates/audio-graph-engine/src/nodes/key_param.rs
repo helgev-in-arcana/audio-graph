@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compile::{CompileError, ParamCx};
-use crate::ir::{Op, Operand};
+use crate::engine::ParamEvalContext;
+use crate::ir::{Op, Operand, ParamBindings, ParamKernel};
 use crate::nodes::Node;
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{NodeUi, combo, decimals, fallback, key_control};
@@ -85,6 +86,35 @@ impl KeyParam {
     }
 }
 
+#[derive(Debug)]
+struct KeyParamKernel {
+    mode: KeyParamMode,
+    keys: Box<[u8]>,
+}
+
+impl ParamKernel for KeyParamKernel {
+    fn eval(&self, cx: &mut ParamEvalContext<'_>) {
+        let notes = cx.notes.as_ref().expect("KeyParam has a note input");
+        let latch = cx.latch.as_deref_mut().expect("KeyParam has a latch");
+        match self.mode {
+            KeyParamMode::Select => {
+                if let Some(index) = self.keys.iter().rposition(|&key| notes.struck(key)) {
+                    *latch = index as f64;
+                }
+            }
+            KeyParamMode::Toggle => {
+                if notes.struck(self.keys[0]) {
+                    let at = if latch.is_nan() { 0.0 } else { *latch };
+                    *latch = (at + 1.0).rem_euclid(self.keys.len() as f64);
+                }
+            }
+        }
+        // Clamp only the lookup: a later recompile may restore the omitted rows.
+        let index = (*latch as usize).min(cx.inputs.len() - 1);
+        cx.outputs[0] = cx.inputs.read(index);
+    }
+}
+
 impl Node for KeyParam {
     fn title(&self) -> String {
         "Key Param Select".into()
@@ -139,47 +169,28 @@ impl Node for KeyParam {
             cx.bind_output(0, out);
             return Ok(());
         }
-        let first = value(cx, 0);
-
-        // No notes, no keys: the node rests on its first value. Emitting the key
-        // ops anyway would make an unwired node quietly follow a keyboard it is
-        // not connected to.
-        let position = if let Some(buf) = cx.note_source_of(0) {
+        if let Some(buf) = cx.note_source_of(0) {
+            let inputs = (0..self.keys.len()).map(|index| value(cx, index)).collect();
             let state = cx.latch()?;
-            match self.mode {
-                KeyParamMode::Toggle => cx.emit(Op::KeyStep {
-                    state,
-                    buf,
-                    key: self.keys[0],
-                    count: self.keys.len() as u16,
-                }),
-                KeyParamMode::Select => {
-                    for (index, &key) in self.keys.iter().enumerate() {
-                        cx.emit(Op::KeyLatch {
-                            state,
-                            buf,
-                            key,
-                            value: index as f64,
-                        });
-                    }
-                }
-            }
-            let position = cx.alloc()?;
-            cx.emit(Op::Latch {
-                out: position,
-                state,
-                initial: 0.0,
-            });
-            Some(position)
-        } else {
-            None
-        };
+            let out = cx.alloc()?;
+            cx.emit_custom(
+                KeyParamKernel {
+                    mode: self.mode,
+                    keys: self.keys.clone().into_boxed_slice(),
+                },
+                ParamBindings {
+                    inputs,
+                    outputs: out..out + 1,
+                    latch: Some(state),
+                    notes: Some(buf),
+                },
+            );
+            cx.bind_output(0, out);
+            return Ok(());
+        }
 
-        // Fold the values into one register, each later one winning where the
-        // latch has reached it.
-        // The latch holds a whole number, so a `>=` per value is an exact pick and
-        // costs one instruction each.
-        let mut chosen = match first {
+        // An unwired note input rests on the first value, including its alias.
+        let chosen = match value(cx, 0) {
             Operand::Reg(reg) => reg,
             Operand::Value(value) => {
                 let out = cx.alloc()?;
@@ -187,19 +198,6 @@ impl Node for KeyParam {
                 out
             }
         };
-        if let Some(position) = position {
-            for index in 1..self.keys.len() {
-                let next = cx.alloc()?;
-                cx.emit(Op::Select {
-                    out: next,
-                    control: position,
-                    threshold: index as f64,
-                    low: Operand::Reg(chosen),
-                    high: value(cx, index),
-                });
-                chosen = next;
-            }
-        }
         cx.bind_output(0, chosen);
         Ok(())
     }

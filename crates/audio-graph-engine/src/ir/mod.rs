@@ -1,10 +1,9 @@
 //! Compiled intermediate representation: a flat sequence of instructions over register files and audio buffers.
 //!
-//! A [`Program`] is what crosses to the audio thread. It holds no `Rc`, no
-//! `Box<dyn>`, no map lookups and no pointers back into the edit graph —
-//! running it is a straight walk down a `Vec` writing `f64`s into a slice.
-//! Everything that could have been a decision has already been made by the
-//! compiler: the audio thread does not think, it executes.
+//! A [`Program`] is what crosses to the audio thread. Core instructions and
+//! prepared custom kernels use resolved bindings, with no map lookups or
+//! pointers back into the edit graph. Custom kernels own immutable settings;
+//! their inputs, outputs and state are borrowed for each evaluation.
 //!
 //! A `Program` is immutable once built. The per-instance state that changes as
 //! it runs — LFO phases, delay ring contents, latches — lives in
@@ -20,9 +19,11 @@
 mod audio_op;
 mod note_op;
 mod op;
+mod param_kernel;
 mod tremolo;
 
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
+pub(crate) use param_kernel::{CustomParam, ParamBindings, ParamKernel};
 
 pub use audio_op::{
     AudioMathOp, AudioOp, Buf, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, MixIn, QUANTUM_CHOICES,
@@ -229,10 +230,11 @@ pub use plugin_host::MAX_AUX_BUSES;
 /// let mut program = audio_graph_engine::Program::empty();
 /// program.ops.clear();
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct Program {
     /// Topologically ordered scalar operations. Every `Op` reads only registers already written.
     pub(crate) ops: Vec<Op>,
+    pub(crate) custom_params: Vec<CustomParam>,
     pub(crate) registers: usize,
     /// Which lane each output drives, and where its value ends up. Sorted by
     /// lane, and at most one entry per lane.
@@ -322,7 +324,7 @@ pub struct Program {
 /// use audio_graph_engine::{PreparedProgram, Program};
 /// let prepared = PreparedProgram { program: Program::empty() };
 /// ```
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct PreparedProgram {
     pub(crate) fallback_destinations: Vec<crate::notes::FallbackDestination>,
     pub(crate) program: Program,
@@ -445,6 +447,7 @@ impl Program {
     pub fn empty() -> Program {
         Program {
             ops: Vec::new(),
+            custom_params: Vec::new(),
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),

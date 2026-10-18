@@ -34,6 +34,7 @@ Program {
             clamp: true,
         },
     ],
+    custom_params: [],
     registers: 5,
     outputs: [
         (

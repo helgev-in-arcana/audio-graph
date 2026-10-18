@@ -23,6 +23,31 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
 }
 
+/// Custom settings and local bindings remain visible beside their core inputs.
+#[test]
+fn key_param_with_a_live_value() {
+    use audio_graph_engine::{KeyParam, KeyParamMode};
+
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let value = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0; 2]);
+    let key = graph.add(
+        NodeKind::KeyParam(KeyParam {
+            mode: KeyParamMode::Select,
+            keys: vec![24, 25, 26],
+            values: vec![0.1, 0.5, 0.9],
+            mute_keys: true,
+        }),
+        [0.0; 2],
+    );
+    let sink = graph.add(stereo_plugin(0, 0), [0.0; 2]);
+    graph.node_mut(sink).unwrap().always_on = true;
+    graph.connect(notes, 0, key, 0);
+    graph.connect(value, 0, key, 2);
+    graph.connect(key, 0, sink, plugin_param_port(&graph, sink));
+    check("key_param_with_a_live_value", &graph);
+}
+
 /// Compile `graph` and compare the pretty-printed program with `tests/golden/<name>.txt`.
 fn check(name: &str, graph: &Graph) {
     let program =

@@ -13,7 +13,7 @@
 //! restarted each time would make the editor unusable for exactly the thing an
 //! LFO is for.
 //!
-//! Outside of its tests (`tests.rs`), nothing in this module mentions `graph`
+//! Outside of its test-only modules, nothing in this module mentions `graph`
 //! or a node kind, and that is the thread boundary rather than an accident:
 //! what reaches this side is a [`Program`] and nothing else. A
 //! `use crate::graph::…` in any other file here is the signal that something
@@ -37,6 +37,7 @@ use subhost_adapter::{AudioChunk, AudioInstances, MIN_RESOLUTION, ScheduleView, 
 mod audio;
 mod lines;
 mod notes;
+mod param_context;
 mod params;
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,7 @@ mod tremolo;
 use audio::Window;
 use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, adopt_rings, reorder};
 use notes::{NoteState, key_bit};
+pub(crate) use param_context::ParamEvalContext;
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
 const NOT_PRESENT: usize = usize::MAX;

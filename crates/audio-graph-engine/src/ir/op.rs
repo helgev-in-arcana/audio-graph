@@ -44,6 +44,10 @@ pub enum RateSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Op {
+    /// Calls a prepared kernel owned by this program, using its resolved bindings.
+    Custom {
+        index: usize,
+    },
     Const {
         out: Reg,
         value: f64,

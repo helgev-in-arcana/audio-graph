@@ -49,11 +49,23 @@ The crate is split along the one line that matters, the thread boundary:
 
 What reaches the audio side is a `PreparedProgram` and nothing else. The
 `engine` module must not mention `graph` or a node kind outside of its tests,
-which live in `engine/tests.rs`.
+which live in `engine/tests.rs` and test-only modules.
 
 **A `use crate::graph::…` in any other file under `engine/` is the signal that
 something has leaked across.** That is the cheapest way to check the invariant
 by eye, and it is worth checking in review.
+
+Parameter execution combines core `Op` instructions with prepared
+`ParamKernel` objects. Each custom kernel is compiled alongside its node and
+receives only local input lookups, a dedicated output slice, its own optional
+latch value and a read-only note view. Global register and state IDs stay in
+the compiled bindings. Inputs precede newly allocated outputs, so the evaluator
+can borrow both without copying values or using unsafe code.
+
+Kernel settings are immutable. Mutable processing state stays in `Engine`, so
+the normal end-row snapshot and node-identity migration apply to custom kernels
+as well. Their boxes are created during compilation and reclaimed with their
+program through `ProgramPublisher`.
 
 ### The audio side allocates nothing
 

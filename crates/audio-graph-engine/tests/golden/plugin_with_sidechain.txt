@@ -5,6 +5,7 @@ Program {
             value: 0.75,
         },
     ],
+    custom_params: [],
     registers: 1,
     outputs: [
         (

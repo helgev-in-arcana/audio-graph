@@ -1,0 +1,163 @@
+Program {
+    ops: [
+        Slot {
+            out: 0,
+            slot: 3,
+        },
+        Custom {
+            index: 0,
+        },
+    ],
+    custom_params: [
+        CustomParam {
+            node: 2,
+            bindings: ParamBindings {
+                inputs: [
+                    Value(
+                        0.1,
+                    ),
+                    Reg(
+                        0,
+                    ),
+                    Value(
+                        0.9,
+                    ),
+                ],
+                outputs: 1..2,
+                latch: Some(
+                    0,
+                ),
+                notes: Some(
+                    0,
+                ),
+            },
+            kernel: KeyParamKernel {
+                mode: Select,
+                keys: [
+                    24,
+                    25,
+                    26,
+                ],
+            },
+        },
+    ],
+    registers: 2,
+    outputs: [
+        (
+            32,
+            1,
+        ),
+    ],
+    audio_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    param_lines: Rings {
+        nodes: [],
+        seconds: [],
+        len: [],
+        rings: [],
+    },
+    audio_ops: [
+        Silence {
+            out: 0,
+        },
+        Plugin {
+            instance: 0,
+            input: 0,
+            input_buses: [
+                2,
+            ],
+            output: 1,
+            output_buses: [
+                2,
+            ],
+            notes: None,
+        },
+    ],
+    note_ops: [
+        Input {
+            out: 0,
+            bus: 0,
+        },
+    ],
+    note_bufs: 1,
+    note_streams: [
+        NoteStream {
+            node: 0,
+            port: 0,
+            source: None,
+            kind: Input(
+                0,
+            ),
+        },
+    ],
+    param_targets: [
+        ParamTarget {
+            instance: 0,
+            param: 7,
+        },
+    ],
+    audio_lane_base: 96,
+    instances: [
+        InstanceIo {
+            instance: 0,
+            input_channels: 2,
+            aux_inputs: [],
+            output_channels: 2,
+            aux_outputs: [],
+        },
+    ],
+    buffers: [
+        2,
+        2,
+    ],
+    stages: [
+        Stage {
+            params: Span {
+                start: 0,
+                end: 2,
+            },
+            notes: Span {
+                start: 0,
+                end: 1,
+            },
+            audio: Span {
+                start: 0,
+                end: 2,
+            },
+            outputs: Span {
+                start: 0,
+                end: 1,
+            },
+            note_bufs: 1,
+            chunking: WholeBlock,
+        },
+    ],
+    latency: 0,
+    latch_nodes: [
+        2,
+    ],
+    lfo_nodes: [],
+    dsp_nodes: [],
+    note_delay_nodes: [],
+    tremolo_nodes: [],
+    output_registers: [
+        (
+            (
+                1,
+                0,
+            ),
+            0,
+        ),
+        (
+            (
+                2,
+                0,
+            ),
+            1,
+        ),
+    ],
+}

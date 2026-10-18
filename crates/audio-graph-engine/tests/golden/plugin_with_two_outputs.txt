@@ -1,5 +1,6 @@
 Program {
     ops: [],
+    custom_params: [],
     registers: 0,
     outputs: [],
     audio_lines: Rings {

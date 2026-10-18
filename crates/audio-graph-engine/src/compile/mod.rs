@@ -198,6 +198,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
 
     Ok(Program {
         ops: param.ops,
+        custom_params: param.custom_params,
         registers: param.registers,
         outputs: param.outputs,
         audio_ops: audio.ops,
@@ -477,16 +478,33 @@ mod tests {
         graph.connect(b, 0, sum, 1);
         graph.connect(a, 0, sum, 0);
 
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(crate::KeyParam {
+                mode: crate::KeyParamMode::Select,
+                keys: vec![24, 25, 26],
+                values: vec![0.0, 0.0, 0.75],
+                mute_keys: false,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(notes, 0, key, 0);
+        graph.connect(sum, 0, key, 1);
+        graph.connect(b, 0, key, 2);
+        graph.connect(key, 0, out, 0);
+
         let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.custom_params.len(), 1);
+        assert_eq!(program.custom_params[0].node, key);
         let mut written = vec![false; program.registers];
         for op in &program.ops {
-            for read in reads(op) {
+            for read in reads(op, &program) {
                 assert!(
                     written[read as usize],
                     "op reads register {read} before it is written"
                 );
             }
-            if let Some(out) = writes(op) {
+            for out in writes(op, &program) {
                 written[out as usize] = true;
             }
         }
@@ -708,8 +726,17 @@ mod tests {
         ));
     }
 
-    fn reads(op: &Op) -> Vec<Reg> {
+    fn reads(op: &Op, program: &Program) -> Vec<Reg> {
         match *op {
+            Op::Custom { index } => program.custom_params[index]
+                .bindings
+                .inputs
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::Reg(reg) => Some(*reg),
+                    Operand::Value(_) => None,
+                })
+                .collect(),
             Op::Const { .. }
             | Op::Slot { .. }
             | Op::Lfo { .. }
@@ -742,13 +769,13 @@ mod tests {
         }
     }
 
-    /// Returns the register an op writes, if any.
-    ///
-    /// Operations like `DelayWrite`, `KeyStep`, and `KeyLatch` deliberately do not
-    /// write to registers. This omits an edge in the topological sort, thereby
-    /// preventing cycles from forming in feedback loops or self-modifying latches.
-    fn writes(op: &Op) -> Option<Reg> {
+    fn writes(op: &Op, program: &Program) -> Vec<Reg> {
         match *op {
+            Op::Custom { index } => program.custom_params[index]
+                .bindings
+                .outputs
+                .clone()
+                .collect(),
             Op::Const { out, .. }
             | Op::Slot { out, .. }
             | Op::Lfo { out, .. }
@@ -761,8 +788,8 @@ mod tests {
             | Op::Latch { out, .. }
             | Op::NoteCc { out, .. }
             | Op::LatchIs { out, .. }
-            | Op::DelayRead { out, .. } => Some(out),
-            Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => None,
+            | Op::DelayRead { out, .. } => vec![out],
+            Op::DelayWrite { .. } | Op::KeyStep { .. } | Op::KeyLatch { .. } => Vec::new(),
         }
     }
 }

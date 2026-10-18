@@ -21,6 +21,7 @@ Program {
             a: 0,
         },
     ],
+    custom_params: [],
     registers: 3,
     outputs: [
         (

@@ -12,6 +12,7 @@ Program {
             centre: 0.5,
         },
     ],
+    custom_params: [],
     registers: 1,
     outputs: [
         (

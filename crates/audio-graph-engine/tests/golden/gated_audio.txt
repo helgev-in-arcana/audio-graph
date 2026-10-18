@@ -16,6 +16,7 @@ Program {
             ),
         },
     ],
+    custom_params: [],
     registers: 2,
     outputs: [
         (
