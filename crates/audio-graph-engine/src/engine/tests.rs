@@ -5559,3 +5559,212 @@ fn only_an_explicit_reset_stops_a_latched_tremolo() {
     );
     assert_eq!(notes_only(&heard), vec![(0, "on", 60), (1000, "off", 60)]);
 }
+
+mod key_param_characterization {
+    use super::*;
+
+    fn patch(mode: KeyParamMode, keys: Vec<u8>, values: Vec<f64>) -> (Graph, NodeId) {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode,
+                keys,
+                values,
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 0, out, 0);
+        (graph, key)
+    }
+
+    /// The last matching socket wins within a row, including duplicate keys;
+    /// keys outside the MIDI mask never choose a socket.
+    #[test]
+    fn simultaneous_key_strikes_use_socket_order() {
+        let (graph, _) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 24, 128, 255],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5],
+        );
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        for strikes in [[24, 25, 128, 255], [25, 24, 255, 128]] {
+            keyboard.pending.extend(
+                strikes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, key)| note_on(key, offset as u32)),
+            );
+            keyboard.run(&mut engine, 8, &mut slots);
+            assert_eq!(slots[SINK], 0.3);
+        }
+
+        keyboard.pending.extend([note_on(128, 0), note_on(255, 1)]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.3);
+    }
+
+    /// Toggle advances once per row from its first key, regardless of how
+    /// many times that key or the other configured keys are struck.
+    #[test]
+    fn toggle_uses_only_the_first_key_and_steps_once_per_row() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![24, 25, 26], vec![0.1, 0.2, 0.3]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        keyboard.pending.extend([note_on(25, 0), note_on(26, 1)]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.1);
+        assert!(engine.latches[0].value.is_nan());
+
+        keyboard.pending.extend([
+            note_on(24, 0),
+            note_on(24, 1),
+            note_on(25, 2),
+            note_on(26, 3),
+        ]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+    }
+
+    /// A configured value socket with no stored fallback reads zero.
+    #[test]
+    fn missing_key_values_default_to_zero() {
+        let (graph, _) = patch(KeyParamMode::Select, vec![24, 25, 26], vec![0.25]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+        keyboard.pending.push(note_on(26, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.0);
+    }
+
+    /// Shrinking the bank clamps the chosen output but preserves the raw
+    /// position for a subsequent mode change and toggle.
+    #[test]
+    fn recompiling_a_smaller_bank_preserves_the_raw_position() {
+        let (mut graph, key) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 26, 27],
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+        keyboard.pending.push(note_on(27, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.4);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.keys.truncate(3);
+        settings.values.truncate(3);
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.3);
+        assert_eq!(engine.latches[0].value, 3.0);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.mode = KeyParamMode::Toggle;
+        load(&mut engine, &graph);
+        keyboard.pending.push(note_on(24, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+    }
+
+    /// An end-row read predicts the pending toggle without consuming its
+    /// strike or changing the latch and published register values.
+    #[test]
+    fn reading_the_end_row_does_not_consume_a_pending_toggle() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![24, 25], vec![0.2, 0.8]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        engine.begin_block(&[note_on(24, 7)]);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+        assert!(engine.latches[0].value.is_nan());
+        let registers = engine.registers.clone();
+
+        let end = BlockContext {
+            offset: 8,
+            row: 1,
+            frames: 0,
+            ..ctx(8)
+        };
+        for _ in 0..2 {
+            engine.run_stage_end(0, &end, &mut slots);
+            assert_eq!(slots[SINK], 0.8);
+            assert!(engine.latches[0].value.is_nan());
+            assert_eq!(engine.registers, registers);
+        }
+
+        engine.begin_block(&[]);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+        assert_eq!(engine.latches[0].value, 1.0);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+    }
+
+    /// A key parameter without notes aliases its first wired input and
+    /// allocates no latch.
+    #[test]
+    fn no_notes_preserves_the_first_inputs_register_alias() {
+        let (mut graph, key) = patch(KeyParamMode::Select, vec![24, 25], vec![0.2, 0.8]);
+        graph.disconnect(key, 0);
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        graph.connect(signal, 0, key, 1);
+        let program = compile(&graph, SLOTS).unwrap();
+        let output = |node| {
+            program
+                .output_registers()
+                .iter()
+                .find_map(|&(socket, register)| (socket == (node, 0)).then_some(register))
+                .unwrap()
+        };
+        assert_eq!(output(key), output(signal));
+        assert!(program.latch_nodes.is_empty());
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        slots[3] = 0.65;
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+    }
+
+    /// An empty key bank emits zero even when notes and stored values exist.
+    #[test]
+    fn an_empty_key_bank_needs_no_latch() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![], vec![0.9]);
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(program.latch_nodes.is_empty());
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        keyboard.pending.push(note_on(24, 0));
+        let mut slots = lanes();
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.0);
+    }
+}
