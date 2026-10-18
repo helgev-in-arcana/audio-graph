@@ -316,3 +316,375 @@ fn custom_kernels_follow_program_ownership_without_audio_thread_allocations() {
     records[2].assert_drops(1);
     assert_eq!(engine.publication(), 0);
 }
+
+fn audio_note_program() -> Program {
+    use crate::nodes::{
+        AudioIn, AudioOut, AudioTremolo, Beats, KeySwitchMode, MidiDelay, Ratio, TremoloKeys,
+        TremoloRow,
+    };
+
+    let mut graph = Graph::new();
+    let audio = graph.add(
+        NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0; 2],
+    );
+    let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let delay = graph.add(
+        NodeKind::MidiDelay(MidiDelay {
+            seconds: 0.001,
+            beats: Beats::new(1, 64),
+            sync: false,
+        }),
+        [0.0; 2],
+    );
+    let cut = graph.add(
+        NodeKind::AudioTremolo(AudioTremolo {
+            channels: 2,
+            keys: TremoloKeys {
+                mode: KeySwitchMode::Select,
+                rows: vec![TremoloRow {
+                    key: 24,
+                    step: Beats::new(1, 32),
+                }],
+                stop_key: 23,
+                share: Ratio::EVEN,
+            },
+            fade_in_ms: 2.0,
+            fade_out_ms: 3.0,
+        }),
+        [0.0; 2],
+    );
+    let out = graph.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0; 2],
+    );
+    graph.connect(audio, 0, cut, 0);
+    graph.connect(notes, 0, delay, 0);
+    graph.connect(delay, 0, cut, 1);
+    graph.connect(cut, 0, out, 0);
+    compile(&graph, 0).unwrap()
+}
+
+struct AudioBlock {
+    schedule: super::SlotSchedule,
+    output: [f32; 128],
+    ended: Vec<crate::notes::Ended>,
+}
+
+impl AudioBlock {
+    fn new() -> Self {
+        Self {
+            schedule: super::SlotSchedule::new(
+                crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES,
+                64,
+                16,
+            )
+            .unwrap(),
+            output: [0.0; 128],
+            ended: Vec::with_capacity(crate::notes::MAX_LIVE_NOTES),
+        }
+    }
+
+    fn run(&mut self, engine: &mut Engine, events: &[Event]) {
+        engine.run_block(
+            &mut self.schedule,
+            &[],
+            events,
+            64,
+            super::Granularity {
+                resolution: 16,
+                quantum: 32,
+            },
+            48_000.0,
+            120.0,
+            &[1.0; 128],
+            &mut self.output,
+            &mut subhost_adapter::NoInstances,
+        );
+        engine.end_block([], &mut self.ended);
+    }
+}
+
+/// Prepared note and audio kernels allocate and free nothing during adoption, evaluation, reset or removal.
+#[test]
+fn audio_and_note_custom_nodes_keep_the_audio_thread_allocation_free() {
+    let publisher = ProgramPublisher::default();
+    let program = audio_note_program();
+    assert_eq!(program.custom_audio.len(), 1);
+    assert_eq!(program.custom_notes.len(), 1);
+    publisher.publish(program, 48_000.0);
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    let mut block = AudioBlock::new();
+    let events = [Event::Note(NoteEvent::NoteOn {
+        note_id: None,
+        port: 0,
+        channel: 0,
+        key: 24,
+        velocity: 1.0,
+        sample_offset: 47,
+    })];
+    let (_, counts) = measured(|| {
+        assert!(engine.adopt(&publisher));
+        block.run(&mut engine, &events);
+        block.run(&mut engine, &[]);
+        engine.reset_notes(&mut block.ended);
+        engine.reset();
+        engine.reset_everything(&mut block.ended);
+    });
+    assert_eq!(counts, Allocations::default());
+    publisher.publish(audio_note_program(), 48_000.0);
+    let (_, counts) = measured(|| {
+        assert!(engine.adopt(&publisher));
+        block.run(&mut engine, &events);
+    });
+    assert_eq!(counts, Allocations::default());
+    publisher.publish(Program::empty(), 48_000.0);
+    let (_, counts) = measured(|| {
+        assert!(engine.adopt(&publisher));
+        block.run(&mut engine, &[]);
+    });
+    assert_eq!(counts, Allocations::default());
+    publisher.reclaim();
+}
+
+#[derive(Debug)]
+struct ProbeState {
+    processed: usize,
+    reset: Option<crate::ir::ResetReason>,
+    retained: Box<[u8; 32]>,
+    record: Arc<DropRecord>,
+}
+
+impl crate::ir::KernelState for ProbeState {
+    fn reset(&mut self, reason: crate::ir::ResetReason) {
+        self.processed = 0;
+        self.reset = Some(reason);
+        self.retained.fill(0);
+    }
+}
+
+impl Drop for ProbeState {
+    fn drop(&mut self) {
+        if thread::current().id() != self.record.owner {
+            self.record.wrong_thread.store(true, Ordering::Relaxed);
+        }
+        self.record.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct ProbeKernel<const KIND: u8> {
+    setting: usize,
+    record: Arc<DropRecord>,
+}
+
+impl<const KIND: u8> ProbeKernel<KIND> {
+    fn state(&self) -> ProbeState {
+        ProbeState {
+            processed: 0,
+            reset: None,
+            retained: Box::new([0; 32]),
+            record: Arc::clone(&self.record),
+        }
+    }
+}
+
+impl<const KIND: u8> Drop for ProbeKernel<KIND> {
+    fn drop(&mut self) {
+        if thread::current().id() != self.record.owner {
+            self.record.wrong_thread.store(true, Ordering::Relaxed);
+        }
+        self.record.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl<const KIND: u8> crate::ir::AudioKernel for ProbeKernel<KIND> {
+    type State = ProbeState;
+
+    fn create_state(&self) -> Self::State {
+        self.state()
+    }
+
+    fn eval(&self, state: &mut Self::State, cx: &mut super::AudioEvalContext<'_>) {
+        use super::audio_context::{AudioIo, AudioSamples};
+        fn pass(audio: &mut impl AudioSamples) {
+            for channel in 0..audio.channels() {
+                for frame in 0..audio.frames() {
+                    audio.write(channel, frame, audio.read(channel, frame));
+                }
+            }
+        }
+        let frames = match &mut cx.audio {
+            AudioIo::InPlace(audio) => {
+                pass(audio);
+                audio.frames()
+            }
+            AudioIo::Separate(audio) => {
+                pass(audio);
+                audio.frames()
+            }
+        };
+        state.processed += frames * self.setting;
+    }
+}
+
+impl<const KIND: u8> crate::ir::NoteKernel for ProbeKernel<KIND> {
+    type State = ProbeState;
+
+    fn create_state(&self) -> Self::State {
+        self.state()
+    }
+
+    fn eval(&self, state: &mut Self::State, cx: &mut super::NoteEvalContext<'_>) {
+        state.processed += cx.frames() as usize * self.setting;
+        for &event in cx.input {
+            cx.output.push(event);
+        }
+    }
+}
+
+fn probe_program<const KIND: u8>(record: &Arc<DropRecord>, setting: usize) -> Program {
+    let mut program = audio_note_program();
+    let audio = &mut program.custom_audio[0];
+    *audio = crate::ir::CustomAudio::new(
+        audio.node,
+        ProbeKernel::<KIND> {
+            setting,
+            record: Arc::clone(record),
+        },
+    );
+    let note = &mut program.custom_notes[0];
+    *note = crate::ir::CustomNote::new(
+        note.node,
+        std::mem::take(&mut note.parameters),
+        ProbeKernel::<KIND> {
+            setting,
+            record: Arc::clone(record),
+        },
+    );
+    for stream in &mut program.note_streams {
+        if stream.node == note.node {
+            stream.kind = crate::ir::NoteStreamKind::Custom(note.processor.kind());
+        }
+    }
+    program
+}
+
+fn assert_probe_states(
+    engine: &mut Engine,
+    processed: usize,
+    reason: Option<crate::ir::ResetReason>,
+) {
+    for runtime in [
+        engine.custom_audio[0].processor.state_mut(),
+        engine.notes.custom[0].processor.state_mut(),
+    ] {
+        let state = runtime.downcast_ref::<ProbeState>().unwrap();
+        assert_eq!(state.processed, processed);
+        assert_eq!(state.reset, reason);
+    }
+}
+
+/// Unregistered kernel types keep state only across matching node and kind, take new settings, and die on the publisher thread.
+#[test]
+fn unknown_note_and_audio_kernels_migrate_reset_and_retire_without_rt_destruction() {
+    let record = DropRecord::new();
+    let publisher = ProgramPublisher::default();
+    publisher.publish(probe_program::<0>(&record, 9), 48_000.0);
+    publisher.publish(probe_program::<0>(&record, 1), 48_000.0);
+    record.assert_drops(4);
+    let mut engine = Engine::new();
+    engine.prepare(64, &[2]);
+    let mut block = AudioBlock::new();
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_probe_states(&mut engine, 64, None);
+            })
+            .join()
+            .unwrap()
+    });
+
+    publisher.publish(probe_program::<0>(&record, 3), 48_000.0);
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    assert_probe_states(&mut engine, 64, None);
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_probe_states(&mut engine, 256, None);
+                for reason in [
+                    crate::ir::ResetReason::Notes,
+                    crate::ir::ResetReason::Transport,
+                    crate::ir::ResetReason::All,
+                ] {
+                    let (_, counts) = measured(|| match reason {
+                        crate::ir::ResetReason::Notes => engine.reset_notes(&mut block.ended),
+                        crate::ir::ResetReason::Transport => engine.reset(),
+                        crate::ir::ResetReason::All => engine.reset_everything(&mut block.ended),
+                    });
+                    assert_eq!(counts, Allocations::default());
+                    assert_probe_states(&mut engine, 0, Some(reason));
+                    block.run(&mut engine, &[]);
+                }
+            })
+            .join()
+            .unwrap()
+    });
+
+    publisher.publish(probe_program::<1>(&record, 2), 48_000.0);
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    assert_probe_states(&mut engine, 0, None);
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_probe_states(&mut engine, 128, None);
+            })
+            .join()
+            .unwrap()
+    });
+    let mut changed_nodes = probe_program::<1>(&record, 4);
+    changed_nodes.custom_audio[0].node += 100;
+    changed_nodes.custom_notes[0].node += 100;
+    publisher.publish(changed_nodes, 48_000.0);
+    thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let (_, counts) = measured(|| {
+                    assert!(engine.adopt(&publisher));
+                    assert_probe_states(&mut engine, 0, None);
+                    block.run(&mut engine, &[]);
+                });
+                assert_eq!(counts, Allocations::default());
+                assert_probe_states(&mut engine, 256, None);
+            })
+            .join()
+            .unwrap()
+    });
+    publisher.reclaim();
+    let (released, counts) = measured(|| engine.release());
+    assert_eq!(counts, Allocations::default());
+    drop(released);
+    record.assert_drops(16);
+    drop(engine);
+    record.assert_drops(20);
+}
