@@ -254,7 +254,7 @@ fn measure(name: &str, channels: u16, frames: u32, quantum: u32, resolution: u32
     let mut event_count = 0usize;
     let mut block = 0usize;
     let mut run = |engine: &mut Engine, sink: &mut Sink| {
-        let incoming = if audio && block % 16 != 0 {
+        let incoming = if audio && !block.is_multiple_of(16) {
             &[][..]
         } else {
             &events
