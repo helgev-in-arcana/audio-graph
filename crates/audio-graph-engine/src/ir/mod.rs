@@ -5,23 +5,28 @@
 //! pointers back into the edit graph. Custom kernels own immutable settings;
 //! their inputs, outputs and state are borrowed for each evaluation.
 //!
-//! A `Program` is immutable once built. The per-instance state that changes as
-//! it runs — LFO phases, delay ring contents, latches — lives in
-//! [`Engine`][crate::Engine] instead, so swapping a program does not reset an
-//! oscillator mid-note.
+//! Published instructions and kernel settings are immutable. Prepared runtime
+//! resources are moved into [`Engine`][crate::Engine], alongside LFO phases,
+//! delay rings and latches, so swapping a program preserves processing state.
 //!
 //! **Nothing in this module may reach back into the edit side**: no `use` of
 //! `graph`, `nodes` or `port` appears here or in its children. That is what
-//! keeps a `Program` a value rather than a view onto a graph, and it is what
-//! would let an out-of-process backend be a substitution rather than a
-//! rewrite.
+//! keeps a `Program` independent of the editable graph's lifetime.
 
+mod audio_kernel;
 mod audio_op;
+mod kernel;
+mod note_kernel;
 mod note_op;
 mod op;
 mod param_kernel;
 mod tremolo;
 
+pub(crate) use audio_kernel::{AudioKernel, CustomAudio};
+pub(crate) use kernel::{
+    KernelKind, KernelState, NoteOwnership, ResetReason, Runtime, RuntimeEntry, Stateful,
+};
+pub(crate) use note_kernel::{CustomNote, NoteKernel, NoteParamBinding};
 pub(crate) use note_op::{NoteStream, NoteStreamKind};
 pub(crate) use param_kernel::{CustomParam, ParamBindings, ParamKernel};
 
@@ -30,8 +35,8 @@ pub use audio_op::{
     Span, Stage,
 };
 pub use note_op::{
-    ALL_CHANNELS, ALL_CONTROLLERS, CC_INTERVAL, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
-    MAX_NOTE_EMITS, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteBuf, NoteOp,
+    ALL_CHANNELS, ALL_CONTROLLERS, CC_INTERVAL, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS,
+    NOTE_BUF_CAPACITY, NoteBuf, NoteOp,
 };
 
 pub use tremolo::{MAX_TREMOLO_ROWS, MAX_TREMOLOS, TREMOLO_NOTES, TremoloSpec};
@@ -249,8 +254,10 @@ pub struct Program {
     pub(crate) param_lines: Rings<f64>,
     /// Audio processing operations in topological execution order.
     pub(crate) audio_ops: Vec<AudioOp>,
+    pub(crate) custom_audio: Vec<CustomAudio>,
     /// The note half, run once per row ahead of the audio ops.
     pub(crate) note_ops: Vec<NoteOp>,
+    pub(crate) custom_notes: Vec<CustomNote>,
     /// How many note buffers this program uses.
     pub(crate) note_bufs: u16,
     pub(crate) note_streams: Vec<NoteStream>,
@@ -297,12 +304,8 @@ pub struct Program {
     /// Carried across a swap like the LFOs: a filter whose history emptied on
     /// every recompile would click on every drag of every control.
     pub(crate) dsp_nodes: Vec<NodeId>,
-    /// Note delay index → the node whose queue it is, carried across a swap
-    /// so the notes in flight are not lost to a recompile.
-    pub(crate) note_delay_nodes: Vec<NodeId>,
-    /// Tremolo index → the node whose clock and notes it is, the MIDI
-    /// tremolos first and then the audio ones. Carried across a swap so a
-    /// recompile neither moves the grid nor drops a note being cut.
+    /// MIDI tremolo index → its node, carried across recompiles so neither
+    /// the grid moves nor a note being cut is lost.
     pub(crate) tremolo_nodes: Vec<NodeId>,
     /// Param output socket → the register holding its value, in the order the
     /// outputs were bound.
@@ -326,6 +329,10 @@ pub struct Program {
 /// ```
 #[derive(Debug)]
 pub struct PreparedProgram {
+    /// After adoption these vectors carry retired processors back through the
+    /// handoff, avoiding allocation or destruction during the swap.
+    pub(crate) custom_audio: Vec<CustomAudio>,
+    pub(crate) custom_notes: Vec<CustomNote>,
     pub(crate) fallback_destinations: Vec<crate::notes::FallbackDestination>,
     pub(crate) program: Program,
     pub(crate) publication: u64,
@@ -348,6 +355,8 @@ impl PreparedProgram {
         let sizes = program.size_rings(sample_rate, previous);
         (
             Self {
+                custom_audio: std::mem::take(&mut program.custom_audio),
+                custom_notes: std::mem::take(&mut program.custom_notes),
                 fallback_destinations: program
                     .instances
                     .iter()
@@ -451,7 +460,9 @@ impl Program {
             registers: 0,
             outputs: Vec::new(),
             audio_ops: Vec::new(),
+            custom_audio: Vec::new(),
             note_ops: Vec::new(),
+            custom_notes: Vec::new(),
             note_bufs: 0,
             note_streams: Vec::new(),
             param_targets: Vec::new(),
@@ -465,7 +476,6 @@ impl Program {
             lfo_nodes: Vec::new(),
             latch_nodes: Vec::new(),
             dsp_nodes: Vec::new(),
-            note_delay_nodes: Vec::new(),
             tremolo_nodes: Vec::new(),
             output_registers: Vec::new(),
         }
@@ -558,11 +568,15 @@ mod tests {
         next.audio_lines.rings = vec![Vec::new(), Vec::new()];
 
         let mut next = PreparedProgram {
+            custom_audio: Vec::new(),
+            custom_notes: Vec::new(),
             fallback_destinations: Vec::new(),
             program: next,
             publication: 0,
         };
         let mut old = PreparedProgram {
+            custom_audio: Vec::new(),
+            custom_notes: Vec::new(),
             fallback_destinations: Vec::new(),
             program: old,
             publication: 0,

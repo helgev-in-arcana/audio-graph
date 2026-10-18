@@ -20,10 +20,10 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, CustomParam, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS,
-    MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_SECONDS,
-    MAX_DSP_STATES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, MAX_TREMOLOS, NoteBuf,
-    Op, Operand, ParamBindings, ParamKernel, Reg, Span,
+    AudioKernel, AudioOp, Buf, CustomAudio, CustomParam, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES,
+    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_DELAY_SECONDS, MAX_DSP_STATES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS,
+    NoteBuf, Op, Operand, ParamBindings, ParamKernel, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -586,6 +586,7 @@ pub(crate) struct AudioCx<'a> {
     pool: Pool,
     produced: Vec<Produced>,
     ops: Vec<AudioOp>,
+    custom_audio: Vec<CustomAudio>,
     deferred: Vec<AudioOp>,
     /// The runs of `ops` closed so far, and where the open one starts.
     spans: Vec<Span>,
@@ -599,7 +600,6 @@ pub(crate) struct AudioCx<'a> {
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
     dsp_nodes: Vec<NodeId>,
-    tremolo_nodes: Vec<NodeId>,
 
     notes: &'a Notes,
 }
@@ -628,6 +628,7 @@ impl<'a> AudioCx<'a> {
             produced: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            custom_audio: Vec::new(),
             spans: Vec::new(),
             span_start: 0,
             held: Vec::new(),
@@ -638,7 +639,6 @@ impl<'a> AudioCx<'a> {
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
             dsp_nodes: Vec::new(),
-            tremolo_nodes: Vec::new(),
             notes,
         }
     }
@@ -718,27 +718,32 @@ impl<'a> AudioCx<'a> {
             sockets,
             ops: self.ops,
             spans: self.spans,
+            custom_audio: self.custom_audio,
             delay_nodes: self.delay_nodes,
             dsp_nodes: self.dsp_nodes,
-            tremolo_nodes: self.tremolo_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
             latency: self.latency,
         }
     }
 
-    /// Books this node a tremolo's state, numbered after the MIDI tremolos'
-    /// because both halves share one table — see [`AudioOp::Tremolo`].
-    pub(crate) fn tremolo_state(&mut self) -> Result<u16, CompileError> {
-        let index = self.notes.tremolo_nodes.len() + self.tremolo_nodes.len();
-        if index >= MAX_TREMOLOS {
-            return Err(CompileError::TooLarge {
-                what: "tremolos",
-                limit: MAX_TREMOLOS,
-            });
-        }
-        self.tremolo_nodes.push(self.id);
-        Ok(index as u16)
+    pub(crate) fn custom<K: AudioKernel>(&mut self, kernel: K) -> usize {
+        assert!(!self.custom_audio.iter().any(|entry| entry.node == self.id));
+        let index = self.custom_audio.len();
+        self.custom_audio.push(CustomAudio::new(self.id, kernel));
+        index
+    }
+
+    pub(crate) fn emit_custom(&mut self, index: usize, a: Buf, out: Buf, notes: Option<NoteBuf>) {
+        assert_eq!(self.custom_audio[index].node, self.id);
+        assert_eq!(self.pool.widths[a as usize], self.pool.widths[out as usize]);
+        assert!(notes.is_none_or(|buf| buf < self.notes.bufs));
+        self.emit(AudioOp::Custom {
+            out,
+            a,
+            notes,
+            index,
+        });
     }
 
     /// Books this node a DSP state, which survives a program swap — see

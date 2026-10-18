@@ -19,6 +19,7 @@ mod notes;
 mod stages;
 
 pub(crate) use cx::{AudioCx, DeclareCx, ParamCx};
+pub(crate) use notes::NoteCx;
 
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{MAX_NOTE_BUFS, NoteOp, Op, Program, Rings, Stage};
@@ -185,7 +186,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
                     | NoteOp::Emit { out, .. }
                     | NoteOp::Filter { out, .. }
                     | NoteOp::Merge { out, .. }
-                    | NoteOp::Delay { out, .. }
+                    | NoteOp::Custom { out, .. }
                     | NoteOp::Tremolo { out, .. } => 1u16 << (out as usize % MAX_NOTE_BUFS),
                 })
                 .fold(0, |mask, bit| mask | bit),
@@ -202,7 +203,9 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         registers: param.registers,
         outputs: param.outputs,
         audio_ops: audio.ops,
+        custom_audio: audio.custom_audio,
         note_ops: notes.ops,
+        custom_notes: notes.custom_notes,
         note_bufs: notes.bufs,
         note_streams: notes.streams,
         param_targets: param.param_targets,
@@ -227,13 +230,7 @@ pub fn compile(graph: &Graph, slot_count: usize) -> Result<Program, CompileError
         lfo_nodes: param.lfo_nodes,
         latch_nodes: param.latch_nodes,
         dsp_nodes: audio.dsp_nodes,
-        note_delay_nodes: notes.delay_nodes,
-        tremolo_nodes: notes
-            .tremolo_nodes
-            .iter()
-            .chain(&audio.tremolo_nodes)
-            .copied()
-            .collect(),
+        tremolo_nodes: notes.tremolo_nodes,
         output_registers: param.reg_of,
     })
 }

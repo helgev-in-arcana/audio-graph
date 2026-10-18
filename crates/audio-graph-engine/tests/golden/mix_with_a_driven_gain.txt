@@ -72,7 +72,9 @@ Program {
             bus: 0,
         },
     ],
+    custom_audio: [],
     note_ops: [],
+    custom_notes: [],
     note_bufs: 0,
     note_streams: [],
     param_targets: [],
@@ -111,7 +113,6 @@ Program {
         5,
     ],
     dsp_nodes: [],
-    note_delay_nodes: [],
     tremolo_nodes: [],
     output_registers: [
         (

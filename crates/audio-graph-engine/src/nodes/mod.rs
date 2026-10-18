@@ -174,12 +174,10 @@ pub(crate) trait Node {
         None
     }
 
-    /// For a node that holds notes back: where the notes leaving output `port`
-    /// come in, and how long they wait — see
-    /// [`NoteOp::Delay`][crate::ir::NoteOp::Delay].
-    fn note_delay(&self, port: u8) -> Option<NoteDelay> {
-        let _ = port;
-        None
+    /// Returning true leaves routing to this hook, including an unwired output.
+    fn compile_note(&self, port: u8, cx: &mut NoteCx) -> Result<bool, CompileError> {
+        let _ = (port, cx);
+        Ok(false)
     }
 
     /// For a node that cuts notes into a tremolo: where the notes leaving
@@ -338,19 +336,7 @@ pub(crate) trait Node {
     }
 }
 
-use crate::compile::{AudioCx, CompileError, DeclareCx, ParamCx};
-
-/// What a node that delays notes says about one of its outputs.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct NoteDelay {
-    /// The note input the delayed stream comes in through.
-    pub input: u8,
-    /// The parameter input that can drive the time instead of `time`.
-    pub time_input: u8,
-    /// Seconds, or beats when `beats` is set.
-    pub time: f64,
-    pub beats: bool,
-}
+use crate::compile::{AudioCx, CompileError, DeclareCx, NoteCx, ParamCx};
 
 /// What a node that cuts notes into a tremolo says about one of its outputs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -504,9 +490,8 @@ impl NodeKind {
         for_kind!(self, node => node.note_tremolo(port))
     }
 
-    /// How output `port` delays its notes — see [`Node::note_delay`].
-    pub(crate) fn note_delay(&self, port: u8) -> Option<NoteDelay> {
-        for_kind!(self, node => node.note_delay(port))
+    pub(crate) fn compile_note(&self, port: u8, cx: &mut NoteCx) -> Result<bool, CompileError> {
+        for_kind!(self, node => node.compile_note(port, cx))
     }
 
     /// The inputs output `port` joins — see [`Node::note_merge`].

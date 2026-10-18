@@ -1,13 +1,12 @@
 //! Audio instruction set and audio buffer operations.
 //!
 //! Kept apart from [`Op`][crate::Op] because the two halves run at different
-//! rates. Buffers are indices into a pool the engine owns; nothing here is a
-//! pointer, so a `Program` stays a value that could cross a process boundary
-//! unchanged.
+//! rates. Buffers are indices into an engine-owned pool, resolved into local
+//! borrows when a prepared processor runs.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{NoteBuf, TremoloSpec};
+use crate::ir::NoteBuf;
 
 /// An index into the audio buffer pool.
 pub type Buf = u16;
@@ -261,33 +260,18 @@ pub enum AudioOp {
         op: AudioMathOp,
         state: u16,
     },
-    /// Cut `a` into steps while a key in `spec` has started a tremolo: the
-    /// gain is 1 in the sounding part of each step and 0 in the rest, and 1
-    /// whenever no tremolo is running.
-    ///
-    /// The keys are read off `notes`, the stream wired into the node, by the
-    /// same clock a [`NoteOp::Tremolo`][crate::ir::NoteOp::Tremolo] runs, so a
-    /// part and its audio set the same way are cut on the same samples. With
-    /// nothing wired there, nothing starts a tremolo and the audio passes.
-    ///
-    /// The gain does not jump: it slides at a fixed rate, all the way across
-    /// in `fade_in` seconds going up and `fade_out` going down. A step shorter
-    /// than its fades never reaches the ends, which is the cost of not
-    /// clicking. `state` holds the clock and the gain, and survives a swap.
-    Tremolo {
-        out: Buf,
-        a: Buf,
-        notes: Option<NoteBuf>,
-        state: u16,
-        spec: TremoloSpec,
-        fade_in: f64,
-        fade_out: f64,
-    },
     /// Advance an audio delay line's write head over silence.
     ///
     /// Emitted for a line nothing writes. The read position is measured back
     /// from the head, so a head that stopped would replay the ring forever.
     DelaySilence { line: u16 },
+    /// Calls a prepared processor over these buffers and this chunk's notes.
+    Custom {
+        out: Buf,
+        a: Buf,
+        notes: Option<NoteBuf>,
+        index: usize,
+    },
 }
 
 /// What an [`AudioOp::Math`] does to each sample.

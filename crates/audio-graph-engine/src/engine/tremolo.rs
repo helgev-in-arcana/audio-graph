@@ -1,8 +1,8 @@
 //! The clock a key-switched tremolo cuts by, and what one tremolo keeps
 //! between rows.
 //!
-//! The MIDI half and the audio half each own a [`TremoloLine`], but they run
-//! the same [`Clock`] over the same events, one sample at a time. That is what
+//! MIDI and audio processors run the same [`Clock`] over the same events,
+//! one sample at a time. That is what
 //! puts a note's cut and the audio's cut on the same sample: two clocks that
 //! agreed only on the arithmetic, one stepping edge to edge and the other
 //! sample by sample, would disagree about which sample a boundary rounds to.
@@ -21,7 +21,7 @@ const EPSILON: f64 = 1e-9;
 
 /// What the clock crossed at a sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Edge {
+pub(crate) enum Edge {
     /// A new step began: whatever was cut sounds again.
     Step,
     /// The sounding part of a step ended.
@@ -35,7 +35,7 @@ pub(super) enum Edge {
 /// step would drift, and a drift of one sample at a boundary is exactly what
 /// the two halves must not disagree about.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Clock {
+pub(crate) struct Clock {
     /// The row whose key started the running tremolo.
     row: Option<u8>,
     /// Rows whose key is down, one bit each, for a tremolo that runs while
@@ -53,7 +53,14 @@ pub(super) struct Clock {
 }
 
 impl Clock {
-    const STOPPED: Clock = Clock {
+    pub(crate) fn stopped(&self) -> bool {
+        self.row.is_none()
+    }
+
+    pub(crate) fn advance(&mut self, frames: usize) {
+        self.samples += frames as u64;
+    }
+    pub(crate) const STOPPED: Clock = Clock {
         row: None,
         held: 0,
         base: 0.0,
@@ -65,14 +72,14 @@ impl Clock {
 
     /// Whether the sample the clock is on sounds: always, unless a tremolo is
     /// running and it is in the cut part of a step.
-    pub(super) fn sounding(&self) -> bool {
+    pub(crate) fn sounding(&self) -> bool {
         self.row.is_none() || self.sounding
     }
 
     /// Carry the position over a change of tempo, so the samples after it are
     /// counted at the new one. Called at the start of every run, which is as
     /// often as the host can change it.
-    pub(super) fn follow(&mut self, tempo: f64, sample_rate: f64) {
+    pub(crate) fn follow(&mut self, tempo: f64, sample_rate: f64) {
         if tempo != self.tempo {
             self.base = self.beats(sample_rate);
             self.samples = 0;
@@ -98,7 +105,7 @@ impl Clock {
 
     /// Look at the sample the clock is on, and say what was crossed getting
     /// there.
-    pub(super) fn edge(&mut self, spec: &TremoloSpec, sample_rate: f64) -> Option<Edge> {
+    pub(crate) fn edge(&mut self, spec: &TremoloSpec, sample_rate: f64) -> Option<Edge> {
         let row = self.row?;
         let (step, sounding) = self.place(spec, row, sample_rate);
         let edge = if step != self.step && sounding {
@@ -115,13 +122,13 @@ impl Clock {
         edge
     }
 
-    pub(super) fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.samples += 1;
     }
 
     /// A key that steers the tremolo went down (`on`) or up. Returns whether
     /// a tremolo started here — which is a step beginning, and struck as one.
-    pub(super) fn switch(&mut self, spec: &TremoloSpec, key: i16, on: bool) -> bool {
+    pub(crate) fn switch(&mut self, spec: &TremoloSpec, key: i16, on: bool) -> bool {
         let row = spec.row_of(key).map(|row| row as u8);
         if spec.latch {
             match row {
@@ -177,7 +184,7 @@ impl Clock {
     /// Let go of every held key, as the notes are forgotten. A latched
     /// tremolo keeps its key — it is a setting the player made, not a note
     /// being played — and starts its grid again from here.
-    fn forget_keys(&mut self) {
+    pub(crate) fn forget_keys(&mut self) {
         if self.held != 0 {
             self.held = 0;
             self.row = None;
@@ -237,8 +244,6 @@ impl Held {
 pub(super) struct TremoloLine {
     pub(super) clock: Clock,
     notes: Vec<Held>,
-    /// The audio half's gain, where the last sample left it.
-    pub(super) gain: f64,
     node: u32,
 }
 
@@ -247,7 +252,6 @@ impl TremoloLine {
         TremoloLine {
             clock: Clock::STOPPED,
             notes: Vec::with_capacity(TREMOLO_NOTES),
-            gain: 1.0,
             node: u32::MAX,
         }
     }
@@ -438,6 +442,5 @@ impl Slot for TremoloLine {
     fn clear(&mut self) {
         self.notes.clear();
         self.clock = Clock::STOPPED;
-        self.gain = 1.0;
     }
 }

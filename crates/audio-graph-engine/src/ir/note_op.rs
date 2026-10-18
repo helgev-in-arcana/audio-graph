@@ -58,13 +58,6 @@ pub const ALL_CONTROLLERS: u128 = u128::MAX;
 /// Ceiling on the ops that remember the last value they sent.
 pub const MAX_NOTE_EMITS: usize = 16;
 
-/// How many [`NoteOp::Delay`]s one program may have. A ceiling because each
-/// holds a queue sized once, in [`Engine::new`][crate::Engine::new].
-pub const MAX_NOTE_DELAYS: usize = 16;
-
-/// How many events one [`NoteOp::Delay`] can hold in flight: a buffer's worth.
-pub const NOTE_DELAY_CAPACITY: usize = NOTE_BUF_CAPACITY;
-
 /// How many streams one [`NoteOp::Merge`] joins. A `Mix`'s ceiling, for a
 /// `Mix`'s reason: past it the node is a wall of sockets.
 pub const MAX_MERGE_INPUTS: usize = 8;
@@ -97,7 +90,7 @@ pub(crate) enum NoteStreamKind {
     Merge {
         count: u8,
     },
-    Delay,
+    Custom(super::KernelKind),
     Tremolo,
 }
 
@@ -176,26 +169,10 @@ pub enum NoteOp {
         count: u8,
         out: NoteBuf,
     },
-    /// Hand `a` on to `out` later: `time` seconds, or beats when `beats`
-    /// is set, or what `lane` carries when the time is wired.
-    ///
-    /// Events wait in a queue that belongs to the node (`state`) and survives
-    /// a program swap. Each is given the time it comes out as it goes in, and
-    /// never earlier than the event queued before it: shortening the time
-    /// while notes are in flight must not let a note-off overtake its note-on,
-    /// which would leave the note sounding for good. A queue that is full
-    /// drops what arrives, counted like any other overflow.
-    ///
-    /// A note-on waiting here is one the graph has not yet handed to any
-    /// plugin, so the engine counts it as held by the delay until it comes
-    /// out; see [`NoteLedger::delivered`][crate::notes::NoteLedger::delivered].
-    Delay {
+    Custom {
         a: NoteBuf,
         out: NoteBuf,
-        state: u16,
-        lane: Option<u16>,
-        time: f64,
-        beats: bool,
+        index: u16,
     },
     /// Cut `a` into steps while a key in `spec` has started a tremolo, and
     /// strike each held note again at every step: what cutting a part up by

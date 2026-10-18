@@ -3,9 +3,9 @@
 //! Executes compiled [`Program`] instructions on the audio thread.
 //!
 //! The rules this file exists to keep: no allocation, no locking, and no `Drop`
-//! of anything the main thread gave us. Every buffer is sized once in
-//! [`Engine::new`] against the compiler's ceilings, so adopting a new program
-//! is a pointer swap and a short loop, never a resize.
+//! of anything the main thread gave us. Buffers and custom state are prepared
+//! before processing starts or handed over already allocated, so adopting a
+//! program swaps ownership and retained state without resizing.
 //!
 //! It also holds the state that must *survive* a swap — LFO phases, delay ring
 //! contents, latch registers, the current note expression values.
@@ -23,21 +23,24 @@ use plugin_host::{Event, NoteEvent};
 
 use crate::handoff::Handoff;
 use crate::ir::{
-    AudioMathOp, AudioOp, Buf, CC_INTERVAL, Chunking, DC_CUTOFF_HZ, DEFAULT_QUANTUM, DSP_VALUES,
-    Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_CHANNELS,
-    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DSP_STATES, MAX_LATCHES, MAX_LFOS,
-    MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS, MAX_NOTE_EMITS, MAX_REGISTERS, MAX_TREMOLOS,
-    MathOp, NOTE_BUF_CAPACITY, NOTE_DELAY_CAPACITY, NoteOp, NoteStream, Op, Operand,
-    PreparedProgram, Program, QUANTUM_CHOICES, RateSpec, Rings, Stage, Waveform,
+    AudioMathOp, AudioOp, Buf, CC_INTERVAL, Chunking, CustomAudio, DC_CUTOFF_HZ, DEFAULT_QUANTUM,
+    DSP_VALUES, Detect, Follow, MAX_AUDIO_DELAY_LINES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
+    MAX_CHANNELS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DSP_STATES, MAX_LATCHES,
+    MAX_LFOS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_EMITS, MAX_REGISTERS, MAX_TREMOLOS, MathOp,
+    NOTE_BUF_CAPACITY, NoteOp, NoteStream, Op, Operand, PreparedProgram, Program, QUANTUM_CHOICES,
+    RateSpec, ResetReason, Rings, Stage, Waveform,
 };
 use crate::nodes::db_to_linear;
 use crate::notes::{Ended, NoteLedger};
 use subhost_adapter::{AudioChunk, AudioInstances, MIN_RESOLUTION, ScheduleView, SlotSchedule};
 
 mod audio;
+mod audio_context;
 #[cfg(test)]
 mod custom_tests;
+mod kernel_runtime;
 mod lines;
+mod note_context;
 mod notes;
 mod param_context;
 mod params;
@@ -46,9 +49,12 @@ mod tests;
 mod tremolo;
 
 use audio::Window;
+pub(crate) use audio_context::{AudioEvalContext, AudioIo, AudioSamples};
 use lines::{AudioLine, DspState, Latch, Lfo, ParamLine, Peek, Slot, adopt_rings, reorder};
+pub(crate) use note_context::NoteEvalContext;
 use notes::{NoteState, key_bit};
 pub(crate) use param_context::ParamEvalContext;
+pub(crate) use tremolo::Clock as TremoloClock;
 
 /// Sentinel indicating that no ring buffer currently holds this delay line.
 const NOT_PRESENT: usize = usize::MAX;
@@ -220,6 +226,7 @@ const MAX_BLOCK_EVENTS: usize = 1024;
 
 pub struct Engine {
     program: Option<Box<PreparedProgram>>,
+    custom_audio: Vec<CustomAudio>,
     registers: Vec<f64>,
     /// One per LFO state index of the current program. See [`Slot`] for how
     /// each follows its node across a program swap, which is what keeps an
@@ -294,6 +301,7 @@ impl Engine {
     pub fn new() -> Engine {
         Engine {
             program: None,
+            custom_audio: Vec::new(),
             registers: vec![0.0; MAX_REGISTERS],
             lfos: (0..MAX_LFOS).map(|_| Lfo::new()).collect(),
             lines: (0..MAX_DELAY_LINES).map(|_| ParamLine::new()).collect(),
@@ -324,7 +332,6 @@ impl Engine {
                 MAX_LFOS
                     .max(MAX_LATCHES)
                     .max(MAX_DSP_STATES)
-                    .max(MAX_NOTE_DELAYS)
                     .max(MAX_TREMOLOS)
                     .max(MAX_DELAY_LINES)
                     .max(MAX_AUDIO_DELAY_LINES)
@@ -381,19 +388,16 @@ impl Engine {
                 .expect("take reported a swap")
                 .fallback_destinations,
         );
-        let next = self.program.as_ref().expect("take reported a swap");
-
-        // A delay the new program no longer has gives back the notes it was
-        // holding, or the ledger would wait for them for good.
-        for line in &mut self.notes.delays {
-            if !next.note_delay_nodes.contains(&line.node()) {
-                line.release(&mut self.ledger);
-            }
-        }
-        reorder(
-            &mut self.notes.delays,
-            &mut self.order,
-            &next.note_delay_nodes,
+        let next = self.program.as_mut().expect("take reported a swap");
+        kernel_runtime::adopt(
+            &mut self.custom_audio,
+            &mut next.custom_audio,
+            &mut self.ledger,
+        );
+        kernel_runtime::adopt(
+            &mut self.notes.custom,
+            &mut next.custom_notes,
+            &mut self.ledger,
         );
         for line in &mut self.notes.tremolos {
             if !next.tremolo_nodes.contains(&line.node()) {
@@ -435,6 +439,10 @@ impl Engine {
     /// Give back whatever program is loaded, so the main thread can free it.
     ///
     /// Called when the plugin is torn down, from the main thread.
+    /// Processing state, including custom runtimes, stays in the engine so a
+    /// later adoption can resume it by node identity. Retired runtimes travel
+    /// with the returned program; active ones are retired on adoption or freed
+    /// when the engine is dropped on the main thread.
     pub fn release(&mut self) -> Option<Box<PreparedProgram>> {
         self.program.take()
     }
@@ -451,6 +459,7 @@ impl Engine {
     /// one that jumped. See [`NoteLedger::clear`].
     pub fn reset(&mut self) {
         self.ledger.clear();
+        self.reset_custom(ResetReason::Transport);
         self.forget_notes();
         self.forget_params();
         self.forget_audio();
@@ -470,6 +479,7 @@ impl Engine {
     /// notes it asked for are over. It is told, through `ended`.
     pub fn reset_everything(&mut self, ended: &mut Vec<Ended>) {
         self.ledger.end_all(ended);
+        self.reset_custom(ResetReason::All);
         self.forget_notes();
         self.forget_params();
         // A latch nothing has set reads as NaN, which is what a fresh program
@@ -487,7 +497,13 @@ impl Engine {
     /// delay lines with it would undo the user's patch a few times an hour.
     pub fn reset_notes(&mut self, ended: &mut Vec<Ended>) {
         self.ledger.end_all(ended);
+        self.reset_custom(ResetReason::Notes);
         self.forget_notes();
+    }
+
+    fn reset_custom(&mut self, reason: ResetReason) {
+        kernel_runtime::reset(&mut self.custom_audio, reason);
+        kernel_runtime::reset(&mut self.notes.custom, reason);
     }
 
     /// The note half of a reset: who is playing, and what has been said about
@@ -504,9 +520,6 @@ impl Engine {
         // its value again rather than holding back a number that matches what
         // a sub-plugin no longer has.
         self.notes.emitted.iter_mut().for_each(|v| *v = f64::NAN);
-        // What was in flight is not coming; the ledger is settled by the
-        // caller.
-        self.notes.delays.iter_mut().for_each(Slot::clear);
         self.notes
             .tremolos
             .iter_mut()

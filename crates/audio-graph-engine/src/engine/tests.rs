@@ -4317,6 +4317,8 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     engine.prepare(128, &[2]);
     let handoff = Handoff::new();
     handoff.send(Box::new(PreparedProgram {
+        custom_audio: Vec::new(),
+        custom_notes: Vec::new(),
         fallback_destinations: Vec::new(),
         program,
         publication: 0,
@@ -4343,6 +4345,8 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     );
     let handoff = Handoff::new();
     handoff.send(Box::new(PreparedProgram {
+        custom_audio: Vec::new(),
+        custom_notes: Vec::new(),
         fallback_destinations: Vec::new(),
         program: wider,
         publication: 0,

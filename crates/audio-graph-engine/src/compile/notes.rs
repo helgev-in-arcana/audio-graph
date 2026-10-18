@@ -18,8 +18,9 @@
 use crate::compile::stages::Plan;
 use crate::graph::{Graph, NodeId};
 use crate::ir::{
-    ALL_CHANNELS, ALL_CONTROLLERS, MAX_MERGE_INPUTS, MAX_NOTE_BUFS, MAX_NOTE_DELAYS,
-    MAX_NOTE_EMITS, MAX_TREMOLOS, NoteBuf, NoteOp, NoteStream, NoteStreamKind, Span,
+    ALL_CHANNELS, ALL_CONTROLLERS, CustomNote, KernelKind, MAX_MERGE_INPUTS, MAX_NOTE_BUFS,
+    MAX_NOTE_EMITS, MAX_TREMOLOS, NoteBuf, NoteKernel, NoteOp, NoteParamBinding, NoteStream,
+    NoteStreamKind, Span,
 };
 use crate::nodes::NodeKind;
 
@@ -39,9 +40,6 @@ enum Wants {
     Gate,
     /// A generator's value, filed against the node's input socket 0.
     Value,
-    /// A delay's time, filed against the input socket the op names. Optional:
-    /// without one the op keeps the time it was compiled with.
-    Time,
 }
 
 /// An op whose lane number the parameter half has yet to book.
@@ -52,9 +50,17 @@ struct Pending {
     wants: Wants,
 }
 
+struct PendingCustom {
+    custom: usize,
+    input: usize,
+    node: NodeId,
+    port: u8,
+}
+
 /// The note half of a program, before lane numbers are known.
 pub(crate) struct Notes {
     pub ops: Vec<NoteOp>,
+    pub custom_notes: Vec<CustomNote>,
     pub bufs: u16,
     pub streams: Vec<NoteStream>,
     /// Which stage each op belongs to, and the spans that fall out of it once
@@ -68,12 +74,76 @@ pub(crate) struct Notes {
     /// buffer twice, so the sharing is free.
     outputs: Vec<((NodeId, u8), NoteBuf)>,
     pending: Vec<Pending>,
+    pending_custom: Vec<PendingCustom>,
     states: u16,
-    /// Note delay index → the node whose queue it is.
-    pub delay_nodes: Vec<NodeId>,
-    /// Tremolo index → the node, for the MIDI tremolos. The audio half books
-    /// its own after these.
+    /// Tremolo index → the MIDI node whose clock and held notes it carries.
     pub tremolo_nodes: Vec<NodeId>,
+}
+
+pub(crate) struct NoteCx<'a> {
+    graph: &'a Graph,
+    notes: &'a mut Notes,
+    node: NodeId,
+    port: u8,
+}
+
+impl NoteCx<'_> {
+    pub(crate) fn input(&self, port: u8) -> Option<NoteBuf> {
+        self.notes.source_of(self.graph, self.node, port)
+    }
+
+    pub(crate) fn emit_custom<K: NoteKernel>(
+        &mut self,
+        input: NoteBuf,
+        parameters: &[(u8, f64)],
+        kernel: K,
+    ) -> Result<(), CompileError> {
+        // State follows the node, so two processors could not be distinguished
+        // when their order changes during recompilation.
+        assert!(
+            self.notes
+                .custom_notes
+                .iter()
+                .all(|custom| custom.node != self.node),
+            "a node registers one custom note processor"
+        );
+        let out = alloc_buf(
+            self.notes,
+            NoteStream {
+                node: self.node,
+                port: self.port,
+                source: Some(input),
+                kind: NoteStreamKind::Custom(KernelKind::of::<K>()),
+            },
+        )?;
+        let index = self.notes.custom_notes.len();
+        let bindings = parameters
+            .iter()
+            .enumerate()
+            .map(|(at, &(port, fallback))| {
+                self.notes.pending_custom.push(PendingCustom {
+                    custom: index,
+                    input: at,
+                    node: self.node,
+                    port,
+                });
+                NoteParamBinding {
+                    lane: None,
+                    fallback,
+                }
+            })
+            .collect();
+        self.notes
+            .custom_notes
+            .push(CustomNote::new(self.node, bindings, kernel));
+        self.notes.ops.push(NoteOp::Custom {
+            a: input,
+            out,
+            index: index as u16,
+        });
+        self.notes.outputs.push(((self.node, self.port), out));
+        Ok(())
+    }
 }
 
 impl Notes {
@@ -99,14 +169,15 @@ pub(crate) fn compile_notes(
 ) -> Result<Notes, CompileError> {
     let mut notes = Notes {
         ops: Vec::new(),
+        custom_notes: Vec::new(),
         bufs: 0,
         streams: Vec::new(),
         stages: Vec::new(),
         spans: Vec::new(),
         outputs: Vec::new(),
         pending: Vec::new(),
+        pending_custom: Vec::new(),
         states: 0,
-        delay_nodes: Vec::new(),
         tremolo_nodes: Vec::new(),
     };
 
@@ -134,12 +205,17 @@ pub(crate) fn compile_notes(
 /// nothing to send, and for a gate it would mean a program the engine should
 /// not have been handed.
 pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId, u8), u16)]) {
+    for pending in &notes.pending_custom {
+        notes.custom_notes[pending.custom].parameters[pending.input].lane = lanes
+            .iter()
+            .find(|&&(socket, _)| socket == (pending.node, pending.port))
+            .map(|&(_, lane)| lane);
+    }
     let mut drop = Vec::new();
     for pending in &notes.pending {
         let socket = match pending.wants {
             Wants::Gate => (pending.node, OUTPUT_SOCKET + pending.port),
             Wants::Value => (pending.node, 0),
-            Wants::Time => (pending.node, pending.port),
         };
         let found = lanes
             .iter()
@@ -148,8 +224,6 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
         match (found, &mut notes.ops[pending.op]) {
             (Some(lane), NoteOp::Filter { gate, .. }) => *gate = Some(lane),
             (Some(lane), NoteOp::Emit { lane: slot, .. }) => *slot = lane,
-            (Some(lane), NoteOp::Delay { lane: slot, .. }) => *slot = Some(lane),
-            (None, NoteOp::Delay { .. }) => {}
             (None, _) => drop.push(pending.op),
             _ => {}
         }
@@ -165,7 +239,7 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
             | NoteOp::Filter { out, .. }
             | NoteOp::Emit { out, .. }
             | NoteOp::Merge { out, .. }
-            | NoteOp::Delay { out, .. }
+            | NoteOp::Custom { out, .. }
             | NoteOp::Tremolo { out, .. } => out,
         };
         notes.streams[usize::from(out)].kind = NoteStreamKind::Empty;
@@ -194,12 +268,9 @@ pub(crate) fn resolve_lanes(notes: &mut Notes, stages: usize, lanes: &[((NodeId,
 
 /// One node's share of the note half.
 ///
-/// Generic over the node kinds rather than written into each of them: what a
-/// note node contributes is entirely described by the questions it already
-/// answers — where notes come from, which input an output hands on, what it
-/// drops on the way, and whether it makes controllers of its own. Topological
-/// order guarantees the buffer feeding a socket is bound before anything reads
-/// it.
+/// Core routing shares filters, merges and generators; custom processors bind
+/// their own output through `NoteCx`. Topological order guarantees the buffer
+/// feeding a socket is bound before anything reads it.
 fn route(
     graph: &Graph,
     order: &[NodeId],
@@ -231,47 +302,15 @@ fn route(
             continue;
         }
 
-        if let Some(delay) = kind.note_delay(port) {
-            // Unwired, there is nothing to hold back, and no queue is booked.
-            let Some(a) = notes.source_of(graph, id, delay.input) else {
-                continue;
-            };
-            if notes.delay_nodes.len() >= MAX_NOTE_DELAYS {
-                return Err(CompileError::TooLarge {
-                    what: "MIDI delays",
-                    limit: MAX_NOTE_DELAYS,
-                });
-            }
-            let state = notes.delay_nodes.len() as u16;
-            notes.delay_nodes.push(id);
-            let out = alloc_buf(
-                notes,
-                NoteStream {
-                    node: id,
-                    port,
-                    source: Some(a),
-                    kind: NoteStreamKind::Delay,
-                },
-            )?;
-            notes.ops.push(NoteOp::Delay {
-                a,
-                out,
-                state,
-                // Filled in by `resolve_lanes` when the time is wired.
-                lane: None,
-                time: delay.time.max(0.0),
-                beats: delay.beats,
-            });
-            notes.pending.push(Pending {
-                op: notes.ops.len() - 1,
-                node: id,
-                port: delay.time_input,
-                wants: Wants::Time,
-            });
-            notes.outputs.push(((id, port), out));
+        let mut cx = NoteCx {
+            graph,
+            notes,
+            node: id,
+            port,
+        };
+        if kind.compile_note(port, &mut cx)? {
             continue;
         }
-
         if let Some(tremolo) = kind.note_tremolo(port) {
             let Some(a) = notes.source_of(graph, id, tremolo.input) else {
                 continue;
@@ -460,4 +499,122 @@ fn alloc_state(notes: &mut Notes) -> Result<u16, CompileError> {
     let state = notes.states;
     notes.states += 1;
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Chunking, Stateful};
+    use crate::nodes::{Beats, Constant, MidiDelay, Plugin, PluginPorts};
+
+    fn delay_graph(wired: bool, read: bool) -> (Graph, NodeId, NodeId) {
+        let mut graph = Graph::new();
+        let source = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let delay = graph.add(
+            NodeKind::MidiDelay(MidiDelay {
+                seconds: 0.25,
+                beats: Beats::new(1, 2),
+                sync: false,
+            }),
+            [0.0, 0.0],
+        );
+        let sink = graph.add(
+            NodeKind::Plugin(Plugin {
+                instance: 0,
+                ports: PluginPorts {
+                    accepts_notes: true,
+                    ..PluginPorts::default()
+                },
+            }),
+            [0.0, 0.0],
+        );
+        graph.node_mut(delay).unwrap().always_on = true;
+        if wired {
+            graph.connect(source, 0, delay, 0);
+        }
+        if read {
+            graph.connect(delay, 0, sink, 0);
+        }
+        (graph, source, delay)
+    }
+
+    /// An unwired or unread stream never prepares a stateful processor.
+    #[test]
+    fn an_unused_custom_note_output_has_no_runtime() {
+        for (wired, read) in [(false, true), (true, false)] {
+            let (graph, _, _) = delay_graph(wired, read);
+            let program = crate::compile(&graph, 0).unwrap();
+            assert!(program.custom_notes.is_empty());
+            assert!(
+                !program
+                    .note_ops
+                    .iter()
+                    .any(|op| matches!(op, NoteOp::Custom { .. }))
+            );
+        }
+    }
+
+    /// Custom inputs resolve the parameter pass's lanes and retain unwired defaults.
+    #[test]
+    fn custom_note_parameters_bind_after_the_parameter_pass() {
+        let (mut graph, _, delay) = delay_graph(true, true);
+        let fallback = crate::compile(&graph, 0).unwrap();
+        assert_eq!(fallback.custom_notes[0].parameters[0].lane, None);
+        assert_eq!(fallback.custom_notes[0].parameters[0].fallback, 0.25);
+
+        let time = graph.add(NodeKind::Constant(Constant { value: 0.125 }), [0.0, 0.0]);
+        graph.connect(time, 0, delay, 1);
+        let program = crate::compile(&graph, 0).unwrap();
+        let lane = program.custom_notes[0].parameters[0].lane.unwrap();
+        let register = program
+            .output_registers
+            .iter()
+            .find(|(socket, _)| *socket == (time, 0))
+            .unwrap()
+            .1;
+        assert!(program.outputs.contains(&(lane, register)));
+        assert!(program.stages.iter().any(|stage| {
+            program.note_ops[stage.notes.range()]
+                .iter()
+                .any(|op| matches!(op, NoteOp::Custom { .. }))
+        }));
+    }
+
+    /// A node-local kernel type needs no entry in a central execution enum.
+    #[test]
+    fn a_local_kernel_can_register_a_note_stream() {
+        #[derive(Debug)]
+        struct LocalKernel;
+
+        impl NoteKernel for LocalKernel {
+            type State = ();
+            fn create_state(&self) {}
+            fn eval(&self, _: &mut (), _: &mut crate::engine::NoteEvalContext<'_>) {}
+        }
+
+        let (graph, source, node) = delay_graph(true, true);
+        let plan = Plan {
+            stages: vec![Chunking::WholeBlock],
+            of: vec![0],
+        };
+        let mut notes = compile_notes(&graph, &[source], &plan).unwrap();
+        let mut cx = NoteCx {
+            graph: &graph,
+            notes: &mut notes,
+            node,
+            port: 0,
+        };
+        let input = cx.input(0).unwrap();
+        cx.emit_custom(input, &[], LocalKernel).unwrap();
+        assert_eq!(notes.custom_notes.len(), 1);
+        assert_eq!(
+            notes.custom_notes[0].processor.kind(),
+            KernelKind::of::<Stateful<LocalKernel, ()>>()
+        );
+        assert_eq!(notes.streams[1].source, Some(input));
+        assert_eq!(
+            notes.streams[1].kind,
+            NoteStreamKind::Custom(KernelKind::of::<LocalKernel>())
+        );
+    }
 }
