@@ -2,7 +2,7 @@
 
 状態: **採用済み**。調査開始: 2026-10-17。製品移行: 2026-10-18。追加検証: 2026-10-19。記録整理: 2026-10-20。
 
-対象は`refactor/hybrid-keyparam`の`fe088b8`まで。この記録は当時の判断と根拠を保存するもので、将来の実装仕様を自動的に更新する文書ではない。
+対象は`refactor/hybrid-keyparam`の`6a0be82`まで。この記録は当時の判断と根拠を保存するもので、将来の実装仕様を自動的に更新する文書ではない。
 
 ## 背景
 
@@ -54,4 +54,4 @@ alpha段階のリポジトリ内互換性を優先し、未使用の`Program: Cl
 - [data/keyparam](data/keyparam/): CPU固定の最終比較と前後の生ログ。[data/audio-note](data/audio-note/): 最終3組の生データ・比較表と採用時間の集計。
 - 再利用する実Engine計測は[hybrid_keyparam.rs](../../../crates/audio-graph-engine/examples/hybrid_keyparam.rs)と[hybrid_audio_note.rs](../../../crates/audio-graph-engine/examples/hybrid_audio_note.rs)をexamplesに残す。
 - 先行実験の別backend・一時実装は`exp/ir-vs-dyn-benchmark`の`5c535b4`を参照する。このディレクトリには複製しない。不採用の試作と中間ログを残し続ける運用にはしない。
-- 統合前の設計・計画・報告・中間ログは`fe088b8`の`docs/hybrid-*.md`と`docs/benchmarks/hybrid-*`から復元できる。履歴は書き換えず、READMEのサブページ・アセットと作業記録を分離する。
+- 本記録に統合した旧文書・中間ログは、この作業ブランチの履歴から除去した。採用判断・最終データと再測定用exampleを保存し、READMEのサブページ・アセットと作業記録を分離する。

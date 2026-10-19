@@ -1,6 +1,6 @@
 # Hybrid実行の調査・測定記録
 
-[採用判断](README.md)の根拠をまとめる。数値は2026-10-18の製品移行時の測定、テスト結果は2026-10-19の追加検証まで。2026-10-20の文書整理では再測定や製品変更を行っていない。
+[採用判断](README.md)の根拠をまとめる。数値は2026-10-18の製品移行時の測定、テスト結果は2026-10-19の追加検証まで。2026-10-20の文書整理・履歴整理では再測定や製品変更を行っていない。
 
 ## 対象の履歴
 
@@ -9,10 +9,12 @@
 | 先行調査の開始 | `276bc4b`、2026-10-17 |
 | 先行実験の保管 | `exp/ir-vs-dyn-benchmark` / `5c535b4190adb683d2e6fd89055eb85b9d688f65` |
 | 製品移行の起点 | `main` / `dbb70df6fded4d7f080622c371c729d55f80e37d` |
-| KeyParam移行前の計測example付き | `0825d3de1cc18309a439ca76b62df186d8a98298`。製品処理は起点と同じ |
-| KeyParam移行後 / Audio・Note移行前 | `a286673c6a5f26760153dad4dda473b2402a06c4` |
-| Audio・Note移行後の計測ソース | `feea47bec6b8678ffe3a7dc6f627b3a5190b0065` |
-| 追加テスト・統合前文書 | `fe088b8e06b84ad380ab82200ffb29cec808d75a` |
+| KeyParam移行前の計測example付き | `4f9f020f45b55439de50b48b7066d039b59cd0df`。製品処理は起点と同じ |
+| KeyParam移行後 / Audio・Note移行前 | `f732cbdeba8026391d95a312fa56b66531afcf9e` |
+| Audio・Note移行後の計測ソース | `de0e9c2e08df389c66880162de55383b9e220099` |
+| 追加テストの検証点 | `6a0be820aa350006097a2a261aba2df64b4690c1` |
+
+製品移行以降の参照は履歴整理後のコミットへ更新し、計測・検証時の製品コードとexampleの内容が一致することを確認した。文書だけの保存点が除かれた箇所は、同じ製品状態を持つ直前のコミットを使う。先行実験と移行起点の履歴は変更していない。
 
 先行実験には`crates/audio-graph-engine/src/execution_experiment/`、`crates/audio-graph-engine/examples/ir_*.rs`、`docs/ir-execution-choices.md`、`docs/ir-vs-dyn-performance-guidance.md`がある。方式を比較するための別実装であり、以下の実Engine計測とは区別する。試作コードは製品側へ持ち込まず、採用した考え方と最終比較を残す。
 
@@ -131,7 +133,7 @@ Customを通らない基準構成もAudio Coreで−3.3〜＋3.3%（最大＋0.3
 
 2026-10-19の追加レビューでは`temp/astra_handout_report.md`のPart 1に対応する7テストを追加し、製品コード変更は不要だった。既存テストにもNodeId / 型の不一致検証があったこと、切断中のクロックは進まないこと、直接配置テストの欠如とコード未通過の証明は異なることを訂正した。Part 2の後続実装は未検証・未着手であり、採用済みの計画としては扱わない。
 
-`fe088b8`時点の結果は`cargo test -p audio-graph-engine`が244件、`--features ui`付きが256件、`cargo test -p audio-graph-plugin`が81件成功、`cargo fmt --all -- --check`も成功。件数は統合テスト・doc testを含む。plugin全体は先に`cargo build -p clap-test-plugin`で既存fixtureのライブラリを用意して再実行した。移行時にはworkspace全体のcheckも成功している。これらは当時の結果であり、文書整理時の再実行結果ではない。
+`6a0be82`時点の結果は`cargo test -p audio-graph-engine`が244件、`--features ui`付きが256件、`cargo test -p audio-graph-plugin`が81件成功、`cargo fmt --all -- --check`も成功。件数は統合テスト・doc testを含む。plugin全体は先に`cargo build -p clap-test-plugin`で既存fixtureのライブラリを用意して再実行した。移行時にはworkspace全体のcheckも成功している。これらは当時の結果であり、文書整理時の再実行結果ではない。
 
 ## 既知の挙動と範囲
 
@@ -153,15 +155,15 @@ cmd /c 'start "" /b /wait /affinity 4 target\release\examples\hybrid_keyparam.ex
 cmd /c 'start "" /b /wait /affinity 4 target\release\examples\hybrid_audio_note.exe > target\hybrid-repro\audio-note.csv'
 ```
 
-当時の前後比較を再構築する場合は、上の履歴表のコミットを別のdetached worktreeへ展開してビルドする。KeyParamは`0825d3d`と`a286673`が同じ計測ソースを持つ。Audio / Noteは`a286673`と`feea47b`を使い、前者にはexampleがないため、後者の`hybrid_audio_note.rs`をそのままコピーして両側で使用する。同じソース・環境・CPU固定・実行順で比較し、タイミング値そのものの一致は期待しない。
+当時の前後比較を再構築する場合は、上の履歴表のコミットを別のdetached worktreeへ展開してビルドする。KeyParamは`4f9f020`と`f732cbd`が同じ計測ソースを持つ。Audio / Noteは`f732cbd`と`de0e9c2`を使い、前者にはexampleがないため、後者の`hybrid_audio_note.rs`をそのままコピーして両側で使用する。同じソース・環境・CPU固定・実行順で比較し、タイミング値そのものの一致は期待しない。
 
-Audio / Noteの計測後、`281de34`でexampleの`% 16 != 0`を`!is_multiple_of(16)`へ変更した。現在のexampleは再利用できるが、保存データのソースを特定する場合は`feea47b`を使う。以下のSHA-256は測定時の識別情報であり、バイナリの存在や再ビルド時の同一ハッシュを保証するものではない。バイナリはGitに保存していない。
+Audio / Noteの計測後、`81f83d1`でexampleの`% 16 != 0`を`!is_multiple_of(16)`へ変更した。現在のexampleは再利用できるが、保存データのソースを特定する場合は`de0e9c2`を使う。以下のSHA-256は測定時の識別情報であり、バイナリの存在や再ビルド時の同一ハッシュを保証するものではない。バイナリはGitに保存していない。
 
 | 対象 | SHA-256 |
 | --- | --- |
 | Audio / Note移行前の実行ファイル | `279C4ED51287206329F1E742881140A327F26A3E4C6AD073B48180C17526B6A9` |
 | Audio / Note移行後の実行ファイル | `BAA3ECBC3757E4417C8E0630AD4887D1A1EF0D0E8D363B1B7ADAED42EB64362B` |
 | 採用時間の一時実行ファイル | `4DEE2064D2FEDF0A9C5739C7FE311C0A9D17F621EB59F853FD4030E4F133AB4E` |
-| `feea47b`のAudio / Note example（LF・末尾改行あり） | `484EC07D40DAD613E662A6C2826B0BE61338B7AB682663573709B2B93070EBE5` |
+| `de0e9c2`のAudio / Note example（LF・末尾改行あり） | `484EC07D40DAD613E662A6C2826B0BE61338B7AB682663573709B2B93070EBE5` |
 
-文書整理ではKeyParamの前後生ログ2本、Audio / Noteの生データ6本・比較表・採用集計を内容を変えずに移動した。KeyParam比較表は中間候補の`initial_ns`・`initial_to_final_pct`を除き、残る値を維持した。CPU未固定の試行、中間候補、重複した計画・報告は現行ツリーから除き、必要時は`fe088b8`の`docs/`から確認する。
+文書整理ではKeyParamの前後生ログ2本、Audio / Noteの生データ6本・比較表・採用集計を内容を変えずに移動した。KeyParam比較表は中間候補の`initial_ns`・`initial_to_final_pct`を除き、残る値を維持した。CPU未固定の試行、中間候補、重複した計画・報告は、この作業ブランチの履歴から除いた。ここに保存した最終資料を判断根拠とし、中間ログは保存対象にしない。
