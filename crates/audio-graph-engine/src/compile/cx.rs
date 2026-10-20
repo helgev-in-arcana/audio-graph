@@ -20,9 +20,10 @@ use super::audio::Audio;
 use super::{CompileError, Line, NO_WRITER};
 use crate::graph::{Graph, LineId, NodeId};
 use crate::ir::{
-    AudioOp, Buf, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES, MAX_BUFFER_CHANNELS, MAX_BUFFERS,
-    MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES, MAX_DELAY_SECONDS, MAX_DSP_STATES,
-    MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS, MAX_TREMOLOS, NoteBuf, Op, Reg, Span,
+    AudioKernel, AudioOp, Buf, CustomAudio, CustomParam, MAX_AUDIO_DELAY_LINES, MAX_AUDIO_LANES,
+    MAX_BUFFER_CHANNELS, MAX_BUFFERS, MAX_COMPENSATION, MAX_COMPENSATORS, MAX_DELAY_LINES,
+    MAX_DELAY_SECONDS, MAX_DSP_STATES, MAX_GRAPH_PARAMS, MAX_LATCHES, MAX_LFOS, MAX_REGISTERS,
+    NoteBuf, Op, Operand, ParamBindings, ParamKernel, Reg, Span,
 };
 
 /// Offset added to an output socket index when filing a note gate's lane, so it
@@ -48,8 +49,10 @@ pub(crate) struct ParamCx<'a> {
     id: NodeId,
 
     next_reg: usize,
+    node_first_reg: usize,
     reg_of: Vec<((NodeId, u8), Reg)>,
     ops: Vec<Op>,
+    custom_params: Vec<CustomParam>,
     deferred: Vec<Op>,
     /// The runs of `ops` closed so far, and where the open one starts. See
     /// [`Stage`].
@@ -79,6 +82,7 @@ pub(crate) struct ParamCx<'a> {
 /// What the parameter half produced.
 pub(crate) struct ParamHalf {
     pub ops: Vec<Op>,
+    pub custom_params: Vec<CustomParam>,
     /// One per stage, in the order they run.
     pub spans: Vec<Span>,
     /// Op index → the socket whose buffer it reads. See
@@ -111,8 +115,10 @@ impl<'a> ParamCx<'a> {
             slot_count,
             id: NodeId::MAX,
             next_reg: 0,
+            node_first_reg: 0,
             reg_of: Vec::new(),
             ops: Vec::new(),
+            custom_params: Vec::new(),
             deferred: Vec::new(),
             spans: Vec::new(),
             span_start: 0,
@@ -132,6 +138,7 @@ impl<'a> ParamCx<'a> {
     /// Says which node the calls that follow belong to.
     pub(crate) fn begin(&mut self, id: NodeId) {
         self.id = id;
+        self.node_first_reg = self.next_reg;
     }
 
     /// Ends the run of ops that execute together, and any writes it held
@@ -168,6 +175,7 @@ impl<'a> ParamCx<'a> {
             spans: self.spans,
             follows: self.follows,
             ops: self.ops,
+            custom_params: self.custom_params,
             registers: self.next_reg,
             ring_seconds: self.ring_seconds,
             outputs: self.outputs,
@@ -258,6 +266,33 @@ impl<'a> ParamCx<'a> {
 
     pub(crate) fn emit(&mut self, op: Op) {
         self.ops.push(op);
+    }
+
+    pub(crate) fn emit_custom(
+        &mut self,
+        kernel: impl ParamKernel + 'static,
+        bindings: ParamBindings,
+    ) {
+        assert!(bindings.outputs.start < bindings.outputs.end);
+        assert!(usize::from(bindings.outputs.start) >= self.node_first_reg);
+        assert_eq!(usize::from(bindings.outputs.end), self.next_reg);
+        assert!(bindings.inputs.iter().all(|input| match input {
+            Operand::Reg(reg) => *reg < bindings.outputs.start,
+            Operand::Value(_) => true,
+        }));
+        if let Some(latch) = bindings.latch {
+            assert_eq!(self.latch_nodes[latch as usize], self.id);
+        }
+        if let Some(buf) = bindings.notes {
+            assert!(buf < self.notes.bufs);
+        }
+        let index = self.custom_params.len();
+        self.custom_params.push(CustomParam {
+            node: self.id,
+            bindings,
+            kernel: Box::new(kernel),
+        });
+        self.emit(Op::Custom { index });
     }
 
     /// Emits an op that runs after every other op in the program.
@@ -551,6 +586,7 @@ pub(crate) struct AudioCx<'a> {
     pool: Pool,
     produced: Vec<Produced>,
     ops: Vec<AudioOp>,
+    custom_audio: Vec<CustomAudio>,
     deferred: Vec<AudioOp>,
     /// The runs of `ops` closed so far, and where the open one starts.
     spans: Vec<Span>,
@@ -564,7 +600,6 @@ pub(crate) struct AudioCx<'a> {
     delay_nodes: Vec<NodeId>,
     ring_seconds: Vec<f64>,
     dsp_nodes: Vec<NodeId>,
-    tremolo_nodes: Vec<NodeId>,
 
     notes: &'a Notes,
 }
@@ -593,6 +628,7 @@ impl<'a> AudioCx<'a> {
             produced: Vec::new(),
             ops: Vec::new(),
             deferred: Vec::new(),
+            custom_audio: Vec::new(),
             spans: Vec::new(),
             span_start: 0,
             held: Vec::new(),
@@ -603,7 +639,6 @@ impl<'a> AudioCx<'a> {
             delay_nodes: Vec::new(),
             ring_seconds: Vec::new(),
             dsp_nodes: Vec::new(),
-            tremolo_nodes: Vec::new(),
             notes,
         }
     }
@@ -683,27 +718,32 @@ impl<'a> AudioCx<'a> {
             sockets,
             ops: self.ops,
             spans: self.spans,
+            custom_audio: self.custom_audio,
             delay_nodes: self.delay_nodes,
             dsp_nodes: self.dsp_nodes,
-            tremolo_nodes: self.tremolo_nodes,
             ring_seconds: self.ring_seconds,
             buffers: self.pool.widths,
             latency: self.latency,
         }
     }
 
-    /// Books this node a tremolo's state, numbered after the MIDI tremolos'
-    /// because both halves share one table — see [`AudioOp::Tremolo`].
-    pub(crate) fn tremolo_state(&mut self) -> Result<u16, CompileError> {
-        let index = self.notes.tremolo_nodes.len() + self.tremolo_nodes.len();
-        if index >= MAX_TREMOLOS {
-            return Err(CompileError::TooLarge {
-                what: "tremolos",
-                limit: MAX_TREMOLOS,
-            });
-        }
-        self.tremolo_nodes.push(self.id);
-        Ok(index as u16)
+    pub(crate) fn custom<K: AudioKernel>(&mut self, kernel: K) -> usize {
+        assert!(!self.custom_audio.iter().any(|entry| entry.node == self.id));
+        let index = self.custom_audio.len();
+        self.custom_audio.push(CustomAudio::new(self.id, kernel));
+        index
+    }
+
+    pub(crate) fn emit_custom(&mut self, index: usize, a: Buf, out: Buf, notes: Option<NoteBuf>) {
+        assert_eq!(self.custom_audio[index].node, self.id);
+        assert_eq!(self.pool.widths[a as usize], self.pool.widths[out as usize]);
+        assert!(notes.is_none_or(|buf| buf < self.notes.bufs));
+        self.emit(AudioOp::Custom {
+            out,
+            a,
+            notes,
+            index,
+        });
     }
 
     /// Books this node a DSP state, which survives a program swap — see

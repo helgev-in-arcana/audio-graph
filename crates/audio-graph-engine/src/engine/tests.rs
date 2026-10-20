@@ -4317,6 +4317,8 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     engine.prepare(128, &[2]);
     let handoff = Handoff::new();
     handoff.send(Box::new(PreparedProgram {
+        custom_audio: Vec::new(),
+        custom_notes: Vec::new(),
         fallback_destinations: Vec::new(),
         program,
         publication: 0,
@@ -4343,6 +4345,8 @@ fn a_longer_max_time_gets_a_longer_ring_and_keeps_what_was_in_it() {
     );
     let handoff = Handoff::new();
     handoff.send(Box::new(PreparedProgram {
+        custom_audio: Vec::new(),
+        custom_notes: Vec::new(),
         fallback_destinations: Vec::new(),
         program: wider,
         publication: 0,
@@ -5558,4 +5562,882 @@ fn only_an_explicit_reset_stops_a_latched_tremolo() {
         &in_blocks(&[note_on(60, 0), note_off(60, 1000)], 20),
     );
     assert_eq!(notes_only(&heard), vec![(0, "on", 60), (1000, "off", 60)]);
+}
+
+mod key_param_characterization {
+    use super::*;
+
+    fn patch(mode: KeyParamMode, keys: Vec<u8>, values: Vec<f64>) -> (Graph, NodeId) {
+        let mut graph = Graph::new();
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let key = graph.add(
+            NodeKind::KeyParam(KeyParam {
+                mode,
+                keys,
+                values,
+                mute_keys: true,
+            }),
+            [0.0, 0.0],
+        );
+        let out = param_sink(&mut graph);
+        graph.connect(notes, 0, key, 0);
+        graph.connect(key, 0, out, 0);
+        (graph, key)
+    }
+
+    /// A one-value key bank preserves every upstream parameter row even when
+    /// its note input is gated in a later audio-dependent stage.
+    #[test]
+    fn a_single_wired_value_keeps_its_rows_across_a_note_stage_boundary() {
+        let (mut graph, key) = patch(KeyParamMode::Select, vec![24], vec![0.0]);
+        let notes = graph.source_of(key, 0).unwrap().0;
+        let audio = graph.add(
+            NodeKind::AudioIn(AudioIn {
+                bus: 0,
+                channels: 2,
+            }),
+            [0.0; 2],
+        );
+        let follower = graph.add(
+            NodeKind::EnvelopeFollower(EnvelopeFollower::default()),
+            [0.0; 2],
+        );
+        let gate = graph.add(
+            NodeKind::NoteGate(NoteGate {
+                threshold: 0.5,
+                invert: false,
+            }),
+            [0.0; 2],
+        );
+        let lfo = graph.add(
+            NodeKind::Lfo(Lfo {
+                waveform: Waveform::Saw,
+                rate: Rate::Hz(RATE / 64.0),
+                phase: 0.0,
+                depth: 0.5,
+                offset: 0.5,
+            }),
+            [0.0; 2],
+        );
+        graph.connect(audio, 0, follower, 0);
+        graph.connect(follower, 0, gate, 1);
+        graph.connect(notes, 0, gate, 0);
+        graph.connect(gate, 0, key, 0);
+        graph.connect(lfo, 0, key, 1);
+
+        let mut engine = Engine::new();
+        engine.prepare(64, &[2]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.stages(), 2);
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, 64, 16).unwrap();
+        engine.run_block(
+            &mut schedule,
+            &[],
+            &[],
+            64,
+            Granularity {
+                resolution: 16,
+                quantum: 32,
+            },
+            RATE,
+            120.0,
+            &[0.0; 128],
+            &mut [0.0; 128],
+            &mut Adders,
+        );
+        let values: Vec<_> = (0..4).map(|row| schedule.row(row)[SINK]).collect();
+        assert_eq!(values, [0.0, 0.25, 0.5, 0.75]);
+    }
+
+    /// A single wired row still records key selection, so regrowing the bank
+    /// cannot revive a position selected before that key was struck.
+    #[test]
+    fn a_single_wired_value_still_updates_the_latch_before_regrowing() {
+        let (mut graph, key) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 26, 27],
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+        let bank = graph.node(key).unwrap().kind.clone();
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0; 2]);
+        graph.connect(signal, 0, key, 1);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+        slots[3] = 0.65;
+        keyboard.pending.push(note_on(27, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.4);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.keys.truncate(1);
+        settings.values.truncate(1);
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 3.0);
+        keyboard.pending.push(note_on(24, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 0.0);
+
+        graph.node_mut(key).unwrap().kind = bank;
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+        assert_eq!(engine.latches[0].value, 0.0);
+    }
+
+    /// The last matching socket wins within a row, including duplicate keys;
+    /// keys outside the MIDI mask never choose a socket.
+    #[test]
+    fn simultaneous_key_strikes_use_socket_order() {
+        let (graph, _) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 24, 128, 255],
+            vec![0.1, 0.2, 0.3, 0.4, 0.5],
+        );
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        for strikes in [[24, 25, 128, 255], [25, 24, 255, 128]] {
+            keyboard.pending.extend(
+                strikes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, key)| note_on(key, offset as u32)),
+            );
+            keyboard.run(&mut engine, 8, &mut slots);
+            assert_eq!(slots[SINK], 0.3);
+        }
+
+        keyboard.pending.extend([note_on(128, 0), note_on(255, 1)]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.3);
+    }
+
+    /// Toggle advances once per row from its first key, regardless of how
+    /// many times that key or the other configured keys are struck.
+    #[test]
+    fn toggle_uses_only_the_first_key_and_steps_once_per_row() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![24, 25, 26], vec![0.1, 0.2, 0.3]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        keyboard.pending.extend([note_on(25, 0), note_on(26, 1)]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.1);
+        assert!(engine.latches[0].value.is_nan());
+
+        keyboard.pending.extend([
+            note_on(24, 0),
+            note_on(24, 1),
+            note_on(25, 2),
+            note_on(26, 3),
+        ]);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+    }
+
+    /// A configured value socket with no stored fallback reads zero.
+    #[test]
+    fn missing_key_values_default_to_zero() {
+        let (graph, _) = patch(KeyParamMode::Select, vec![24, 25, 26], vec![0.25]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.25);
+        keyboard.pending.push(note_on(26, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.0);
+    }
+
+    /// Shrinking the bank clamps the chosen output but preserves the raw
+    /// position for a subsequent mode change and toggle.
+    #[test]
+    fn recompiling_a_smaller_bank_preserves_the_raw_position() {
+        let (mut graph, key) = patch(
+            KeyParamMode::Select,
+            vec![24, 25, 26, 27],
+            vec![0.1, 0.2, 0.3, 0.4],
+        );
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        let mut slots = lanes();
+        keyboard.pending.push(note_on(27, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.4);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.keys.truncate(3);
+        settings.values.truncate(3);
+        load(&mut engine, &graph);
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.3);
+        assert_eq!(engine.latches[0].value, 3.0);
+
+        let NodeKind::KeyParam(settings) = &mut graph.node_mut(key).unwrap().kind else {
+            unreachable!()
+        };
+        settings.mode = KeyParamMode::Toggle;
+        load(&mut engine, &graph);
+        keyboard.pending.push(note_on(24, 0));
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+    }
+
+    /// An end-row read predicts the pending toggle without consuming its
+    /// strike or changing the latch and published register values.
+    #[test]
+    fn reading_the_end_row_does_not_consume_a_pending_toggle() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![24, 25], vec![0.2, 0.8]);
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        engine.begin_block(&[note_on(24, 7)]);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.2);
+        assert!(engine.latches[0].value.is_nan());
+        let registers = engine.registers.clone();
+
+        let end = BlockContext {
+            offset: 8,
+            row: 1,
+            frames: 0,
+            ..ctx(8)
+        };
+        for _ in 0..2 {
+            engine.run_stage_end(0, &end, &mut slots);
+            assert_eq!(slots[SINK], 0.8);
+            assert!(engine.latches[0].value.is_nan());
+            assert_eq!(engine.registers, registers);
+        }
+
+        engine.begin_block(&[]);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+        assert_eq!(engine.latches[0].value, 1.0);
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.8);
+    }
+
+    /// A key parameter without notes aliases its first wired input and
+    /// allocates no latch.
+    #[test]
+    fn no_notes_preserves_the_first_inputs_register_alias() {
+        let (mut graph, key) = patch(KeyParamMode::Select, vec![24, 25], vec![0.2, 0.8]);
+        graph.disconnect(key, 0);
+        let signal = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0, 0.0]);
+        graph.connect(signal, 0, key, 1);
+        let program = compile(&graph, SLOTS).unwrap();
+        let output = |node| {
+            program
+                .output_registers()
+                .iter()
+                .find_map(|&(socket, register)| (socket == (node, 0)).then_some(register))
+                .unwrap()
+        };
+        assert_eq!(output(key), output(signal));
+        assert!(program.latch_nodes.is_empty());
+
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut slots = lanes();
+        slots[3] = 0.65;
+        engine.run(&ctx(8), &mut slots);
+        assert_eq!(slots[SINK], 0.65);
+    }
+
+    /// An empty key bank emits zero even when notes and stored values exist.
+    #[test]
+    fn an_empty_key_bank_needs_no_latch() {
+        let (graph, _) = patch(KeyParamMode::Toggle, vec![], vec![0.9]);
+        let program = compile(&graph, SLOTS).unwrap();
+        assert!(program.latch_nodes.is_empty());
+        let mut engine = Engine::new();
+        load(&mut engine, &graph);
+        let mut keyboard = Keyboard::default();
+        keyboard.pending.push(note_on(24, 0));
+        let mut slots = lanes();
+        keyboard.run(&mut engine, 8, &mut slots);
+        assert_eq!(slots[SINK], 0.0);
+    }
+}
+
+mod audio_note_characterization {
+    use super::*;
+
+    fn audio_patch(fanout: bool) -> Graph {
+        let mut graph = Graph::new();
+        let input = stereo_in(&mut graph);
+        let notes = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+        let cut = graph.add(
+            NodeKind::AudioTremolo(crate::nodes::AudioTremolo {
+                channels: 2,
+                keys: tremolo_keys(KeySwitchMode::Select),
+                fade_in_ms: 2.0,
+                fade_out_ms: 3.0,
+            }),
+            [0.0, 0.0],
+        );
+        graph.connect(input, 0, cut, 0);
+        graph.connect(notes, 0, cut, 1);
+        let out = stereo_out(&mut graph);
+        if fanout {
+            let mix = graph.add(
+                NodeKind::Mix(Mix {
+                    channels: 2,
+                    inputs: 2,
+                    gains: vec![0.0, -100.0],
+                }),
+                [0.0, 0.0],
+            );
+            graph.connect(cut, 0, mix, 0);
+            graph.connect(input, 0, mix, 2);
+            graph.connect(mix, 0, out, 0);
+        } else {
+            graph.connect(cut, 0, out, 0);
+        }
+        graph
+    }
+
+    fn audio_program(graph: &Graph, subblocks: bool) -> Program {
+        let mut program = compile(graph, SLOTS).unwrap();
+        if subblocks {
+            for stage in &mut program.stages {
+                stage.chunking = Chunking::SubBlock;
+            }
+        }
+        program
+    }
+
+    fn render(engine: &mut Engine, mut start: u32, lengths: &[u32], events: &[Event]) -> Vec<f32> {
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, 96, 16).unwrap();
+        let mut rendered = Vec::new();
+        for &frames in lengths {
+            let notes: Vec<_> = events
+                .iter()
+                .filter(|event| (start..start + frames).contains(&event.sample_offset()))
+                .map(|event| event.at_offset(event.sample_offset() - start))
+                .collect();
+            let input: Vec<_> = (0..2)
+                .flat_map(|channel| {
+                    (0..frames).map(move |i| {
+                        (1 + (start + i) % 29) as f32 / 29.0 * if channel == 0 { 1.0 } else { -0.5 }
+                    })
+                })
+                .collect();
+            let mut output = vec![0.0; input.len()];
+            engine.run_block(
+                &mut schedule,
+                &[],
+                &notes,
+                frames,
+                Granularity {
+                    resolution: 16,
+                    quantum: 32,
+                },
+                RATE,
+                120.0,
+                &input,
+                &mut output,
+                &mut subhost_adapter::NoInstances,
+            );
+            engine.end_block([], &mut Vec::with_capacity(MAX_LIVE_NOTES));
+            rendered.extend(output);
+            start += frames;
+        }
+        rendered
+    }
+
+    /// Buffer reuse and partial sub-blocks preserve both channels and sample-accurate tremolo keys.
+    #[test]
+    fn an_audio_tremolo_sounds_the_same_with_shared_or_reused_input() {
+        let events = [
+            note_on(24, 13),
+            note_off(24, 31),
+            note_on(24, 777),
+            note_on(23, 1511),
+        ];
+        let lengths: Vec<_> = [47, 64, 19, 96].repeat(8);
+        let mut expected = None;
+        for (fanout, subblocks) in [(false, false), (false, true), (true, true)] {
+            let graph = audio_patch(fanout);
+            let program = audio_program(&graph, subblocks);
+            assert_eq!(program.buffers.len(), if fanout { 2 } else { 1 });
+            let publisher = crate::ProgramPublisher::default();
+            publisher.publish(program, RATE);
+            let mut engine = Engine::new();
+            engine.prepare(96, &[2]);
+            assert!(engine.adopt(&publisher));
+            let rendered = render(&mut engine, 0, &lengths, &events);
+            assert!(rendered.contains(&0.0), "the pattern reaches a full cut");
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &rendered, expected,
+                    "fanout={fanout}, subblocks={subblocks}"
+                );
+            } else {
+                expected = Some(rendered);
+            }
+        }
+    }
+
+    /// Coalesced publications retain an audio tremolo's clock and unfinished fade; reset clears both.
+    #[test]
+    fn an_audio_tremolos_fade_survives_publication_and_ends_on_reset() {
+        let graph = audio_patch(false);
+        let events = [note_on(24, 13), note_off(24, 31)];
+        let mut expected = None;
+        for swap in [false, true] {
+            let publisher = crate::ProgramPublisher::default();
+            publisher.publish(audio_program(&graph, true), RATE);
+            let mut engine = Engine::new();
+            engine.prepare(96, &[2]);
+            assert!(engine.adopt(&publisher));
+            let mut rendered = render(&mut engine, 0, &[64; 7], &events);
+            if swap {
+                publisher.publish(audio_program(&graph, true), RATE);
+                let newest = publisher.publish(audio_program(&graph, true), RATE);
+                assert!(engine.adopt(&publisher));
+                assert_eq!(engine.publication(), newest);
+            }
+            rendered.extend(render(&mut engine, 448, &[47, 64, 19, 96, 64, 64], &[]));
+            if let Some(expected) = &expected {
+                assert_eq!(&rendered, expected);
+            } else {
+                expected = Some(rendered);
+            }
+            engine.reset_everything(&mut Vec::with_capacity(MAX_LIVE_NOTES));
+            let reset = render(&mut engine, 0, &[64; 16], &[]);
+            let mut fresh = Engine::new();
+            fresh.prepare(96, &[2]);
+            load(&mut fresh, &graph);
+            assert_eq!(reset, render(&mut fresh, 0, &[64; 16], &[]));
+        }
+    }
+
+    /// Disconnecting an audio input silences the output and pauses the tremolo's clock and unfinished fade.
+    #[test]
+    fn an_audio_tremolo_resumes_its_clock_after_reconnecting_audio() {
+        let mut graph = audio_patch(false);
+        let cut = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::AudioTremolo(_)))
+            .unwrap()
+            .id;
+        let (input, port) = graph.source_of(cut, 0).unwrap();
+        let mut reference = Engine::new();
+        let mut disconnected = Engine::new();
+        for engine in [&mut reference, &mut disconnected] {
+            engine.prepare(96, &[2]);
+            load(engine, &graph);
+            render(engine, 0, &[64; 7], &[note_on(24, 13), note_off(24, 31)]);
+        }
+
+        graph.disconnect(cut, 0);
+        let program = compile(&graph, SLOTS).unwrap();
+        assert_eq!(program.custom_audio.len(), 1);
+        assert!(
+            !program
+                .audio_ops
+                .iter()
+                .any(|op| matches!(op, AudioOp::Custom { .. }))
+        );
+        load(&mut disconnected, &graph);
+        assert!(
+            render(&mut disconnected, 448, &[64], &[])
+                .iter()
+                .all(|&sample| sample == 0.0)
+        );
+
+        graph.connect(input, port, cut, 0);
+        load(&mut disconnected, &graph);
+        let expected = render(&mut reference, 512, &[64; 16], &[]);
+        assert!(expected.contains(&0.0), "the retained pattern is active");
+        assert!(
+            expected.iter().any(|&sample| sample != 0.0),
+            "the retained pattern also opens the gate"
+        );
+        assert_eq!(
+            render(&mut disconnected, 512, &[64; 16], &[]),
+            expected,
+            "the disconnected interval does not advance the clock or reset the fade"
+        );
+    }
+
+    /// A wired delay time is read anew each row, overrides the setting, and floors negative seconds at zero.
+    #[test]
+    fn a_midi_delay_uses_each_rows_wired_time() {
+        const FRAMES: u32 = 256;
+        const RESOLUTION: u32 = 32;
+        let mut graph = delayed_synth(1.0, false);
+        let delay = graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::MidiDelay(_)))
+            .unwrap()
+            .id;
+        let time = graph.add(NodeKind::SlotIn(SlotIn { slot: 0 }), [0.0, 0.0]);
+        graph.connect(time, 0, delay, 1);
+        let program = compile(&graph, SLOTS).unwrap();
+        let time_lane = program.custom_notes[0].parameters[0].lane.unwrap() as usize;
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut schedule = SlotSchedule::new(width, FRAMES, RESOLUTION).unwrap();
+        schedule.begin(FRAMES).unwrap();
+        schedule.fill(&[0.0; SLOTS]);
+        let mut engine = Engine::new();
+        engine.prepare(FRAMES, &[]);
+        load(&mut engine, &graph);
+        assert_eq!(engine.stages(), 1);
+        engine.begin_block(&[
+            note_on(60, 0),
+            note_off(60, 4),
+            note_on(62, 32),
+            note_off(62, 36),
+            note_on(64, 160),
+            note_off(64, 164),
+        ]);
+        for (row, time) in [-0.5, 0.002, 0.0, 0.0, 0.0, 0.001, 0.0, 0.0]
+            .into_iter()
+            .enumerate()
+        {
+            let slots = schedule.row_mut(row);
+            slots[0] = time;
+            engine.run(
+                &BlockContext {
+                    frames: RESOLUTION,
+                    offset: row as u32 * RESOLUTION,
+                    row: row as u32,
+                    block: FRAMES,
+                    ..ctx(RESOLUTION)
+                },
+                slots,
+            );
+            assert_eq!(slots[time_lane], time, "the lane retains physical units");
+        }
+        let mut heard = Heard::default();
+        engine.run_audio(
+            &AudioContext {
+                frames: FRAMES,
+                quantum: RESOLUTION,
+                resolution: RESOLUTION,
+                lanes: schedule.rows(),
+                lanes_per_row: width,
+                ..audio_ctx(FRAMES)
+            },
+            &[],
+            &mut [0.0; 2 * FRAMES as usize],
+            &mut heard,
+        );
+        let events: Vec<_> = heard.0[&0]
+            .iter()
+            .map(|&event| (event.sample_offset() as usize, event))
+            .collect();
+        assert_eq!(
+            notes_only(&events),
+            [
+                (0, "on", 60),
+                (4, "off", 60),
+                (128, "on", 62),
+                (132, "off", 62),
+                (208, "on", 64),
+                (212, "off", 64),
+            ]
+        );
+        assert_eq!(engine.notes_dropped(), 0);
+    }
+
+    /// Delayed notes update followers on the next row and retain held keys when recompilation renumbers their stream.
+    #[test]
+    fn delayed_note_followers_survive_stream_remapping() {
+        const FRAMES: u32 = 128;
+        const RESOLUTION: u32 = 32;
+        for what in [Follow::Gate, Follow::HeldKeys] {
+            let mut graph = Graph::new();
+            let input = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+            let delay = midi_delay(&mut graph, seconds(64.0), false);
+            let follow = graph.add(NodeKind::NoteFollow(NoteFollow { what }), [0.0, 0.0]);
+            let scale = if what == Follow::HeldKeys { 8.0 } else { 1.0 };
+            let map = graph.add(
+                NodeKind::RangeMap(RangeMap {
+                    in_lo: 0.0,
+                    in_hi: scale,
+                    out_lo: 0.0,
+                    out_hi: 1.0,
+                    clamp: true,
+                }),
+                [0.0, 0.0],
+            );
+            let sink = param_sink(&mut graph);
+            graph.connect(input, 0, delay, 0);
+            graph.connect(delay, 0, follow, 0);
+            graph.connect(follow, 0, map, 0);
+            graph.connect(map, 0, sink, 0);
+            let stream_index = |program: &Program| {
+                program
+                    .note_streams
+                    .iter()
+                    .position(|stream| stream.node == delay && stream.port == 0)
+                    .unwrap()
+            };
+            let original_stream = stream_index(&compile(&graph, SLOTS).unwrap());
+            let mut engine = Engine::new();
+            engine.prepare(FRAMES, &[]);
+            load(&mut engine, &graph);
+            let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+            let mut schedule = SlotSchedule::new(width, FRAMES, RESOLUTION).unwrap();
+            let mut run = |engine: &mut Engine, events: &[Event]| {
+                engine.run_block(
+                    &mut schedule,
+                    &[],
+                    events,
+                    FRAMES,
+                    Granularity {
+                        resolution: RESOLUTION,
+                        quantum: RESOLUTION,
+                    },
+                    RATE,
+                    120.0,
+                    &[],
+                    &mut [],
+                    &mut subhost_adapter::NoInstances,
+                );
+                engine.end_block([], &mut Vec::with_capacity(MAX_LIVE_NOTES));
+                (0..schedule.row_count())
+                    .map(|row| schedule.row(row)[SINK] * scale)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                run(&mut engine, &[note_on(60, 0), note_on(64, 32)]),
+                [0.0, 0.0, 0.0, 1.0],
+                "{what:?}: each delayed event is visible at the following row boundary"
+            );
+
+            let other_input = graph.add(NodeKind::NoteIn, [0.0, 0.0]);
+            let other_follow = graph.add(
+                NodeKind::NoteFollow(NoteFollow { what: Follow::Gate }),
+                [0.0, 0.0],
+            );
+            graph.connect(other_input, 0, other_follow, 0);
+            graph.node_mut(other_follow).unwrap().always_on = true;
+            graph.nodes.rotate_right(2);
+            let next = compile(&graph, SLOTS).unwrap();
+            assert_ne!(stream_index(&next), original_stream);
+            load(&mut engine, &graph);
+            let held = if what == Follow::HeldKeys { 2.0 } else { 1.0 };
+            assert_eq!(
+                run(&mut engine, &[note_off(60, 0), note_off(64, 32)]),
+                [held, held, held, 1.0],
+                "{what:?}: recompilation preserves the stream until its delayed releases arrive"
+            );
+            assert_eq!(run(&mut engine, &[]), [0.0; 4]);
+            assert_eq!(engine.notes_dropped(), 0);
+        }
+    }
+
+    /// Replaced pending programs cannot discard a running delay's queued events or note ownership.
+    #[test]
+    fn coalesced_delay_publications_preserve_notes_in_flight() {
+        let publisher = crate::ProgramPublisher::default();
+        publisher.publish(compile(&delayed_synth(0.002, false), SLOTS).unwrap(), RATE);
+        let mut engine = Engine::new();
+        engine.prepare(64, &[]);
+        assert!(engine.adopt(&publisher));
+        let (heard, reports) =
+            hear_blocks(&mut engine, 0, &[vec![note_on(60, 10), note_off(60, 20)]]);
+        assert!(heard.is_empty());
+        assert!(reports[0].is_empty());
+        publisher.publish(compile(&delayed_synth(0.0, false), SLOTS).unwrap(), RATE);
+        let newest = publisher.publish(compile(&delayed_synth(0.01, false), SLOTS).unwrap(), RATE);
+        assert!(engine.adopt(&publisher));
+        assert_eq!(engine.publication(), newest);
+        let (heard, reports) = hear_blocks(&mut engine, 1, &[vec![], vec![]]);
+        assert_eq!(notes_only(&heard), [(106, "on", 60), (116, "off", 60)]);
+        assert!(reports.iter().all(Vec::is_empty));
+        let finished = Event::Note(NoteEvent::NoteEnd {
+            note_id: named(&heard[0].1),
+            port: 0,
+            channel: 0,
+            key: 60,
+            sample_offset: 0,
+        });
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        engine.end_block([&finished], &mut ended);
+        assert_eq!(ended.iter().map(|note| note.key).collect::<Vec<_>>(), [60]);
+    }
+
+    /// Pending deadlines survive tempo and block-size changes, and an emptied queue starts a fresh timing epoch.
+    #[test]
+    fn a_midi_delay_keeps_absolute_times_across_variable_rows_and_idle_gaps() {
+        let mut engine = Engine::new();
+        engine.prepare(96, &[]);
+        load(&mut engine, &delayed_synth(1.0 / 64.0, true));
+        let events = [
+            note_on(60, 13),
+            note_off(60, 50),
+            note_on(62, 65),
+            note_off(62, 199),
+            note_on(64, 718),
+            note_off(64, 720),
+        ];
+        let blocks = [
+            (47, 16, 120.0),
+            (19, 7, 240.0),
+            (96, 32, 90.0),
+            (65, 17, 90.0),
+            (31, 9, 300.0),
+            (96, 1, 60.0),
+            (47, 32, 120.0),
+            (19, 7, 120.0),
+            (96, 17, 120.0),
+            (96, 32, 120.0),
+            (88, 15, 120.0),
+            (13, 5, 120.0),
+            (47, 16, 120.0),
+            (96, 32, 120.0),
+            (96, 7, 120.0),
+            (96, 19, 120.0),
+            (96, 32, 120.0),
+        ];
+        let width = SLOTS + crate::ir::MAX_GRAPH_PARAMS + crate::ir::MAX_AUDIO_LANES;
+        let mut start = 0;
+        let mut heard_at = Vec::new();
+        let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+        for (frames, resolution, tempo) in blocks {
+            let notes: Vec<_> = events
+                .iter()
+                .filter(|event| (start..start + frames).contains(&event.sample_offset()))
+                .map(|event| event.at_offset(event.sample_offset() - start))
+                .collect();
+            let mut schedule = SlotSchedule::new(width, 96, resolution).unwrap();
+            let mut heard = Heard::default();
+            engine.run_block(
+                &mut schedule,
+                &[],
+                &notes,
+                frames,
+                Granularity {
+                    resolution,
+                    quantum: 32,
+                },
+                RATE,
+                tempo,
+                &[],
+                &mut vec![0.0; frames as usize * 2],
+                &mut heard,
+            );
+            engine.end_block([], &mut ended);
+            assert!(
+                ended.is_empty(),
+                "notes remain owned while waiting or sounding"
+            );
+            for event in heard.0.get(&0).into_iter().flatten() {
+                heard_at.push(((start + event.sample_offset()) as usize, *event));
+            }
+            start += frames;
+        }
+        assert_eq!(
+            notes_only(&heard_at),
+            [
+                (388, "on", 60),
+                (388, "off", 60),
+                (388, "on", 62),
+                (699, "off", 62),
+                (1093, "on", 64),
+                (1095, "off", 64),
+            ]
+        );
+        let finished: Vec<_> = heard_at
+            .iter()
+            .filter_map(|(_, event)| {
+                let Event::Note(NoteEvent::NoteOn { note_id, key, .. }) = *event else {
+                    return None;
+                };
+                Some(Event::Note(NoteEvent::NoteEnd {
+                    note_id,
+                    port: 0,
+                    channel: 0,
+                    key,
+                    sample_offset: 0,
+                }))
+            })
+            .collect();
+        engine.end_block(&finished, &mut ended);
+        assert_eq!(
+            ended.iter().map(|note| note.key).collect::<Vec<_>>(),
+            [60, 62, 64]
+        );
+        assert_eq!(engine.notes_dropped(), 0);
+    }
+
+    /// Full delay queues count drops without retaining rejected notes, and removal or reset releases accepted notes.
+    #[test]
+    fn a_full_delay_releases_its_notes_on_removal_or_reset() {
+        for remove in [false, true] {
+            let mut graph = delayed_synth(1.0, false);
+            let delay = graph
+                .nodes
+                .iter()
+                .find(|node| matches!(node.kind, NodeKind::MidiDelay(_)))
+                .unwrap()
+                .id;
+            let mut engine = Engine::new();
+            engine.prepare(64, &[]);
+            load(&mut engine, &graph);
+            let controller = Event::Note(NoteEvent::Cc {
+                port: 0,
+                channel: 0,
+                cc: 1,
+                value: 0.5,
+                sample_offset: 0,
+            });
+            let mut events = vec![controller; crate::ir::NOTE_BUF_CAPACITY - 1];
+            events.push(note_on(60, 0));
+            let (heard, reports) = hear_blocks(&mut engine, 0, &[events]);
+            assert!(heard.is_empty());
+            assert!(reports[0].is_empty());
+            let (heard, reports) =
+                hear_blocks(&mut engine, 1, &[vec![note_on(62, 0), note_off(60, 1)]]);
+            assert!(heard.is_empty());
+            assert_eq!(engine.notes_dropped(), 2);
+            assert_eq!(
+                reports[0].iter().map(|note| note.key).collect::<Vec<_>>(),
+                [62]
+            );
+            let mut ended = Vec::with_capacity(MAX_LIVE_NOTES);
+            if remove {
+                graph.remove(delay);
+                load(&mut engine, &graph);
+                engine.end_block([], &mut ended);
+            } else {
+                engine.reset_everything(&mut ended);
+            }
+            assert_eq!(ended.iter().map(|note| note.key).collect::<Vec<_>>(), [60]);
+            let (heard, reports) = hear_blocks(&mut engine, 2, &vec![vec![]; 752]);
+            assert!(heard.is_empty(), "discarded events never come out later");
+            assert!(
+                reports.iter().all(Vec::is_empty),
+                "each note ends only once"
+            );
+        }
+    }
 }

@@ -140,6 +140,24 @@ impl Engine {
 
         for op in &program.ops[stage.params.range()] {
             match *op {
+                Op::Custom { index } => {
+                    let custom = &program.custom_params[index];
+                    debug_assert!(custom.bindings.latch.is_none_or(|state| {
+                        self.latches[state as usize].node() == custom.node
+                    }));
+                    debug_assert!(
+                        custom
+                            .bindings
+                            .notes
+                            .is_none_or(|buf| buf < program.note_bufs)
+                    );
+                    custom.kernel.eval(&mut ParamEvalContext::new(
+                        &custom.bindings,
+                        &mut self.registers,
+                        &mut self.latches,
+                        &self.notes.bufs,
+                    ));
+                }
                 Op::DelayRead {
                     out,
                     line,

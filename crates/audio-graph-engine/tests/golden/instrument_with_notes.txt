@@ -1,5 +1,6 @@
 Program {
     ops: [],
+    custom_params: [],
     registers: 0,
     outputs: [],
     audio_lines: Rings {
@@ -35,12 +36,14 @@ Program {
             bus: 0,
         },
     ],
+    custom_audio: [],
     note_ops: [
         Input {
             out: 0,
             bus: 0,
         },
     ],
+    custom_notes: [],
     note_bufs: 1,
     note_streams: [
         NoteStream {
@@ -93,7 +96,6 @@ Program {
     latch_nodes: [],
     lfo_nodes: [],
     dsp_nodes: [],
-    note_delay_nodes: [],
     tremolo_nodes: [],
     output_registers: [],
 }

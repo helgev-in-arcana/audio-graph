@@ -1,9 +1,13 @@
+use plugin_host::{Event, NoteEvent};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
-use crate::compile::{CompileError, ParamCx};
+use crate::compile::{CompileError, NoteCx, ParamCx};
+use crate::engine::NoteEvalContext;
+use crate::ir::{KernelState, NOTE_BUF_CAPACITY, NoteKernel, NoteOwnership, ResetReason};
 #[cfg(feature = "ui")]
 use crate::nodes::widgets::{NodeUi, beats_control, decimals, fallback};
-use crate::nodes::{Beats, Node, NoteDelay};
+use crate::nodes::{Beats, Node};
 use crate::port::{Port, PortType};
 
 /// Holds a note stream back by a time, in seconds or in beats of the host's
@@ -14,9 +18,8 @@ use crate::port::{Port, PortType};
 /// delay beside the first and a merge after them.
 ///
 /// Everything in the stream waits the same, controllers included, so a pedal
-/// stays with the notes it was pressed under. See
-/// [`NoteOp::Delay`][crate::ir::NoteOp::Delay] for what happens when the time
-/// changes with notes in flight.
+/// stays with the notes it was pressed under. Shortening the time never lets
+/// an event overtake one already waiting, keeping a note-off behind its note-on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MidiDelay {
     /// The time while `sync` is off.
@@ -47,17 +50,23 @@ impl Node for MidiDelay {
         Ok(())
     }
 
-    fn note_delay(&self, port: u8) -> Option<NoteDelay> {
-        (port == 0).then_some(NoteDelay {
-            input: 0,
-            time_input: 1,
-            time: if self.sync {
+    fn compile_note(&self, port: u8, cx: &mut NoteCx) -> Result<bool, CompileError> {
+        if port != 0 {
+            return Ok(false);
+        }
+        if let Some(input) = cx.input(0) {
+            let time = if self.sync {
                 self.beats.value()
             } else {
                 self.seconds
-            },
-            beats: self.sync,
-        })
+            };
+            cx.emit_custom(
+                input,
+                &[(1, time.max(0.0))],
+                DelayKernel { beats: self.sync },
+            )?;
+        }
+        Ok(true)
     }
 
     #[cfg(feature = "ui")]
@@ -121,6 +130,116 @@ impl Node for MidiDelay {
             self.seconds = shown;
         }
         changed
+    }
+}
+
+/// A buffer's worth of events bounds memory while notes wait across blocks.
+const QUEUE_CAPACITY: usize = NOTE_BUF_CAPACITY;
+
+#[derive(Debug)]
+struct DelayKernel {
+    beats: bool,
+}
+
+/// Queued note-ons retain ledger ownership until delivery or node removal,
+/// so a block without downstream delivery cannot end a note still in flight.
+#[derive(Debug)]
+struct DelayState {
+    queue: VecDeque<(u64, Event)>,
+    /// Absolute deadlines avoid visiting every waiting event on every row.
+    clock: u64,
+    last: u64,
+}
+
+impl KernelState for DelayState {
+    fn reset(&mut self, _reason: ResetReason) {
+        self.queue.clear();
+        self.clock = 0;
+        self.last = 0;
+    }
+
+    fn release(&mut self, notes: &mut NoteOwnership<'_>) {
+        for (_, event) in self.queue.drain(..) {
+            if let Event::Note(NoteEvent::NoteOn {
+                note_id: Some(id), ..
+            }) = event
+            {
+                notes.release(id);
+            }
+        }
+        self.clock = 0;
+        self.last = 0;
+    }
+}
+
+impl NoteKernel for DelayKernel {
+    type State = DelayState;
+
+    fn create_state(&self) -> Self::State {
+        DelayState {
+            queue: VecDeque::with_capacity(QUEUE_CAPACITY),
+            clock: 0,
+            last: 0,
+        }
+    }
+
+    fn eval(&self, state: &mut Self::State, cx: &mut NoteEvalContext<'_>) {
+        if state.queue.is_empty() {
+            if cx.input.is_empty() {
+                return;
+            }
+            // With no deadlines outstanding, a fresh epoch keeps idle time
+            // from consuming the clock's range.
+            state.clock = 0;
+            state.last = 0;
+        }
+
+        if !cx.input.is_empty() {
+            let amount = cx.parameter(0).max(0.0);
+            let seconds = if self.beats {
+                amount * 60.0 / cx.tempo().max(1.0)
+            } else {
+                amount
+            };
+            let delay = (seconds * cx.sample_rate().max(0.0)).round() as u64;
+
+            for &event in cx.input {
+                if state.queue.len() == QUEUE_CAPACITY {
+                    cx.output.drop_event();
+                    continue;
+                }
+                let due = state
+                    .clock
+                    .saturating_add(u64::from(event.sample_offset().saturating_sub(cx.start())))
+                    .saturating_add(delay)
+                    .max(state.last);
+                if let Event::Note(NoteEvent::NoteOn {
+                    note_id: Some(id), ..
+                }) = event
+                {
+                    cx.notes.retain(id);
+                }
+                state.queue.push_back((due, event));
+                state.last = due;
+            }
+        }
+
+        let end = state.clock.saturating_add(u64::from(cx.frames()));
+        while let Some(&(due, event)) = state.queue.front() {
+            if due >= end {
+                break;
+            }
+            state.queue.pop_front();
+            if let Event::Note(NoteEvent::NoteOn {
+                note_id: Some(id), ..
+            }) = event
+            {
+                cx.notes.release(id);
+            }
+            cx.output
+                .push(event.at_offset(cx.start() + (due - state.clock) as u32));
+        }
+        state.clock = end;
     }
 }
 

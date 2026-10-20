@@ -23,6 +23,109 @@ fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
 }
 
+/// Custom settings and local bindings remain visible beside their core inputs.
+#[test]
+fn key_param_with_a_live_value() {
+    use audio_graph_engine::{KeyParam, KeyParamMode};
+
+    let mut graph = Graph::new();
+    let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let value = graph.add(NodeKind::SlotIn(SlotIn { slot: 3 }), [0.0; 2]);
+    let key = graph.add(
+        NodeKind::KeyParam(KeyParam {
+            mode: KeyParamMode::Select,
+            keys: vec![24, 25, 26],
+            values: vec![0.1, 0.5, 0.9],
+            mute_keys: true,
+        }),
+        [0.0; 2],
+    );
+    let sink = graph.add(stereo_plugin(0, 0), [0.0; 2]);
+    graph.node_mut(sink).unwrap().always_on = true;
+    graph.connect(notes, 0, key, 0);
+    graph.connect(value, 0, key, 2);
+    graph.connect(key, 0, sink, plugin_param_port(&graph, sink));
+    check("key_param_with_a_live_value", &graph);
+}
+
+/// Audio custom settings and prepared state remain visible without changing
+/// the shared input/output buffer routing.
+#[test]
+fn audio_tremolo_with_note_control() {
+    use audio_graph_engine::{AudioTremolo, Beats, KeySwitchMode, Ratio, TremoloKeys, TremoloRow};
+
+    let mut graph = Graph::new();
+    let audio = graph.add(
+        NodeKind::AudioIn(AudioIn {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0; 2],
+    );
+    let notes = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let tremolo = graph.add(
+        NodeKind::AudioTremolo(AudioTremolo {
+            channels: 2,
+            keys: TremoloKeys {
+                mode: KeySwitchMode::Select,
+                rows: vec![TremoloRow {
+                    key: 24,
+                    step: Beats::new(1, 4),
+                }],
+                stop_key: 23,
+                share: Ratio::EVEN,
+            },
+            fade_in_ms: 5.0,
+            fade_out_ms: 5.0,
+        }),
+        [0.0; 2],
+    );
+    let out = graph.add(
+        NodeKind::AudioOut(AudioOut {
+            bus: 0,
+            channels: 2,
+        }),
+        [0.0; 2],
+    );
+    graph.connect(audio, 0, tremolo, 0);
+    graph.connect(notes, 0, tremolo, 1);
+    graph.connect(tremolo, 0, out, 0);
+    check("audio_tremolo_with_note_control", &graph);
+}
+
+/// A custom note processor exposes its resolved lane and initial owned state.
+#[test]
+fn midi_delay_with_a_live_time() {
+    use audio_graph_engine::{Beats, MidiDelay};
+
+    let mut graph = Graph::new();
+    let input = graph.add(NodeKind::NoteIn, [0.0; 2]);
+    let time = graph.add(NodeKind::SlotIn(SlotIn { slot: 4 }), [0.0; 2]);
+    let delay = graph.add(
+        NodeKind::MidiDelay(MidiDelay {
+            seconds: 0.25,
+            beats: Beats::new(1, 2),
+            sync: false,
+        }),
+        [0.0; 2],
+    );
+    let sink = graph.add(
+        NodeKind::Plugin(Plugin {
+            instance: 0,
+            ports: PluginPorts {
+                accepts_notes: true,
+                ..Default::default()
+            },
+        }),
+        [0.0; 2],
+    );
+    graph.node_mut(sink).unwrap().always_on = true;
+    graph.connect(input, 0, delay, 0);
+    graph.connect(time, 0, delay, 1);
+    graph.connect(delay, 0, sink, 0);
+    check("midi_delay_with_a_live_time", &graph);
+}
+
 /// Compile `graph` and compare the pretty-printed program with `tests/golden/<name>.txt`.
 fn check(name: &str, graph: &Graph) {
     let program =

@@ -13,7 +13,7 @@
 /// rows being pressed.
 pub const MAX_TREMOLO_ROWS: usize = 8;
 
-/// How many tremolos, of either half, one program may have. A ceiling because
+/// How many MIDI tremolos one program may have. A ceiling because
 /// each holds its notes in a table sized once, in
 /// [`Engine::new`][crate::Engine::new].
 pub const MAX_TREMOLOS: usize = 16;

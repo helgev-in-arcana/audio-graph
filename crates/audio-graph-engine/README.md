@@ -49,18 +49,49 @@ The crate is split along the one line that matters, the thread boundary:
 
 What reaches the audio side is a `PreparedProgram` and nothing else. The
 `engine` module must not mention `graph` or a node kind outside of its tests,
-which live in `engine/tests.rs`.
+which live in `engine/tests.rs` and test-only modules.
 
 **A `use crate::graph::…` in any other file under `engine/` is the signal that
 something has leaked across.** That is the cheapest way to check the invariant
 by eye, and it is worth checking in review.
 
+Parameter execution combines core `Op` instructions with prepared
+`ParamKernel` objects. Each custom kernel is compiled alongside its node and
+receives only local input lookups, a dedicated output slice, its own optional
+latch value and a read-only note view. Global register and state IDs stay in
+the compiled bindings. Inputs precede newly allocated outputs, so the evaluator
+can borrow both without copying values or using unsafe code.
+
+Kernel settings are immutable. Mutable processing state stays in `Engine`, so
+the normal end-row snapshot applies to parameter kernels as well. Their boxes
+are created during compilation and reclaimed through `ProgramPublisher`.
+
+Audio custom processors borrow either an in-place buffer or disjoint input and
+output regions. Each channel keeps the host block's stride even when processing
+a shorter chunk. No sample gathering is needed to construct the local view.
+
+Note custom processors borrow this row's input events and a capacity-limited
+output writer. Timing and lanes are shared once per row, while parameter
+lookups remain local to each node. Buffer accumulation and held-note tracking
+belong to the evaluator. End-row previews evaluate parameters only.
+
+Prepared custom processors pair immutable settings with a concrete state type.
+The engine adopts their vectors and matches state by node identity and processor
+type. Type checking occurs during adoption, not during evaluation. Unmatched
+state releases any retained notes, and retired boxes return with the prepared
+program for destruction off-thread. Reset behavior belongs to each state type;
+adding a processor does not require another state branch in `Engine`.
+
+Releasing the program keeps engine state for subsequent adoption. Active
+custom processors therefore remain in the engine until they are replaced or
+the engine is dropped on the main thread, like its built-in state tables.
+
 ### The audio side allocates nothing
 
-Every buffer the engine uses is sized once in `Engine::new`, against the
-compiler's ceilings. Adopting a new program is a pointer swap and a short loop,
-never a resize. No allocation, no locking, and no `Drop` of anything the main
-thread handed over.
+Buffer pools are sized in `Engine::new` and `prepare`; custom state is allocated
+with its processor on the publishing side. Adopting a program transfers these
+allocations and retained state without resizing. No allocation, no locking,
+and no `Drop` of anything the main thread handed over.
 
 `ProgramPublisher` owns the only handoff used by the product. It prepares rings
 on the non-realtime side and transfers matching rings from an unadopted

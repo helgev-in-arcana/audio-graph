@@ -236,6 +236,10 @@ pub enum Op {
         line: u16,
         a: Reg,
     },
+    /// Calls a prepared kernel owned by this program, using its resolved bindings.
+    Custom {
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
