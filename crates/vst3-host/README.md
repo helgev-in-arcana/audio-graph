@@ -58,7 +58,7 @@ expects. Parameter mappings are prepared outside processing and searched by ID
 without asking the controller again for every audio block.
 
 VST3 silence flags describe the current block, not whether a plugin will remain
-silent. They do not cause the host to return `ProcessStatus::Sleep`. Latency
+silent. They do not cause the host to return `ProcessStatus::Silent`. Latency
 change requests are propagated only when the reported latency actually changes.
 
 ## Tests

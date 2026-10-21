@@ -37,9 +37,9 @@ boundaries drawn in the same places.
 - **`tick` runs whether or not an editor is open.** `on_main_thread` and the
   timer extension exist regardless of what is on screen, and a plugin starved of
   them stalls its own worker.
-- **A `Sleep` process status means silent and staying silent.** Every other
-  status means the tail is still running; collapsing the two would cut reverbs
-  off.
+- **CLAP sleep maps to `ProcessStatus::Silent`.** Continuation and tail statuses
+  keep processing, while errors return `ProcessStatus::Error`. A silent block
+  alone does not imply that a plugin will stay silent.
 
 Input batches must fit `AudioConfig::max_input_events` and be ordered within
 the current block. Invalid batches are rejected without partial delivery.
