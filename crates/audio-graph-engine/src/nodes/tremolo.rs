@@ -174,6 +174,7 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run_ui(input, |ui| {
+            ui.set_style(crate::nodes::widgets::node_style(ui.style()));
             // The dropdown takes whatever width it is given, so the question
             // is whether anything spills past a node-wide `Ui`.
             width = ui

@@ -1,11 +1,7 @@
 //! The node canvas.
 //!
-//! Hand-rolled rather than taken from a crate. Every published egui node-graph
-//! library — `egui_node_graph2`, `egui-snarl`, `egui-graph-edit` — is pinned to
-//! egui 0.29–0.35, and `nice-plug-egui` requires 0.36.1. Two versions of egui
-//! cannot share a `Ui`, so using one would mean holding the plugin's whole GUI
-//! stack back a release. A canvas is a few hundred lines; that trade is not
-//! close.
+//! Drawing the canvas here keeps sockets, live values and inline node controls
+//! in one layout and interaction model.
 //!
 //! Values and wires can be edited inline because they touch no native object.
 //! Adding plugins, removing nodes, and replacing the document are deferred so
@@ -486,7 +482,7 @@ impl GraphEditor {
         // widget registered over it, and the title bar is both the handle and
         // the home of the delete button.
         let handle = Rect::from_min_size(pos, Vec2::new(width, PORT_TOP * zoom));
-        let drag = ui.interact(handle, ui.id().with(("node", id)), Sense::drag());
+        let drag = ui.interact(handle, ui.scope_id().with(("node", id)), Sense::drag());
 
         let mut child = ui.new_child(
             egui::UiBuilder::new()
@@ -504,9 +500,8 @@ impl GraphEditor {
         // Zooming the *style* rather than only the geometry is what makes a
         // zoomed node a smaller node instead of the same node with its text
         // hanging out of it.
-        if zoom != 1.0 {
-            child.set_style(zoomed_style(ui.style(), zoom));
-        }
+        let style = audio_graph_engine::node_style(ui.style());
+        child.set_style(zoomed_style(&style, zoom));
 
         // A socket's circle is painted on the node's edge, centred on it, so
         // the outer half of it lies over the node's own contents. Anything
@@ -908,7 +903,7 @@ impl GraphEditor {
         } = socket;
         let radius = PORT_RADIUS * self.zoom;
         let hit = Rect::from_center_size(centre, Vec2::splat(radius * 3.0));
-        let response = ui.interact(hit, ui.id().with(("port", which)), Sense::click());
+        let response = ui.interact(hit, ui.scope_id().with(("port", which)), Sense::click());
         // The colour says what the socket takes; filled against hollow says
         // whether anything is in it. Two facts, two channels — dimming the
         // colour to mean "empty" would have made them one.
@@ -945,7 +940,7 @@ impl GraphEditor {
         let mut added = false;
         let mut close = false;
 
-        egui::Area::new(ui.id().with("add-node"))
+        egui::Area::new(ui.scope_id().with("add-node"))
             .order(egui::Order::Foreground)
             .fixed_pos(
                 self.add_screen
@@ -1429,6 +1424,7 @@ mod tests {
             // is only set once a frame has seen it move there.
             self.frame(vec![egui::Event::PointerMoved(Pos2::new(450.0, 450.0))]);
             self.frame(vec![egui::Event::MouseWheel {
+                source: egui::MouseWheelSource::Wheel,
                 unit: egui::MouseWheelUnit::Line,
                 delta: Vec2::new(0.0, lines),
                 phase: egui::TouchPhase::Move,

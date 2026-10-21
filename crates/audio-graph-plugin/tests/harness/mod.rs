@@ -149,8 +149,12 @@ impl ProcessContext<WrapperFx> for Daw {
         (!self.incoming.is_empty()).then(|| self.incoming.remove(0))
     }
 
-    fn send_event(&mut self, event: NoteEvent<()>) {
+    fn try_send_event(
+        &mut self,
+        event: NoteEvent<()>,
+    ) -> Result<(), (NoteEvent<()>, nice_plug::context::process::SendEventError)> {
         self.outgoing.push(event);
+        Ok(())
     }
 
     fn set_latency_samples(&self, samples: u32) {
@@ -158,6 +162,8 @@ impl ProcessContext<WrapperFx> for Daw {
     }
 
     fn set_current_voice_capacity(&self, _capacity: u32) {}
+
+    fn request_restart(&self) {}
 }
 
 /// One block of audio, owning the samples on both sides of the wrapper.

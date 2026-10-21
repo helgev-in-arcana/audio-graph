@@ -23,6 +23,15 @@ use crate::nodes::{Beats, Rate, Ratio};
 /// only shows up once somebody adds a node.
 pub const NODE_WIDTH: f32 = 232.0;
 
+pub fn node_style(base: &egui::Style) -> egui::Style {
+    let mut style = base.clone();
+    // A 232-point node must fit a key, its name, a beat fraction and a remove
+    // button on one row. Four-point horizontal padding and gaps leave room for all four.
+    style.spacing.button_padding.x = 4.0;
+    style.spacing.item_spacing.x = 4.0;
+    style
+}
+
 /// One sub-plugin instance, as the node holding it needs to draw it.
 ///
 /// Filled in by the wrapper: this crate has no idea what is loaded, and does not
@@ -357,7 +366,7 @@ pub(crate) fn rate_control(ui: &mut egui::Ui, rate: &mut Rate) -> bool {
 /// way a score marks one.
 ///
 /// `id_salt` tells this control's list apart from any other drawn in the
-/// same node, and must differ between them. It cannot come from `ui.id()`:
+/// same node, and must differ between them. It cannot come from `ui.scope_id()`:
 /// sibling `Ui`s — the rows of a node, each laid out with `ui.horizontal` —
 /// share that id, and rows sharing a list's id share its open state and its
 /// clicks, so only the last row's list could be opened.
@@ -384,7 +393,7 @@ fn beats_parts(
         .on_hover_text("beats")
         .changed();
     ui.label("/");
-    let den = egui::ComboBox::from_id_salt(ui.id().with(("beats-den", id_salt)))
+    let den = egui::ComboBox::from_id_salt(ui.scope_id().with(("beats-den", id_salt)))
         .selected_text(beats.den.to_string())
         .width(ui.spacing().interact_size.x)
         .show_ui(ui, |ui| {
@@ -449,7 +458,7 @@ pub(crate) fn combo<T: PartialEq + Copy>(
     // Whatever the row has left rather than a fixed width: `NODE_WIDTH` is in
     // canvas units and the `Ui` here is already zoomed, so a constant made the
     // dropdown the one control that did not scale with the rest.
-    egui::ComboBox::from_id_salt(ui.id().with(label))
+    egui::ComboBox::from_id_salt(ui.scope_id().with(label))
         .selected_text(name(*current))
         .width(ui.available_width())
         .show_ui(ui, |ui| {
@@ -534,6 +543,7 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run_ui(input, |ui| {
+            ui.set_style(node_style(ui.style()));
             width = ui
                 .horizontal(|ui| rate_control(ui, &mut rate))
                 .response

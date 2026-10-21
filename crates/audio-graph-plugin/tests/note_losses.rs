@@ -10,6 +10,7 @@ mod harness;
 use harness::{Block, Daw, LIVE, fx_layout};
 
 use audio_graph_plugin::{ErrorSource, Wrapper, WrapperKind};
+use nice_plug::midi::{Channel, Key, VoiceID};
 use nice_plug::prelude::NoteEvent;
 
 const FRAMES: usize = 64;
@@ -29,9 +30,9 @@ fn note_ons(from: usize, count: usize) -> Vec<NoteEvent<()>> {
     (from..from + count)
         .map(|n| NoteEvent::NoteOn {
             timing: 0,
-            voice_id: None,
-            channel: (n / 128) as u8,
-            note: (n % 128) as u8,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number((n / 128) as u8),
+            key: Key::Number((n % 128) as u8),
             velocity: 0.8,
         })
         .collect()

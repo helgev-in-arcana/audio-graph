@@ -8,6 +8,7 @@
 mod harness;
 
 use harness::{Block, Daw, LIVE, fx_layout};
+use nice_plug::midi::{Channel, Key, VoiceID};
 
 use audio_graph_engine::{
     AudioIn, AudioOut, DelayRead, DelayWrite, Graph, NodeKind, Plugin, PluginPorts, PortType,
@@ -195,9 +196,9 @@ fn a_reset_gives_the_daw_back_the_notes_the_graph_was_holding() {
     let mut daw = Daw::playing();
     daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
         timing: 0,
-        voice_id: None,
-        channel: 0,
-        note: 60,
+        voice_id: VoiceID::Wildcard,
+        channel: Channel::Number(0),
+        key: Key::Number(60),
         velocity: 1.0,
     });
     Block::silent(FRAMES).process(&mut wrapper, &mut daw);
@@ -212,7 +213,10 @@ fn a_reset_gives_the_daw_back_the_notes_the_graph_was_holding() {
     assert!(
         daw.outgoing.iter().any(|event| matches!(
             event,
-            nice_plug::prelude::NoteEvent::VoiceTerminated { note: 60, .. }
+            nice_plug::prelude::NoteEvent::VoiceTerminated {
+                key: Key::Number(60),
+                ..
+            }
         )),
         "the DAW was not told the note is over: {:?}",
         daw.outgoing
@@ -256,9 +260,9 @@ fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
         let mut daw = Daw::playing();
         daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
             timing: 0,
-            voice_id: Some(42),
-            channel: 0,
-            note: 60,
+            voice_id: VoiceID::ID(42),
+            channel: Channel::Number(0),
+            key: Key::Number(60),
             velocity: 1.0,
         });
         let mut held = Block::silent(FRAMES);
@@ -275,7 +279,7 @@ fn output_overflow_resets_the_native_plugin_and_the_note_ledger() {
         assert!(daw.outgoing.iter().any(|event| matches!(
             event,
             nice_plug::prelude::NoteEvent::VoiceTerminated {
-                voice_id: Some(42),
+                voice_id: VoiceID::ID(42),
                 ..
             }
         )));
@@ -347,9 +351,9 @@ fn a_daw_reset_reaches_the_sub_plugin() {
     let mut daw = Daw::playing();
     daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
         timing: 0,
-        voice_id: Some(1),
-        channel: 0,
-        note: 60,
+        voice_id: VoiceID::ID(1),
+        channel: Channel::Number(0),
+        key: Key::Number(60),
         velocity: 1.0,
     });
     let mut block = Block::silent(32);

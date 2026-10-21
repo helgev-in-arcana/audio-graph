@@ -14,17 +14,17 @@ plugin-host.workspace = true
 plugin-scan.workspace = true
 subhost-adapter.workspace = true
 audio-graph-engine = { workspace = true, features = ["ui"] }
-nice-plug = "0.3"
+nice-plug = "0.4"
 nice-log = "0.3"
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-nice-plug-egui = "0.4"
+nice-plug-egui = "0.6"
 parking_lot = "0.12"
 # `default_fonts` is not optional in practice: nice-plug-egui pulls egui in
 # with default features off, and without the embedded fonts every label,
 # heading and button in the editor renders as nothing at all.
-egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 raw-window-handle = "0.6"
 
 [dev-dependencies]
