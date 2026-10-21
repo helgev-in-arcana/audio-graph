@@ -39,9 +39,10 @@ else lives here.
   Main-thread edits remain queued until a complete batch can be delivered.
 - **Successful activation matches the requested buses.** The backend verifies
   native arrangements and channel counts; it does not silently substitute stereo.
-- **The host context is module-scoped.** The factory keeps the pointer it is
-  given for the module's whole lifetime. Each binary has one owner thread within
-  this backend; another thread receives `HostError::ModuleBusy` until it is released.
+- **The native host application is module-scoped.** It retains only the host
+  name, not one instance's callback context. Per-instance component handlers
+  retain their own `HostContext`. Each binary has one owner thread; another
+  thread receives `HostError::ModuleBusy` until it is released.
 - **Thread initialization has an owner.** Hold the `ApartmentGuard` returned by
   `init_apartment()` until every plugin, view and returned processor is released.
   An incompatible Windows apartment is reported as an error.
@@ -50,3 +51,25 @@ else lives here.
   which plugins do not expect and at least one corrupts its heap over.
 - **The editor seam owns native lifetime.** `vst3-host-view` receives `Vst3View`.
   Its raw pointer is borrowed; derived native references must not outlive the handle.
+
+Plain parameter values use the controller's conversion methods, including
+stepped parameters. `SetNormalized` already carries the value the VST3 processor
+expects. Parameter mappings are prepared outside processing and searched by ID
+without asking the controller again for every audio block.
+
+VST3 silence flags describe the current block, not whether a plugin will remain
+silent. They do not cause the host to return `ProcessStatus::Sleep`. Latency
+change requests are propagated only when the reported latency actually changes.
+
+## Tests
+
+From the repository root:
+
+```sh
+cargo build --workspace --locked
+cargo test -p vst3-host --locked
+```
+
+The [VST3 fixture](../vst3-test-plugin/README.md) exercises native ownership,
+parameter synchronization, event capacity, and activation contracts. Optional
+installed-plugin tests use [`AUDIO_GRAPH_TEST_PLUGINS`](../../.env.example).

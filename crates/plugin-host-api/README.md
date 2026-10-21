@@ -1,7 +1,7 @@
 # plugin-host-api
 
 The format-agnostic data model and traits both plugin backends implement. This
-crate is dependency-free, and every other crate in the workspace depends on it.
+crate has no dependencies; the native hosts, facade, and adapter share its types.
 
 ## Responsibilities
 
@@ -9,8 +9,7 @@ crate is dependency-free, and every other crate in the workspace depends on it.
   expressions, audio buffers, bus layouts, transport, capabilities, errors.
 - The traits a backend implements (`SubPluginMain`, `SubPluginProcessor`) and
   the one a host implements (`HostContext`).
-- Staying dependency-free, because every other crate in the workspace depends on
-  this one.
+- Staying dependency-free so native backend types cannot enter the shared model.
 
 ## Not this crate's job
 
@@ -35,10 +34,10 @@ Collapsing them here would delete that capability from every backend, including
 the one that has it. The VST3 backend flattens them back together in its own
 layer, where the loss belongs.
 
-Parameters are likewise carried as plain values with an explicit range rather
-than normalised to `0..1`. Normalising in the core would bake VST3's poverty in:
-CLAP's stepped and enum semantics do not survive that round trip. Backends
-normalise on the way out instead.
+Parameter descriptors and `SetValue` use plain values with an explicit range.
+`Modulate` carries a plain-unit offset. These representations preserve the
+declared range and stepped or enum semantics instead of requiring every caller
+to convert through `0..1`.
 
 A value that is already normalized, the way a DAW's automation lane holds it,
 travels as `SetNormalized` rather than being turned into a plain value first.
@@ -50,9 +49,9 @@ Where a format genuinely has nothing to offer, the answer is `None`, never a
 guess — `VoiceInfo` comes from CLAP's `voice-info` and a VST3 sub-plugin reports
 `None`.
 
-### Nothing that cannot cross a process boundary appears in a public signature
+### Event and configuration payloads carry no native handles
 
-No `ComPtr`, no raw pointers, no references, `Arc`s or callbacks in payloads.
+No `ComPtr`, raw pointers, references, `Arc`s or callbacks appear in event payloads.
 The host's services reach a backend through one injected trait, `HostContext`,
 which an out-of-process backend forwards as messages. `HostError` is a flat
 owned enum for the same reason, down to the message of `InvalidState`. This is
@@ -106,10 +105,11 @@ processors and reclaims them before the owner thread or its host module exits.
 
 ### The host's services are injected, never assumed
 
-A backend never builds its own host object — `vst3-host` does not construct an
-`IHostApplication`, it receives a `HostContext`. That keeps "forwarded from the
-DAW" out of the core vocabulary entirely, so a standalone scanner and the nested
-wrapper are expressed by the same types.
+The caller injects `HostContext`; a backend implements its format's native host
+objects around those services. For example, `vst3-host` constructs
+`IHostApplication` and component-handler shims without choosing the caller's
+restart or parameter-edit policy. A standalone host and the nested wrapper use
+the same traits.
 
 ### Processing and metadata contracts
 
@@ -120,6 +120,8 @@ blocks return `Error` with cleared audio; zero-frame blocks do not call native D
 `AudioConfig::max_input_events` is the caller's bound on the events one
 `process` call is handed. Backends reserve their input buffers for it at
 activation and reject a longer batch whole, before any of it reaches the plugin.
+Input events must be ordered by their sample offsets and fall inside the block.
+After `ProcessStatus::Error`, reset held-note state before resuming processing.
 
 Prepare `EventSink::with_capacity` off the audio thread. `push` never grows it;
 failure is sticky in `overflowed()` until the caller clears the collection interval.
@@ -137,3 +139,8 @@ from the updated descriptors before activating. Failed updates remain pending.
 `NoteEnd` represents native voice completion. `note_end_ports` identifies input
 ports that supply it. A caller's note-off reclamation policy for other ports must
 track actual deliveries; it must not fabricate native completion events.
+
+Note identities remain optional. A missing `note_id` is not replaced by a key
+number, and negative port, channel, or key selectors retain their wildcard
+meaning where the event supports it. MIDI 1 encoding is a separate conversion;
+it cannot represent all native note identities and expression targets.

@@ -15,5 +15,15 @@ The parts of loading a plugin module that do not depend on its format, shared by
 
 Which folders to look in is not here: that is the caller's to say.
 
-Below `plugin-host`, which is where a format is chosen; nothing above the
-backends needs this crate.
+`vst3-host` and `clap-host` use the loader and lifetime helpers. `plugin-scan`
+also uses the filesystem discovery helpers; listing paths does not open their
+libraries. `plugin-host` chooses the format and exposes the hosting facade.
+
+`list_modules` only examines the named directory. `find_modules` also examines
+its immediate subdirectories, treating bundle directories as modules rather
+than descending into them. Neither function performs a recursive disk scan.
+
+The lease identifies a binary by its canonical path when available. Opening a
+module owned by another thread returns `HostError::ModuleBusy`; loading must be
+retried after that owner releases it, rather than calling the native entry point
+concurrently.

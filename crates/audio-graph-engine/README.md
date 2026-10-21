@@ -2,10 +2,11 @@
 
 The node graph: what turns the wrapper into an instrument of its own.
 
-Constants, LFOs and note expressions are combined into values that drive the
-wrapper's slots, and the slots drive the sub-plugin's parameters. Nothing in
-this crate knows what a VST3 is or what a slot is bound to — it reads numbers
-and writes numbers, and the outer layers decide what those numbers mean.
+Audio, MIDI, and parameter signals are connected in one graph. Constants, LFOs,
+note followers, and audio followers produce values for plugin parameters and
+audio controls; `Slot In` reads automation supplied by the wrapper. Plugin
+parameter sockets use direct schedule lanes as well as the wrapper's bound
+slots. Nothing here depends on VST3 or CLAP types.
 
 ## Responsibilities
 
@@ -23,8 +24,8 @@ and writes numbers, and the outer layers decide what those numbers mean.
 - **What a plugin is.** A plugin node reaches its sub-plugin only through
   `subhost_adapter::AudioInstances`: an instance number, note events, a schedule
   view, and flat audio slices. It never learns whether a VST3 or a CLAP answered.
-- **What a slot is bound to.** A node reads a slot and a node writes a slot;
-  the binding lives outside the graph.
+- **What a slot is bound to.** `Slot In` reads a supplied slot value. The
+  wrapper and adapter own slot bindings and map direct plugin parameter lanes.
 - **Deciding the numbers.** How many slots exist, how many instances a patch may
   hold: the wrapper's, handed in.
 - **The canvas.** Panning, zooming, drawing links, the add-node menu, loading
@@ -42,6 +43,33 @@ The crate is split along the one line that matters, the thread boundary:
 | `handoff`  | both   | Carries the program down to the audio thread and the old one back up, without a lock in either direction. |
 | `ir`       | main   | Owns compiled and prepared programs and their publisher.             |
 | `engine`   | audio  | Runs a `PreparedProgram`, allocating nothing and freeing nothing.     |
+| `nodes`    | main / prepared kernels | Node data, compilation, optional controls, and node-local parameter, audio, and MIDI processing. |
+| `notes`    | audio  | Note identity, delivery ownership, bounded voice storage, and completion. |
+
+## Execution and editor integration
+
+`Granularity` separates parameter `resolution` from audio-loop `quantum`.
+Parameter rows are evaluated at the chosen resolution; audio stages outside a
+feedback loop can process the whole host block. Audio delay lines have a minimum
+of one quantum, while parameter delay lines have a minimum of one parameter row.
+Changing resolution also requires the caller to prepare hosted processors for
+the resulting event capacity.
+
+The built-in node catalogue includes MIDI Split, Merge, Delay and Tremolo,
+Audio Math and Tremolo, and Held Keys. The full user-facing descriptions belong
+in [Nodes and Usage](../../docs/nodes-usage.md). Key Param Select uses a
+`ParamKernel`; Audio Tremolo and MIDI Delay use typed custom processors. The
+[execution ADR](../../dev/adr/2026-10-17_ir-dyn-hybrid-execution/README.md)
+records the design and measurements behind those choices.
+
+The default feature set is headless. Enable `ui` for `NodeUi`, the catalogue,
+node controls, and `node_style`. A canvas applies `node_style` before scaling
+for zoom so the controls fit `NODE_WIDTH`; the crate does not create a window.
+Live socket values are supplied by the embedding editor through `NodeUi`.
+
+The saved `Graph` preserves unknown nodes and connections. Compilation excludes
+unreadable nodes and their connected routes without deleting their saved data.
+The embedding product decides how to present the compatibility warning.
 
 ## Invariants
 
@@ -123,3 +151,18 @@ A plugin node has something behind it, but this crate only ever sees it through
 `subhost_adapter::AudioInstances`: an instance number, note events, a schedule
 view, and flat audio slices. `subhost-adapter` is the general crate and this one is
 AudioGraph's, so this one does the depending — never the reverse.
+
+## Verification
+
+From the repository root:
+
+```sh
+cargo test -p audio-graph-engine --locked
+cargo test -p audio-graph-engine --features ui --locked
+```
+
+The first run checks the configuration used by the CLI. A workspace test alone
+does not cover it because `audio-graph-plugin` enables `ui` through feature
+unification. The second run also checks node control geometry without opening
+a native window. The `hybrid_keyparam` and `hybrid_audio_note` examples provide
+the performance workloads referenced by the ADR.
