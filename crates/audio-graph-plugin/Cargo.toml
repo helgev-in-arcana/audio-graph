@@ -19,12 +19,21 @@ nice-log = "0.3"
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-nice-plug-egui = "0.6"
+# Keep the GUI stack on egui 0.36 / baseview 0.3.2, including in future releases.
+# baseview 0.4.1 leaks Win32 timers and uses a destroyed HWND during cleanup;
+# this affects AudioGraph inside DAWs as well as host-cli. 0.4.0 has timer-ID
+# collisions, so it is not a safe fallback. Revisit only after an upstream fix
+# and Windows VST3/CLAP tests covering sustained display and repeated open/close.
+# nice-plug-egui 0.5 still supports nice-plug-core 0.4, keeping the audio API intact.
+nice-plug-egui = "=0.5.0"
+# Explicit transitive pin: do not let a GUI dependency update bypass the above.
+baseview = "=0.3.2"
 parking_lot = "0.12"
 # `default_fonts` is not optional in practice: nice-plug-egui pulls egui in
 # with default features off, and without the embedded fonts every label,
 # heading and button in the editor renders as nothing at all.
-egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+# Match nice-plug-egui 0.5 and audio-graph-engine; upgrade this stack together.
+egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
 raw-window-handle = "0.6"
 
 [dev-dependencies]
