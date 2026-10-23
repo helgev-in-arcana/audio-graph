@@ -23,18 +23,21 @@ DTMで、ディレイループにエフェクトを掛けることは、伝統�
 
 音源/エフェクト問わず、複数のプラグインを組み合わせて大きなマクロを組むことも可能。
 
-## Getting Started / Features
+## Download / Getting Started
 
-1. [Releases](https://github.com/helgev-in-arcana/audio-graph/releases) から環境に合わせてダウンロード
+[Latest Version(`v0.1.6-alpha`)](https://github.com/helgev-in-arcana/audio-graph/releases/tag/v0.1.6-alpha)
 
-    動作確認済み:
+[All Releases](https://github.com/helgev-in-arcana/audio-graph/releases)
 
-    |OS|Arch|
-    | --- | --- |
-    |Win-11|x86_64|
-    |Ubuntu-24.04 (XWayland)|x86_64|
-2. DAW で AudioGraph を立ち上げ、`Plugin folders` に手持ちのプラグインのスキャンディレクトリを登録
-3. 空白を右クリック（または `Add Node`）でノードを置き、繋ぐ
+対応状況
+
+| OS(Arch)                       | vst | clap | load vst | load clap |
+| ------------------------------ | --- | ---- | -------- | --------- |
+| Win-11(x86_64)                 | ✅  | ✅   | ✅       | ✅        |
+| Win-11(arm)                    | ⚠️  | ⚠️   | ⚠️       | ⚠️        |
+| Ubuntu-24.04(XWayland)(x86_64) | -   | ✅   | ✅       | ✅        |
+| Ubuntu-24.04(-)(arm)           | -   | ⚠️   | ⚠️       | ⚠️        |
+| Mac                            | -   | -    | -        | -         |
 
 機能、詳しい操作とノードの一覧は →[Nodes and Usage](docs/nodes-usage.md)
 
@@ -84,7 +87,7 @@ processor.deactivate();
   - **macOS** はビルドが通っているだけで、ウィンドウ実装がまだありません。
   - 手持ちのVST3とCLAPで動作確認していますが、規格のすべてをテストできている保証は無いです。
 - VST2ネイティブ対応はライセンスの問題で今後も不可能です。VST3化ツールなど使ってください。
-- このリポジトリはAI駆動で開発されており、私([@helgev-in-arcana](https://github.com/helgev-in-arcana))が設計・コード監査を進めています。<br>
+- このリポジトリはAI駆動で開発されていますが、私([@helgev-in-arcana](https://github.com/helgev-in-arcana))が設計・コード監査を行っています。<br>
   §Architecture など、クレート/モジュ―ル構成、依存フローの構造は確認/リファクタが完了しています。
 
 ―――――――――――――――――――――――――――――――――――――――🚧🚧🚧
