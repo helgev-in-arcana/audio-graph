@@ -566,7 +566,7 @@ impl WrapperEditor {
 
         ui.separator();
         if ui
-            .button("Reset")
+            .button("Engine Reset")
             .on_hover_text(
                 "forget everything the running graph is holding: the notes it \
                  thinks are down, the sub-plugins' own state, latched key \
