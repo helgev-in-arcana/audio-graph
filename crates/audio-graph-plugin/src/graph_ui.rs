@@ -265,8 +265,10 @@ impl GraphEditor {
 
         // Panning the background moves the view, not the patch, so node
         // positions stay meaningful when the window is resized.
-        if response.dragged_by(egui::PointerButton::Middle)
-            || (response.dragged() && self.dragging.is_none() && self.linking.is_none())
+        if (response.dragged_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Middle))
+            && self.dragging.is_none()
+            && self.linking.is_none()
         {
             self.pan += response.drag_delta();
         }
@@ -477,13 +479,6 @@ impl GraphEditor {
         let zoom = self.zoom;
         let width = NODE_WIDTH * zoom;
         let body = Rect::from_min_size(pos, Vec2::new(width, 0.0));
-        // The drag handle is registered before the node's contents so that the
-        // widgets inside win the pointer. egui resolves a click to the last
-        // widget registered over it, and the title bar is both the handle and
-        // the home of the delete button.
-        let handle = Rect::from_min_size(pos, Vec2::new(width, PORT_TOP * zoom));
-        let drag = ui.interact(handle, ui.id().with(("node", id)), Sense::drag());
-
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 // Without a salt of its own, every node's contents land in the
@@ -491,6 +486,10 @@ impl GraphEditor {
                 // box's open/closed state and one button's click, and the
                 // second one drawn wins. Node id makes each node its own world.
                 .id_salt(("graph-node", id))
+                // The Ui's background covers its measured frame and sits behind
+                // its controls, so empty space moves the node without taking
+                // clicks or value drags away from those controls.
+                .sense(Sense::click_and_drag())
                 .max_rect(Rect::from_min_size(body.min, Vec2::new(width, 4000.0)))
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
@@ -500,7 +499,9 @@ impl GraphEditor {
         // Zooming the *style* rather than only the geometry is what makes a
         // zoomed node a smaller node instead of the same node with its text
         // hanging out of it.
-        let style = audio_graph_engine::node_style(ui.style());
+        let mut style = audio_graph_engine::node_style(ui.style());
+        // Labels are part of the node's drag surface, not text-selection targets.
+        style.interaction.selectable_labels = false;
         child.set_style(zoomed_style(&style, zoom));
 
         // A socket's circle is painted on the node's edge, centred on it, so
@@ -601,7 +602,7 @@ impl GraphEditor {
                     if !plugin {
                         controls(ui);
                     }
-                    // Truncation keeps the drag handle one line tall; the
+                    // Truncation keeps the title one line tall; the
                     // tooltip retains the full name.
                     let rest = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
                     ui.allocate_ui_with_layout(
@@ -806,9 +807,11 @@ impl GraphEditor {
         }
 
         let rect = response.response.rect;
+        let drag = child.response();
 
-        if drag.drag_started()
-            && let Some(pointer) = ui.ctx().pointer_latest_pos()
+        if (drag.drag_started_by(egui::PointerButton::Primary)
+            || drag.drag_started_by(egui::PointerButton::Middle))
+            && let Some(pointer) = ui.input(|i| i.pointer.press_origin())
         {
             self.dragging = Some((id, pointer - rect.min));
         }
@@ -1370,6 +1373,7 @@ mod tests {
         time: f64,
         instances: Vec<InstanceView>,
         touched: Vec<audio_graph_engine::Touch>,
+        shapes: Vec<egui::Shape>,
     }
 
     impl Canvas {
@@ -1381,6 +1385,7 @@ mod tests {
                 time: 0.0,
                 instances: Vec::new(),
                 touched: Vec::new(),
+                shapes: Vec::new(),
             }
         }
 
@@ -1414,7 +1419,84 @@ mod tests {
                 };
                 editor.ui(ui, graph, &context);
             });
+            fn collect(shape: &egui::Shape, shapes: &mut Vec<egui::Shape>) {
+                match shape {
+                    egui::Shape::Vec(children) => {
+                        for child in children {
+                            collect(child, shapes);
+                        }
+                    }
+                    shape => shapes.push(shape.clone()),
+                }
+            }
+            self.shapes.clear();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut self.shapes);
+            }
             output.drop_without_applying_deltas();
+        }
+
+        fn single_node(zoom: f32) -> Self {
+            let mut canvas = Self::new();
+            canvas.editor.zoom = zoom;
+            canvas.graph = Graph::new();
+            canvas.graph.add(
+                NodeKind::Constant(audio_graph_engine::Constant { value: 0.5 }),
+                [80.0, 80.0],
+            );
+            for _ in 0..3 {
+                canvas.frame(Vec::new());
+            }
+            canvas
+        }
+
+        fn node_rect(&self) -> Rect {
+            self.shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(shape)
+                        if shape.fill == self.ctx.style_of(self.ctx.theme()).visuals.panel_fill
+                            && shape.rect.width() < 400.0 =>
+                    {
+                        Some(shape.rect)
+                    }
+                    _ => None,
+                })
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("node frame")
+        }
+
+        fn text_rect(&self, text: &str) -> Rect {
+            self.shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                        Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing text: {text}"))
+        }
+
+        fn button(&mut self, pos: Pos2, button: egui::PointerButton, pressed: bool) {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+
+        fn drag(&mut self, from: Pos2, delta: Vec2, button: egui::PointerButton) {
+            self.button(from, button, true);
+            for step in 1..=4 {
+                self.frame(vec![egui::Event::PointerMoved(
+                    from + delta * (step as f32 / 4.0),
+                )]);
+            }
+            self.button(from + delta, button, false);
+            self.frame(Vec::new());
         }
 
         /// A wheel notch over the canvas, and the frames it takes egui to smooth
@@ -1433,6 +1515,106 @@ mod tests {
                 self.frame(Vec::new());
             }
         }
+    }
+
+    /// The title, body margins and port labels move the node at every zoom without panning.
+    #[test]
+    fn dragging_any_non_control_part_moves_only_the_node() {
+        for zoom in [0.6, 1.0, 1.6] {
+            for part in 0..4 {
+                let mut canvas = Canvas::single_node(zoom);
+                let rect = canvas.node_rect();
+                let from = match part {
+                    0 => canvas.text_rect("Constant").center(),
+                    1 => Pos2::new(rect.left() + 3.0 * zoom, rect.center().y),
+                    2 => Pos2::new(rect.center().x, rect.bottom() - 3.0 * zoom),
+                    _ => canvas.text_rect("out").center(),
+                };
+                let delta = Vec2::new(40.0, 24.0);
+                let before = Vec2::from(canvas.graph.nodes[0].pos);
+                canvas.drag(from, delta, egui::PointerButton::Primary);
+                let actual = Vec2::from(canvas.graph.nodes[0].pos) - before;
+                assert!(
+                    (actual - delta / zoom).length() < 0.1,
+                    "part={part}, zoom={zoom}, actual={actual:?}"
+                );
+                assert_eq!(canvas.editor.pan, Vec2::ZERO);
+                assert!(canvas.editor.dragging.is_none());
+            }
+        }
+    }
+
+    /// A drag begun on the background pans without changing the stored node positions.
+    #[test]
+    fn only_background_drags_pan_the_canvas() {
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Middle] {
+            let mut canvas = Canvas::single_node(1.0);
+            let before = canvas.graph.nodes[0].pos;
+            let from = Pos2::new(700.0, 500.0);
+            let delta = canvas.node_rect().center() - from;
+            canvas.drag(from, delta, button);
+            assert!((canvas.editor.pan - delta).length() < 0.1);
+            assert_eq!(canvas.graph.nodes[0].pos, before);
+
+            let mut canvas = Canvas::single_node(1.0);
+            let rect = canvas.node_rect();
+            let from = Pos2::new(rect.center().x, rect.bottom() - 3.0);
+            canvas.drag(from, Vec2::new(400.0, 250.0), button);
+            assert_eq!(
+                canvas.editor.pan,
+                Vec2::ZERO,
+                "a node drag cannot turn into a background pan"
+            );
+            assert_ne!(canvas.graph.nodes[0].pos, before);
+        }
+    }
+
+    /// Parameter drags edit the value without moving either the node or the canvas.
+    #[test]
+    fn node_controls_keep_their_drag_interaction() {
+        let mut canvas = Canvas::single_node(1.0);
+        canvas.ctx.global_style_mut(|style| {
+            style.visuals.handle_shape = egui::style::HandleShape::Circle
+        });
+        canvas.frame(Vec::new());
+        let rect = canvas.node_rect().shrink(15.0);
+        let slider = canvas
+            .shapes
+            .iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Circle(shape) if rect.contains(shape.center) => Some(shape.center),
+                _ => None,
+            })
+            .expect("slider handle");
+        let before = canvas.graph.nodes[0].pos;
+        canvas.drag(slider, Vec2::new(30.0, 0.0), egui::PointerButton::Primary);
+        let NodeKind::Constant(value) = &canvas.graph.nodes[0].kind else {
+            unreachable!()
+        };
+        assert!(value.value > 0.5);
+        assert_eq!(canvas.graph.nodes[0].pos, before);
+        assert_eq!(canvas.editor.pan, Vec2::ZERO);
+    }
+
+    /// Buttons and ports retain their clicks above the node's drag surface.
+    #[test]
+    fn node_buttons_and_ports_keep_their_clicks() {
+        let mut canvas = Canvas::single_node(1.0);
+        let before = canvas.graph.nodes[0].pos;
+        let on = canvas.graph.nodes[0].always_on;
+        let button = canvas.text_rect("always on").center();
+        canvas.button(button, egui::PointerButton::Primary, true);
+        canvas.button(button, egui::PointerButton::Primary, false);
+        assert_ne!(canvas.graph.nodes[0].always_on, on);
+        let port = Pos2::new(
+            canvas.node_rect().right(),
+            canvas.text_rect("out").center().y,
+        );
+        canvas.button(port, egui::PointerButton::Primary, true);
+        canvas.button(port, egui::PointerButton::Primary, false);
+        assert_eq!(canvas.editor.linking, Some((canvas.graph.nodes[0].id, 0)));
+        assert_eq!(canvas.graph.nodes[0].pos, before);
+        assert_eq!(canvas.editor.pan, Vec2::ZERO);
     }
 
     #[test]
