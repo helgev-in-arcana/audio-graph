@@ -23,6 +23,15 @@ use crate::nodes::{Beats, Rate, Ratio};
 /// only shows up once somebody adds a node.
 pub const NODE_WIDTH: f32 = 232.0;
 
+pub fn node_style(base: &egui::Style) -> egui::Style {
+    let mut style = base.clone();
+    // A 232-point node must fit a key, its name, a beat fraction and a remove
+    // button on one row. Four-point horizontal padding and gaps leave room for all four.
+    style.spacing.button_padding.x = 4.0;
+    style.spacing.item_spacing.x = 4.0;
+    style
+}
+
 /// One sub-plugin instance, as the node holding it needs to draw it.
 ///
 /// Filled in by the wrapper: this crate has no idea what is loaded, and does not
@@ -534,6 +543,7 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run_ui(input, |ui| {
+            ui.set_style(node_style(ui.style()));
             width = ui
                 .horizontal(|ui| rate_control(ui, &mut rate))
                 .response

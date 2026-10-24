@@ -33,8 +33,8 @@ its parameters", "open its editor" and never learns which format answered.
   resolving saved references are `plugin-scan`'s.
 - **Talking to a specific format.** `vst3-host`, `vst3-host-view` and `clap-host`
   do that; this crate is the arm that chooses between them.
-- **Windows.** `host-window` owns the container window, the deferred queue and
-  key forwarding.
+- **Windows.** `host-window` owns the container window and key forwarding.
+  The embedding application owns deferred main-thread work.
 
 The test for whether something belongs here: **would a standalone offline
 renderer or a plugin scanner still need it?** If yes, it belongs here or below.
@@ -58,7 +58,8 @@ have been released and returned resources reclaimed.
 The main loop services three separate responsibilities:
 
 - `poll()` advances this library's window events inside a DAW. Standalone hosts
-  can use `pump_events()` to dispatch their own message queue.
+  can use `pump_events()` to dispatch their own message queue. A plugin must not
+  call `pump_events()` on behalf of its DAW.
 - Call each `Plugin::tick()` even without an open editor, to deliver main-thread
   callbacks and service plugin timers and editor changes.
 - Call `reclaim_main_thread()` to destroy resources returned from other threads,
@@ -66,3 +67,38 @@ The main loop services three separate responsibilities:
 
 Processing, metadata refresh, and processor return follow the
 [shared API contracts](../plugin-host-api/README.md#processing-and-metadata-contracts).
+
+## Processing flow
+
+1. Initialize the owner thread, then call `Plugin::load(path, class_id, context)`.
+   `None` selects the first class; restoring a saved reference should pass its ID.
+2. Inspect `io_layout()` and parameters. Request main bus widths while inactive,
+   then build an `AudioConfig` matching the supported layout and input-event bound.
+3. Allocate flat audio buffers and an `EventSink::with_capacity` before processing.
+   `activate(config)` returns the owning `Processor`.
+4. Import `SubPluginProcessor` to call `process`. Clear the output sink at the
+   start of its collection interval, inspect the returned `ProcessStatus`, and
+   check `overflowed()` before treating the output event stream as complete.
+5. Service `tick()` and metadata requests on the owner thread. Stop and return
+   the processor before applying a change that needs deactivation, then rebuild
+   buffers and activate with the new descriptors.
+6. Call `processor.deactivate()` or drop it. Return resources from the audio
+   thread, reclaim them on the owner thread, close editors and release plugins
+   before dropping the thread guard.
+
+The [CLI host](../host-cli/src/host.rs) provides a concrete `HostContext`;
+[CLI commands](../host-cli/src/main.rs) show complete loading and processing
+flows. These APIs are intended for workspace use and are not yet stable.
+
+## Tests
+
+From the repository root, build the native fixtures before running the tests:
+
+```sh
+cargo build --workspace --locked
+cargo test -p plugin-host --locked
+```
+
+Tests of installed plugins use the explicit path list described in
+[`.env.example`](../../.env.example); absent suitable paths, those cases skip.
+Fixture-based tests do not require an installed commercial plugin.

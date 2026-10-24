@@ -19,7 +19,8 @@ makes different choices and gets the same crate.
 
 ## Responsibilities
 
-- Loading, unloading and re-finding sub-plugins, and holding the loaded ones.
+- Loading and unloading sub-plugins, retaining unavailable instances, and
+  restoring them from paths supplied by the caller.
 - The slot table: the parameters the wrapper publishes to the DAW, and their
   bindings to sub-plugin parameters.
 - The schedule those values travel in: a row of lane values every
@@ -68,10 +69,17 @@ returns those activations directly, so unloading or replacing a slot cannot
 redirect an outstanding processor's return into another instance. A failed group
 activation also returns all processors created before the failure.
 
-`load_state` takes caller-selected search folders. Failed restoration retains
-the original state and leaves the native plugin unloaded, so a default preset
-cannot overwrite it. A failed save retains the last successful blob. The saved
-document format is independent of whether a native instance is available today.
+`load_state` takes a candidate callback from `PluginRef` to an ordered list of
+paths. It tries the saved path first when present, then the supplied candidates,
+loading each with the saved plugin ID. It does not scan folders or depend on
+`plugin-scan`; the caller can use that crate's catalogue or its own resolver.
+`retry_unloaded` applies the same callback to retained instances after a scan
+finds more candidates.
+
+Failed restoration retains the original state and leaves the native plugin
+unloaded, so a default preset cannot overwrite it. A failed save retains the
+last successful blob. `load_state` returns diagnostics for individual failures
+without preventing the other instances from loading.
 
 ### A binding outlives what it points at
 
@@ -119,6 +127,10 @@ resolution activates again, which is a restart for the sub-plugins.
 happens during preparation, before deduplication, so an unchanged preferred
 value cannot be overridden by a changing lower-priority lane. The caller selects
 the policy; the adapter does not decide whether a graph or a DAW should win.
+
+Scheduled values are normalized to `0..1` and sent as `SetNormalized`. Native
+backends perform the format-specific mapping, including the VST3 plugin's own
+parameter curve. The caller supplies plain-unit changes separately as events.
 
 ### Child output retains its identity
 

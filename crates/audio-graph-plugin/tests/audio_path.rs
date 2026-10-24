@@ -8,6 +8,7 @@
 mod harness;
 
 use harness::{BOUNCE, Block, Daw, LIVE, fixture_as_clap, fixture_state, fx_layout};
+use nice_plug::midi::{Channel, Key, VoiceID};
 
 use audio_graph_plugin::{Wrapper, WrapperKind};
 
@@ -68,9 +69,9 @@ fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
     let mut daw = Daw::playing();
     daw.incoming.push(nice_plug::prelude::NoteEvent::NoteOn {
         timing: 0,
-        voice_id: Some(42),
-        channel: 0,
-        note: 60,
+        voice_id: VoiceID::ID(42),
+        channel: Channel::Number(0),
+        key: Key::Number(60),
         velocity: 1.0,
     });
     let mut before = Block::silent(64);
@@ -122,7 +123,7 @@ fn metadata_changes_reach_graph_ports_and_parameter_bindings() {
         daw.outgoing.iter().any(|event| matches!(
             event,
             nice_plug::prelude::NoteEvent::VoiceTerminated {
-                voice_id: Some(42),
+                voice_id: VoiceID::ID(42),
                 ..
             }
         )),

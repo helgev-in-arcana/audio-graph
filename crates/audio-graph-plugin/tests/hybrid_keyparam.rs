@@ -6,6 +6,7 @@ use audio_graph_engine::{
 };
 use audio_graph_plugin::{Wrapper, WrapperKind};
 use harness::{Block, Daw, LIVE, fx_layout};
+use nice_plug::midi::{Channel, Key, VoiceID};
 use nice_plug::prelude::NoteEvent;
 
 fn playing(mode: KeyParamMode) -> (Wrapper, NodeId) {
@@ -67,9 +68,9 @@ fn publish(wrapper: &Wrapper) {
 fn strike(daw: &mut Daw, key: u8) {
     daw.incoming.push(NoteEvent::NoteOn {
         timing: 0,
-        voice_id: None,
-        channel: 0,
-        note: key,
+        voice_id: VoiceID::Wildcard,
+        channel: Channel::Number(0),
+        key: Key::Number(key),
         velocity: 1.0,
     });
 }
@@ -201,9 +202,9 @@ fn resetting_a_midi_delay_discards_pending_notes_and_releases_their_voices() {
     let mut daw = Daw::playing();
     daw.incoming.push(NoteEvent::NoteOn {
         timing: 0,
-        voice_id: Some(42),
-        channel: 0,
-        note: 61,
+        voice_id: VoiceID::ID(42),
+        channel: Channel::Number(0),
+        key: Key::Number(61),
         velocity: 1.0,
     });
     let mut block = Block::silent(FRAMES);
@@ -219,9 +220,9 @@ fn resetting_a_midi_delay_discards_pending_notes_and_releases_their_voices() {
     assert!(matches!(
         daw.outgoing.as_slice(),
         [NoteEvent::VoiceTerminated {
-            voice_id: Some(42),
-            channel: 0,
-            note: 61,
+            voice_id: VoiceID::ID(42),
+            channel: Channel::Number(0),
+            key: Key::Number(61),
             ..
         }]
     ));

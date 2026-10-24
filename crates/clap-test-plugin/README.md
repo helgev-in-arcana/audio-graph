@@ -29,4 +29,14 @@ A deterministic CLAP plugin, built as a `cdylib`, so that `clap-host` and
   panic, not a skip: a green run with the fixture missing would be a green run
   that proved nothing.
 - **Cargo does not build another package's `cdylib` on its own.** Run
-  `cargo build --workspace` before `cargo test --workspace`.
+  `cargo build --workspace --locked` before `cargo test --workspace --locked`.
+
+The fixture also exposes controls for metadata changes, event-capacity failures,
+callbacks, and native resource lifetime. Tests in `clap-host`, `plugin-host`,
+`plugin-scan`, `subhost-adapter`, and `audio-graph-plugin` use those controls to
+check the surrounding layers. Test helpers load isolated module copies where
+module-global state must not be shared between cases.
+
+No installed third-party plugin or `AUDIO_GRAPH_TEST_PLUGINS` setting is needed
+for these fixture tests. GUI cases require Win32 or an X server; Linux CI uses
+Xvfb. This crate is a test dependency and is not bundled as a product plugin.

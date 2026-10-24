@@ -17,17 +17,17 @@ sight.
 
 ## Backends
 
-One module each, under `src/`: `win32`, `x11`, and `stub` for what is left.
-X11 rather than Wayland, and not because Wayland is unspoken: VST3 has
-`IWaylandHost` and `IWaylandFrame` for it, and CLAP reserves the name `wayland`
-without yet saying what handle goes with it. What decides it is that the formats
-disagree — a Wayland backend would serve VST3 and leave CLAP where it is — and
-that the model is inverted. Wayland has no cross-process reparenting, so there
-the *host* owns the surface and lends it; here the plugin owns its window and
-reparents into an id, which is what lets this container own no pixels at all.
+The platform implementations are under `src/`:
 
-Under a Wayland session the DAW and the plugins are on XWayland, which is what
-every Linux host does today for the same reason.
+| Backend | Platform | Editor container |
+| --- | --- | --- |
+| `win32` | Windows | Native top-level window, driven by the owning thread's message pump. |
+| `x11` | Unix except macOS | X11 window with this crate's own connection, advanced by `poll()`. |
+| `stub` | macOS and other targets | Container creation returns an error. |
+
+The Linux editor requires X11, including XWayland when running in a Wayland
+session. There is no native Wayland container. Compiling for macOS does not
+provide a working hosted-editor window.
 
 ## Not this crate's job
 
@@ -48,10 +48,9 @@ every Linux host does today for the same reason.
 ## Invariants
 
 - **`poll` runs no caller code.** An event only ever writes to a `WindowState`,
-  so there is no turn of it that is unsafe to be inside of. Deferring work out
-  of a draw callback is a real rule, but it belongs to whoever owns the plugin
-  instance, not here — this crate used to carry a `Deferred` for it and the
-  queue's owner turned out to be the wrong place for it to live.
+  so callers can collect window changes without reentering their own handlers.
+  The plugin owner schedules native operations outside draw callbacks; this
+  crate does not own that deferred work queue.
 - **`watch` never calls a plugin back with its list locked, and re-checks
   registration identity before every callback.** Replacing or retiming a watch
   invalidates callbacks collected for its previous generation. A plugin may unregister from
@@ -66,3 +65,8 @@ every Linux host does today for the same reason.
 - **The tests open real windows.** `cargo test` on X11 therefore needs a display;
   without one it fails saying so rather than passing vacuously. CI runs the Linux
   job under `xvfb-run`.
+
+`pump_events()` is for standalone applications that own the message queue.
+An embedded plugin must use `poll()` instead, leaving dispatch of the DAW's
+messages to the DAW. Timer and descriptor callbacks are dispatched separately
+by each backend's main-thread tick through `watch`.

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::config::{LANES, SLOT_COUNT, SUB_HOST};
 use crate::state::WrapperState;
 use audio_graph_engine::{Ended, Engine, Graph, MAX_LIVE_NOTES};
+use nice_plug::midi::{Channel, Key, VoiceID};
 use nice_plug::prelude::*;
 use plugin_host::{
     AudioConfig, Event, NoteEvent as ApiNote, ParamEvent, ProcessStatus as ApiStatus, Target,
@@ -693,11 +694,11 @@ fn settle_notes<P: Plugin>(
 /// keeps for the rest of the session.
 fn report_ended<P: Plugin>(ended: &[Ended], context: &mut impl ProcessContext<P>) {
     for note in ended {
-        context.send_event(NoteEvent::VoiceTerminated {
+        let _ = context.try_send_event(NoteEvent::VoiceTerminated {
             timing: 0,
-            voice_id: note.daw_id,
-            channel: note.channel.clamp(0, 15) as u8,
-            note: note.key.clamp(0, 127) as u8,
+            voice_id: note.daw_id.map_or(VoiceID::Wildcard, VoiceID::ID),
+            channel: Channel::Number(note.channel.clamp(0, 15) as u8),
+            key: Key::Number(note.key.clamp(0, 127) as u8),
         });
     }
 }
@@ -746,17 +747,17 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
     // the shape is factored out and only the value differs.
     fn expression(
         timing: u32,
-        voice_id: Option<i32>,
-        channel: u8,
-        note: u8,
+        voice_id: VoiceID,
+        channel: Channel,
+        key: Key,
         expression: Expr,
         value: f32,
     ) -> ApiNote {
         ApiNote::Expression {
-            note_id: voice_id,
+            note_id: voice_id.id(),
             port: 0,
-            channel: channel as i16,
-            key: note as i16,
+            channel: channel.number().map_or(-1, i16::from),
+            key: key.number().map_or(-1, i16::from),
             expression,
             value: value as f64,
             sample_offset: timing,
@@ -768,13 +769,13 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             velocity,
         } => ApiNote::NoteOn {
-            note_id: voice_id,
+            note_id: voice_id.id(),
             port: 0,
-            channel: channel as i16,
-            key: note as i16,
+            channel: channel.number().map_or(-1, i16::from),
+            key: key.number().map_or(-1, i16::from),
             velocity: velocity as f64,
             sample_offset: timing,
         },
@@ -782,13 +783,13 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             velocity,
         } => ApiNote::NoteOff {
-            note_id: voice_id,
+            note_id: voice_id.id(),
             port: 0,
-            channel: channel as i16,
-            key: note as i16,
+            channel: channel.number().map_or(-1, i16::from),
+            key: key.number().map_or(-1, i16::from),
             velocity: velocity as f64,
             sample_offset: timing,
         },
@@ -796,70 +797,63 @@ fn convert_note<S>(event: &NoteEvent<S>) -> Option<ApiNote> {
             timing,
             voice_id,
             channel,
-            note,
+            key,
         } => ApiNote::NoteEnd {
-            note_id: voice_id,
+            note_id: voice_id.id(),
             port: 0,
-            channel: channel as i16,
-            key: note as i16,
+            channel: channel.number().map_or(-1, i16::from),
+            key: key.number().map_or(-1, i16::from),
             sample_offset: timing,
         },
         NoteEvent::PolyPressure {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             pressure,
-        } => expression(timing, voice_id, channel, note, Expr::Pressure, pressure),
+        } => expression(timing, voice_id, channel, key, Expr::Pressure, pressure),
         NoteEvent::PolyVolume {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             gain,
-        } => expression(timing, voice_id, channel, note, Expr::Volume, gain),
+        } => expression(timing, voice_id, channel, key, Expr::Volume, gain),
         NoteEvent::PolyPan {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             pan,
-        } => expression(timing, voice_id, channel, note, Expr::Pan, pan),
+        } => expression(timing, voice_id, channel, key, Expr::Pan, pan),
         NoteEvent::PolyTuning {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             tuning,
-        } => expression(timing, voice_id, channel, note, Expr::Tuning, tuning),
+        } => expression(timing, voice_id, channel, key, Expr::Tuning, tuning),
         NoteEvent::PolyVibrato {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             vibrato,
-        } => expression(timing, voice_id, channel, note, Expr::Vibrato, vibrato),
+        } => expression(timing, voice_id, channel, key, Expr::Vibrato, vibrato),
         NoteEvent::PolyExpression {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             expression: value,
-        } => expression(timing, voice_id, channel, note, Expr::Expression, value),
+        } => expression(timing, voice_id, channel, key, Expr::Expression, value),
         NoteEvent::PolyBrightness {
             timing,
             voice_id,
             channel,
-            note,
+            key,
             brightness,
-        } => expression(
-            timing,
-            voice_id,
-            channel,
-            note,
-            Expr::Brightness,
-            brightness,
-        ),
+        } => expression(timing, voice_id, channel, key, Expr::Brightness, brightness),
         NoteEvent::MidiCC {
             timing,
             channel,
@@ -961,12 +955,77 @@ mod tests {
     fn a_missing_voice_id_stays_missing() {
         let on = convert_note(&NoteEvent::<()>::NoteOn {
             timing: 0,
-            voice_id: None,
-            channel: 0,
-            note: 60,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number(0),
+            key: Key::Number(60),
             velocity: 1.0,
         });
         assert!(matches!(on, Some(ApiNote::NoteOn { note_id: None, .. })));
+    }
+
+    /// A wildcard note-off keeps its scope instead of targeting channel zero or middle C.
+    #[test]
+    fn wildcard_note_off_keeps_its_scope() {
+        let off = convert_note(&NoteEvent::<()>::NoteOff {
+            timing: 7,
+            voice_id: VoiceID::ID(42),
+            channel: Channel::Wildcard,
+            key: Key::Wildcard,
+            velocity: 0.5,
+        });
+        assert_eq!(
+            off,
+            Some(ApiNote::NoteOff {
+                note_id: Some(42),
+                port: 0,
+                channel: -1,
+                key: -1,
+                velocity: 0.5,
+                sample_offset: 7,
+            })
+        );
+    }
+
+    /// Per-note expression preserves independent voice, channel and key targeting.
+    #[test]
+    fn expression_targeting_survives_the_wrapper_boundary() {
+        for (voice_id, channel, key, note_id, expected_channel, expected_key) in [
+            (
+                VoiceID::ID(42),
+                Channel::Wildcard,
+                Key::Wildcard,
+                Some(42),
+                -1,
+                -1,
+            ),
+            (
+                VoiceID::Wildcard,
+                Channel::Number(15),
+                Key::Number(127),
+                None,
+                15,
+                127,
+            ),
+        ] {
+            assert_eq!(
+                convert_note(&NoteEvent::<()>::PolyPressure {
+                    timing: 5,
+                    voice_id,
+                    channel,
+                    key,
+                    pressure: 0.25,
+                }),
+                Some(ApiNote::Expression {
+                    note_id,
+                    port: 0,
+                    channel: expected_channel,
+                    key: expected_key,
+                    expression: plugin_host::NoteExpression::Pressure,
+                    value: 0.25,
+                    sample_offset: 5,
+                })
+            );
+        }
     }
     use audio_graph_engine::{
         Graph, Lfo, Math, MathOp, NodeKind, ParamPort, Plugin, PluginPorts, Rate, Waveform, compile,

@@ -16,5 +16,6 @@ plugin-host.workspace = true
 subhost-adapter.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Pinned to what nice-plug-egui resolves, so the wrapper links one egui.
+# Match nice-plug-egui 0.5; see audio-graph-plugin/Cargo.toml for the Windows
+# timer bug that prevents upgrading the GUI stack independently.
 egui = { version = "0.36", optional = true, default-features = false }
