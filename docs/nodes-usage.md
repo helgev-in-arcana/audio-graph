@@ -1,82 +1,82 @@
-# Nodes
+# Nodes and Usage
 
-`AudioGraph.vst3` / `AudioGraph.clap` 1ファイルにインストゥルメント、エフェクト両方入っています。
+| DAW上の表示名 | 用途 |
+| --- | --- |
+| **Audio Graph Instrument** | インストゥルメント |
+| **Audio Graph FX** | エフェクト |
 
-|                        |                    |
-| ---------------------- | ------------------ |
-| Audio Graph Instrument | インストゥルメント |
-| Audio Graph FX         | エフェクト         |
+- キャンバスの右クリック、またはツールバーの **Add node** からノードやプラグインを配置します（操作感は Blender のノードエディターに準じています）。
+- **Plugin folders** でサブプラグインのスキャン先を管理します。設定はユーザー領域（Windows: `%LOCALAPPDATA%\AudioGraph\config.json`、macOS: `~/Library/Application Support/AudioGraph/`、Linux: `$XDG_CONFIG_HOME/audio-graph/`）に保存され、全インスタンスで共有されます。
 
-AddNodeもしくは空白を右クリックでノードを配置
+## Commons
 
-Plugin foldersでプラグインのスキャンディレクトリを登録
+- **ソケットの色** — **青**: Audio / **紫**: Sidechain (Aux) / **黄**: MIDI / **緑**: Parameter
+- **Parameter resolution** — パラメーターの値を何サンプルごとに計算し、サブプラグインへ送るか（`1` / `4` / `16` / `32` / `64` / `128`、既定は `32` ＝ 48kHzで約0.67ms）。オーディオの処理単位（Sub-block）とは独立しています。
+- **Sub-block** — オーディオのフィードバックループを含むパッチが一度に処理するサンプル数で、オーディオ遅延の最短時間でもあります（`16` / `32` / `64` / `128`、既定は `32`）。
+- **Engine Reset** — グラフの配線はそのままに、鳴りっぱなしのノート・ディレイ残響・LFO位相・キースイッチの保持状態だけをリセットします（ツールバーの `Reset` は初期配線への初期化、`Clear` は全消去です）。
+- **拍の指定** — LFO、MIDI Delay、Tremolo などの音価は `[分子] / [分母▾] [3]` で指定します。単位は「拍（4分音符）」なので、4/4拍子での `1/4` は16分音符、`[3]` は3連符（長さが 2/3）になります。
 
-設定はユーザーごとの領域（Windows は `%LOCALAPPDATA%\AudioGraph\config.json`、
-macOS は `~/Library/Application Support/AudioGraph/`、
-Linux は `$XDG_CONFIG_HOME/audio-graph/`）に保存され、同じPC内で共有されます。
-
-ノード操作はBlenderのノードを参考にしています。
-
-- Parameter resolution — パラメーターの値を何サンプルごとに計算し、サブプラグインへ送るか。
-  1 / 4 / 16 / 32 / 64 / 128 から選び、既定は 32（48kHz で約0.67ms）。
-  小さいほど滑らかですが、動いている値はその間隔ごとに1イベントになります。
-  オーディオの処理単位（Sub-block）とは独立しています。
-- Sub-block — オーディオのフィードバックループを含むパッチが一度に処理するサンプル数で、
-  オーディオ遅延の最短時間でもあります。16 / 32 / 64 / 128、既定は 32。
-  小さいほどループ内のプラグインが頻繁に呼ばれます。
-
-拍の長さ（LFO の rate の beats、MIDI Delay の sync 時の time）は DAW と同じく分数で指定します。
-`[分子] / [分母▾] [3]` の形で、分子は 1〜64 の整数、分母は 1 / 2 / 4 / … / 64 から選び、
-[3] で3連符（長さが 2/3）になります。単位は拍なので、4分の4拍子で 1/4 は16分音符です。
-
-## Audio
-
-ソケットは青、サイドチェインが紫
-<br>色分けしていますが交互に繋げられます
-
-- Audio Delay
-- Audio Out
-- Mix
-- Audio Gate
-- Audio Math
-- Audio Tremolo
-
-## MIDI
-
-ソケットは黄色
-<br>フルチャンネル、MIDI-CC込み
-
-- MIDI In
-- MIDI Gate
-- Key MIDI Route
-- MIDI Split
-- MIDI Key Mute
-- MIDI Filter
-- MIDI Merge
-- MIDI Delay
-- MIDI Tremolo
-- Param -> CC
-- CC In
-- Velocity
-- Gate
-- Key Track
-- Held Keys
-
-## Parameter
-
-ソケットは緑
-
-- Envelope Follower
-- Constant
-- Slot In
-- LFO
-- Math
-- Param Map
-- Param Select
-- Key Param Select
+---
 
 ## Plugin Node
 
-- [+] でパラメーター入力を呼び出せます。
-- [GUI] でプラグインのUIが開きます
-- [always on] でプラグインが常に有効になります。デフォルトでは出力が繋がっていないプラグインの処理が省略されるので、アナライザなど、出力無しであっても動かしたいプラグインは [always on] で有効にしてください。
+- **`[GUI]`** — サブプラグイン自身のウィンドウを開閉します。
+- **`[Learn]`** — 押してからサブプラグインのGUI上でツマミを動かすと、そのパラメーターの入力ソケットが自動追加されます（`[+]` から手動追加も可）。
+- **パラメーターの範囲** — サブプラグインのパラメーター入力は `0.0〜1.0` の正規化値で駆動します。Hz や dB などの値から変換したい場合は `Param Map` を挟みます。
+- **`[always on]`** — 出力がどこにも繋がっていなくても処理を実行します。アナライザーなど出力を使わないプラグインで有効にしてください。
+
+## Delay
+
+メニューの **Delay** から追加すると、同じ `line` 番号を持つ `write` と `read` のペアが配置されます。直接線を繋がないため、フィードバックループを作ることができます（1つの `write` に対して複数の `read` を置けばマルチタップになります）。
+
+| ノード | 説明 |
+| --- | --- |
+| **Audio delay** (`Delay N write` / `read`) | 音声のディレイライン。最短遅延は1 Sub-block分。`time` をパラメーターで揺らすとピッチも変化します。 |
+| **Param delay** (`Delay N write` / `read`) | パラメーター信号のディレイライン。最短遅延は1 Parameter resolution分。 |
+
+## Audio
+
+ソケットは**青**（サイドチェイン / Aux は**紫**、相互に接続可能）。
+
+| ノード | 説明 |
+| --- | --- |
+| **Audio In** | DAWからの音声入力（bus 1: メイン、bus 2: サイドチェイン）。 |
+| **Audio Out** | DAWへの音声出力。平行経路のレイテンシ差は自動で補正されます。 |
+| **Mix** | 複数音声のミックスとゲイン調整（dB）。入力1つで使えば単体のゲインノードになります。 |
+| **Audio Gate** | パラメーターが閾値以上のとき音声を通すゲート（クリック防止の fade in / out 付き）。 |
+| **Audio Math** | 波形演算（`Remove DC` / `Invert` / `Rectify` / 2入力の掛け算 `Multiply`）。 |
+| **Audio Tremolo** | キースイッチで指定した音価・カット率で音声を刻むトレモロ（`Hold` / `Select` 対応）。 |
+
+## MIDI
+
+ソケットは**黄色**（フルチャンネル・MIDI CC 込み）。
+
+| ノード | 説明 |
+| --- | --- |
+| **MIDI In** | DAWからのMIDI入力。 |
+| **MIDI Gate** | パラメーターが閾値以上のとき新規ノートオンを通すゲート（ノートオフは常に通過）。 |
+| **Key MIDI Route** | キースイッチでMIDIの送り先を切り替えるルーター（`Hold` / `Select` / `Toggle`）。 |
+| **MIDI Split** | 指定したキー境界で音域を分割して別々の出力へ送る（CCやピッチベンドは全出力へ通過）。 |
+| **MIDI Key Mute** | 指定したキーのノートだけをストリームから除外する。 |
+| **MIDI Filter** | 指定したMIDIチャンネルやCC番号だけを通す（`keep`）または除外する（`drop`）。 |
+| **MIDI Merge** | 複数のMIDIストリームを1つに合流させる。 |
+| **MIDI Delay** | MIDIストリーム全体を秒数または拍数（`sync`）だけ遅らせる。 |
+| **MIDI Tremolo** | キースイッチで押さえているノートを指定音価で連打・カットする。 |
+| **Param → CC** | パラメーター値（`0.0〜1.0`）を指定したMIDI CCイベントに変換してストリームへ混ぜる。 |
+| **CC In** | MIDIストリーム上の指定CCの値をパラメーター信号として取り出す。 |
+| **Velocity** / **Gate** / **Key Track** / **Held Keys** | ノート情報（ベロシティ / 押下ゲート / 音高 `0..1` / 押下中のキー数）をパラメーターとして取り出す。 |
+
+## Parameter
+
+ソケットは**緑**。接続された入力ソケットには、現在流れているライブ値が表示されます。
+
+| ノード | 説明 |
+| --- | --- |
+| **Envelope Follower** | 音声の音量（`peak` / `RMS`）を attack / release 付きでパラメーター値に変換する。 |
+| **Constant** | 固定の数値（`0.0〜1.0`）を出力する。 |
+| **Slot In** | DAWに公開されている32個のオートメーションスロット（`Slot 1〜32`）の値を読み取る。 |
+| **LFO** | 自由周期（Hz）またはテンポ同期（beats）で揺れるオシレーター。 |
+| **Math** | 2つのパラメーターの四則演算・最大最小などの計算。 |
+| **Param Map** | 入力レンジ `[in]` を出力レンジ `[out]` に線形マッピングする（`clamp` 切り替え可）。 |
+| **Param Select** | `control` の値が閾値（`≥`）を超すごとに、対応する行の値（または入力信号）へ切り替える。 |
+| **Key Param Select** | キースイッチ（`Select` / `Toggle`）で出力するパラメーター値や信号を切り替える。 |
