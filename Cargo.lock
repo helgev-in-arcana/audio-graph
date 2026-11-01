@@ -129,7 +129,7 @@ dependencies = [
  "nice-log",
  "nice-plug",
  "nice-plug-egui",
- "parking_lot",
+ "parking_lot 0.13.0",
  "plugin-host",
  "plugin-scan",
  "raw-window-handle",
@@ -674,7 +674,7 @@ dependencies = [
  "harfrust",
  "log",
  "nohash-hasher",
- "parking_lot",
+ "parking_lot 0.12.5",
  "profiling",
  "self_cell",
  "skrifa",
@@ -1147,6 +1147,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1244,7 +1253,7 @@ dependencies = [
  "nice-plug-core",
  "nice-plug-derive",
  "objc2 0.6.5",
- "parking_lot",
+ "parking_lot 0.12.5",
  "raw-window-handle",
  "serde_json",
  "thiserror 2.0.21",
@@ -1270,7 +1279,7 @@ dependencies = [
  "midi-consts",
  "nice-assert-no-alloc",
  "nice-plug-derive",
- "parking_lot",
+ "parking_lot 0.12.5",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -1299,7 +1308,7 @@ dependencies = [
  "egui",
  "egui-baseview",
  "nice-plug-core",
- "parking_lot",
+ "parking_lot 0.12.5",
  "raw-window-handle",
  "serde",
 ]
@@ -1660,8 +1669,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -1673,6 +1692,18 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
