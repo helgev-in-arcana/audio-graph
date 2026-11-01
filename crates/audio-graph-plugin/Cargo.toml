@@ -27,7 +27,7 @@ serde_json.workspace = true
 # nice-plug-egui 0.5 still supports nice-plug-core 0.4, keeping the audio API intact.
 nice-plug-egui = "=0.5.0"
 # Explicit transitive pin: do not let a GUI dependency update bypass the above.
-baseview = "=0.3.2"
+baseview = "=0.4.2"
 parking_lot = "0.12"
 # `default_fonts` is not optional in practice: nice-plug-egui pulls egui in
 # with default features off, and without the embedded fonts every label,
