@@ -18,4 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 # Match nice-plug-egui 0.5; see audio-graph-plugin/Cargo.toml for the Windows
 # timer bug that prevents upgrading the GUI stack independently.
-egui = { version = "0.36", optional = true, default-features = false }
+egui = { version = "0.37", optional = true, default-features = false }
